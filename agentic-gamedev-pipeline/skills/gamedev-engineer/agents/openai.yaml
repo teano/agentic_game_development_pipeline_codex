@@ -1,4 +1,4 @@
 interface:
   display_name: "GameDev Engineer"
   short_description: "Audit and remediate one complete bounded batch"
-  default_prompt: "Use $gamedev-engineer to complete one scope-wide engineering pass or evidence-only batch, run the required checks, compute exact revisions, and return verified manifests and reports."
+  default_prompt: "Use $gamedev-engineer as the assigned persistent writing owner to complete one scope-wide product pass or one support/evidence recovery batch, run the required checks, compute exact revisions, and return verified manifests and reports."

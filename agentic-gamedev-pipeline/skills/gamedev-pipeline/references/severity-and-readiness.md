@@ -7,6 +7,7 @@ Classify kind and severity independently.
 Kinds:
 
 - `product`: production behavior, contract, configuration, integration, or runtime source is wrong;
+- `support`: derived handoff, index, operator guidance, or non-normative metadata is stale or misleading while runtime behavior and public contracts remain unchanged;
 - `evidence`: required tests, fixtures, assertions, measurements, cleanup guarantees, or coverage cannot protect approved behavior.
 
 Severity:
@@ -32,15 +33,18 @@ Each gate records the exact revision, pending scenario IDs, completed reusable e
 Require all of the following:
 
 - current approved PRD and traced technical specification;
+- passed resource-budget preflight and a recorded runtime capability/manual-operator plan;
 - every repository-required supporting product document, including an ADR when policy requires one;
 - no source drift;
 - current-revision passing machine/engine verification and complete coverage manifest;
-- one fresh scope-complete `CLEAN` Engineer on the current product revision;
-- two distinct passed full Reviews on the current identities, or their preserved same-product reports plus one passed recovery reviewer;
+- one passed parallel read-only convergence wave on the current product revision;
+- two distinct passed full Reviews on the current identities, their preserved reports plus one passed targeted local-product closure reviewer, or their preserved same-product reports plus one passed support/evidence recovery reviewer;
 - feature-focused runtime QA `pass` on the current revision;
 - no unresolved critical/major finding;
 - no unaccepted minor finding;
 - no open gate hiding a mandatory scenario;
+- no unavailable required preflight capability;
+- worker and full-Review budgets either remain within their configured limits or have an explicit director authorization;
 - controller phase `ready` and successful `ready` command.
 
 This verdict is a production-ready candidate, not authorization to publish, deploy, migrate, spend, submit, or accept risk.

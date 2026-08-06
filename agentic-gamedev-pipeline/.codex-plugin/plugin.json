@@ -1,12 +1,12 @@
 {
   "name": "agentic-gamedev-pipeline",
-  "version": "0.2.0+codex.20260804182012",
-  "description": "An autonomous bounded game-feature pipeline with full-owner engineering, evidence-only recovery, parallel final review, and in-game QA.",
+  "version": "0.3.0+codex.20260805",
+  "description": "A bounded game-feature pipeline with director preflight, one persistent writing owner, parallel read-only convergence, risk-based review closure, and in-game QA.",
   "author": {
     "name": "teano",
     "url": "https://github.com/teano"
   },
-  "repository": "https://github.com/teano/agentic_game_development_pipeline",
+  "repository": "https://github.com/teano/agentic_game_development_pipeline_codex",
   "keywords": [
     "gamedev",
     "multi-agent",
@@ -18,8 +18,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Agentic GameDev Pipeline",
-    "shortDescription": "Autonomous bounded engineering, review, and QA.",
-    "longDescription": "Turns approved feature documents into a production-ready candidate through autonomous bounded Engineer ownership, deterministic revisions, evidence-only recovery, two parallel read-only Reviews, explicit execution gates, and feature-focused runtime QA.",
+    "shortDescription": "Preflight, one owner, parallel audits, review, and QA.",
+    "longDescription": "Turns approved feature documents into a production-ready candidate through resource/runtime preflight, one persistent writing owner, deterministic product/support/evidence revisions, parallel read-only convergence, risk-based Review closure, explicit worker budgets and execution gates, and feature-focused runtime QA.",
     "developerName": "teano",
     "category": "Productivity",
     "capabilities": [
@@ -29,9 +29,9 @@
     "defaultPrompt": [
       "Stabilize the product requirements for this game.",
       "Run the bounded development pipeline from approved feature documents.",
-      "Run a fresh Engineer pass that completes the full audit scope before batch-fixing every discovered defect.",
-      "Recover test-only Review findings without restarting product convergence.",
-      "Run two parallel final Reviews and then feature-focused in-game QA."
+      "Run one persistent Engineer owner and aggregate parallel read-only convergence findings before remediation.",
+      "Recover support or test-only Review findings without restarting runtime convergence.",
+      "Use targeted closure for local fixes, then run feature-focused in-game QA."
     ]
   }
 }

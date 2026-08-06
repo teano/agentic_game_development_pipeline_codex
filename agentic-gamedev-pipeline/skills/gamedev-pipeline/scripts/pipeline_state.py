@@ -15,12 +15,29 @@ from typing import Any
 
 
 STATE_DIR = ".agentic-pipeline"
-SCHEMA_VERSION = 3
-CONTRACT_VERSION = "2026-08-04-review-qa-v1"
+SCHEMA_VERSION = 4
+CONTRACT_VERSION = "2026-08-05-efficient-review-v2"
 BLOCKING_SEVERITIES = {"critical", "major"}
-FINDING_KINDS = {"product", "evidence"}
-PASSED_REVIEW_STATUSES = {"passed", "passed_recovery"}
+FINDING_KINDS = {"product", "support", "evidence"}
+PASSED_REVIEW_STATUSES = {"passed", "passed_targeted", "passed_recovery"}
 DEFAULT_MAX_CONSECUTIVE_PRODUCT_CHANGES = 2
+DEFAULT_REQUIRED_CONVERGENCE_AUDITS = 3
+DEFAULT_MAX_CONVERGENCE_WAVES = 2
+DEFAULT_MAX_WORKERS = 14
+DEFAULT_MAX_FULL_REVIEW_WAVES = 2
+CONVERGENCE_LENSES = {
+    "persistence-lifecycle",
+    "config-security-capacity",
+    "integration-runtime-docs",
+}
+PREFLIGHT_CAPABILITY_STATUSES = {
+    "available",
+    "not_required",
+    "planned_manual",
+    "blocked_user",
+    "blocked_environment",
+    "error_test",
+}
 QA_STATUSES = {
     "pass",
     "fail_product",
@@ -176,8 +193,9 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def normalize_runtime(state: dict[str, Any], findings: dict[str, Any]) -> None:
-    """Add current optional fields without invalidating schema-v3 runs."""
+    """Add optional fields introduced within the current controller contract."""
     state.setdefault("product_revision", state.get("revision"))
+    state.setdefault("support_revision", state.get("product_revision"))
     state.setdefault("evidence_revision", state.get("revision"))
     state.setdefault("coverage_manifest", None)
     iteration = state.setdefault("iteration_control", {})
@@ -187,6 +205,8 @@ def normalize_runtime(state: dict[str, Any], findings: dict[str, Any]) -> None:
         for run in state.get("engineer_runs", [])
         if run.get("outcome") == "clean"
     ]
+    if state.get("engineer_clean"):
+        boundary_times.append(state["engineer_clean"].get("recorded_at", ""))
     boundary_times.extend(
         item.get("recorded_at", "")
         for item in authorizations
@@ -221,20 +241,49 @@ def normalize_runtime(state: dict[str, Any], findings: dict[str, Any]) -> None:
         iteration["status"] = "running"
         iteration["reason"] = None
     state.setdefault("recovery", None)
+    state.setdefault("engineering_owner_id", None)
+    state.setdefault("product_revalidation", None)
+    state.setdefault("preflight", empty_preflight_state())
+    state.setdefault(
+        "convergence",
+        empty_convergence_state(
+            state.get("required_convergence_audits", DEFAULT_REQUIRED_CONVERGENCE_AUDITS)
+        ),
+    )
+    state.setdefault("closure_review", None)
+    state.setdefault(
+        "worker_budget",
+        empty_worker_budget(DEFAULT_MAX_WORKERS, DEFAULT_MAX_FULL_REVIEW_WAVES),
+    )
+    state["worker_budget"].setdefault("checkpoint_causes", [])
+    state["worker_budget"].setdefault(
+        "worker_ids",
+        sorted(
+            {
+                record["worker_id"]
+                for record in state["worker_budget"].get("records", [])
+                if record.get("worker_id")
+            }
+        ),
+    )
 
     for run in state.get("engineer_runs", []):
         run.setdefault("product_revision", run.get("revision"))
+        run.setdefault("support_revision", run.get("product_revision"))
         run.setdefault("evidence_revision", run.get("revision"))
         run.setdefault("change_class", "product" if run.get("outcome") == "changed" else "none")
     clean = state.get("engineer_clean")
     if clean:
         clean.setdefault("product_revision", clean.get("revision"))
+        clean.setdefault("support_revision", clean.get("product_revision"))
         clean.setdefault("evidence_revision", clean.get("revision"))
     machine = state.get("machine_checks", {})
     machine.setdefault("product_revision", machine.get("revision"))
+    machine.setdefault("support_revision", machine.get("product_revision"))
     machine.setdefault("evidence_revision", machine.get("revision"))
     review = state.get("review", {})
     review.setdefault("product_revision", review.get("revision"))
+    review.setdefault("support_revision", review.get("product_revision"))
     review.setdefault("evidence_revision", review.get("revision"))
     review.setdefault("recovery_run", None)
     for item in findings.get("items", []):
@@ -276,12 +325,14 @@ def empty_review_state(
     required: int,
     revision: str | None = None,
     product_revision: str | None = None,
+    support_revision: str | None = None,
     evidence_revision: str | None = None,
 ) -> dict[str, Any]:
     return {
         "status": "pending",
         "revision": revision,
         "product_revision": product_revision if product_revision is not None else revision,
+        "support_revision": support_revision if support_revision is not None else revision,
         "evidence_revision": evidence_revision if evidence_revision is not None else revision,
         "required": required,
         "runs": [],
@@ -292,13 +343,61 @@ def empty_review_state(
     }
 
 
+def empty_preflight_state() -> dict[str, Any]:
+    return {
+        "status": "pending",
+        "resource_budget_check": "pending",
+        "capabilities": {},
+        "runs": [],
+    }
+
+
+def empty_convergence_state(
+    required: int,
+    revision: str | None = None,
+    product_revision: str | None = None,
+    support_revision: str | None = None,
+    evidence_revision: str | None = None,
+    wave: int = 0,
+) -> dict[str, Any]:
+    return {
+        "status": "pending",
+        "wave": wave,
+        "required": required,
+        "revision": revision,
+        "product_revision": product_revision,
+        "support_revision": support_revision,
+        "evidence_revision": evidence_revision,
+        "runs": [],
+        "decision": None,
+        "decision_report": None,
+    }
+
+
+def empty_worker_budget(max_workers: int, max_full_review_waves: int) -> dict[str, Any]:
+    return {
+        "status": "running",
+        "completed_workers": 0,
+        "worker_ids": [],
+        "max_workers": max_workers,
+        "full_review_waves": 0,
+        "max_full_review_waves": max_full_review_waves,
+        "records": [],
+        "reason": None,
+        "checkpoint_causes": [],
+        "authorizations": [],
+    }
+
+
 def empty_qa_state() -> dict[str, Any]:
     return {
         "status": "pending",
         "revision": None,
         "product_revision": None,
+        "support_revision": None,
         "evidence_revision": None,
         "run_id": None,
+        "worker_id": None,
         "report": None,
         "pending_scenarios": [],
         "reason": None,
@@ -317,12 +416,18 @@ def reset_validation(
     state: dict[str, Any],
     revision: str | None = None,
     product_revision: str | None = None,
+    support_revision: str | None = None,
     evidence_revision: str | None = None,
 ) -> None:
     state["engineer_clean"] = None
     state["review"] = empty_review_state(
-        state["required_reviews"], revision, product_revision, evidence_revision
+        state["required_reviews"],
+        revision,
+        product_revision,
+        support_revision,
+        evidence_revision,
     )
+    state["closure_review"] = None
     state["qa"] = empty_qa_state()
     invalidate_open_gates(state, "product revision changed")
 
@@ -340,6 +445,7 @@ def require_current_identity(
     state: dict[str, Any],
     revision: str,
     product_revision: str | None = None,
+    support_revision: str | None = None,
     evidence_revision: str | None = None,
 ) -> None:
     require_current_revision(state, revision)
@@ -348,10 +454,60 @@ def require_current_identity(
             "Product revision mismatch: "
             f"current={state.get('product_revision')!r}, supplied={product_revision!r}"
         )
+    if support_revision is not None and support_revision != state.get("support_revision"):
+        raise PipelineError(
+            "Support revision mismatch: "
+            f"current={state.get('support_revision')!r}, supplied={support_revision!r}"
+        )
     if evidence_revision is not None and evidence_revision != state.get("evidence_revision"):
         raise PipelineError(
             "Evidence revision mismatch: "
             f"current={state.get('evidence_revision')!r}, supplied={evidence_revision!r}"
+        )
+
+
+def blocked_preflight_capabilities(state: dict[str, Any]) -> dict[str, str]:
+    capabilities = state.get("preflight", {}).get("capabilities", {})
+    return {
+        name: status
+        for name, status in capabilities.items()
+        if status in QA_GATE_STATUSES
+    }
+
+
+def record_worker(state: dict[str, Any], role: str, worker_id: str) -> None:
+    budget = state["worker_budget"]
+    worker_ids = budget.setdefault("worker_ids", [])
+    reused = worker_id in worker_ids
+    if not reused:
+        worker_ids.append(worker_id)
+        budget["completed_workers"] += 1
+    budget["records"].append(
+        {
+            "role": role,
+            "worker_id": worker_id,
+            "reused": reused,
+            "recorded_at": utc_now(),
+        }
+    )
+    if budget["completed_workers"] >= budget["max_workers"]:
+        budget["status"] = "checkpoint_required"
+        if "workers" not in budget["checkpoint_causes"]:
+            budget["checkpoint_causes"].append("workers")
+        budget["reason"] = (
+            f"Worker budget reached {budget['completed_workers']}/"
+            f"{budget['max_workers']}; consolidate the remaining scope before spawning more workers"
+        )
+
+
+def require_worker_budget(state: dict[str, Any], worker_id: str) -> None:
+    budget = state.get("worker_budget", {})
+    if (
+        budget.get("status") == "checkpoint_required"
+        and worker_id not in budget.get("worker_ids", [])
+    ):
+        raise PipelineError(
+            "Worker budget checkpoint is open; run authorize-budget before recording another worker"
         )
 
 
@@ -375,6 +531,7 @@ def resolve_coverage_manifest(
     state: dict[str, Any],
     supplied: str,
     product_revision: str,
+    support_revision: str,
     evidence_revision: str,
 ) -> str:
     manifest_path = resolve_report(root, state, supplied, "Coverage manifest")
@@ -383,6 +540,8 @@ def resolve_coverage_manifest(
         raise PipelineError("Coverage manifest must use schema_version 1")
     if manifest.get("product_revision") != product_revision:
         raise PipelineError("Coverage manifest product_revision does not match the pass")
+    if manifest.get("support_revision") != support_revision:
+        raise PipelineError("Coverage manifest support_revision does not match the pass")
     if manifest.get("evidence_revision") != evidence_revision:
         raise PipelineError("Coverage manifest evidence_revision does not match the pass")
     entries = manifest.get("entries")
@@ -447,10 +606,15 @@ def revision_for_domain(base_revision: str, records: list[dict[str, str]]) -> st
 def cmd_compute_revisions(args: argparse.Namespace) -> int:
     root, _, _, state, _ = load_runtime(args.project_root)
     require_sources_current(state)
-    domains: dict[str, list[dict[str, str]]] = {"product": [], "evidence": []}
+    domains: dict[str, list[dict[str, str]]] = {
+        "product": [],
+        "support": [],
+        "evidence": [],
+    }
     assigned: dict[str, str] = {}
     for domain, supplied_files in (
         ("product", args.product_file or []),
+        ("support", args.support_file or []),
         ("evidence", args.evidence_file or []),
     ):
         for supplied in supplied_files:
@@ -468,10 +632,12 @@ def cmd_compute_revisions(args: argparse.Namespace) -> int:
             domains[domain].append({"path": relative, "sha256": file_sha256(path)})
 
     product_revision = revision_for_domain(args.base_revision, domains["product"])
+    support_revision = revision_for_domain(args.base_revision, domains["support"])
     evidence_revision = revision_for_domain(args.base_revision, domains["evidence"])
     revision = hashlib.sha256(
         (
             f"product:{product_revision}\n"
+            f"support:{support_revision}\n"
             f"evidence:{evidence_revision}\n"
         ).encode("utf-8")
     ).hexdigest()
@@ -479,8 +645,10 @@ def cmd_compute_revisions(args: argparse.Namespace) -> int:
         "schema_version": 1,
         "base_revision": args.base_revision,
         "product_files": sorted(domains["product"], key=lambda item: item["path"]),
+        "support_files": sorted(domains["support"], key=lambda item: item["path"]),
         "evidence_files": sorted(domains["evidence"], key=lambda item: item["path"]),
         "product_revision": product_revision,
+        "support_revision": support_revision,
         "evidence_revision": evidence_revision,
         "revision": revision,
     }
@@ -521,10 +689,8 @@ def resolve_product_findings(
             raise PipelineError(f"Unknown finding ID: {finding_id}")
         if target.get("status") != "open":
             raise PipelineError(f"Finding is not open: {finding_id}")
-        if target.get("kind") != "product":
-            raise PipelineError(
-                f"Full engineering can resolve only product findings: {finding_id}"
-            )
+        # A product-changing owner pass may close one normalized mixed batch;
+        # keeping support/evidence findings open would force a second serial lane.
         target["status"] = "resolved"
         target["resolved_revision"] = revision
         target["resolved_product_revision"] = product_revision
@@ -542,11 +708,73 @@ def next_action(
             "owner": "technical_director",
             "user_input_required": False,
         }
-    if phase == "engineering":
+    budget = state.get("worker_budget", {})
+    technical_decision_pending = (
+        phase == "convergence"
+        and state.get("convergence", {}).get("status") == "awaiting_decision"
+    ) or (
+        phase == "review"
+        and state.get("review", {}).get("status") == "awaiting_decision"
+    )
+    resume_identity_available = (
+        phase == "engineering" and bool(state.get("engineering_owner_id"))
+    ) or (
+        phase == "qa" and bool(state.get("qa", {}).get("worker_id"))
+    ) or (
+        phase == "evidence_recovery"
+        and bool((state.get("recovery") or {}).get("remediation_owner_id"))
+    )
+    full_review_checkpoint = "full_review_waves" in budget.get(
+        "checkpoint_causes", []
+    )
+    if (
+        budget.get("status") == "checkpoint_required"
+        and not technical_decision_pending
+        and (full_review_checkpoint or not resume_identity_available)
+        and phase != "ready"
+    ):
         return {
-            "action": "spawn_full_engineer",
+            "action": "director_budget_checkpoint",
             "owner": "technical_director",
             "user_input_required": False,
+            "completed_workers": budget.get("completed_workers"),
+            "max_workers": budget.get("max_workers"),
+            "reason": budget.get("reason"),
+        }
+    if phase == "preflight":
+        action = (
+            "reconcile_resource_budget"
+            if state.get("preflight", {}).get("resource_budget_check") == "fail"
+            else "run_environment_preflight"
+        )
+        return {
+            "action": action,
+            "owner": "technical_director",
+            "user_input_required": False,
+        }
+    if phase == "engineering":
+        return {
+            "action": (
+                "resume_engineering_owner"
+                if state.get("engineering_owner_id")
+                else "spawn_implementation_owner"
+            ),
+            "owner": "technical_director",
+            "user_input_required": False,
+            "engineering_owner_id": state.get("engineering_owner_id"),
+        }
+    if phase == "convergence":
+        convergence = state.get("convergence", {})
+        return {
+            "action": (
+                "finalize_convergence_wave"
+                if convergence.get("status") == "awaiting_decision"
+                else "complete_parallel_read_only_audits"
+            ),
+            "owner": "technical_director",
+            "user_input_required": False,
+            "required": convergence.get("required"),
+            "completed": len(convergence.get("runs", [])),
         }
     if phase in {"convergence_hold", "recovery_hold"}:
         return {
@@ -567,9 +795,14 @@ def next_action(
         }
     if phase == "evidence_recovery":
         return {
-            "action": "run_evidence_remediation",
+            "action": (
+                "resume_nonproduct_remediator"
+                if (state.get("recovery") or {}).get("remediation_owner_id")
+                else "run_nonproduct_remediation"
+            ),
             "owner": "technical_director",
             "user_input_required": False,
+            "worker_id": (state.get("recovery") or {}).get("remediation_owner_id"),
         }
     if phase == "recovery_review":
         return {
@@ -577,7 +810,24 @@ def next_action(
             "owner": "technical_director",
             "user_input_required": False,
         }
+    if phase == "closure_review":
+        return {
+            "action": "run_targeted_closure_review",
+            "owner": "technical_director",
+            "user_input_required": False,
+        }
     if phase == "qa":
+        blocked_capabilities = blocked_preflight_capabilities(state)
+        if blocked_capabilities:
+            user_gate = any(
+                status == "blocked_user" for status in blocked_capabilities.values()
+            )
+            return {
+                "action": "prepare_qa_prerequisites",
+                "owner": "user" if user_gate else "technical_director",
+                "user_input_required": user_gate,
+                "capabilities": blocked_capabilities,
+            }
         gates = [
             gate for gate in state.get("gates", []) if gate.get("status") == "open"
         ]
@@ -623,6 +873,14 @@ def cmd_init(args: argparse.Namespace) -> int:
         raise PipelineError("required-reviews must be exactly 2")
     if args.max_consecutive_product_changes < 1:
         raise PipelineError("max-consecutive-product-changes must be positive")
+    if args.required_convergence_audits not in {2, 3}:
+        raise PipelineError("required-convergence-audits must be 2 or 3")
+    if args.max_convergence_waves < 1:
+        raise PipelineError("max-convergence-waves must be positive")
+    if args.max_workers < 1:
+        raise PipelineError("max-workers must be positive")
+    if args.max_full_review_waves < 1:
+        raise PipelineError("max-full-review-waves must be positive")
 
     requirements = resolve_project_file(root, args.requirements, "Approved product requirements")
     spec = resolve_project_file(root, args.spec, "Approved technical specification")
@@ -642,9 +900,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         "spec_path": str(spec),
         "spec_sha256": file_sha256(spec),
         "tests_path": str(tests_root),
-        "phase": "engineering",
+        "phase": "preflight",
         "revision": None,
         "product_revision": None,
+        "support_revision": None,
         "evidence_revision": None,
         "coverage_manifest": None,
         "last_engineer_run_id": None,
@@ -655,13 +914,23 @@ def cmd_init(args: argparse.Namespace) -> int:
             "report": None,
         },
         "engineer_clean": None,
+        "engineering_owner_id": None,
         "engineer_runs": [],
+        "required_convergence_audits": args.required_convergence_audits,
+        "max_convergence_waves": args.max_convergence_waves,
+        "convergence": empty_convergence_state(args.required_convergence_audits),
         "required_reviews": args.required_reviews,
         "review": empty_review_state(args.required_reviews),
         "review_runs": [],
+        "product_revalidation": None,
+        "closure_review": None,
         "qa": empty_qa_state(),
         "qa_runs": [],
         "gates": [],
+        "preflight": empty_preflight_state(),
+        "worker_budget": empty_worker_budget(
+            args.max_workers, args.max_full_review_waves
+        ),
         "iteration_control": {
             "consecutive_product_changes": 0,
             "max_consecutive_product_changes": args.max_consecutive_product_changes,
@@ -690,6 +959,56 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_capabilities(values: list[str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise PipelineError("Capabilities must use <name>=<status>")
+        name, status = value.split("=", 1)
+        name = name.strip()
+        status = status.strip()
+        if not re.fullmatch(r"[a-z0-9]+(?:[-_][a-z0-9]+)*", name):
+            raise PipelineError(f"Invalid capability name: {name!r}")
+        if status not in PREFLIGHT_CAPABILITY_STATUSES:
+            raise PipelineError(f"Invalid capability status for {name}: {status!r}")
+        if name in result:
+            raise PipelineError(f"Duplicate capability: {name}")
+        result[name] = status
+    return result
+
+
+def cmd_preflight_complete(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    require_sources_current(state)
+    if state["phase"] == "ready":
+        raise PipelineError("A ready pipeline does not accept preflight updates")
+    preflight = state["preflight"]
+    if any(run["run_id"] == args.run_id for run in preflight["runs"]):
+        raise PipelineError(f"Preflight run ID already recorded: {args.run_id}")
+    report = resolve_report(root, state, args.report, "Preflight report")
+    capabilities = parse_capabilities(args.capability)
+    preflight["resource_budget_check"] = args.resource_budget_check
+    preflight["capabilities"].update(capabilities)
+    preflight["status"] = (
+        "complete" if args.resource_budget_check == "pass" else "budget_failed"
+    )
+    preflight["runs"].append(
+        {
+            "run_id": args.run_id,
+            "resource_budget_check": args.resource_budget_check,
+            "capabilities": capabilities,
+            "report": report,
+            "recorded_at": utc_now(),
+        }
+    )
+    if args.resource_budget_check == "fail":
+        state["phase"] = "preflight"
+    elif state["phase"] == "preflight":
+        state["phase"] = "engineering"
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     _, _, _, state, findings = load_runtime(args.project_root)
     counts = {"critical": 0, "major": 0, "minor": 0}
@@ -705,14 +1024,21 @@ def cmd_status(args: argparse.Namespace) -> int:
         "slice": state["slice_id"],
         "revision": state["revision"],
         "product_revision": state["product_revision"],
+        "support_revision": state["support_revision"],
         "evidence_revision": state["evidence_revision"],
         "phase": state["phase"],
         "last_engineer_outcome": state["last_engineer_outcome"],
         "machine_checks": state["machine_checks"],
         "engineer_clean": state["engineer_clean"],
+        "engineering_owner_id": state["engineering_owner_id"],
+        "preflight": state["preflight"],
+        "convergence": state["convergence"],
         "review": state["review"],
+        "product_revalidation": state["product_revalidation"],
+        "closure_review": state["closure_review"],
         "qa": state["qa"],
         "iteration_control": state["iteration_control"],
+        "worker_budget": state["worker_budget"],
         "recovery": state["recovery"],
         "open_findings": counts,
         "open_gates": gate_counts,
@@ -726,6 +1052,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_engineer_complete(args: argparse.Namespace) -> int:
     root, state_path, findings_path, state, findings = load_runtime(args.project_root)
     require_sources_current(state)
+    require_worker_budget(state, args.owner_id)
     if state["phase"] != "engineering":
         raise PipelineError("Full Engineer completion is valid only in the engineering phase")
     if not args.audit_complete:
@@ -736,19 +1063,29 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
         raise PipelineError(
             "Automatic convergence circuit breaker is open; run authorize-iteration first"
         )
+    if state.get("engineering_owner_id") is None:
+        state["engineering_owner_id"] = args.owner_id
+    elif state["engineering_owner_id"] != args.owner_id:
+        raise PipelineError(
+            "Product remediation must resume the assigned engineering owner; "
+            "use transfer-engineering-owner for an explicit handoff"
+        )
     report = resolve_report(root, state, args.report, "Engineer verification report")
 
     input_revision = state.get("revision")
     input_product_revision = state.get("product_revision")
+    input_support_revision = state.get("support_revision")
     input_evidence_revision = state.get("evidence_revision")
     product_revision = args.product_revision or args.revision
+    support_revision = args.support_revision or product_revision
     evidence_revision = args.evidence_revision or args.revision
     product_changed = input_product_revision != product_revision
+    support_changed = input_support_revision != support_revision
     evidence_changed = input_evidence_revision != evidence_revision
     revision_changed = input_revision != args.revision
-    if not product_changed and (revision_changed or evidence_changed):
+    if not product_changed and (revision_changed or support_changed or evidence_changed):
         raise PipelineError(
-            "Evidence-only changes must use evidence-remediation-complete; "
+            "Support/evidence-only changes must use recovery-remediation-complete; "
             "a full Engineer pass must not invalidate clean product evidence"
         )
     if product_changed and args.machine_checks != "pass":
@@ -764,18 +1101,28 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
             "Architectural or lifecycle scope expansion requires --scope-approval"
         )
     coverage_manifest = resolve_coverage_manifest(
-        root, state, args.coverage_manifest, product_revision, evidence_revision
+        root,
+        state,
+        args.coverage_manifest,
+        product_revision,
+        support_revision,
+        evidence_revision,
     )
     resolved_ids = set(args.resolved_finding or [])
     if resolved_ids and not product_changed:
         raise PipelineError("Resolving product findings requires a changed product revision")
     if product_changed:
         reset_validation(
-            state, args.revision, product_revision, evidence_revision
+            state,
+            args.revision,
+            product_revision,
+            support_revision,
+            evidence_revision,
         )
 
     state["revision"] = args.revision
     state["product_revision"] = product_revision
+    state["support_revision"] = support_revision
     state["evidence_revision"] = evidence_revision
     state["coverage_manifest"] = coverage_manifest
     state["last_engineer_run_id"] = args.run_id
@@ -783,6 +1130,7 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
         "status": args.machine_checks,
         "revision": args.revision,
         "product_revision": product_revision,
+        "support_revision": support_revision,
         "evidence_revision": evidence_revision,
         "report": report,
         "coverage_manifest": coverage_manifest,
@@ -795,6 +1143,15 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
         outcome = "changed"
         iteration = state["iteration_control"]
         iteration["consecutive_product_changes"] += 1
+        next_wave = state.get("convergence", {}).get("wave", 0) + 1
+        state["convergence"] = empty_convergence_state(
+            state["required_convergence_audits"],
+            args.revision,
+            product_revision,
+            support_revision,
+            evidence_revision,
+            next_wave,
+        )
         if (
             iteration["consecutive_product_changes"]
             >= iteration["max_consecutive_product_changes"]
@@ -802,16 +1159,24 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
             iteration["status"] = "checkpoint_required"
             iteration["reason"] = (
                 "Two product-changing Engineer passes require a director checkpoint "
-                "before another full convergence pass"
+                "before another read-only convergence wave"
             )
+            iteration["resume_phase"] = "convergence"
             state["phase"] = "convergence_hold"
         else:
             iteration["status"] = "running"
             iteration["reason"] = None
-            state["phase"] = "engineering"
+            iteration["resume_phase"] = None
+            state["phase"] = "convergence"
     elif args.machine_checks != "pass" or open_blocking(findings):
         outcome = "blocked"
-        reset_validation(state, args.revision, product_revision, evidence_revision)
+        reset_validation(
+            state,
+            args.revision,
+            product_revision,
+            support_revision,
+            evidence_revision,
+        )
         state["phase"] = "engineering"
     else:
         outcome = "clean"
@@ -822,6 +1187,7 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
             "run_id": args.run_id,
             "revision": args.revision,
             "product_revision": product_revision,
+            "support_revision": support_revision,
             "evidence_revision": evidence_revision,
             "audit_complete": True,
             "report": report,
@@ -832,6 +1198,7 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
             state["required_reviews"],
             args.revision,
             product_revision,
+            support_revision,
             evidence_revision,
         )
         state["qa"] = empty_qa_state()
@@ -841,11 +1208,14 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
     state["engineer_runs"].append(
         {
             "run_id": args.run_id,
+            "owner_id": args.owner_id,
             "input_revision": input_revision,
             "input_product_revision": input_product_revision,
+            "input_support_revision": input_support_revision,
             "input_evidence_revision": input_evidence_revision,
             "revision": args.revision,
             "product_revision": product_revision,
+            "support_revision": support_revision,
             "evidence_revision": evidence_revision,
             "change_class": "product" if product_changed else "none",
             "outcome": outcome,
@@ -861,6 +1231,168 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
             "recorded_at": utc_now(),
         }
     )
+    record_worker(state, "engineer", args.owner_id)
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+def cmd_transfer_engineering_owner(args: argparse.Namespace) -> int:
+    _, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    if state["phase"] != "engineering":
+        raise PipelineError("Engineering ownership can transfer only before a remediation pass")
+    if state.get("engineering_owner_id") != args.from_owner:
+        raise PipelineError("from-owner does not match the assigned engineering owner")
+    if args.from_owner == args.to_owner:
+        raise PipelineError("Engineering ownership transfer requires a different owner")
+    state["engineering_owner_id"] = args.to_owner
+    state.setdefault("owner_transfers", []).append(
+        {
+            "from": args.from_owner,
+            "to": args.to_owner,
+            "reason": args.reason,
+            "recorded_at": utc_now(),
+        }
+    )
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+def cmd_convergence_audit_complete(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    require_sources_current(state)
+    require_worker_budget(state, args.reviewer_id)
+    require_current_identity(
+        state,
+        args.revision,
+        args.product_revision,
+        args.support_revision,
+        args.evidence_revision,
+    )
+    if state["phase"] != "convergence":
+        raise PipelineError("Convergence audits can complete only in convergence phase")
+    convergence = state["convergence"]
+    if convergence.get("status") == "awaiting_decision":
+        raise PipelineError("The current convergence wave already has all required reports")
+    if any(run["run_id"] == args.run_id for run in convergence["runs"]):
+        raise PipelineError(f"Convergence run ID already recorded: {args.run_id}")
+    if any(run["reviewer_id"] == args.reviewer_id for run in convergence["runs"]):
+        raise PipelineError(f"Convergence reviewer already recorded: {args.reviewer_id}")
+    if args.reviewer_id == state.get("engineering_owner_id"):
+        raise PipelineError("Convergence audits must be independent of the writing owner")
+    if args.reviewer_id in state["worker_budget"].get("worker_ids", []):
+        raise PipelineError("Every convergence audit requires a fresh worker identity")
+    if any(run["lens"] == args.lens for run in convergence["runs"]):
+        raise PipelineError(f"Convergence lens already covered: {args.lens}")
+    report = resolve_report(root, state, args.report, "Convergence audit report")
+    run = {
+        "run_id": args.run_id,
+        "reviewer_id": args.reviewer_id,
+        "lens": args.lens,
+        "status": args.status,
+        "revision": args.revision,
+        "product_revision": state["product_revision"],
+        "support_revision": state["support_revision"],
+        "evidence_revision": state["evidence_revision"],
+        "report": report,
+        "recorded_at": utc_now(),
+    }
+    convergence["runs"].append(run)
+    convergence["status"] = "running"
+    if len(convergence["runs"]) == convergence["required"]:
+        convergence["status"] = "awaiting_decision"
+    record_worker(state, "convergence_audit", args.reviewer_id)
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+def cmd_convergence_finalize(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    require_sources_current(state)
+    require_current_revision(state, args.revision)
+    convergence = state.get("convergence", {})
+    if state["phase"] != "convergence" or convergence.get("status") != "awaiting_decision":
+        raise PipelineError("Convergence decision requires the complete parallel audit wave")
+    if len(convergence.get("runs", [])) != convergence.get("required"):
+        raise PipelineError("Convergence decision requires every configured audit lens")
+    report = resolve_report(root, state, args.report, "Convergence decision report")
+    current_findings = [
+        item
+        for item in findings["items"]
+        if item["status"] == "open"
+        and item["source"] == "convergence"
+        and item["revision"] == args.revision
+    ]
+    audit_failed = any(run["status"] == "fail" for run in convergence["runs"])
+    convergence["decision"] = args.decision
+    convergence["decision_report"] = report
+    convergence["decided_at"] = utc_now()
+
+    if args.decision == "pass":
+        if current_findings or audit_failed:
+            raise PipelineError(
+                "Convergence cannot pass while an audit failed or current findings remain open"
+            )
+        convergence["status"] = "passed"
+        state["iteration_control"]["status"] = "running"
+        state["iteration_control"]["reason"] = None
+        state["iteration_control"]["resume_phase"] = None
+        state["iteration_control"]["consecutive_product_changes"] = 0
+        state["engineer_clean"] = {
+            "source": "parallel_read_only_convergence",
+            "run_ids": [run["run_id"] for run in convergence["runs"]],
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+            "audit_complete": True,
+            "report": report,
+            "coverage_manifest": state["coverage_manifest"],
+            "recorded_at": utc_now(),
+        }
+        revalidation = state.get("product_revalidation")
+        if revalidation and revalidation.get("mode") == "targeted":
+            state["closure_review"] = {
+                "status": "pending",
+                "revision": state["revision"],
+                "product_revision": state["product_revision"],
+                "support_revision": state["support_revision"],
+                "evidence_revision": state["evidence_revision"],
+                "base_review_runs": revalidation["base_review_runs"],
+                "finding_ids": revalidation["finding_ids"],
+                "run": None,
+            }
+            state["review"] = empty_review_state(
+                state["required_reviews"],
+                state["revision"],
+                state["product_revision"],
+                state["support_revision"],
+                state["evidence_revision"],
+            )
+            state["review"]["status"] = "targeted_pending"
+            state["phase"] = "closure_review"
+        else:
+            state["review"] = empty_review_state(
+                state["required_reviews"],
+                state["revision"],
+                state["product_revision"],
+                state["support_revision"],
+                state["evidence_revision"],
+            )
+            state["phase"] = "review"
+    else:
+        if not current_findings:
+            raise PipelineError("Convergence rework requires registered current findings")
+        convergence["status"] = "failed"
+        if convergence["wave"] >= state["max_convergence_waves"]:
+            state["iteration_control"]["status"] = "checkpoint_required"
+            state["iteration_control"]["reason"] = (
+                "Configured convergence-wave budget was exhausted; aggregate the complete "
+                "remaining batch before another owner remediation"
+            )
+            state["iteration_control"]["resume_phase"] = "engineering"
+            state["phase"] = "convergence_hold"
+        else:
+            state["phase"] = "engineering"
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
@@ -868,8 +1400,13 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
 def cmd_review_complete(args: argparse.Namespace) -> int:
     root, state_path, findings_path, state, findings = load_runtime(args.project_root)
     require_sources_current(state)
+    require_worker_budget(state, args.reviewer_id)
     require_current_identity(
-        state, args.revision, args.product_revision, args.evidence_revision
+        state,
+        args.revision,
+        args.product_revision,
+        args.support_revision,
+        args.evidence_revision,
     )
     if state["phase"] != "review":
         raise PipelineError("Final reviews can complete only during the review phase")
@@ -878,14 +1415,23 @@ def cmd_review_complete(args: argparse.Namespace) -> int:
         not clean
         or clean.get("revision") != state["revision"]
         or clean.get("product_revision") != state["product_revision"]
+        or clean.get("support_revision") != state["support_revision"]
         or clean.get("evidence_revision") != state["evidence_revision"]
     ):
-        raise PipelineError("Final reviews require a clean Engineer pass on the current revision")
+        raise PipelineError("Final reviews require passed independent convergence on the current revision")
     if any(run["run_id"] == args.run_id for run in state["review_runs"]):
         raise PipelineError(f"Review run ID already recorded: {args.run_id}")
     current_runs = state["review"]["runs"]
     if any(run["reviewer_id"] == args.reviewer_id for run in current_runs):
         raise PipelineError(f"Reviewer already recorded for this revision: {args.reviewer_id}")
+    excluded_reviewers = {state.get("engineering_owner_id")}
+    excluded_reviewers.update(
+        run.get("reviewer_id") for run in state.get("convergence", {}).get("runs", [])
+    )
+    if args.reviewer_id in excluded_reviewers:
+        raise PipelineError("Final Review requires a fresh identity independent of engineering and convergence")
+    if args.reviewer_id in state["worker_budget"].get("worker_ids", []):
+        raise PipelineError("Every full Review requires a fresh worker identity")
     report = resolve_report(root, state, args.report, "Review report")
 
     run = {
@@ -893,6 +1439,7 @@ def cmd_review_complete(args: argparse.Namespace) -> int:
         "reviewer_id": args.reviewer_id,
         "revision": args.revision,
         "product_revision": state["product_revision"],
+        "support_revision": state["support_revision"],
         "evidence_revision": state["evidence_revision"],
         "status": args.status,
         "report": report,
@@ -905,6 +1452,7 @@ def cmd_review_complete(args: argparse.Namespace) -> int:
     if len(current_runs) >= state["required_reviews"]:
         state["review"]["status"] = "awaiting_decision"
 
+    record_worker(state, "full_review", args.reviewer_id)
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
@@ -919,6 +1467,8 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
     if len(review.get("runs", [])) != state["required_reviews"]:
         raise PipelineError("Review decision requires exactly two completed Review reports")
     report = resolve_report(root, state, args.report, "Aggregated Review decision report")
+    budget = state["worker_budget"]
+    budget["full_review_waves"] += 1
     reviewer_failed = any(run["status"] == "fail" for run in review["runs"])
     review_findings = [
         item
@@ -934,24 +1484,27 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
         if reviewer_failed and not args.reason:
             raise PipelineError("Overriding a reviewer FAIL requires --reason")
         review["status"] = "passed"
+        state["product_revalidation"] = None
         state["phase"] = "qa"
     else:
         if not review_findings:
             raise PipelineError("Rework decision requires at least one registered Review finding")
         review["status"] = "failed"
         state["qa"] = empty_qa_state()
-        if args.rework_scope == "evidence":
-            if any(item.get("kind") != "evidence" for item in review_findings):
+        if args.rework_scope in {"evidence", "support", "recovery"}:
+            if any(item.get("kind") == "product" for item in review_findings):
                 raise PipelineError(
-                    "Evidence recovery requires every confirmed Review finding to use --kind evidence"
+                    "Non-product recovery cannot contain a product finding"
                 )
             state["recovery"] = {
                 "status": "awaiting_remediation",
                 "base_revision": state["revision"],
                 "base_product_revision": state["product_revision"],
+                "base_support_revision": state["support_revision"],
                 "base_evidence_revision": state["evidence_revision"],
                 "finding_ids": [item["id"] for item in review_findings],
                 "base_review_runs": list(review["runs"]),
+                "remediation_owner_id": None,
                 "remediation_runs": [],
                 "verification_runs": [],
                 "cycles": 0,
@@ -960,12 +1513,141 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
             state["phase"] = "evidence_recovery"
         else:
             state["recovery"] = None
+            state["product_revalidation"] = {
+                "mode": args.revalidation,
+                "base_revision": state["revision"],
+                "base_product_revision": state["product_revision"],
+                "base_support_revision": state["support_revision"],
+                "base_evidence_revision": state["evidence_revision"],
+                "base_review_runs": list(review["runs"]),
+                "finding_ids": [item["id"] for item in review_findings],
+                "reason": args.reason,
+            }
             state["phase"] = "engineering"
 
     review["decision"] = args.decision
     review["decision_report"] = report
     review["decision_reason"] = args.reason
     review["decided_at"] = utc_now()
+    if (
+        args.decision == "rework"
+        and args.rework_scope == "product"
+        and args.revalidation == "full"
+        and budget["full_review_waves"] >= budget["max_full_review_waves"]
+    ):
+        budget["status"] = "checkpoint_required"
+        if "full_review_waves" not in budget["checkpoint_causes"]:
+            budget["checkpoint_causes"].append("full_review_waves")
+        budget["reason"] = (
+            f"Full Review wave budget reached {budget['full_review_waves']}/"
+            f"{budget['max_full_review_waves']}; use targeted closure or justify another full wave"
+        )
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+def cmd_closure_review_complete(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    require_sources_current(state)
+    require_worker_budget(state, args.reviewer_id)
+    require_current_identity(
+        state,
+        args.revision,
+        args.product_revision,
+        args.support_revision,
+        args.evidence_revision,
+    )
+    closure = state.get("closure_review")
+    if state["phase"] != "closure_review" or not closure:
+        raise PipelineError("No targeted product closure Review is pending")
+    if closure.get("run"):
+        raise PipelineError("The targeted closure Review is already recorded")
+    prior_reviewers = {
+        run["reviewer_id"] for run in closure.get("base_review_runs", [])
+    }
+    if args.reviewer_id in prior_reviewers:
+        raise PipelineError("Targeted closure requires one fresh reviewer identity")
+    if args.reviewer_id == state.get("engineering_owner_id") or any(
+        run.get("reviewer_id") == args.reviewer_id
+        for run in state.get("convergence", {}).get("runs", [])
+    ):
+        raise PipelineError("Targeted closure reviewer must be independent of the writer and convergence wave")
+    if args.reviewer_id in state["worker_budget"].get("worker_ids", []):
+        raise PipelineError("Targeted closure requires a fresh worker identity")
+    if any(run["run_id"] == args.run_id for run in state["review_runs"]):
+        raise PipelineError(f"Review run ID already recorded: {args.run_id}")
+    report = resolve_report(root, state, args.report, "Targeted closure Review report")
+    run = {
+        "run_id": args.run_id,
+        "reviewer_id": args.reviewer_id,
+        "mode": "targeted_product_closure",
+        "revision": args.revision,
+        "product_revision": state["product_revision"],
+        "support_revision": state["support_revision"],
+        "evidence_revision": state["evidence_revision"],
+        "status": args.status,
+        "report": report,
+        "recorded_at": utc_now(),
+    }
+    closure["run"] = run
+    state["review_runs"].append(run)
+    record_worker(state, "targeted_closure_review", args.reviewer_id)
+    current_review_findings = [
+        item
+        for item in findings["items"]
+        if item["status"] == "open"
+        and item["source"] == "review"
+        and item["revision"] == args.revision
+    ]
+    if args.status == "pass":
+        if current_review_findings or open_blocking(findings):
+            raise PipelineError(
+                "Targeted closure cannot pass while current or blocking findings remain open"
+            )
+        closure["status"] = "passed"
+        state["review"] = {
+            "status": "passed_targeted",
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+            "required": state["required_reviews"],
+            "runs": closure["base_review_runs"],
+            "recovery_run": run,
+            "decision": "pass",
+            "decision_report": report,
+            "decision_reason": (
+                "One fresh closure reviewer verified the frozen local product batch, "
+                "changed impact surface, and preserved complementary Review evidence"
+            ),
+        }
+        state["product_revalidation"] = None
+        state["qa"] = empty_qa_state()
+        state["phase"] = "qa"
+    else:
+        if not current_review_findings:
+            raise PipelineError(
+                "A failed targeted closure Review must register at least one current finding"
+            )
+        closure["status"] = "failed"
+        if any(item.get("kind") == "product" for item in current_review_findings):
+            state["phase"] = "engineering"
+        else:
+            state["recovery"] = {
+                "status": "awaiting_remediation",
+                "base_revision": state["revision"],
+                "base_product_revision": state["product_revision"],
+                "base_support_revision": state["support_revision"],
+                "base_evidence_revision": state["evidence_revision"],
+                "finding_ids": [item["id"] for item in current_review_findings],
+                "base_review_runs": list(closure["base_review_runs"]),
+                "remediation_owner_id": None,
+                "remediation_runs": [],
+                "verification_runs": [],
+                "cycles": 0,
+                "reason": "Targeted product closure found only support/evidence gaps",
+            }
+            state["phase"] = "evidence_recovery"
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
@@ -978,7 +1660,8 @@ def cmd_add_finding(args: argparse.Namespace) -> int:
         raise PipelineError(f"Finding ID already exists: {args.id}")
     valid_phases = {
         "engineer": {"engineering"},
-        "review": {"review", "recovery_review"},
+        "convergence": {"convergence"},
+        "review": {"review", "recovery_review", "closure_review"},
         "qa": {"qa"},
     }
     if state["phase"] not in valid_phases[args.source]:
@@ -1002,7 +1685,11 @@ def cmd_add_finding(args: argparse.Namespace) -> int:
         }
     )
     deferred_director_decision = (
-        (args.source == "review" and state["phase"] in {"review", "recovery_review"})
+        (
+            args.source == "review"
+            and state["phase"] in {"review", "recovery_review", "closure_review"}
+        )
+        or (args.source == "convergence" and state["phase"] == "convergence")
         or (args.source == "qa" and state["phase"] == "qa")
     )
     if args.severity in BLOCKING_SEVERITIES and not deferred_director_decision:
@@ -1051,7 +1738,7 @@ def cmd_accept_finding(args: argparse.Namespace) -> int:
 
 
 def cmd_start_evidence_recovery(args: argparse.Namespace) -> int:
-    """Convert a paused legacy Review rework into the evidence-only recovery lane."""
+    """Convert a paused legacy Review rework into the non-product recovery lane."""
     _, state_path, findings_path, state, findings = load_runtime(args.project_root)
     require_sources_current(state)
     require_current_revision(state, args.revision)
@@ -1071,24 +1758,31 @@ def cmd_start_evidence_recovery(args: argparse.Namespace) -> int:
             "Supply every and only open Review finding with --finding-id"
         )
     for item in open_review:
-        item["kind"] = "evidence"
+        if item.get("kind") == "product":
+            item["kind"] = "evidence"
     state["product_revision"] = args.product_revision
+    state["support_revision"] = args.support_revision
     state["evidence_revision"] = args.evidence_revision
     clean = state.get("engineer_clean")
     if clean:
         clean["product_revision"] = args.product_revision
+        clean["support_revision"] = args.support_revision
         clean["evidence_revision"] = args.evidence_revision
     state["machine_checks"]["product_revision"] = args.product_revision
+    state["machine_checks"]["support_revision"] = args.support_revision
     state["machine_checks"]["evidence_revision"] = args.evidence_revision
     review["product_revision"] = args.product_revision
+    review["support_revision"] = args.support_revision
     review["evidence_revision"] = args.evidence_revision
     state["recovery"] = {
         "status": "awaiting_remediation",
         "base_revision": state["revision"],
         "base_product_revision": args.product_revision,
+        "base_support_revision": args.support_revision,
         "base_evidence_revision": args.evidence_revision,
         "finding_ids": sorted(selected),
         "base_review_runs": list(review.get("runs", [])),
+        "remediation_owner_id": None,
         "remediation_runs": [],
         "verification_runs": [],
         "cycles": 0,
@@ -1102,19 +1796,31 @@ def cmd_start_evidence_recovery(args: argparse.Namespace) -> int:
 def cmd_evidence_remediation_complete(args: argparse.Namespace) -> int:
     root, state_path, findings_path, state, findings = load_runtime(args.project_root)
     require_sources_current(state)
+    require_worker_budget(state, args.worker_id)
     recovery = state.get("recovery")
     if state["phase"] != "evidence_recovery" or not recovery:
-        raise PipelineError("No evidence-only remediation is awaiting completion")
+        raise PipelineError("No support/evidence remediation is awaiting completion")
     if args.product_revision != recovery["base_product_revision"]:
         raise PipelineError(
             "Product revision changed during evidence recovery; return to full engineering"
         )
+    if recovery.get("remediation_owner_id") is None:
+        recovery["remediation_owner_id"] = args.worker_id
+    elif recovery["remediation_owner_id"] != args.worker_id:
+        raise PipelineError(
+            "Support/evidence recovery must resume the assigned remediator identity"
+        )
     if args.production_change_scope != "none":
-        raise PipelineError("Evidence recovery must not modify production code")
+        raise PipelineError("Support/evidence recovery must not modify runtime product code")
     if args.machine_checks != "pass":
-        raise PipelineError("Evidence recovery requires passing targeted and aggregate checks")
-    if args.evidence_revision == recovery["base_evidence_revision"]:
-        raise PipelineError("Evidence remediation must produce a new evidence revision")
+        raise PipelineError("Support/evidence recovery requires passing targeted and aggregate checks")
+    if (
+        args.support_revision == recovery["base_support_revision"]
+        and args.evidence_revision == recovery["base_evidence_revision"]
+    ):
+        raise PipelineError(
+            "Non-product remediation must produce a new support or evidence revision"
+        )
     if any(
         run["run_id"] == args.run_id
         for run in recovery.get("remediation_runs", [])
@@ -1126,7 +1832,7 @@ def cmd_evidence_remediation_complete(args: argparse.Namespace) -> int:
         item for item in findings["items"] if item["id"] in required_ids
     ]
     if len(selected_items) != len(required_ids) or any(
-        item.get("status") != "open" or item.get("kind") != "evidence"
+        item.get("status") != "open" or item.get("kind") == "product"
         for item in selected_items
     ):
         raise PipelineError("The frozen evidence-recovery batch is missing or no longer open")
@@ -1141,6 +1847,7 @@ def cmd_evidence_remediation_complete(args: argparse.Namespace) -> int:
         state,
         args.coverage_manifest,
         args.product_revision,
+        args.support_revision,
         args.evidence_revision,
     )
     for item in findings["items"]:
@@ -1148,29 +1855,35 @@ def cmd_evidence_remediation_complete(args: argparse.Namespace) -> int:
             item["status"] = "resolved"
             item["resolved_revision"] = args.revision
             item["resolved_product_revision"] = args.product_revision
+            item["resolved_support_revision"] = args.support_revision
             item["resolved_evidence_revision"] = args.evidence_revision
             item["resolved_at"] = utc_now()
 
     state["revision"] = args.revision
     state["product_revision"] = args.product_revision
+    state["support_revision"] = args.support_revision
     state["evidence_revision"] = args.evidence_revision
     state["coverage_manifest"] = coverage_manifest
     state["machine_checks"] = {
         "status": "pass",
         "revision": args.revision,
         "product_revision": args.product_revision,
+        "support_revision": args.support_revision,
         "evidence_revision": args.evidence_revision,
         "report": report,
         "coverage_manifest": coverage_manifest,
     }
     recovery["status"] = "awaiting_verification"
     recovery["current_revision"] = args.revision
+    recovery["current_support_revision"] = args.support_revision
     recovery["current_evidence_revision"] = args.evidence_revision
     recovery["remediation_runs"].append(
         {
             "run_id": args.run_id,
+            "worker_id": args.worker_id,
             "revision": args.revision,
             "product_revision": args.product_revision,
+            "support_revision": args.support_revision,
             "evidence_revision": args.evidence_revision,
             "resolved_findings": sorted(resolved_ids),
             "report": report,
@@ -1182,10 +1895,12 @@ def cmd_evidence_remediation_complete(args: argparse.Namespace) -> int:
     review["status"] = "recovery_verification"
     review["revision"] = args.revision
     review["product_revision"] = args.product_revision
+    review["support_revision"] = args.support_revision
     review["evidence_revision"] = args.evidence_revision
     review["recovery_run"] = None
     state["qa"] = empty_qa_state()
     state["phase"] = "recovery_review"
+    record_worker(state, "nonproduct_remediation", args.worker_id)
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
@@ -1193,8 +1908,13 @@ def cmd_evidence_remediation_complete(args: argparse.Namespace) -> int:
 def cmd_recovery_review_complete(args: argparse.Namespace) -> int:
     root, state_path, findings_path, state, findings = load_runtime(args.project_root)
     require_sources_current(state)
+    require_worker_budget(state, args.reviewer_id)
     require_current_identity(
-        state, args.revision, args.product_revision, args.evidence_revision
+        state,
+        args.revision,
+        args.product_revision,
+        args.support_revision,
+        args.evidence_revision,
     )
     recovery = state.get("recovery")
     if state["phase"] != "recovery_review" or not recovery:
@@ -1204,6 +1924,10 @@ def cmd_recovery_review_complete(args: argparse.Namespace) -> int:
         for run in recovery.get("base_review_runs", []) + recovery.get("verification_runs", [])
     ):
         raise PipelineError("Recovery verification requires a fresh reviewer identity")
+    if args.reviewer_id == state.get("engineering_owner_id"):
+        raise PipelineError("Recovery reviewer must be independent of the writing owner")
+    if args.reviewer_id in state["worker_budget"].get("worker_ids", []):
+        raise PipelineError("Recovery verification requires a fresh worker identity")
     if any(run["run_id"] == args.run_id for run in state["review_runs"]):
         raise PipelineError(f"Review run ID already recorded: {args.run_id}")
     report = resolve_report(root, state, args.report, "Recovery Review report")
@@ -1212,6 +1936,7 @@ def cmd_recovery_review_complete(args: argparse.Namespace) -> int:
         "reviewer_id": args.reviewer_id,
         "revision": args.revision,
         "product_revision": args.product_revision,
+        "support_revision": args.support_revision,
         "evidence_revision": args.evidence_revision,
         "status": args.status,
         "mode": "evidence_recovery",
@@ -1221,6 +1946,7 @@ def cmd_recovery_review_complete(args: argparse.Namespace) -> int:
     recovery["verification_runs"].append(run)
     state["review_runs"].append(run)
     state["review"]["recovery_run"] = run
+    record_worker(state, "recovery_review", args.reviewer_id)
     if args.status == "pass":
         if open_blocking(findings):
             raise PipelineError(
@@ -1230,7 +1956,7 @@ def cmd_recovery_review_complete(args: argparse.Namespace) -> int:
         state["review"]["decision"] = "pass"
         state["review"]["decision_reason"] = (
             "Product revision stayed unchanged; one fresh reviewer verified the "
-            "complete normalized evidence finding batch"
+            "complete normalized support/evidence finding batch"
         )
         recovery["status"] = "passed"
         state["qa"] = empty_qa_state()
@@ -1251,12 +1977,12 @@ def cmd_recovery_review_complete(args: argparse.Namespace) -> int:
             item
             for item in findings["items"]
             if item.get("status") == "open"
-            and item.get("kind") == "evidence"
+            and item.get("kind") in {"support", "evidence"}
             and item.get("revision") == args.revision
         ]
         if not open_evidence:
             raise PipelineError(
-                "A failed recovery Review must register at least one open evidence finding"
+                "A failed recovery Review must register at least one open support/evidence finding"
             )
         recovery["finding_ids"] = sorted(item["id"] for item in open_evidence)
         recovery["cycles"] += 1
@@ -1290,13 +2016,47 @@ def cmd_authorize_iteration(args: argparse.Namespace) -> int:
     state["iteration_control"]["reason"] = args.reason
     if previous_phase == "convergence_hold":
         state["iteration_control"]["consecutive_product_changes"] = 0
+        resume_phase = state["iteration_control"].get("resume_phase") or "convergence"
+        state["iteration_control"]["resume_phase"] = None
     else:
         recovery = state.get("recovery")
         if recovery:
             recovery["cycles"] = 0
-    state["phase"] = (
-        "engineering" if previous_phase == "convergence_hold" else "evidence_recovery"
+        resume_phase = "evidence_recovery"
+    state["phase"] = resume_phase
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+def cmd_authorize_budget(args: argparse.Namespace) -> int:
+    _, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    budget = state["worker_budget"]
+    if budget.get("status") != "checkpoint_required":
+        raise PipelineError("No worker budget checkpoint is open")
+    if args.additional_workers < 1:
+        raise PipelineError("additional-workers must be positive")
+    if args.additional_full_review_waves < 0:
+        raise PipelineError("additional-full-review-waves cannot be negative")
+    review_extension_required = "full_review_waves" in budget.get(
+        "checkpoint_causes", []
     )
+    if review_extension_required and args.additional_full_review_waves < 1:
+        raise PipelineError(
+            "The full-Review wave budget is exhausted; authorize at least one additional wave"
+        )
+    budget["authorizations"].append(
+        {
+            "reason": args.reason,
+            "additional_workers": args.additional_workers,
+            "additional_full_review_waves": args.additional_full_review_waves,
+            "recorded_at": utc_now(),
+        }
+    )
+    budget["max_workers"] += args.additional_workers
+    budget["max_full_review_waves"] += args.additional_full_review_waves
+    budget["status"] = "running"
+    budget["reason"] = args.reason
+    budget["checkpoint_causes"] = []
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
@@ -1316,11 +2076,29 @@ def resolve_qa_gates(state: dict[str, Any], revision: str, resolution: str) -> N
 def cmd_qa_complete(args: argparse.Namespace) -> int:
     root, state_path, findings_path, state, findings = load_runtime(args.project_root)
     require_sources_current(state)
+    require_worker_budget(state, args.worker_id)
     require_current_identity(
-        state, args.revision, args.product_revision, args.evidence_revision
+        state,
+        args.revision,
+        args.product_revision,
+        args.support_revision,
+        args.evidence_revision,
     )
     if state["phase"] != "qa":
         raise PipelineError("QA can complete only during the QA phase")
+    blocked_capabilities = blocked_preflight_capabilities(state)
+    if blocked_capabilities:
+        raise PipelineError(
+            "QA must not spawn before preflight capabilities are ready: "
+            + ", ".join(sorted(blocked_capabilities))
+        )
+    non_qa_roles = {
+        record["role"]
+        for record in state["worker_budget"].get("records", [])
+        if record.get("worker_id") == args.worker_id and record.get("role") != "runtime_qa"
+    }
+    if non_qa_roles:
+        raise PipelineError("Runtime QA requires an identity independent of earlier pipeline roles")
     review = state.get("review", {})
     if review.get("status") not in PASSED_REVIEW_STATUSES or review.get("revision") != args.revision:
         raise PipelineError("QA requires two passed final reviews on the current revision")
@@ -1356,8 +2134,10 @@ def cmd_qa_complete(args: argparse.Namespace) -> int:
     effective_status = args.status
     qa_run = {
         "run_id": args.run_id,
+        "worker_id": args.worker_id,
         "revision": args.revision,
         "product_revision": state["product_revision"],
+        "support_revision": state["support_revision"],
         "evidence_revision": state["evidence_revision"],
         "status": effective_status,
         "report": report,
@@ -1370,8 +2150,10 @@ def cmd_qa_complete(args: argparse.Namespace) -> int:
         "status": effective_status,
         "revision": args.revision,
         "product_revision": state["product_revision"],
+        "support_revision": state["support_revision"],
         "evidence_revision": state["evidence_revision"],
         "run_id": args.run_id,
+        "worker_id": args.worker_id,
         "report": report,
         "pending_scenarios": pending,
         "reason": args.reason,
@@ -1387,6 +2169,7 @@ def cmd_qa_complete(args: argparse.Namespace) -> int:
             state["required_reviews"],
             args.revision,
             state["product_revision"],
+            state["support_revision"],
             state["evidence_revision"],
         )
         state["phase"] = "engineering"
@@ -1406,6 +2189,10 @@ def cmd_qa_complete(args: argparse.Namespace) -> int:
         )
         state["phase"] = "qa"
 
+    record_worker(state, "runtime_qa", args.worker_id)
+    if state["phase"] == "ready":
+        state["worker_budget"]["status"] = "running"
+        state["worker_budget"]["reason"] = None
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
@@ -1415,6 +2202,7 @@ def readiness_reasons(state: dict[str, Any], findings: dict[str, Any]) -> list[s
     reasons.extend(source_drift(state))
     revision = state.get("revision")
     product_revision = state.get("product_revision")
+    support_revision = state.get("support_revision")
     evidence_revision = state.get("evidence_revision")
     if not revision:
         reasons.append("no current revision")
@@ -1423,11 +2211,12 @@ def readiness_reasons(state: dict[str, Any], findings: dict[str, Any]) -> list[s
         machine.get("status") != "pass"
         or machine.get("revision") != revision
         or machine.get("product_revision") != product_revision
+        or machine.get("support_revision") != support_revision
         or machine.get("evidence_revision") != evidence_revision
     ):
         reasons.append("machine checks have not passed on the current revision")
     if open_blocking(findings):
-        reasons.append("critical or major product findings remain unresolved")
+        reasons.append("critical or major findings remain unresolved")
     if any(
         item["status"] == "open" and item["severity"] == "minor"
         for item in findings["items"]
@@ -1435,7 +2224,7 @@ def readiness_reasons(state: dict[str, Any], findings: dict[str, Any]) -> list[s
         reasons.append("minor findings require resolution or explicit acceptance")
     clean = state.get("engineer_clean")
     if not clean or clean.get("product_revision") != product_revision:
-        reasons.append("a clean Engineer pass has not completed on the current product revision")
+        reasons.append("parallel read-only convergence has not passed on the current product revision")
     review = state.get("review", {})
     if review.get("status") not in PASSED_REVIEW_STATUSES or review.get("revision") != revision:
         reasons.append("two final reviews have not passed on the current revision")
@@ -1451,6 +2240,19 @@ def readiness_reasons(state: dict[str, Any], findings: dict[str, Any]) -> list[s
             or not review.get("recovery_run")
         ):
             reasons.append("evidence recovery review chain is incomplete")
+    elif review.get("status") == "passed_targeted":
+        closure = state.get("closure_review") or {}
+        if (
+            closure.get("status") != "passed"
+            or not closure.get("run")
+            or len(closure.get("base_review_runs", [])) != state.get("required_reviews", 2)
+        ):
+            reasons.append("targeted product closure review chain is incomplete")
+    preflight = state.get("preflight", {})
+    if preflight.get("resource_budget_check") != "pass":
+        reasons.append("preflight resource-budget proof has not passed")
+    if blocked_preflight_capabilities(state):
+        reasons.append("preflight runtime capabilities remain unavailable")
     qa = state.get("qa", {})
     if qa.get("status") != "pass" or qa.get("revision") != revision:
         reasons.append("feature-focused runtime QA has not passed on the current revision")
@@ -1490,7 +2292,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MAX_CONSECUTIVE_PRODUCT_CHANGES,
     )
+    init.add_argument(
+        "--required-convergence-audits",
+        type=int,
+        default=DEFAULT_REQUIRED_CONVERGENCE_AUDITS,
+    )
+    init.add_argument(
+        "--max-convergence-waves", type=int, default=DEFAULT_MAX_CONVERGENCE_WAVES
+    )
+    init.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
+    init.add_argument(
+        "--max-full-review-waves", type=int, default=DEFAULT_MAX_FULL_REVIEW_WAVES
+    )
     init.set_defaults(handler=cmd_init)
+
+    preflight = commands.add_parser("preflight-complete")
+    add_common_project_root(preflight)
+    preflight.add_argument("--run-id", required=True)
+    preflight.add_argument("--resource-budget-check", choices=("pass", "fail"), required=True)
+    preflight.add_argument("--capability", action="append")
+    preflight.add_argument("--report", required=True)
+    preflight.set_defaults(handler=cmd_preflight_complete)
 
     status = commands.add_parser("status")
     add_common_project_root(status)
@@ -1500,6 +2322,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_project_root(revisions)
     revisions.add_argument("--base-revision", required=True)
     revisions.add_argument("--product-file", action="append")
+    revisions.add_argument("--support-file", action="append")
     revisions.add_argument("--evidence-file", action="append")
     revisions.add_argument("--output")
     revisions.set_defaults(handler=cmd_compute_revisions)
@@ -1508,8 +2331,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_project_root(engineer)
     engineer.add_argument("--revision", required=True)
     engineer.add_argument("--product-revision")
+    engineer.add_argument("--support-revision")
     engineer.add_argument("--evidence-revision")
     engineer.add_argument("--run-id", required=True)
+    engineer.add_argument("--owner-id", required=True)
     engineer.add_argument("--machine-checks", choices=("pass", "fail"), required=True)
     engineer.add_argument("--report", required=True)
     engineer.add_argument("--coverage-manifest", required=True)
@@ -1530,10 +2355,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     engineer.set_defaults(handler=cmd_engineer_complete)
 
+    transfer_owner = commands.add_parser("transfer-engineering-owner")
+    add_common_project_root(transfer_owner)
+    transfer_owner.add_argument("--from-owner", required=True)
+    transfer_owner.add_argument("--to-owner", required=True)
+    transfer_owner.add_argument("--reason", required=True)
+    transfer_owner.set_defaults(handler=cmd_transfer_engineering_owner)
+
+    convergence_audit = commands.add_parser("convergence-audit-complete")
+    add_common_project_root(convergence_audit)
+    convergence_audit.add_argument("--revision", required=True)
+    convergence_audit.add_argument("--product-revision")
+    convergence_audit.add_argument("--support-revision")
+    convergence_audit.add_argument("--evidence-revision")
+    convergence_audit.add_argument("--run-id", required=True)
+    convergence_audit.add_argument("--reviewer-id", required=True)
+    convergence_audit.add_argument("--lens", choices=tuple(sorted(CONVERGENCE_LENSES)), required=True)
+    convergence_audit.add_argument("--status", choices=("pass", "fail"), required=True)
+    convergence_audit.add_argument("--report", required=True)
+    convergence_audit.set_defaults(handler=cmd_convergence_audit_complete)
+
+    convergence_finalize = commands.add_parser("convergence-finalize")
+    add_common_project_root(convergence_finalize)
+    convergence_finalize.add_argument("--revision", required=True)
+    convergence_finalize.add_argument("--decision", choices=("pass", "rework"), required=True)
+    convergence_finalize.add_argument("--report", required=True)
+    convergence_finalize.set_defaults(handler=cmd_convergence_finalize)
+
     review = commands.add_parser("review-complete")
     add_common_project_root(review)
     review.add_argument("--revision", required=True)
     review.add_argument("--product-revision")
+    review.add_argument("--support-revision")
     review.add_argument("--evidence-revision")
     review.add_argument("--run-id", required=True)
     review.add_argument("--reviewer-id", required=True)
@@ -1548,14 +2401,33 @@ def build_parser() -> argparse.ArgumentParser:
     review_finalize.add_argument("--report", required=True)
     review_finalize.add_argument("--reason")
     review_finalize.add_argument(
-        "--rework-scope", choices=("product", "evidence"), default="product"
+        "--rework-scope",
+        choices=("product", "support", "evidence", "recovery"),
+        default="product",
+    )
+    review_finalize.add_argument(
+        "--revalidation", choices=("targeted", "full"), default="targeted"
     )
     review_finalize.set_defaults(handler=cmd_review_finalize)
+
+    closure_review = commands.add_parser("closure-review-complete")
+    add_common_project_root(closure_review)
+    closure_review.add_argument("--revision", required=True)
+    closure_review.add_argument("--product-revision")
+    closure_review.add_argument("--support-revision")
+    closure_review.add_argument("--evidence-revision")
+    closure_review.add_argument("--run-id", required=True)
+    closure_review.add_argument("--reviewer-id", required=True)
+    closure_review.add_argument("--status", choices=("pass", "fail"), required=True)
+    closure_review.add_argument("--report", required=True)
+    closure_review.set_defaults(handler=cmd_closure_review_complete)
 
     add_finding = commands.add_parser("add-finding")
     add_common_project_root(add_finding)
     add_finding.add_argument("--id", required=True)
-    add_finding.add_argument("--source", choices=("engineer", "review", "qa"), required=True)
+    add_finding.add_argument(
+        "--source", choices=("engineer", "convergence", "review", "qa"), required=True
+    )
     add_finding.add_argument("--kind", choices=tuple(sorted(FINDING_KINDS)), default="product")
     add_finding.add_argument("--severity", choices=("critical", "major", "minor"), required=True)
     add_finding.add_argument("--title", required=True)
@@ -1580,17 +2452,23 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_project_root(recovery_start)
     recovery_start.add_argument("--revision", required=True)
     recovery_start.add_argument("--product-revision", required=True)
+    recovery_start.add_argument("--support-revision", required=True)
     recovery_start.add_argument("--evidence-revision", required=True)
     recovery_start.add_argument("--finding-id", action="append", required=True)
     recovery_start.add_argument("--reason", required=True)
     recovery_start.set_defaults(handler=cmd_start_evidence_recovery)
 
-    remediation = commands.add_parser("evidence-remediation-complete")
+    remediation = commands.add_parser(
+        "recovery-remediation-complete",
+        aliases=["evidence-remediation-complete"],
+    )
     add_common_project_root(remediation)
     remediation.add_argument("--revision", required=True)
     remediation.add_argument("--product-revision", required=True)
+    remediation.add_argument("--support-revision", required=True)
     remediation.add_argument("--evidence-revision", required=True)
     remediation.add_argument("--run-id", required=True)
+    remediation.add_argument("--worker-id", required=True)
     remediation.add_argument("--machine-checks", choices=("pass", "fail"), required=True)
     remediation.add_argument("--report", required=True)
     remediation.add_argument("--coverage-manifest", required=True)
@@ -1606,6 +2484,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_project_root(recovery_review)
     recovery_review.add_argument("--revision", required=True)
     recovery_review.add_argument("--product-revision", required=True)
+    recovery_review.add_argument("--support-revision", required=True)
     recovery_review.add_argument("--evidence-revision", required=True)
     recovery_review.add_argument("--run-id", required=True)
     recovery_review.add_argument("--reviewer-id", required=True)
@@ -1618,12 +2497,21 @@ def build_parser() -> argparse.ArgumentParser:
     authorize.add_argument("--reason", required=True)
     authorize.set_defaults(handler=cmd_authorize_iteration)
 
+    authorize_budget = commands.add_parser("authorize-budget")
+    add_common_project_root(authorize_budget)
+    authorize_budget.add_argument("--additional-workers", type=int, required=True)
+    authorize_budget.add_argument("--additional-full-review-waves", type=int, default=0)
+    authorize_budget.add_argument("--reason", required=True)
+    authorize_budget.set_defaults(handler=cmd_authorize_budget)
+
     qa = commands.add_parser("qa-complete")
     add_common_project_root(qa)
     qa.add_argument("--revision", required=True)
     qa.add_argument("--product-revision")
+    qa.add_argument("--support-revision")
     qa.add_argument("--evidence-revision")
     qa.add_argument("--run-id", required=True)
+    qa.add_argument("--worker-id", required=True)
     qa.add_argument("--status", choices=tuple(sorted(QA_STATUSES)), required=True)
     qa.add_argument("--report", required=True)
     qa.add_argument("--reason")

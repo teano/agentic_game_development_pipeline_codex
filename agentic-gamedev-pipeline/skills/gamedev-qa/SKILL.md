@@ -9,10 +9,11 @@ Remain read-only with respect to product code, tests, configuration, requirement
 
 ## Build the runtime matrix
 
-1. Read the approved feature documents, exact composite/product/evidence revisions, verification report, coverage manifest, and complete Review chain.
-2. Reuse passing deterministic/build evidence; do not rerun the full automated or project-wide integration suite.
-3. Derive scenarios for primary player flows, negative/repeated/interrupted/recovery/boundary behavior, resolved findings, directly affected shared systems, and a small justified adjacent smoke set.
-4. State exclusions. Do not expand into unrelated features or a project-wide manual tour.
+1. Read the approved feature documents, exact composite/product/support/evidence revisions, verification report, coverage manifest, and complete Review chain.
+2. Read the controller preflight capability matrix. Do not begin while a required editor connection, published configuration, persistence service, place topology, credential, or control path is recorded unavailable. Use a planned manual operator immediately when preflight says automation cannot perform the required player action.
+3. Reuse passing deterministic/build evidence; do not rerun the full automated or project-wide integration suite.
+4. Derive scenarios for primary player flows, negative/repeated/interrupted/recovery/boundary behavior, resolved findings, directly affected shared systems, and a small justified adjacent smoke set.
+5. State exclusions. Do not expand into unrelated features or a project-wide manual tour.
 
 ## Exercise the real game
 
@@ -23,7 +24,7 @@ Remain read-only with respect to product code, tests, configuration, requirement
 
 Continue after every defect through all independent scenarios that remain safe and trustworthy. Do not terminate on the first failure. When one finding invalidates another scenario's prerequisite, record `blocked_by_finding: <id>`; do not misclassify it as a gate or separate defect.
 
-After a stable product reproduction, send the technical director a compact provisional candidate containing ID, severity, requirement/scenario, revision, setup, expected/actual behavior, evidence, and reproducibility. A fresh Engineer may begin read-only discovery, but QA keeps ownership of the remaining matrix and final classification.
+After a stable product reproduction, send the technical director a compact provisional candidate containing ID, severity, requirement/scenario, revision, setup, expected/actual behavior, evidence, and reproducibility. The assigned engineering owner may begin read-only discovery, but QA keeps ownership of the remaining matrix and final classification.
 
 ## Classify outcomes
 
@@ -51,4 +52,4 @@ For mixed non-product gates, choose the result that owns the minimum resume acti
 
 Return the complete compact matrix, normalized product candidates, exclusions, gate details, and report path. Each gate records completed reusable evidence, exact pending scenario IDs, reason, and minimum resume action.
 
-Do not fix the product, waive risk, rerun unrelated suites, edit controller state, or declare readiness. `FAIL_PRODUCT` returns automatically to a fresh full Engineer; other non-pass outcomes remain in QA.
+Do not fix the product, waive risk, rerun unrelated suites, edit controller state, or declare readiness. `FAIL_PRODUCT` returns automatically to the persistent engineering owner; other non-pass outcomes resume the same QA worker whenever possible.

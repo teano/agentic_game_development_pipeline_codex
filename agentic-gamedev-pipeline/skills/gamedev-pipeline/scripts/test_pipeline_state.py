@@ -66,7 +66,7 @@ class PipelineStateTests(unittest.TestCase):
         self.assertEqual(expected, result.returncode, msg=result.stderr or result.stdout)
         return result
 
-    def initialize(self) -> None:
+    def initialize(self, *, complete_preflight: bool = True, extra: tuple[str, ...] = ()) -> None:
         self.run_command(
             "init",
             "--feature",
@@ -77,7 +77,36 @@ class PipelineStateTests(unittest.TestCase):
             f"docs/features/{FEATURE}/technical-specification.md",
             "--slice",
             "slice-1",
+            *extra,
         )
+        if complete_preflight:
+            self.preflight()
+
+    def preflight(
+        self,
+        *,
+        run_id: str = "preflight-1",
+        budget: str = "pass",
+        capabilities: tuple[str, ...] = (
+            "rojo=available",
+            "published-config=available",
+            "datastore=available",
+            "multi-place-teleport=planned_manual",
+            "player-control=planned_manual",
+        ),
+    ) -> dict:
+        arguments = [
+            "preflight-complete",
+            "--run-id",
+            run_id,
+            "--resource-budget-check",
+            budget,
+            "--report",
+            self.report("verification", run_id),
+        ]
+        for capability in capabilities:
+            arguments.extend(("--capability", capability))
+        return json.loads(self.run_command(*arguments).stdout)
 
     def state(self) -> dict:
         return json.loads((self.root / ".agentic-pipeline" / "state.json").read_text(encoding="utf-8"))
@@ -93,7 +122,9 @@ class PipelineStateTests(unittest.TestCase):
         name: str,
         product_revision: str,
         evidence_revision: str,
+        support_revision: str | None = None,
     ) -> str:
+        support_revision = support_revision or product_revision
         manifest = self.root / "tests" / FEATURE / "verification" / f"{name}-coverage.json"
         manifest.parent.mkdir(parents=True, exist_ok=True)
         manifest.write_text(
@@ -101,6 +132,7 @@ class PipelineStateTests(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "product_revision": product_revision,
+                    "support_revision": support_revision,
                     "evidence_revision": evidence_revision,
                     "entries": [
                         {
@@ -132,12 +164,15 @@ class PipelineStateTests(unittest.TestCase):
         checks: str = "pass",
         *,
         product_revision: str | None = None,
+        support_revision: str | None = None,
         evidence_revision: str | None = None,
+        owner_id: str = "owner-main",
         scope: str | None = None,
         scope_approval: str | None = None,
         resolved: tuple[str, ...] = (),
     ) -> dict:
         product_revision = product_revision or revision
+        support_revision = support_revision or product_revision
         evidence_revision = evidence_revision or revision
         if scope is None:
             state_path = self.root / ".agentic-pipeline" / "state.json"
@@ -153,16 +188,22 @@ class PipelineStateTests(unittest.TestCase):
             revision,
             "--product-revision",
             product_revision,
+            "--support-revision",
+            support_revision,
             "--evidence-revision",
             evidence_revision,
             "--run-id",
             run_id,
+            "--owner-id",
+            owner_id,
             "--machine-checks",
             checks,
             "--report",
             self.report("verification", run_id),
             "--coverage-manifest",
-            self.coverage_manifest(run_id, product_revision, evidence_revision),
+            self.coverage_manifest(
+                run_id, product_revision, evidence_revision, support_revision
+            ),
             "--production-change-scope",
             scope,
             "--audit-complete",
@@ -199,6 +240,7 @@ class PipelineStateTests(unittest.TestCase):
         *,
         reason: str | None = None,
         rework_scope: str = "product",
+        revalidation: str = "targeted",
     ) -> dict:
         arguments = [
             "review-finalize",
@@ -210,6 +252,8 @@ class PipelineStateTests(unittest.TestCase):
             self.report("reviews", f"decision-{decision}"),
             "--rework-scope",
             rework_scope,
+            "--revalidation",
+            revalidation,
         ]
         if reason:
             arguments.extend(("--reason", reason))
@@ -217,10 +261,105 @@ class PipelineStateTests(unittest.TestCase):
 
     def converge_to_qa(self, revision: str = "rev-a") -> None:
         self.engineer(revision, "eng-change")
-        self.engineer(revision, "eng-clean")
+        self.convergence_pass(revision)
         self.review(revision, "review-1", "reviewer-a")
         self.review(revision, "review-2", "reviewer-b")
         self.finalize_review(revision, "pass")
+
+    def convergence_pass(self, revision: str, *, prefix: str = "conv") -> dict:
+        for index, lens in enumerate(
+            (
+                "persistence-lifecycle",
+                "config-security-capacity",
+                "integration-runtime-docs",
+            ),
+            start=1,
+        ):
+            self.run_command(
+                "convergence-audit-complete",
+                "--revision",
+                revision,
+                "--run-id",
+                f"{prefix}-{index}",
+                "--reviewer-id",
+                f"{prefix}-reviewer-{index}",
+                "--lens",
+                lens,
+                "--status",
+                "pass",
+                "--report",
+                self.report("verification", f"{prefix}-{index}"),
+            )
+        return json.loads(
+            self.run_command(
+                "convergence-finalize",
+                "--revision",
+                revision,
+                "--decision",
+                "pass",
+                "--report",
+                self.report("verification", f"{prefix}-decision"),
+            ).stdout
+        )
+
+    def convergence_rework(
+        self,
+        revision: str,
+        *,
+        finding_id: str = "CONV-001",
+        prefix: str = "conv-fail",
+    ) -> dict:
+        for index, lens in enumerate(
+            (
+                "persistence-lifecycle",
+                "config-security-capacity",
+                "integration-runtime-docs",
+            ),
+            start=1,
+        ):
+            self.run_command(
+                "convergence-audit-complete",
+                "--revision",
+                revision,
+                "--run-id",
+                f"{prefix}-{index}",
+                "--reviewer-id",
+                f"{prefix}-reviewer-{index}",
+                "--lens",
+                lens,
+                "--status",
+                "fail" if index == 1 else "pass",
+                "--report",
+                self.report("verification", f"{prefix}-{index}"),
+            )
+        self.run_command(
+            "add-finding",
+            "--id",
+            finding_id,
+            "--source",
+            "convergence",
+            "--kind",
+            "product",
+            "--severity",
+            "major",
+            "--title",
+            "Convergence defect",
+            "--evidence",
+            "The read-only audit reproduced the defect",
+            "--revision",
+            revision,
+        )
+        return json.loads(
+            self.run_command(
+                "convergence-finalize",
+                "--revision",
+                revision,
+                "--decision",
+                "rework",
+                "--report",
+                self.report("verification", f"{prefix}-decision"),
+            ).stdout
+        )
 
     def qa(
         self,
@@ -228,6 +367,7 @@ class PipelineStateTests(unittest.TestCase):
         run_id: str,
         status: str,
         *,
+        worker_id: str = "qa-owner",
         reason: str | None = None,
         pending: tuple[str, ...] = (),
     ) -> dict:
@@ -237,6 +377,8 @@ class PipelineStateTests(unittest.TestCase):
             revision,
             "--run-id",
             run_id,
+            "--worker-id",
+            worker_id,
             "--status",
             status,
             "--report",
@@ -257,23 +399,32 @@ class PipelineStateTests(unittest.TestCase):
         evidence_revision: str,
         run_id: str,
         finding_ids: tuple[str, ...],
+        support_revision: str | None = None,
+        worker_id: str = "recovery-owner",
     ) -> dict:
+        support_revision = support_revision or product_revision
         arguments = [
-            "evidence-remediation-complete",
+            "recovery-remediation-complete",
             "--revision",
             revision,
             "--product-revision",
             product_revision,
+            "--support-revision",
+            support_revision,
             "--evidence-revision",
             evidence_revision,
             "--run-id",
             run_id,
+            "--worker-id",
+            worker_id,
             "--machine-checks",
             "pass",
             "--report",
             self.report("verification", run_id),
             "--coverage-manifest",
-            self.coverage_manifest(run_id, product_revision, evidence_revision),
+            self.coverage_manifest(
+                run_id, product_revision, evidence_revision, support_revision
+            ),
             "--production-change-scope",
             "none",
         ]
@@ -287,10 +438,12 @@ class PipelineStateTests(unittest.TestCase):
         product_revision: str,
         evidence_revision: str,
         *,
+        support_revision: str | None = None,
         status: str = "pass",
         run_id: str = "recovery-review-1",
         reviewer_id: str = "recovery-reviewer",
     ) -> dict:
+        support_revision = support_revision or product_revision
         return json.loads(
             self.run_command(
                 "recovery-review-complete",
@@ -298,6 +451,8 @@ class PipelineStateTests(unittest.TestCase):
                 revision,
                 "--product-revision",
                 product_revision,
+                "--support-revision",
+                support_revision,
                 "--evidence-revision",
                 evidence_revision,
                 "--run-id",
@@ -318,12 +473,102 @@ class PipelineStateTests(unittest.TestCase):
             self.assertTrue((self.root / "tests" / FEATURE / child).is_dir())
         state = self.state()
         self.assertEqual(FEATURE, state["feature"])
-        self.assertEqual(3, state["schema_version"])
+        self.assertEqual(4, state["schema_version"])
+        self.assertEqual("engineering", state["phase"])
+        self.assertEqual("pass", state["preflight"]["resource_budget_check"])
 
     def test_init_preserves_existing_gitignore(self) -> None:
         (self.root / ".gitignore").write_text(".cache/\n", encoding="utf-8")
         self.initialize()
         self.assertEqual(".cache/\n/tests/\n", (self.root / ".gitignore").read_text(encoding="utf-8"))
+
+    def test_preflight_requires_resource_budget_proof_and_surfaces_runtime_gates(self) -> None:
+        self.initialize(complete_preflight=False)
+        failed = self.preflight(
+            run_id="preflight-budget-fail",
+            budget="fail",
+            capabilities=("player-control=blocked_user",),
+        )
+        self.assertEqual("preflight", failed["phase"])
+        self.assertEqual("reconcile_resource_budget", failed["next_action"]["action"])
+
+        passed = self.preflight(
+            run_id="preflight-budget-pass",
+            capabilities=("player-control=blocked_user", "rojo=available"),
+        )
+        self.assertEqual("engineering", passed["phase"])
+        self.assertEqual("blocked_user", passed["preflight"]["capabilities"]["player-control"])
+
+    def test_worker_budget_opens_a_director_checkpoint_before_another_spawn(self) -> None:
+        self.initialize(extra=("--max-workers", "1"))
+        changed = self.engineer("rev-a", "eng-1")
+        self.assertEqual("checkpoint_required", changed["worker_budget"]["status"])
+        self.assertEqual("director_budget_checkpoint", changed["next_action"]["action"])
+        authorized = json.loads(
+            self.run_command(
+                "authorize-budget",
+                "--additional-workers",
+                "4",
+                "--reason",
+                "One bounded convergence wave remains",
+            ).stdout
+        )
+        self.assertEqual("running", authorized["worker_budget"]["status"])
+        self.assertEqual("complete_parallel_read_only_audits", authorized["next_action"]["action"])
+
+    def test_full_review_revalidation_requires_explicit_wave_budget_extension(self) -> None:
+        self.initialize(extra=("--max-full-review-waves", "1"))
+        self.engineer("rev-a", "eng-1")
+        self.convergence_pass("rev-a")
+        self.review("rev-a", "review-1", "reviewer-a", status="fail")
+        self.review("rev-a", "review-2", "reviewer-b", status="pass")
+        self.run_command(
+            "add-finding",
+            "--id",
+            "R-BROAD-001",
+            "--source",
+            "review",
+            "--kind",
+            "product",
+            "--severity",
+            "major",
+            "--title",
+            "Architectural contract mismatch",
+            "--evidence",
+            "The correction changes a shared contract across the feature boundary",
+            "--revision",
+            "rev-a",
+        )
+        rework = self.finalize_review(
+            "rev-a",
+            "rework",
+            reason="Broad correction requires a fresh full Review pair",
+            revalidation="full",
+        )
+        self.assertEqual("checkpoint_required", rework["worker_budget"]["status"])
+        self.assertEqual("director_budget_checkpoint", rework["next_action"]["action"])
+        self.run_command(
+            "authorize-budget",
+            "--additional-workers",
+            "4",
+            "--reason",
+            "Fund one bounded full Review revalidation wave",
+            expected=2,
+        )
+        authorized = json.loads(
+            self.run_command(
+                "authorize-budget",
+                "--additional-workers",
+                "4",
+                "--additional-full-review-waves",
+                "1",
+                "--reason",
+                "Fund one bounded full Review revalidation wave",
+            ).stdout
+        )
+        self.assertEqual("running", authorized["worker_budget"]["status"])
+        self.assertEqual(2, authorized["worker_budget"]["max_full_review_waves"])
+        self.assertEqual("resume_engineering_owner", authorized["next_action"]["action"])
 
     def test_init_rejects_noncanonical_document_paths(self) -> None:
         root_prd = self.root / "product-requirements.md"
@@ -374,11 +619,14 @@ class PipelineStateTests(unittest.TestCase):
         product_a = self.root / "src" / "a.py"
         product_b = self.root / "src" / "b.py"
         evidence = self.root / "tests" / "fixture.txt"
+        support = self.root / "docs" / "handoff.md"
         product_a.parent.mkdir(parents=True)
         evidence.parent.mkdir(parents=True, exist_ok=True)
+        support.parent.mkdir(parents=True, exist_ok=True)
         product_a.write_text("a\n", encoding="utf-8")
         product_b.write_text("b\n", encoding="utf-8")
         evidence.write_text("fixture\n", encoding="utf-8")
+        support.write_text("handoff\n", encoding="utf-8")
         first = json.loads(
             self.run_command(
                 "compute-revisions",
@@ -390,6 +638,8 @@ class PipelineStateTests(unittest.TestCase):
                 "src/a.py",
                 "--evidence-file",
                 "tests/fixture.txt",
+                "--support-file",
+                "docs/handoff.md",
                 "--output",
                 f"tests/{FEATURE}/verification/revisions.json",
             ).stdout
@@ -405,10 +655,13 @@ class PipelineStateTests(unittest.TestCase):
                 "src/b.py",
                 "--evidence-file",
                 "tests/fixture.txt",
+                "--support-file",
+                "docs/handoff.md",
             ).stdout
         )
         self.assertEqual(first["revision"], second["revision"])
         self.assertEqual(["src/a.py", "src/b.py"], [item["path"] for item in first["product_files"]])
+        self.assertEqual(["docs/handoff.md"], [item["path"] for item in first["support_files"]])
         self.assertTrue(Path(first["manifest"]).is_file())
         self.run_command(
             "compute-revisions",
@@ -420,12 +673,63 @@ class PipelineStateTests(unittest.TestCase):
             "src/a.py",
             expected=2,
         )
+
+    def test_engineering_owner_is_stable_until_explicit_transfer(self) -> None:
+        self.initialize()
+        self.engineer("rev-a", "eng-1")
+        self.convergence_rework("rev-a", finding_id="CONV-OWNER")
+        self.run_command(
+            "engineer-complete",
+            "--revision",
+            "rev-b",
+            "--product-revision",
+            "rev-b",
+            "--support-revision",
+            "rev-b",
+            "--evidence-revision",
+            "rev-b",
+            "--run-id",
+            "eng-wrong-owner",
+            "--owner-id",
+            "owner-other",
+            "--machine-checks",
+            "pass",
+            "--report",
+            self.report("verification", "eng-wrong-owner"),
+            "--coverage-manifest",
+            self.coverage_manifest("eng-wrong-owner", "rev-b", "rev-b"),
+            "--production-change-scope",
+            "local",
+            "--resolved-finding",
+            "CONV-OWNER",
+            "--audit-complete",
+            expected=2,
+        )
+        transferred = json.loads(
+            self.run_command(
+                "transfer-engineering-owner",
+                "--from-owner",
+                "owner-main",
+                "--to-owner",
+                "owner-other",
+                "--reason",
+                "Original owner is unavailable; frozen batch is unchanged",
+            ).stdout
+        )
+        self.assertEqual("owner-other", transferred["engineering_owner_id"])
+        changed = self.engineer(
+            "rev-b",
+            "eng-new-owner",
+            owner_id="owner-other",
+            resolved=("CONV-OWNER",),
+        )
+        self.assertEqual("convergence_hold", changed["phase"])
     def test_happy_path_uses_one_clean_engineer_and_two_reviews(self) -> None:
         self.initialize()
         changed = self.engineer("rev-a", "eng-1")
         self.assertEqual("changed", changed["last_engineer_outcome"])
-        clean = self.engineer("rev-a", "eng-2")
-        self.assertEqual("clean", clean["last_engineer_outcome"])
+        clean = self.convergence_pass("rev-a")
+        self.assertEqual("parallel_read_only_convergence", clean["engineer_clean"]["source"])
         self.assertEqual("review", clean["phase"])
 
         first = self.review("rev-a", "review-1", "reviewer-a")
@@ -445,7 +749,7 @@ class PipelineStateTests(unittest.TestCase):
         self.initialize()
         changed = self.engineer("rev-a", "eng-1")
         self.assertIsNone(changed["engineer_clean"])
-        self.assertEqual("engineering", changed["phase"])
+        self.assertEqual("convergence", changed["phase"])
 
     def test_evidence_only_change_cannot_use_full_engineer_completion(self) -> None:
         self.initialize()
@@ -455,22 +759,21 @@ class PipelineStateTests(unittest.TestCase):
             product_revision="product-a",
             evidence_revision="evidence-a",
         )
-        self.engineer(
-            "rev-a",
-            "eng-2",
-            product_revision="product-a",
-            evidence_revision="evidence-a",
-        )
+        self.convergence_pass("rev-a")
         self.run_command(
             "engineer-complete",
             "--revision",
             "rev-b",
             "--product-revision",
             "product-a",
+            "--support-revision",
+            "product-a",
             "--evidence-revision",
             "evidence-b",
             "--run-id",
             "eng-wrong-lane",
+            "--owner-id",
+            "owner-main",
             "--machine-checks",
             "pass",
             "--report",
@@ -490,11 +793,13 @@ class PipelineStateTests(unittest.TestCase):
             product_revision="product-a",
             evidence_revision="evidence-a",
         )
+        self.convergence_rework("rev-a", finding_id="CONV-FIRST")
         held = self.engineer(
             "rev-b",
             "eng-2",
             product_revision="product-b",
             evidence_revision="evidence-b",
+            resolved=("CONV-FIRST",),
         )
         self.assertEqual("convergence_hold", held["phase"])
         self.assertEqual("checkpoint_required", held["iteration_control"]["status"])
@@ -505,14 +810,14 @@ class PipelineStateTests(unittest.TestCase):
                 "Director approved one more convergence pass",
             ).stdout
         )
-        self.assertEqual("engineering", authorized["phase"])
+        self.assertEqual("convergence", authorized["phase"])
         self.assertEqual("running", authorized["iteration_control"]["status"])
         self.assertEqual(0, authorized["iteration_control"]["consecutive_product_changes"])
 
     def test_clean_pass_resets_the_consecutive_change_window(self) -> None:
         self.initialize()
         self.engineer("rev-a", "eng-change-a")
-        clean = self.engineer("rev-a", "eng-clean-a")
+        clean = self.convergence_pass("rev-a")
         self.assertEqual(0, clean["iteration_control"]["consecutive_product_changes"])
         self.review("rev-a", "review-a", "reviewer-a")
         self.review("rev-a", "review-b", "reviewer-b")
@@ -523,13 +828,13 @@ class PipelineStateTests(unittest.TestCase):
         )
         self.finalize_review("rev-a", "rework")
         changed = self.engineer("rev-b", "eng-change-b")
-        self.assertEqual("engineering", changed["phase"])
+        self.assertEqual("convergence", changed["phase"])
         self.assertEqual(1, changed["iteration_control"]["consecutive_product_changes"])
 
     def test_legacy_cumulative_counter_does_not_preserve_a_false_hold(self) -> None:
         self.initialize()
         self.engineer("rev-a", "eng-change-a")
-        self.engineer("rev-a", "eng-clean-a")
+        self.convergence_pass("rev-a")
         state = self.state()
         state["phase"] = "convergence_hold"
         state["iteration_control"] = {
@@ -545,28 +850,12 @@ class PipelineStateTests(unittest.TestCase):
         normalized = json.loads(self.run_command("status").stdout)
         self.assertEqual("engineering", normalized["phase"])
         self.assertEqual(0, normalized["iteration_control"]["consecutive_product_changes"])
-        self.assertEqual("spawn_full_engineer", normalized["next_action"]["action"])
+        self.assertEqual("resume_engineering_owner", normalized["next_action"]["action"])
 
     def test_engineer_resolves_product_findings_atomically_without_losing_hold(self) -> None:
         self.initialize()
         self.engineer("rev-a", "eng-change-a")
-        self.run_command(
-            "add-finding",
-            "--id",
-            "ENG-001",
-            "--source",
-            "engineer",
-            "--kind",
-            "product",
-            "--severity",
-            "major",
-            "--title",
-            "Product defect",
-            "--evidence",
-            "Reproduced on rev-a",
-            "--revision",
-            "rev-a",
-        )
+        self.convergence_rework("rev-a", finding_id="ENG-001")
         held = self.engineer(
             "rev-b", "eng-change-b", product_revision="product-b",
             evidence_revision="evidence-b", resolved=("ENG-001",)
@@ -581,23 +870,7 @@ class PipelineStateTests(unittest.TestCase):
     def test_resolve_finding_never_changes_the_pipeline_phase(self) -> None:
         self.initialize()
         self.engineer("rev-a", "eng-change-a")
-        self.run_command(
-            "add-finding",
-            "--id",
-            "MIN-001",
-            "--source",
-            "engineer",
-            "--kind",
-            "product",
-            "--severity",
-            "minor",
-            "--title",
-            "Minor issue",
-            "--evidence",
-            "Observed on rev-b",
-            "--revision",
-            "rev-a",
-        )
+        self.convergence_rework("rev-a", finding_id="MIN-001")
         self.engineer("rev-b", "eng-change-b")
         self.run_command("resolve-finding", "--id", "MIN-001", "--revision", "rev-b")
         self.assertEqual("convergence_hold", self.state()["phase"])
@@ -610,6 +883,8 @@ class PipelineStateTests(unittest.TestCase):
             "rev-a",
             "--run-id",
             "eng-architecture",
+            "--owner-id",
+            "owner-main",
             "--machine-checks",
             "pass",
             "--report",
@@ -626,6 +901,7 @@ class PipelineStateTests(unittest.TestCase):
         self.initialize()
         self.run_command(
             "engineer-complete", "--revision", "rev-a", "--run-id", "eng-none-change",
+            "--owner-id", "owner-main",
             "--machine-checks", "pass", "--report", self.report("verification", "eng-none-change"),
             "--coverage-manifest", self.coverage_manifest("eng-none-change", "rev-a", "rev-a"),
             "--production-change-scope", "none", "--audit-complete", expected=2,
@@ -633,13 +909,15 @@ class PipelineStateTests(unittest.TestCase):
         self.engineer("rev-a", "eng-change")
         self.run_command(
             "engineer-complete", "--revision", "rev-a", "--run-id", "eng-false-local",
+            "--owner-id", "owner-main",
             "--machine-checks", "pass", "--report", self.report("verification", "eng-false-local"),
             "--coverage-manifest", self.coverage_manifest("eng-false-local", "rev-a", "rev-a"),
             "--production-change-scope", "local", "--audit-complete", expected=2,
         )
-        self.engineer("rev-a", "eng-clean")
+        self.convergence_pass("rev-a")
         self.run_command(
             "engineer-complete", "--revision", "rev-a", "--run-id", "eng-during-review",
+            "--owner-id", "owner-main",
             "--machine-checks", "pass", "--report", self.report("verification", "eng-during-review"),
             "--coverage-manifest", self.coverage_manifest("eng-during-review", "rev-a", "rev-a"),
             "--production-change-scope", "none", "--audit-complete", expected=2,
@@ -653,12 +931,7 @@ class PipelineStateTests(unittest.TestCase):
             product_revision="product-a",
             evidence_revision="evidence-a",
         )
-        self.engineer(
-            "rev-a",
-            "eng-2",
-            product_revision="product-a",
-            evidence_revision="evidence-a",
-        )
+        self.convergence_pass("rev-a")
         self.review("rev-a", "review-1", "reviewer-a", status="fail")
         self.review("rev-a", "review-2", "reviewer-b", status="pass")
         self.run_command(
@@ -695,7 +968,7 @@ class PipelineStateTests(unittest.TestCase):
             ("R-EVIDENCE-001",),
         )
         self.assertEqual("recovery_review", remediated["phase"])
-        self.assertEqual(clean_before["run_id"], remediated["engineer_clean"]["run_id"])
+        self.assertEqual(clean_before, remediated["engineer_clean"])
         self.assertEqual("product-a", remediated["product_revision"])
 
         verified = self.recovery_review("rev-b", "product-a", "evidence-b")
@@ -703,10 +976,65 @@ class PipelineStateTests(unittest.TestCase):
         self.assertEqual("qa", verified["phase"])
         self.assertEqual(3, len(self.state()["review_runs"]))
 
+    def test_support_only_rework_preserves_product_and_full_reviews(self) -> None:
+        self.initialize()
+        self.engineer(
+            "rev-a",
+            "eng-1",
+            product_revision="product-a",
+            support_revision="support-a",
+            evidence_revision="evidence-a",
+        )
+        self.convergence_pass("rev-a", prefix="support-conv")
+        self.review("rev-a", "review-1", "reviewer-a", status="fail")
+        self.review("rev-a", "review-2", "reviewer-b", status="pass")
+        self.run_command(
+            "add-finding",
+            "--id",
+            "R-SUPPORT-001",
+            "--source",
+            "review",
+            "--kind",
+            "support",
+            "--severity",
+            "major",
+            "--title",
+            "Stale handoff",
+            "--evidence",
+            "Derived handoff points to an obsolete report",
+            "--revision",
+            "rev-a",
+        )
+        rework = self.finalize_review(
+            "rev-a",
+            "rework",
+            reason="Only derived support documentation changes",
+            rework_scope="support",
+        )
+        clean_before = rework["engineer_clean"]
+        remediated = self.evidence_remediation(
+            "rev-b",
+            "product-a",
+            "evidence-a",
+            "support-fix-1",
+            ("R-SUPPORT-001",),
+            support_revision="support-b",
+        )
+        self.assertEqual("product-a", remediated["product_revision"])
+        self.assertEqual("support-b", remediated["support_revision"])
+        self.assertEqual(clean_before, remediated["engineer_clean"])
+        verified = self.recovery_review(
+            "rev-b",
+            "product-a",
+            "evidence-a",
+            support_revision="support-b",
+        )
+        self.assertEqual("qa", verified["phase"])
+
     def test_failed_recovery_refreezes_new_evidence_and_checkpoint_resets_cycles(self) -> None:
         self.initialize()
         self.engineer("rev-a", "eng-1", product_revision="product-a", evidence_revision="evidence-a")
-        self.engineer("rev-a", "eng-2", product_revision="product-a", evidence_revision="evidence-a")
+        self.convergence_pass("rev-a")
         self.review("rev-a", "review-1", "reviewer-a", status="fail")
         self.review("rev-a", "review-2", "reviewer-b")
         self.run_command(
@@ -755,7 +1083,7 @@ class PipelineStateTests(unittest.TestCase):
     def test_paused_legacy_rework_can_enter_evidence_recovery_explicitly(self) -> None:
         self.initialize()
         self.engineer("rev-a", "eng-1")
-        self.engineer("rev-a", "eng-2")
+        self.convergence_pass("rev-a")
         self.review("rev-a", "review-1", "reviewer-a", status="fail")
         self.review("rev-a", "review-2", "reviewer-b", status="pass")
         self.run_command(
@@ -780,6 +1108,8 @@ class PipelineStateTests(unittest.TestCase):
                 "--revision",
                 "rev-a",
                 "--product-revision",
+                "product-a",
+                "--support-revision",
                 "product-a",
                 "--evidence-revision",
                 "evidence-a",
@@ -832,7 +1162,7 @@ class PipelineStateTests(unittest.TestCase):
     def test_reviews_require_distinct_reviewers(self) -> None:
         self.initialize()
         self.engineer("rev-a", "eng-1")
-        self.engineer("rev-a", "eng-2")
+        self.convergence_pass("rev-a")
         self.review("rev-a", "review-1", "reviewer-a")
         self.run_command(
             "review-complete",
@@ -853,7 +1183,7 @@ class PipelineStateTests(unittest.TestCase):
     def test_failed_review_returns_to_engineering_after_both_reports(self) -> None:
         self.initialize()
         self.engineer("rev-a", "eng-1")
-        self.engineer("rev-a", "eng-2")
+        self.convergence_pass("rev-a")
         first = self.review("rev-a", "review-1", "reviewer-a", status="fail")
         self.assertEqual("review", first["phase"])
         second = self.review("rev-a", "review-2", "reviewer-b", status="pass")
@@ -882,7 +1212,7 @@ class PipelineStateTests(unittest.TestCase):
     def test_parent_may_override_reviewer_failure_with_reason(self) -> None:
         self.initialize()
         self.engineer("rev-a", "eng-1")
-        self.engineer("rev-a", "eng-2")
+        self.convergence_pass("rev-a")
         self.review("rev-a", "review-1", "reviewer-a", status="fail")
         self.review("rev-a", "review-2", "reviewer-b", status="pass")
         self.run_command(
@@ -901,6 +1231,85 @@ class PipelineStateTests(unittest.TestCase):
             reason="Candidate contradicted the exact verification evidence",
         )
         self.assertEqual("qa", finalized["phase"])
+
+    def test_local_product_rework_uses_one_targeted_closure_review(self) -> None:
+        self.initialize()
+        self.engineer("rev-a", "eng-1")
+        self.convergence_pass("rev-a", prefix="initial-conv")
+        self.review("rev-a", "review-1", "reviewer-a", status="fail")
+        self.review("rev-a", "review-2", "reviewer-b", status="pass")
+        self.run_command(
+            "add-finding",
+            "--id",
+            "R-LOCAL-001",
+            "--source",
+            "review",
+            "--kind",
+            "product",
+            "--severity",
+            "major",
+            "--title",
+            "Local rollback defect",
+            "--evidence",
+            "The immutable review reproduced one bounded failure path",
+            "--revision",
+            "rev-a",
+        )
+        rework = self.finalize_review(
+            "rev-a",
+            "rework",
+            reason="Bounded local correction",
+        )
+        self.assertEqual("targeted", rework["product_revalidation"]["mode"])
+        self.engineer("rev-b", "eng-local-fix", resolved=("R-LOCAL-001",))
+        converged = self.convergence_pass("rev-b", prefix="closure-conv")
+        self.assertEqual("closure_review", converged["phase"])
+        closed = json.loads(
+            self.run_command(
+                "closure-review-complete",
+                "--revision",
+                "rev-b",
+                "--run-id",
+                "closure-review-1",
+                "--reviewer-id",
+                "reviewer-c",
+                "--status",
+                "pass",
+                "--report",
+                self.report("reviews", "closure-review-1"),
+            ).stdout
+        )
+        self.assertEqual("passed_targeted", closed["review"]["status"])
+        self.assertEqual("qa", closed["phase"])
+        self.assertEqual(3, len(closed["review"]["runs"]) + 1)
+
+    def test_qa_does_not_spawn_while_preflight_capability_is_blocked(self) -> None:
+        self.initialize(complete_preflight=False)
+        self.preflight(capabilities=("player-control=blocked_user",))
+        self.converge_to_qa()
+        status = json.loads(self.run_command("status").stdout)
+        self.assertEqual("prepare_qa_prerequisites", status["next_action"]["action"])
+        self.assertTrue(status["next_action"]["user_input_required"])
+        self.run_command(
+            "qa-complete",
+            "--revision",
+            "rev-a",
+            "--run-id",
+            "qa-too-early",
+            "--worker-id",
+            "qa-owner",
+            "--status",
+            "pass",
+            "--report",
+            self.report("qa", "qa-too-early"),
+            expected=2,
+        )
+        self.preflight(
+            run_id="preflight-player-ready",
+            capabilities=("player-control=planned_manual",),
+        )
+        final = self.qa("rev-a", "qa-manual-operator", "pass")
+        self.assertEqual("ready", final["phase"])
 
     def test_blocked_user_qa_preserves_engineer_and_review_evidence(self) -> None:
         self.initialize()
@@ -948,6 +1357,8 @@ class PipelineStateTests(unittest.TestCase):
             "rev-a",
             "--run-id",
             "qa-invalid",
+            "--worker-id",
+            "qa-owner",
             "--status",
             "blocked_user",
             "--report",
@@ -978,7 +1389,7 @@ class PipelineStateTests(unittest.TestCase):
         self.assertEqual("engineering", failed["phase"])
         self.assertIsNone(failed["engineer_clean"])
         self.assertEqual("pending", failed["review"]["status"])
-        self.assertEqual("spawn_full_engineer", failed["next_action"]["action"])
+        self.assertEqual("resume_engineering_owner", failed["next_action"]["action"])
         self.assertFalse(failed["next_action"]["user_input_required"])
 
     def test_product_failure_requires_a_registered_qa_finding(self) -> None:
@@ -990,6 +1401,8 @@ class PipelineStateTests(unittest.TestCase):
             "rev-a",
             "--run-id",
             "qa-unregistered-failure",
+            "--worker-id",
+            "qa-owner",
             "--status",
             "fail_product",
             "--reason",
@@ -1028,27 +1441,13 @@ class PipelineStateTests(unittest.TestCase):
             evidence_revision="evidence-b",
             resolved=("QA-LOCAL",),
         )
-        self.assertEqual("engineering", result["phase"])
+        self.assertEqual("convergence", result["phase"])
         self.assertEqual(1, result["iteration_control"]["consecutive_product_changes"])
 
     def test_unresolved_product_finding_prevents_clean_engineer(self) -> None:
         self.initialize()
         self.engineer("rev-a", "eng-1")
-        self.run_command(
-            "add-finding",
-            "--id",
-            "E-001",
-            "--source",
-            "engineer",
-            "--severity",
-            "major",
-            "--title",
-            "Incorrect lifecycle",
-            "--evidence",
-            "Reproduced state corruption",
-            "--revision",
-            "rev-a",
-        )
+        self.convergence_rework("rev-a", finding_id="E-001")
         blocked = self.engineer("rev-a", "eng-2")
         self.assertEqual("blocked", blocked["last_engineer_outcome"])
         self.assertEqual("engineering", blocked["phase"])

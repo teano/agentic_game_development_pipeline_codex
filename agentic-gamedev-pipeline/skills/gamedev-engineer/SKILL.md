@@ -1,16 +1,16 @@
 ---
 name: gamedev-engineer
-description: Execute one scope-complete game-development engineering pass or one bounded evidence-only remediation batch. Use for implementation, product remediation, QA product failures, clean convergence, or Review evidence recovery when one Engineer must audit the full assigned boundary, freeze all findings before editing, batch-fix them, add regressions, run changed and aggregate checks, and resweep before returning.
+description: Act as the persistent writing owner for one scope-complete game-development implementation or product-remediation pass, or execute one bounded support/evidence recovery batch. Use when one owner must audit the assigned boundary, freeze findings before editing, batch-fix them, add regressions, run changed and aggregate checks, and resweep before returning; read-only convergence belongs to independent reviewers.
 ---
 
 # GameDev Engineer
 
 Own the complete assigned pass. Read repository instructions, approved feature documents, assigned IDs, revision manifest, check commands, and report paths. Reconstruct decisions from artifacts, not chat history. Preserve unrelated changes.
 
-Use exactly one mode:
+Use exactly one mode and preserve the assigned owner ID across product passes:
 
-- `full-engineering`: initial implementation, product finding, QA product failure, or clean convergence;
-- `evidence-remediation`: one normalized all-evidence Review batch on an unchanged clean product revision.
+- `full-engineering`: initial implementation, convergence finding batch, Review product batch, or QA product failure;
+- `recovery-remediation`: one normalized support/evidence Review batch on an unchanged clean runtime product revision.
 
 ## Phase A — discover without editing
 
@@ -36,28 +36,28 @@ Before production edits, classify the change:
 - `local`: preserves approved lifecycle, ownership, public contracts, and slice boundary; proceed autonomously;
 - `architectural`: changes those decisions or materially expands the slice; stop for explicit scope approval.
 
-Missing permission, credentials, environment, or executable evidence is a gate, not a product finding. Evidence-remediation mode permits only tests, fixtures, harnesses, revision/coverage manifests, and reports; any product hash drift aborts the mode.
+Missing permission, credentials, environment, or executable evidence is a gate, not a product finding. Recovery-remediation mode permits derived support documentation, tests, fixtures, harnesses, revision/coverage manifests, and reports; any runtime product hash drift aborts the mode.
 
 ## Phase C — verify and resweep
 
-1. In full-engineering mode, run required format, build, static, affected suite, aggregate, and engine checks. In evidence-remediation mode, run changed tests, affected suites, one aggregate regression, and only diagnostics required by the normalized batch.
+1. In full-engineering mode, run required format, build, static, affected suite, aggregate, and engine checks. In recovery-remediation mode, run changed tests, affected suites, one aggregate regression, and only diagnostics required by the normalized batch.
 2. Re-audit the complete assigned boundary on the resulting revision.
 3. If the resweep finds another in-scope defect, freeze that delta and repeat within this same pass.
-4. Use the controller's `compute-revisions` command with the complete frozen product/evidence path inventory. Do not invent or reconstruct hashing logic.
+4. Use the controller's `compute-revisions` command with the complete frozen product/support/evidence path inventory. Do not invent or reconstruct hashing logic.
 5. Write the verification report and schema-1 coverage manifest under `tests/<feature>/verification/`.
 
 ## Return one terminal contract
 
-- `CHANGED`: full audit, remediation, checks, and resweep completed; product revision changed. Self-review does not provide clean credit.
-- `CLEAN`: full unchanged-revision audit completed; no source/evidence change, required checks passed, and no unresolved blocking finding remains.
-- `EVIDENCE_CHANGED`: the complete evidence batch closed, product hash is unchanged, evidence hash changed, and targeted/affected/aggregate checks passed.
+- `CHANGED`: full audit, remediation, checks, and resweep completed; runtime product revision changed. Self-review does not provide independent clean credit; the controller starts read-only convergence.
+- `CLEAN`: valid only for a truly unchanged initial owner pass; normal independent clean credit comes from the configured convergence wave.
+- `RECOVERY_CHANGED`: the complete support/evidence batch closed, runtime product hash is unchanged, support and/or evidence hash changed, and targeted/affected/aggregate checks passed.
 - `INCOMPLETE`: discovery, remediation, checks, or resweep is unfinished. The same Engineer must resume.
 - `BLOCKED`: a genuine external boundary prevents completion.
 
 Return:
 
 - `AUDIT_COMPLETE: yes|no`;
-- input/resulting composite, product, and evidence revisions;
+- owner ID and input/resulting composite, product, support, and evidence revisions;
 - outcome and change class;
 - inspected scope and exclusions;
 - frozen/fixed/unresolved/accepted findings;
@@ -66,4 +66,4 @@ Return:
 - report, revision manifest, and coverage manifest paths;
 - post-fix resweep result.
 
-`CHANGED`, `CLEAN`, and `EVIDENCE_CHANGED` require `AUDIT_COMPLETE: yes`. Do not edit `.agentic-pipeline` files, declare readiness, return raw logs, or spawn agents unless the technical director assigns independent work.
+`CHANGED`, `CLEAN`, and `RECOVERY_CHANGED` require `AUDIT_COMPLETE: yes`. Do not edit `.agentic-pipeline` files, declare readiness, return raw logs, or spawn agents unless the technical director assigns independent work.

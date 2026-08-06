@@ -1,4 +1,4 @@
 interface:
   display_name: "GameDev Final Review"
-  short_description: "Review a full revision or evidence recovery"
-  default_prompt: "Use $gamedev-review to perform a complete final review or a focused evidence-recovery closure review without editing the product."
+  short_description: "Run a risk audit, full Review, or targeted closure"
+  default_prompt: "Use $gamedev-review to perform the assigned read-only convergence lens, full final Review, targeted local-product closure, or support/evidence recovery verification without editing the product."
