@@ -1,0 +1,4 @@
+interface:
+  display_name: "GameDev Requirements"
+  short_description: "Maintain approved requirements for one feature"
+  default_prompt: "Use $gamedev-requirements to maintain docs/features/<feature>/product-requirements.md before specification."

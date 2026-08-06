@@ -1,0 +1,4 @@
+interface:
+  display_name: "GameDev Production Pipeline"
+  short_description: "Autonomous bounded engineering, review, and QA"
+  default_prompt: "Use $gamedev-pipeline to run the approved feature autonomously through bounded engineering, parallel Reviews, evidence recovery, runtime QA, and production-readiness; ask me only for genuine product, scope, risk, credential, or external-action decisions."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "GameDev Final Review"
+  short_description: "Review a full revision or evidence recovery"
+  default_prompt: "Use $gamedev-review to perform a complete final review or a focused evidence-recovery closure review without editing the product."

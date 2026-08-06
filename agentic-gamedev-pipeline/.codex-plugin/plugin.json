@@ -1,0 +1,37 @@
+{
+  "name": "agentic-gamedev-pipeline",
+  "version": "0.2.0+codex.20260804182012",
+  "description": "An autonomous bounded game-feature pipeline with full-owner engineering, evidence-only recovery, parallel final review, and in-game QA.",
+  "author": {
+    "name": "teano",
+    "url": "https://github.com/teano"
+  },
+  "repository": "https://github.com/teano/agentic_game_development_pipeline",
+  "keywords": [
+    "gamedev",
+    "multi-agent",
+    "audit",
+    "review",
+    "qa",
+    "pipeline"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agentic GameDev Pipeline",
+    "shortDescription": "Autonomous bounded engineering, review, and QA.",
+    "longDescription": "Turns approved feature documents into a production-ready candidate through autonomous bounded Engineer ownership, deterministic revisions, evidence-only recovery, two parallel read-only Reviews, explicit execution gates, and feature-focused runtime QA.",
+    "developerName": "teano",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Stabilize the product requirements for this game.",
+      "Run the bounded development pipeline from approved feature documents.",
+      "Run a fresh Engineer pass that completes the full audit scope before batch-fixing every discovered defect.",
+      "Recover test-only Review findings without restarting product convergence.",
+      "Run two parallel final Reviews and then feature-focused in-game QA."
+    ]
+  }
+}

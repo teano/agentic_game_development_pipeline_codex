@@ -1,0 +1,4 @@
+interface:
+  display_name: "GameDev Runtime QA"
+  short_description: "Complete focused runtime QA in the real game"
+  default_prompt: "Use $gamedev-qa to complete every independent runtime scenario for one reviewed feature, preserve exact evidence, and classify product failures separately from execution gates."
