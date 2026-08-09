@@ -1,0 +1,7 @@
+interface:
+  display_name: "GameDev Specification"
+  short_description: "Converge an approved PRD into a buildable spec"
+  default_prompt: "Use $gamedev-specification to turn the approved game-feature PRD into an implementation-ready technical specification."
+
+policy:
+  allow_implicit_invocation: false

@@ -1,4 +1,6 @@
 interface:
   display_name: "GameDev Requirements"
-  short_description: "Maintain approved requirements for one feature"
+  short_description: "Explicit-only GameDev requirements workflow"
   default_prompt: "Use $gamedev-requirements to maintain docs/features/<feature>/product-requirements.md before specification."
+policy:
+  allow_implicit_invocation: false

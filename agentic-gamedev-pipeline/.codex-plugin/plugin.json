@@ -1,7 +1,7 @@
 {
   "name": "agentic-gamedev-pipeline",
-  "version": "0.3.0+codex.20260805",
-  "description": "A bounded game-feature pipeline with director preflight, one persistent writing owner, parallel read-only convergence, risk-based review closure, and in-game QA.",
+  "version": "0.3.0+codex.20260809122154",
+  "description": "An explicitly invoked, bounded game-feature pipeline with PRD-to-spec convergence, approval-gated development planning, director preflight, persistent writing owners, review closure, and in-game QA.",
   "author": {
     "name": "teano",
     "url": "https://github.com/teano"
@@ -18,8 +18,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Agentic GameDev Pipeline",
-    "shortDescription": "Preflight, one owner, parallel audits, review, and QA.",
-    "longDescription": "Turns approved feature documents into a production-ready candidate through resource/runtime preflight, one persistent writing owner, deterministic product/support/evidence revisions, parallel read-only convergence, risk-based Review closure, explicit worker budgets and execution gates, and feature-focused runtime QA.",
+    "shortDescription": "Explicit-only preflight, engineering, review, and QA.",
+    "longDescription": "Runs only when the user explicitly requests the Agentic GameDev Pipeline or one named GameDev mode. It converges an approved PRD into an implementation-ready technical specification, creates a hash-traced user-approved ownership plan, then turns approved feature documents into a production-ready candidate through bounded engineering, deterministic revisions, independent review, and feature-focused runtime QA.",
     "developerName": "teano",
     "category": "Productivity",
     "capabilities": [
@@ -27,11 +27,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Stabilize the product requirements for this game.",
-      "Run the bounded development pipeline from approved feature documents.",
-      "Run one persistent Engineer owner and aggregate parallel read-only convergence findings before remediation.",
-      "Recover support or test-only Review findings without restarting runtime convergence.",
-      "Use targeted closure for local fixes, then run feature-focused in-game QA."
+      "Use $gamedev-pipeline to run the bounded development pipeline from approved feature documents.",
+      "Use $gamedev-requirements to stabilize the product requirements for this game.",
+      "Use $gamedev-specification to converge an approved PRD into an implementation-ready technical specification."
     ]
   }
 }

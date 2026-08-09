@@ -1,9 +1,13 @@
 ---
 name: gamedev-requirements
-description: Interview for and maintain one canonical game-feature PRD before specification or implementation. Use when outcome, audience, core loop, scope, release target, acceptance criteria, constraints, non-goals, assumptions, or product decisions are missing or contradictory; or when an approved PRD must be revised, validated, or handed to the specification pipeline.
+description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-requirements` by name, explicitly asks for the Agentic GameDev Pipeline requirements mode, or an explicitly user-invoked `$gamedev-pipeline` delegates PRD validation. Interview for and maintain one canonical game-feature PRD before specification or implementation. Do not infer activation from missing, incomplete, or contradictory requirements or from a generic request to plan a game feature.
 ---
 
 # GameDev Requirements
+
+## Activation gate
+
+Proceed only when the current user explicitly requests `$gamedev-requirements` by name, clearly asks for the Agentic GameDev Pipeline requirements mode, or this is a delegated PRD-validation step from an active `$gamedev-pipeline` that the user explicitly invoked. Missing requirements, ambiguity, a game-design discussion, or the presence of a feature document is not authorization. If this gate is not satisfied, do not create, validate, approve, or hand off a pipeline PRD; continue under ordinary instructions and only other explicitly requested skills.
 
 Act as product requirements facilitator. Keep product decisions separate from technical design and implementation.
 

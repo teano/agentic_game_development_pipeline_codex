@@ -2,23 +2,50 @@
 
 ## Finding classification
 
-Classify kind and severity independently.
+Severity is impact only. It never decides remediation by itself. Every reviewer, Engineer, and QA worker returns complete evidence plus these independent dimensions; the controller normalizes them, rejects incompatible combinations, and derives `blocking`:
+
+- `finding_kind`: `product`, `evidence`, `support`, or `hardening`;
+- `severity`: `critical`, `major`, or `minor`;
+- `scope_relation`: `candidate_introduced`, `current_feature_path`, `required_shared_contract`, `preexisting_adjacent`, or `out_of_scope`;
+- `introduced_by_candidate`: explicit boolean provenance;
+- `production_reachability`: `normal`, `supported_failure_path`, `theoretical`, `unsupported_configuration`, or `unknown`;
+- `blocks_acceptance_ids`: exact approved `PRD-AC-*` IDs, possibly empty;
+- `violates_required_invariant`: explicit boolean plus exact invariant evidence when true;
+- exact reproduction/evidence and revision;
+- canonical `deferred_reference` for every supported classified nonblocking `preexisting_adjacent` or `out_of_scope` issue, written only after Director atomic upsert to `docs/engineering/deferred-findings.json`.
+
+The controller computes `blocking=true` only when all three clauses are true. Severity is not an input to this formula:
+
+```text
+scope_relation in {candidate_introduced, current_feature_path, required_shared_contract}
+AND production_reachability in {normal, supported_failure_path}
+AND (blocks_acceptance_ids is non-empty OR violates_required_invariant=true)
+```
+
+`introduced_by_candidate` remains a separate provenance fact. `scope_relation=candidate_introduced` requires it to be true; a `preexisting_adjacent` issue cannot claim it. No reviewer may set `blocking` or request remediation directly.
+
+When `production_reachability=unknown`, store `blocking=false`, enter bounded `finding_triage`, and do not start Engineer remediation. Triage answers only whether the path is normal, a supported failure path, theoretical, or an unsupported configuration, records exact evidence, recomputes blocking, and resumes the paused phase.
 
 Kinds:
 
 - `product`: production behavior, contract, configuration, integration, or runtime source is wrong;
-- `support`: derived handoff, index, operator guidance, or non-normative metadata is stale or misleading while runtime behavior and public contracts remain unchanged;
-- `evidence`: required tests, fixtures, assertions, measurements, cleanup guarantees, or coverage cannot protect approved behavior.
+- `evidence`: the current required test/fixture/assertion can let a real product defect pass undetected;
+- `support`: derived handoff, index, operator guidance, or non-normative metadata is stale while runtime behavior and public contracts remain unchanged;
+- `hardening`: defensive improvement beyond approved behavior, including theoretical robustness or an unsupported configuration.
 
 Severity:
 
 - `critical`: security compromise, data loss, unrecoverable corruption, unsafe external action, crash/hard blocker in a core flow, or release-breaking requirement failure;
-- `major`: incorrect core behavior, material requirement violation, likely regression, missing important failure handling, serious performance breach, or evidence that demonstrably cannot protect an important behavior;
+- `major`: incorrect core behavior, material requirement violation, likely regression, missing important supported failure handling, serious performance breach, or qualifying evidence failure;
 - `minor`: bounded defect or maintainability risk that does not invalidate a core flow and has a safe workaround.
 
-Do not create a finding for unavailable tools, permissions, credentials, publication, manual actions, unrelated noise, or an unexecuted scenario. Record those as gates. Do not demand a preferred duplicate evidence format unless approved sources require it or existing proof misses an important failure.
+Critical safety, corruption, or data-loss claims must identify a blocked approved acceptance criterion or the exact required invariant; an invariant claim requires supporting evidence. Missing evidence is never Critical by itself.
 
-Fix ordinary in-scope defects in the owning Engineer pass. Persist only unresolved defects, Review/QA findings awaiting engineering, and minor risks awaiting explicit acceptance.
+An `evidence` finding may be Major only when all are proven: another required proof for a core acceptance criterion is absent; the exact current test can miss a real product defect; and `blocks_acceptance_ids` names that approved criterion. Otherwise classify it Minor or `support`. Duplicate preferred evidence, stale provenance, cosmetic diagnostics, and evidence-format preferences do not block automatically.
+
+The following never block automatically: preexisting adjacent or out-of-scope defects, defensive hardening, theoretical paths, unsupported configurations, cosmetic issues, stale provenance, or duplicate evidence. Support/hardening findings cannot claim blocked acceptance IDs or a required invariant. A Minor classification likewise cannot claim a blocked approved acceptance criterion or required invariant; the controller rejects that incompatible combination, so Minor findings never start a remediation wave by themselves.
+
+Do not create a finding for unavailable tools, permissions, credentials, publication, manual actions, unrelated noise, or an unexecuted scenario. Record those as gates. Fix only controller-classified blocking findings in the current remediation batch. Preserve every supported nonblocking out-of-scope issue through Director `backlog-upsert`; convergence cannot pass until all canonical links resolve. Return introduced/worsened, changed-contract/feature-reachable, acceptance/invariant-blocking, or safety-impact issues to current scope, using `scope_expansion_hold` when the approved plan must materially change.
 
 ## Gate classification
 
@@ -28,19 +55,23 @@ Fix ordinary in-scope defects in the owning Engineer pass. Persist only unresolv
 
 Each gate records the exact revision, pending scenario IDs, completed reusable evidence, reason, and minimum resume action. Gates have no product severity. Only `blocked_user` inherently requires user input.
 
+Before QA spawn, the controller requires a complete capability probe on the exact reviewed revision: Studio/editor sync, single play, mandatory Test Server server plus two clients, stable window/control or declared human operator, logging/screenshots, persistence/DataStore, publication/place topology, and configuration/credentials. Known unavailable capability means no QA spawn. `blocked_environment` and `error_test` require the recorded failed probe plus a minimum resume action; they cannot be inferred from an unexecuted scenario.
+
 ## Production-ready candidate
 
 Require all of the following:
 
-- current approved PRD and traced technical specification;
+- current approved PRD, traced technical specification, and approved development plan;
 - passed resource-budget preflight and a recorded runtime capability/manual-operator plan;
 - every repository-required supporting product document, including an ADR when policy requires one;
 - no source drift;
 - current-revision passing machine/engine verification and complete coverage manifest;
 - one passed parallel read-only convergence wave on the current product revision;
+- no slice has exceeded two append-only full convergence waves; local remediation is closed by one fresh targeted reviewer unless an allowed material full-wave trigger is recorded;
+- valid component Review credits keyed by component product hash, contract hash, lenses, and review revision, with unchanged components reused and Final Review composition/new-boundary coverage recorded;
 - two distinct passed full Reviews on the current identities, their preserved reports plus one passed targeted local-product closure reviewer, or their preserved same-product reports plus one passed support/evidence recovery reviewer;
-- feature-focused runtime QA `pass` on the current revision;
-- no unresolved critical/major finding;
+- a passed exact-revision QA capability probe and feature-focused runtime QA `pass` on that revision;
+- no open controller-classified blocking finding;
 - no unaccepted minor finding;
 - no open gate hiding a mandatory scenario;
 - no unavailable required preflight capability;
