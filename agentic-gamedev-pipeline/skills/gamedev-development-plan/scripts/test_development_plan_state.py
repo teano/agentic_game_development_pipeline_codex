@@ -29,7 +29,7 @@ class DevelopmentPlanStateTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.feature = "sample-feature"
-        self.feature_dir = self.root / "docs" / "features" / self.feature
+        self.feature_dir = self.root / "docs" / "Features" / "template" / self.feature
         self.feature_dir.mkdir(parents=True)
         self.prd = self.feature_dir / "product-requirements.md"
         self.spec = self.feature_dir / "technical-specification.md"
@@ -50,9 +50,10 @@ class DevelopmentPlanStateTests(unittest.TestCase):
 document_type: technical-specification
 status: approved
 revision: 4
-source_prd_path: docs/features/{self.feature}/product-requirements.md
-source_prd_revision: 2
-source_prd_sha256: {prd_hash}
+product_authority:
+  path: docs/Features/template/{self.feature}/product-requirements.md
+  revision: 2
+  sha256: {prd_hash}
 ---
 # Specification
 """,
@@ -66,6 +67,12 @@ source_prd_sha256: {prd_hash}
                 {
                     "feature": self.feature,
                     "status": "spec_ready",
+                    "prd": {
+                        "path": self.prd.relative_to(self.root).as_posix(),
+                    },
+                    "specification": {
+                        "path": self.spec.relative_to(self.root).as_posix(),
+                    },
                     "ready": {"prd_sha256": prd_hash, "spec_sha256": spec_hash},
                 }
             ),
@@ -74,7 +81,13 @@ source_prd_sha256: {prd_hash}
 
     def initialize(self, mode: str = "single_owner") -> dict:
         state = controller.command_init(
-            self.args(feature=self.feature, analyst_id="planning-analyst-1")
+            self.args(
+                feature=self.feature,
+                prd=self.prd.relative_to(self.root).as_posix(),
+                spec=self.spec.relative_to(self.root).as_posix(),
+                plan=self.plan.relative_to(self.root).as_posix(),
+                analyst_id="planning-analyst-1",
+            )
         )
         self.assertEqual(state["status"], "analyzing")
         return controller.command_accept_analysis(
@@ -174,12 +187,14 @@ feature: {self.feature}
 mode: {mode}
 writer_strategy: sequential
 planning_analyst_id: planning-analyst-1
-source_prd_path: docs/features/{self.feature}/product-requirements.md
-source_prd_revision: 2
-source_prd_sha256: {prd_hash}
-source_spec_path: docs/features/{self.feature}/technical-specification.md
-source_spec_revision: 4
-source_spec_sha256: {spec_hash}
+product_authority:
+  path: docs/Features/template/{self.feature}/product-requirements.md
+  revision: 2
+  sha256: {prd_hash}
+specification_authority:
+  path: docs/Features/template/{self.feature}/technical-specification.md
+  revision: 4
+  sha256: {spec_hash}
 slice_count: {slice_count}
 ---
 
@@ -210,7 +225,13 @@ Eight files, three tests, one research packet, and bounded evidence.
         self.spec.write_text(self.spec.read_text(encoding="utf-8") + "drift\n", encoding="utf-8")
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "SPEC_READY evidence"):
             controller.command_init(
-                self.args(feature=self.feature, analyst_id="planning-analyst-1")
+                self.args(
+                    feature=self.feature,
+                    prd=self.prd.relative_to(self.root).as_posix(),
+                    spec=self.spec.relative_to(self.root).as_posix(),
+                    plan=self.plan.relative_to(self.root).as_posix(),
+                    analyst_id="planning-analyst-1",
+                )
             )
 
     def test_single_owner_submit_and_explicit_approval(self) -> None:

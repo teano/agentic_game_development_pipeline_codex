@@ -2,14 +2,11 @@
 
 ## Canonical artifacts
 
-Use these tracked files only:
-
-- `docs/features/<feature>/product-requirements.md`
-- `docs/features/<feature>/technical-specification.md`
+Use the one repository-owned PRD and specification resolved from current user context, repository instructions, feature manifests/indexes, and existing artifacts. Both paths must remain inside the project root. Do not create a duplicate, symlink, move, or alternate namespace to accommodate the controller. If the repository provides more than one plausible pair, ask the user. For an empty repository with no convention, recommend `docs/features/<feature>/product-requirements.md` and its sibling `technical-specification.md` as a proposal and wait for confirmation.
 
 Keep controller state at `.agentic-pipeline/specification-state.json`. State is operational evidence, not part of the specification hash.
 
-The specification frontmatter must contain:
+Preserve the repository's established trace convention. The controller accepts either flat fields:
 
 ```yaml
 ---
@@ -17,11 +14,28 @@ document_type: technical-specification
 status: draft
 revision: 1
 language: Russian
-source_prd_path: docs/features/<feature>/product-requirements.md
+source_prd_path: <repository-relative-prd-path>
 source_prd_revision: 1
 source_prd_sha256: <64 lowercase hex characters>
 ---
 ```
+
+or the equivalent nested authority:
+
+```yaml
+---
+document_type: technical-specification
+status: draft
+revision: 1
+language: Russian
+product_authority:
+  path: <repository-relative-prd-path>
+  revision: 1
+  sha256: <64 lowercase hex characters>
+---
+```
+
+Do not rewrite a valid repository-owned trace shape merely to prefer the other representation.
 
 Use `status: draft` while editing and `status: approved` for the exact candidate submitted to the final Proofreader. Any semantic edit to an approved specification reopens it as a new draft revision.
 

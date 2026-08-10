@@ -6,10 +6,10 @@ feature: FEATURE_SLUG
 mode: single_owner
 writer_strategy: sequential
 planning_analyst_id: ANALYST_ID
-source_prd_path: docs/features/FEATURE_SLUG/product-requirements.md
+source_prd_path: PRD_PATH
 source_prd_revision: PRD_REVISION
 source_prd_sha256: PRD_SHA256
-source_spec_path: docs/features/FEATURE_SLUG/technical-specification.md
+source_spec_path: SPEC_PATH
 source_spec_revision: SPEC_REVISION
 source_spec_sha256: SPEC_SHA256
 slice_count: 1

@@ -20,7 +20,7 @@ class PipelineStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.docs = self.root / "docs" / "features" / FEATURE
+        self.docs = self.root / "docs" / "Features" / "template" / FEATURE
         self.docs.mkdir(parents=True)
         self.requirements = self.docs / "product-requirements.md"
         self.spec = self.docs / "technical-specification.md"
@@ -50,9 +50,10 @@ class PipelineStateTests(unittest.TestCase):
             "revision: 1\n"
             "language: Russian\n"
             "approved_at: 2026-08-03T12:30:00Z\n"
-            f"source_prd_path: docs/features/{FEATURE}/product-requirements.md\n"
-            "source_prd_revision: 1\n"
-            f"source_prd_sha256: {requirements_sha}\n"
+            "product_authority:\n"
+            f"  path: docs/Features/template/{FEATURE}/product-requirements.md\n"
+            "  revision: 1\n"
+            f"  sha256: {requirements_sha}\n"
             "---\n"
             "# Technical Specification\n",
             encoding="utf-8",
@@ -92,12 +93,14 @@ class PipelineStateTests(unittest.TestCase):
             f"mode: {mode}\n"
             "writer_strategy: sequential\n"
             "planning_analyst_id: analyst-1\n"
-            f"source_prd_path: docs/features/{FEATURE}/product-requirements.md\n"
-            "source_prd_revision: 1\n"
-            f"source_prd_sha256: {hashlib.sha256(self.requirements.read_bytes()).hexdigest()}\n"
-            f"source_spec_path: docs/features/{FEATURE}/technical-specification.md\n"
-            "source_spec_revision: 1\n"
-            f"source_spec_sha256: {hashlib.sha256(self.spec.read_bytes()).hexdigest()}\n"
+            "product_authority:\n"
+            f"  path: docs/Features/template/{FEATURE}/product-requirements.md\n"
+            "  revision: 1\n"
+            f"  sha256: {hashlib.sha256(self.requirements.read_bytes()).hexdigest()}\n"
+            "specification_authority:\n"
+            f"  path: docs/Features/template/{FEATURE}/technical-specification.md\n"
+            "  revision: 1\n"
+            f"  sha256: {hashlib.sha256(self.spec.read_bytes()).hexdigest()}\n"
             f"slice_count: {slice_count}\n"
             "approved_by: user\n"
             "approved_at: 2026-08-03T13:00:00+00:00\n"
@@ -115,9 +118,15 @@ class PipelineStateTests(unittest.TestCase):
                     "schema_version": 1,
                     "feature": FEATURE,
                     "status": "approved",
-                    "plan_path": f"docs/features/{FEATURE}/development-plan.md",
-                    "prd": {"sha256": hashlib.sha256(self.requirements.read_bytes()).hexdigest()},
-                    "specification": {"sha256": hashlib.sha256(self.spec.read_bytes()).hexdigest()},
+                    "plan_path": f"docs/Features/template/{FEATURE}/development-plan.md",
+                    "prd": {
+                        "path": f"docs/Features/template/{FEATURE}/product-requirements.md",
+                        "sha256": hashlib.sha256(self.requirements.read_bytes()).hexdigest(),
+                    },
+                    "specification": {
+                        "path": f"docs/Features/template/{FEATURE}/technical-specification.md",
+                        "sha256": hashlib.sha256(self.spec.read_bytes()).hexdigest(),
+                    },
                     "approval": {"approved_sha256": plan_sha},
                 }
             ),
@@ -234,11 +243,11 @@ class PipelineStateTests(unittest.TestCase):
             "--feature",
             FEATURE,
             "--requirements",
-            f"docs/features/{FEATURE}/product-requirements.md",
+            f"docs/Features/template/{FEATURE}/product-requirements.md",
             "--spec",
-            f"docs/features/{FEATURE}/technical-specification.md",
+            f"docs/Features/template/{FEATURE}/technical-specification.md",
             "--plan",
-            f"docs/features/{FEATURE}/development-plan.md",
+            f"docs/Features/template/{FEATURE}/development-plan.md",
             "--plan-sha256",
             hashlib.sha256((self.docs / "development-plan.md").read_bytes()).hexdigest(),
             "--base-revision",
@@ -1601,21 +1610,32 @@ class PipelineStateTests(unittest.TestCase):
         self.assertEqual(2, authorized["worker_budget"]["max_full_review_waves"])
         self.assertEqual("resume_engineering_owner", authorized["next_action"]["action"])
 
-    def test_init_rejects_noncanonical_document_paths(self) -> None:
-        root_prd = self.root / "product-requirements.md"
-        root_prd.write_bytes(self.requirements.read_bytes())
-        self.run_command(
-            "init",
-            "--feature",
-            FEATURE,
-            "--requirements",
-            "product-requirements.md",
-            "--spec",
-            f"docs/features/{FEATURE}/technical-specification.md",
-            "--slice",
-            "slice-1",
-            expected=2,
-        )
+    def test_init_accepts_repository_owned_document_paths(self) -> None:
+        self.initialize()
+        state = self.state()
+        self.assertEqual(str(self.requirements.resolve()), state["requirements_path"])
+        self.assertEqual(str(self.spec.resolve()), state["spec_path"])
+
+    def test_init_rejects_artifacts_outside_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as outside:
+            outside_prd = Path(outside) / "product-requirements.md"
+            outside_prd.write_bytes(self.requirements.read_bytes())
+            self.run_command(
+                "init",
+                "--feature",
+                FEATURE,
+                "--requirements",
+                str(outside_prd),
+                "--spec",
+                f"docs/Features/template/{FEATURE}/technical-specification.md",
+                "--plan",
+                f"docs/Features/template/{FEATURE}/development-plan.md",
+                "--plan-sha256",
+                hashlib.sha256((self.docs / "development-plan.md").read_bytes()).hexdigest(),
+                "--base-revision",
+                "base-0",
+                expected=2,
+            )
 
     def test_init_rejects_draft_or_stale_specification(self) -> None:
         self.write_spec(status="draft")
@@ -1624,9 +1644,9 @@ class PipelineStateTests(unittest.TestCase):
             "--feature",
             FEATURE,
             "--requirements",
-            f"docs/features/{FEATURE}/product-requirements.md",
+            f"docs/Features/template/{FEATURE}/product-requirements.md",
             "--spec",
-            f"docs/features/{FEATURE}/technical-specification.md",
+            f"docs/Features/template/{FEATURE}/technical-specification.md",
             "--slice",
             "slice-1",
             expected=2,
@@ -1637,9 +1657,9 @@ class PipelineStateTests(unittest.TestCase):
             "--feature",
             FEATURE,
             "--requirements",
-            f"docs/features/{FEATURE}/product-requirements.md",
+            f"docs/Features/template/{FEATURE}/product-requirements.md",
             "--spec",
-            f"docs/features/{FEATURE}/technical-specification.md",
+            f"docs/Features/template/{FEATURE}/technical-specification.md",
             "--slice",
             "slice-1",
             expected=2,

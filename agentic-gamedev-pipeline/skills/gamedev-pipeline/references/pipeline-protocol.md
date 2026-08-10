@@ -71,7 +71,7 @@ Findings store `finding_kind`, severity, scope/provenance/reachability/acceptanc
 ## Commands
 
 ```text
-pipeline_state.py init --project-root <root> --feature <slug> --requirements docs/features/<slug>/product-requirements.md --spec docs/features/<slug>/technical-specification.md --plan docs/features/<slug>/development-plan.md --plan-sha256 <exact-approved-sha> --base-revision <exact-revision> [--integration-owner <id>] [--required-convergence-audits 2|3] [--max-workers <n>] [--max-full-review-waves <n>]
+pipeline_state.py init --project-root <root> --feature <slug> --requirements <resolved-repository-prd-path> --spec <resolved-repository-spec-path> --plan <resolved-repository-plan-path> --plan-sha256 <exact-approved-sha> --base-revision <exact-revision> [--integration-owner <id>] [--required-convergence-audits 2|3] [--max-workers <n>] [--max-full-review-waves <n>]
 pipeline_state.py preflight-complete --project-root <root> --run-id <id> --resource-budget-check pass|fail --capability <name>=available|not_required|planned_manual|blocked_user|blocked_environment|error_test ... --report <report>
 pipeline_state.py status --project-root <root>
 pipeline_state.py slice-research-complete --project-root <root> --slice-id SLICE-NNN --base-revision <exact-active-revision> --owner-id <assigned-engineer> --bundle tests/<slug>/research/<bundle>.json [--bundle ... up to 3]

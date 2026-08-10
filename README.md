@@ -14,7 +14,7 @@
 
 ## Skills
 
-- `$gamedev-requirements` — продуктовая беседа и ведение `docs/features/<feature>/product-requirements.md`;
+- `$gamedev-requirements` — продуктовая беседа и ведение канонического PRD по правилам текущего репозитория;
 - `$gamedev-specification` — отдельный Director-цикл от approved PRD до `SPEC_READY`: optional Generator, постоянный Technical Spec Architect и свежие read-only Proofreaders, максимум пять циклов на одного Architect;
 - `$gamedev-development-plan` — fresh Planning Analyst, выбор `single_owner` или последовательных вертикальных срезов и явное утверждение точного plan SHA пользователем;
 - `$gamedev-pipeline` — технический директор и детерминированный контроллер цикла;
@@ -27,18 +27,18 @@
 
 ```text
 requirements conversation
-  -> docs/features/<feature>/product-requirements.md (approved, tracked)
+  -> <repository-owned PRD path> (approved, tracked)
   -> specification Director
        -> optional Generator for a missing/stale specification
        -> persistent Technical Spec Architect
        -> fresh read-only Proofreader <-> Architect (max 5 cycles per Architect)
        -> SPEC_READY on one exact PRD/spec hash pair
-  -> docs/features/<feature>/technical-specification.md (approved, tracked)
+  -> <repository-owned specification path> (approved, tracked)
   -> development-plan Director
        -> fresh Planning Analyst
        -> single integration owner + milestones OR sequential vertical slices
        -> explicit user approval of one exact draft SHA
-  -> docs/features/<feature>/development-plan.md (approved, tracked)
+  -> <repository-owned development-plan path> (approved, tracked)
   -> director preflight
        -> resource/config invariants
        -> runtime capabilities + manual operator plan
@@ -70,6 +70,10 @@ requirements conversation
 
 ## Артефакты
 
+Namespace и регистр путей принадлежат проекту. Контроллер сначала использует явные пути пользователя, инструкции репозитория, feature manifests/indexes и уже существующие документы. Если из контекста получается одна каноническая тройка, он принимает её без переименований. При нескольких вариантах задаёт один уточняющий вопрос. Он не создаёт копии, symlink, переносы или параллельный источник истины ради собственной схемы.
+
+Для пустого проекта без соглашений контроллер может предложить следующий layout, но создаёт его только после подтверждения пользователя:
+
 ```text
 <game-project>/
   docs/features/<feature>/
@@ -82,6 +86,8 @@ requirements conversation
     qa/
   .agentic-pipeline/               # runtime controller state
 ```
+
+Это рекомендация для нового репозитория, а не обязательный namespace плагина. Поддерживаются как плоские trace-поля `source_prd_*` / `source_spec_*`, так и эквивалентные вложенные `product_authority` / `specification_authority`.
 
 `tests/<feature>/` содержит генерируемые отчёты, логи, скриншоты и runtime evidence. Контроллер добавляет `/tests/` в `.gitignore`. Невыполненный сценарий классифицируется как `blocked_user`, `blocked_environment` или `error_test`, а не как product failure.
 

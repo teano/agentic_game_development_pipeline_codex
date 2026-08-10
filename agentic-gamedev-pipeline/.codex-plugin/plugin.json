@@ -1,6 +1,6 @@
 {
   "name": "agentic-gamedev-pipeline",
-  "version": "0.3.0+codex.20260809122154",
+  "version": "0.3.0+codex.20260810190810",
   "description": "An explicitly invoked, bounded game-feature pipeline with PRD-to-spec convergence, approval-gated development planning, director preflight, persistent writing owners, review closure, and in-game QA.",
   "author": {
     "name": "teano",

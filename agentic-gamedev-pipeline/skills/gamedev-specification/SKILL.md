@@ -16,15 +16,16 @@ Before acting, read [specification-contract.md](references/specification-contrac
 ## Establish authority
 
 1. Resolve `<project-root>` and lowercase `<feature>`.
-2. Require the canonical approved PRD at `docs/features/<feature>/product-requirements.md`; validate it with `$gamedev-requirements --require-approved` and record its exact-byte SHA-256.
-3. Use only `docs/features/<feature>/technical-specification.md` as the specification.
-4. Initialize `.agentic-pipeline/specification-state.json` with `init`. Treat controller output as phase authority.
-5. If the specification is absent or stale, spawn one bounded Generator. Otherwise, skip generation. Never run competing generators.
-6. Assign one persistent Technical Spec Architect as the sole writer. Give workers canonical paths, exact hashes, role contracts, and current blocking IDs rather than accumulated chat history.
+2. Resolve the repository-owned PRD and specification paths from explicit user context, repository instructions, feature manifests/indexes, and existing feature artifacts. A known PRD normally makes its repository-defined sibling specification unambiguous. Preserve path case and never create a copy, symlink, move, or parallel namespace merely to satisfy this plugin.
+3. If multiple plausible paths remain, ask one concise path question. If the project is empty and defines no convention, recommend `docs/features/<feature>/product-requirements.md` and sibling `technical-specification.md` as a proposed layout and wait for confirmation before creating either file.
+4. Require the resolved canonical approved PRD; validate that exact path with `$gamedev-requirements --require-approved` and record its exact-byte SHA-256.
+5. Initialize `.agentic-pipeline/specification-state.json` with `init --prd <resolved-prd> --spec <resolved-spec>`. Treat controller output as phase authority.
+6. If the specification is absent or stale, spawn one bounded Generator. Otherwise, skip generation. Never run competing generators.
+7. Assign one persistent Technical Spec Architect as the sole writer. Give workers resolved canonical paths, exact hashes, role contracts, and current blocking IDs rather than accumulated chat history.
 
 ## Generate only when required
 
-Ask the Generator to run `$skill-specification-pipeline` in generation mode against the approved PRD. It must preserve product meaning, trace every `PRD-REQ`, `PRD-NFR`, and `PRD-AC`, record the exact source path/revision/hash, and leave unsupported product choices unresolved. It returns one draft and a compact coverage manifest.
+Ask the Generator to run `$skill-specification-pipeline` in generation mode against the approved PRD. It must preserve product meaning, trace every `PRD-REQ`, `PRD-NFR`, and `PRD-AC`, record the exact source path/revision/hash using the repository's established trace shape, and leave unsupported product choices unresolved. The controller accepts either flat `source_prd_*` fields or nested `product_authority.{path,revision,sha256}`. It returns one draft and a compact coverage manifest.
 
 Run `accept-spec` after generation. Reject stale traceability or a noncanonical path. End the Generator after acceptance; all later specification writes belong to the Architect.
 

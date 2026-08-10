@@ -20,14 +20,13 @@ Before starting or resuming, read:
 ## Establish authority
 
 1. Resolve `<project-root>` and lowercase `<feature>`.
-2. Require approved, mutually traced files at:
-   - `docs/features/<feature>/product-requirements.md`;
-   - `docs/features/<feature>/technical-specification.md`;
-   - `docs/features/<feature>/development-plan.md`.
-3. Require `.agentic-pipeline/development-plan-state.json` to prove explicit user approval of the exact current plan SHA and its exact PRD/specification hashes. If it is missing, draft, stale, or hash-mismatched, stop and run `$gamedev-development-plan`; never derive an implementation queue from chat narration.
-4. Validate the PRD with `$gamedev-requirements --require-approved`. Use `$gamedev-specification` when the specification is missing or stale. Read repository policy and decide whether the plan requires supporting tracked documentation such as an ADR, runbook, or public contract.
-5. Initialize or load `.agentic-pipeline/state.json`. Treat controller output, not chat narration, as phase authority. Never edit state, findings, or deferred backlog JSON directly; only the technical director uses `scripts/deferred_findings.py` for backlog mutations.
-6. Complete controller preflight in the parent context before spawning an Engineer. Prove numeric resource budgets and cross-config invariants from the approved specification. Record editor/project sync, published configuration, persistence access, multiplayer or multi-place setup, control feasibility, credentials/publication, and planned manual operator steps. Preflight is a director check, not another agent session.
+2. Resolve the repository-owned PRD, specification, and development-plan paths from explicit user context, repository instructions, feature manifests/indexes, existing feature artifacts, and unambiguous sibling relationships. Preserve path case and pass all three paths explicitly to the controller. Never create a copy, symlink, move, or parallel namespace merely to satisfy this plugin.
+3. If multiple plausible paths remain, ask one concise path question. If the project is empty and defines no convention, recommend sibling `product-requirements.md`, `technical-specification.md`, and `development-plan.md` under `docs/features/<feature>/` as a proposed layout and wait for confirmation before creating them.
+4. Require those resolved files to be approved and mutually traced. The controller accepts flat source trace fields and the equivalent repository-owned nested authority mappings.
+5. Require `.agentic-pipeline/development-plan-state.json` to prove explicit user approval of the exact current plan SHA and its exact PRD/specification hashes and paths. If it is missing, draft, stale, or hash-mismatched, stop and run `$gamedev-development-plan`; never derive an implementation queue from chat narration.
+6. Validate the resolved PRD with `$gamedev-requirements --require-approved`. Use `$gamedev-specification` when the specification is missing or stale. Read repository policy and decide whether the plan requires supporting tracked documentation such as an ADR, runbook, or public contract.
+7. Initialize or load `.agentic-pipeline/state.json`. Treat controller output, not chat narration, as phase authority. Never edit state, findings, or deferred backlog JSON directly; only the technical director uses `scripts/deferred_findings.py` for backlog mutations.
+8. Complete controller preflight in the parent context before spawning an Engineer. Prove numeric resource budgets and cross-config invariants from the approved specification. Record editor/project sync, published configuration, persistence access, multiplayer or multi-place setup, control feasibility, credentials/publication, and planned manual operator steps. Preflight is a director check, not another agent session.
 
 Let an active specification worker finish unless it reports a terminal failure or external blocker. Resume the same worker after an incomplete handoff; do not start a competing generator.
 

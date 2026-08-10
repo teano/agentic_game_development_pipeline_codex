@@ -39,11 +39,19 @@ def parse_frontmatter(path: Path, label: str) -> dict[str, str]:
     if len(parts) < 3:
         raise SpecificationStateError(f"{label} has unterminated frontmatter: {path}")
     fields: dict[str, str] = {}
+    parent: str | None = None
     for line in parts[1].splitlines():
         if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
             continue
-        key, value = line.split(":", 1)
-        fields[key.strip()] = value.strip().strip("\"'")
+        indentation = len(line) - len(line.lstrip())
+        key, value = line.strip().split(":", 1)
+        value = value.strip().strip("\"'")
+        if indentation == 0:
+            parent = key if not value else None
+            if value:
+                fields[key] = value
+        elif parent and value:
+            fields[f"{parent}.{key}"] = value
     return fields
 
 
@@ -53,9 +61,28 @@ def require_slug(feature: str) -> str:
     return feature
 
 
-def canonical_paths(root: Path, feature: str) -> tuple[Path, Path]:
-    feature_dir = root / "docs" / "features" / feature
-    return feature_dir / "product-requirements.md", feature_dir / "technical-specification.md"
+def resolve_project_path(root: Path, supplied: str, label: str) -> Path:
+    path = Path(supplied)
+    if not path.is_absolute():
+        path = root / path
+    path = path.resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise SpecificationStateError(
+            f"{label} must stay inside the project root: {path}"
+        ) from error
+    return path
+
+
+def product_authority_trace(meta: dict[str, str]) -> dict[str, str | None]:
+    return {
+        "path": meta.get("source_prd_path") or meta.get("product_authority.path"),
+        "revision": meta.get("source_prd_revision")
+        or meta.get("product_authority.revision"),
+        "sha256": meta.get("source_prd_sha256")
+        or meta.get("product_authority.sha256"),
+    }
 
 
 def require_approved_prd(path: Path) -> dict[str, str]:
@@ -76,17 +103,23 @@ def specification_trace(root: Path, prd: Path, spec: Path) -> tuple[dict[str, st
         return {}, ["specification is missing"]
     meta = parse_frontmatter(spec, "Specification")
     prd_meta = require_approved_prd(prd)
+    trace = product_authority_trace(meta)
     expected = {
-        "document_type": "technical-specification",
-        "source_prd_path": prd.relative_to(root).as_posix(),
-        "source_prd_revision": prd_meta["revision"],
-        "source_prd_sha256": sha256(prd),
+        "path": prd.relative_to(root).as_posix(),
+        "revision": prd_meta["revision"],
+        "sha256": sha256(prd),
     }
-    drift = [
-        f"{key}: expected {value!r}, got {meta.get(key)!r}"
+    drift: list[str] = []
+    if meta.get("document_type") != "technical-specification":
+        drift.append(
+            "document_type: expected 'technical-specification', "
+            f"got {meta.get('document_type')!r}"
+        )
+    drift.extend(
+        f"product authority {key}: expected {value!r}, got {trace.get(key)!r}"
         for key, value in expected.items()
-        if meta.get(key) != value
-    ]
+        if trace.get(key) != value
+    )
     return meta, drift
 
 
@@ -140,14 +173,27 @@ def require_source_unchanged(root: Path, state: dict[str, Any]) -> tuple[Path, P
 def command_init(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     feature = require_slug(args.feature)
+    prd = resolve_project_path(root, args.prd, "approved PRD")
+    spec = resolve_project_path(root, args.spec, "technical specification")
     if state_path(root).is_file():
         existing = load_state(root)
         if existing["feature"] != feature:
             raise SpecificationStateError(
                 "specification state already exists for another feature"
             )
+        requested_paths = (
+            prd.relative_to(root).as_posix(),
+            spec.relative_to(root).as_posix(),
+        )
+        recorded_paths = (
+            existing["prd"]["path"],
+            existing["specification"]["path"],
+        )
+        if requested_paths != recorded_paths:
+            raise SpecificationStateError(
+                "specification state already exists with different repository-owned paths"
+            )
         return existing
-    prd, spec = canonical_paths(root, feature)
     prd_meta = require_approved_prd(prd)
     spec_meta, drift = specification_trace(root, prd, spec)
     now = utc_now()
@@ -195,7 +241,8 @@ def command_accept_spec(args: argparse.Namespace) -> dict[str, Any]:
     state = load_state(root)
     if state["status"] not in {"needs_generation", "reviewing"}:
         raise SpecificationStateError(f"cannot accept specification in {state['status']}")
-    prd, spec = canonical_paths(root, state["feature"])
+    prd = root / state["prd"]["path"]
+    spec = root / state["specification"]["path"]
     if sha256(prd) != state["prd"]["sha256"]:
         raise SpecificationStateError("PRD changed after initialization")
     meta, drift = specification_trace(root, prd, spec)
@@ -455,6 +502,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = commands.add_parser("init")
     init.add_argument("--feature", required=True)
+    init.add_argument("--prd", required=True)
+    init.add_argument("--spec", required=True)
     init.add_argument("--architect-id", required=True)
     init.set_defaults(handler=command_init)
 

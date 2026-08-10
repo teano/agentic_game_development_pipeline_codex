@@ -130,11 +130,31 @@ def parse_frontmatter(path: Path, label: str) -> dict[str, str]:
     if len(parts) < 3:
         raise PipelineError(f"{label} has unterminated YAML front matter: {path}")
     result: dict[str, str] = {}
+    parent: str | None = None
     for raw_line in parts[1].splitlines():
         if not raw_line.strip() or raw_line.lstrip().startswith("#") or ":" not in raw_line:
             continue
-        key, value = raw_line.split(":", 1)
-        result[key.strip()] = value.strip().strip('"\'')
+        indentation = len(raw_line) - len(raw_line.lstrip())
+        key, value = raw_line.strip().split(":", 1)
+        value = value.strip().strip('"\'')
+        if indentation == 0:
+            parent = key if not value else None
+            if value:
+                result[key] = value
+        elif parent and value:
+            result[f"{parent}.{key}"] = value
+    return result
+
+
+def authority_trace(
+    meta: dict[str, str], flat_prefix: str, nested_names: tuple[str, ...]
+) -> dict[str, str | None]:
+    result: dict[str, str | None] = {}
+    for field in ("path", "revision", "sha256"):
+        value = meta.get(f"{flat_prefix}_{field}")
+        for nested_name in nested_names:
+            value = value or meta.get(f"{nested_name}.{field}")
+        result[field] = value
     return result
 
 
@@ -151,6 +171,10 @@ def resolve_project_file(root: Path, supplied: str, label: str) -> Path:
     if not path.is_absolute():
         path = root / path
     path = path.resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise PipelineError(f"{label} must stay inside the project root: {path}") from error
     if not path.is_file():
         raise PipelineError(f"{label} does not exist: {path}")
     return path
@@ -159,18 +183,6 @@ def resolve_project_file(root: Path, supplied: str, label: str) -> Path:
 def require_feature_documents(
     root: Path, feature: str, requirements: Path, spec: Path
 ) -> tuple[dict[str, str], dict[str, str]]:
-    feature_dir = (root / "docs" / "features" / feature).resolve()
-    expected_requirements = feature_dir / "product-requirements.md"
-    expected_spec = feature_dir / "technical-specification.md"
-    if requirements != expected_requirements:
-        raise PipelineError(
-            f"Approved product requirements must be stored at {expected_requirements}"
-        )
-    if spec != expected_spec:
-        raise PipelineError(
-            f"Approved technical specification must be stored at {expected_spec}"
-        )
-
     requirements_meta = parse_frontmatter(requirements, "Product requirements")
     if requirements_meta.get("status") != "approved":
         raise PipelineError("product-requirements.md must have status: approved")
@@ -183,15 +195,16 @@ def require_feature_documents(
 
     relative_requirements = requirements.relative_to(root).as_posix()
     expected_trace = {
-        "source_prd_path": relative_requirements,
-        "source_prd_revision": requirements_meta["revision"],
-        "source_prd_sha256": file_sha256(requirements),
+        "path": relative_requirements,
+        "revision": requirements_meta["revision"],
+        "sha256": file_sha256(requirements),
     }
+    actual_trace = authority_trace(spec_meta, "source_prd", ("product_authority",))
     for field, expected in expected_trace.items():
-        if spec_meta.get(field) != expected:
+        if actual_trace.get(field) != expected:
             raise PipelineError(
-                f"technical-specification.md has stale {field}: "
-                f"expected {expected!r}, got {spec_meta.get(field)!r}"
+                f"technical-specification.md has stale product authority {field}: "
+                f"expected {expected!r}, got {actual_trace.get(field)!r}"
             )
     return requirements_meta, spec_meta
 
@@ -354,14 +367,9 @@ def require_development_plan(
     supplied_plan: str | None,
     supplied_sha256: str | None,
 ) -> dict[str, Any]:
-    canonical = (root / "docs" / "features" / feature / "development-plan.md").resolve()
-    plan = resolve_project_file(
-        root,
-        supplied_plan or canonical.relative_to(root).as_posix(),
-        "Approved development plan",
-    )
-    if plan != canonical:
-        raise PipelineError(f"Approved development plan must be stored at {canonical}")
+    if not supplied_plan:
+        raise PipelineError("Approved development plan path is required")
+    plan = resolve_project_file(root, supplied_plan, "Approved development plan")
     plan_meta = parse_frontmatter(plan, "Development plan")
     if plan_meta.get("document_type") != "development-plan":
         raise PipelineError("development-plan.md document_type must be development-plan")
@@ -374,20 +382,37 @@ def require_development_plan(
     mode = plan_meta.get("mode")
     if mode not in {"single_owner", "sequential_slices"}:
         raise PipelineError("development-plan.md mode must be single_owner or sequential_slices")
-    expected_trace = {
-        "source_prd_path": requirements.relative_to(root).as_posix(),
-        "source_prd_revision": parse_frontmatter(requirements, "Product requirements")["revision"],
-        "source_prd_sha256": file_sha256(requirements),
-        "source_spec_path": spec.relative_to(root).as_posix(),
-        "source_spec_revision": parse_frontmatter(spec, "Technical specification").get("revision"),
-        "source_spec_sha256": file_sha256(spec),
-    }
-    for field, expected in expected_trace.items():
-        if plan_meta.get(field) != expected:
-            raise PipelineError(
-                f"development-plan.md has stale {field}: expected {expected!r}, "
-                f"got {plan_meta.get(field)!r}"
-            )
+    trace_checks = (
+        (
+            "product authority",
+            authority_trace(plan_meta, "source_prd", ("product_authority",)),
+            {
+                "path": requirements.relative_to(root).as_posix(),
+                "revision": parse_frontmatter(requirements, "Product requirements")["revision"],
+                "sha256": file_sha256(requirements),
+            },
+        ),
+        (
+            "specification authority",
+            authority_trace(
+                plan_meta,
+                "source_spec",
+                ("specification_authority", "technical_authority"),
+            ),
+            {
+                "path": spec.relative_to(root).as_posix(),
+                "revision": parse_frontmatter(spec, "Technical specification").get("revision"),
+                "sha256": file_sha256(spec),
+            },
+        ),
+    )
+    for label, actual, expected_trace in trace_checks:
+        for field, expected in expected_trace.items():
+            if actual.get(field) != expected:
+                raise PipelineError(
+                    f"development-plan.md has stale {label} {field}: "
+                    f"expected {expected!r}, got {actual.get(field)!r}"
+                )
     approved_hash = file_sha256(plan)
     if supplied_sha256 and supplied_sha256 != approved_hash:
         raise PipelineError("Supplied development-plan SHA does not match current plan bytes")
@@ -399,7 +424,17 @@ def require_development_plan(
         or planning_state.get("status") != "approved"
         or planning_state.get("plan_path") != plan.relative_to(root).as_posix()
         or approval.get("approved_sha256") != approved_hash
+        or (
+            planning_state.get("prd", {}).get("path") is not None
+            and planning_state.get("prd", {}).get("path")
+            != requirements.relative_to(root).as_posix()
+        )
         or planning_state.get("prd", {}).get("sha256") != file_sha256(requirements)
+        or (
+            planning_state.get("specification", {}).get("path") is not None
+            and planning_state.get("specification", {}).get("path")
+            != spec.relative_to(root).as_posix()
+        )
         or planning_state.get("specification", {}).get("sha256") != file_sha256(spec)
     ):
         raise PipelineError(

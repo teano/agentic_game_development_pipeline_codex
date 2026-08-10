@@ -30,7 +30,7 @@ class SpecificationStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.feature_dir = self.root / "docs" / "features" / "sample-feature"
+        self.feature_dir = self.root / "docs" / "Features" / "template" / "sample-feature"
         self.feature_dir.mkdir(parents=True)
         self.prd = self.feature_dir / "product-requirements.md"
         self.spec = self.feature_dir / "technical-specification.md"
@@ -42,17 +42,27 @@ class SpecificationStateTests(unittest.TestCase):
     def args(self, **values: object) -> Namespace:
         return Namespace(project_root=str(self.root), **values)
 
-    def write_spec(self, status: str = "draft", suffix: str = "") -> None:
+    def write_spec(
+        self, status: str = "draft", suffix: str = "", nested_trace: bool = True
+    ) -> None:
         trace = controller.sha256(self.prd)
+        authority = (
+            f"""product_authority:
+  path: docs/Features/template/sample-feature/product-requirements.md
+  revision: 3
+  sha256: {trace}"""
+            if nested_trace
+            else f"""source_prd_path: docs/Features/template/sample-feature/product-requirements.md
+source_prd_revision: 3
+source_prd_sha256: {trace}"""
+        )
         self.spec.write_text(
             f"""---
 document_type: technical-specification
 status: {status}
 revision: 1
 language: English
-source_prd_path: docs/features/sample-feature/product-requirements.md
-source_prd_revision: 3
-source_prd_sha256: {trace}
+{authority}
 ---
 # Technical Specification
 {suffix}
@@ -64,7 +74,12 @@ source_prd_sha256: {trace}
         if with_spec:
             self.write_spec()
         return controller.command_init(
-            self.args(feature="sample-feature", architect_id="architect-1")
+            self.args(
+                feature="sample-feature",
+                prd=self.prd.relative_to(self.root).as_posix(),
+                spec=self.spec.relative_to(self.root).as_posix(),
+                architect_id="architect-1",
+            )
         )
 
     def start_and_record(self, number: int, **overrides: object) -> None:
@@ -132,11 +147,28 @@ source_prd_sha256: {trace}
             )
         )
         state = controller.command_init(
-            self.args(feature="sample-feature", architect_id="replacement")
+            self.args(
+                feature="sample-feature",
+                prd=self.prd.relative_to(self.root).as_posix(),
+                spec=self.spec.relative_to(self.root).as_posix(),
+                architect_id="replacement",
+            )
         )
         self.assertEqual(state["active_architect_id"], "architect-1")
         self.assertEqual(state["total_cycles_completed"], 1)
         self.assertEqual(len(state["waves"]), 1)
+
+    def test_flat_source_prd_trace_remains_compatible(self) -> None:
+        self.write_spec(nested_trace=False)
+        state = controller.command_init(
+            self.args(
+                feature="sample-feature",
+                prd=self.prd.relative_to(self.root).as_posix(),
+                spec=self.spec.relative_to(self.root).as_posix(),
+                architect_id="architect-1",
+            )
+        )
+        self.assertEqual(state["status"], "reviewing")
 
     def test_attempted_sixth_cycle_enters_hold(self) -> None:
         self.initialize()

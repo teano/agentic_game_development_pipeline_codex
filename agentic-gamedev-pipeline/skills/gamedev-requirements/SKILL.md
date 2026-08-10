@@ -16,9 +16,10 @@ Before creating, approving, or structurally editing a PRD, read [product-require
 ## Resolve the canonical document
 
 1. Match the user's language and infer the project root and lowercase feature slug. Ask one blocking question only when either is unsafe to infer.
-2. Use exactly `docs/features/<feature>/product-requirements.md`; reserve the sibling `technical-specification.md` for the specification pipeline.
-3. Read an existing PRD before interviewing. Preserve its stable IDs and epistemic state; do not replace it without explicit approval.
-4. For authorized file-backed work with no PRD, copy [product-requirements.md](assets/product-requirements.md), set the language, and keep `status: draft`. For discussion-only requests, do not write files.
+2. Resolve the repository-owned PRD path from, in order: an explicit current-user path; repository instructions and feature manifests/indexes; an existing PRD; or the sibling of an unambiguous feature specification. Preserve spelling and case. Never create a copy, symlink, move, or parallel namespace merely to fit this plugin.
+3. If several plausible paths remain, ask the user one concise path question. If the project is empty and has no convention to infer, recommend `docs/features/<feature>/product-requirements.md` plus a sibling `technical-specification.md`, explain that it is only a proposed layout, and wait for confirmation before creating it.
+4. Read an existing PRD before interviewing. Preserve its stable IDs and epistemic state; do not replace it without explicit approval.
+5. For authorized file-backed work with a resolved path and no PRD, copy [product-requirements.md](assets/product-requirements.md), set the language, and keep `status: draft`. For discussion-only requests, do not write files.
 
 ## Resolve product decisions progressively
 
@@ -47,9 +48,10 @@ Run `scripts/validate_product_requirements.py <path>` before approval. Resolve e
 When the user requests a technical specification:
 
 1. Require the valid approved PRD.
-2. Invoke `$skill-specification-pipeline` with only its canonical path, revision, SHA-256, target specification path, and instruction to treat the PRD as product authority.
-3. Require the specification to record PRD path, revision, and SHA-256.
-4. Keep unsupported technical choices as assumptions or open questions; do not invent product requirements.
+2. Resolve the repository-owned target specification path by the same rules, normally as the PRD's project-defined sibling; ask only if it remains ambiguous.
+3. Invoke `$skill-specification-pipeline` with only the resolved PRD path, revision, SHA-256, resolved target specification path, and instruction to treat the PRD as product authority.
+4. Require the specification to record PRD path, revision, and SHA-256 using the repository's existing trace shape.
+5. Keep unsupported technical choices as assumptions or open questions; do not invent product requirements.
 
 A later semantic PRD change makes the traced specification stale. Update and re-review it before implementation. Keep both canonical documents tracked; keep runtime evidence under `tests/<feature>/`.
 

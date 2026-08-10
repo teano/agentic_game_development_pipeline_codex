@@ -7,6 +7,16 @@
 
 ## [Unreleased]
 
+### Изменено
+
+- Контроллеры больше не требуют `docs/features/<feature>/...`: они принимают явные repository-owned пути внутри project root, сохраняют регистр и namespace проекта и останавливаются для уточнения только при неоднозначности.
+- Для пустого репозитория прежний layout остаётся рекомендацией, требующей подтверждения, а не автоматически создаваемой схемой.
+- Specification, planning и production controllers принимают как плоские `source_prd_*` / `source_spec_*`, так и вложенные `product_authority` / `specification_authority` trace-контракты.
+
+### Проверено
+
+- Полный набор из 99 тестов проходит на repository-owned namespace `docs/Features/template/...`, включая nested authority trace и запрет путей за пределами project root.
+
 ## [0.3.0] - 2026-08-09
 
 ### Добавлено

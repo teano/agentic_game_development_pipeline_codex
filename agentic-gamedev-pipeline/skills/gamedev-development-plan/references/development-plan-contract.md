@@ -2,15 +2,14 @@
 
 ## Canonical authority
 
-Use only:
+Use only the repository-owned PRD, specification, and development plan resolved from explicit user context, repository instructions, feature manifests/indexes, existing artifacts, and unambiguous sibling relationships. All paths must stay inside the project root. Do not create copies, symlinks, moves, or an alternate namespace for the controller. Ask the user if more than one plausible path remains. In an empty repository, recommend `docs/features/<feature>/` with the three sibling documents as a proposed layout and wait for confirmation.
 
-- `docs/features/<feature>/product-requirements.md`;
-- `docs/features/<feature>/technical-specification.md`;
-- `docs/features/<feature>/development-plan.md`;
+Operational state remains at:
+
 - `.agentic-pipeline/specification-state.json` for immutable `SPEC_READY` evidence;
 - `.agentic-pipeline/development-plan-state.json` for operational planning state.
 
-The plan frontmatter must contain:
+The plan frontmatter must contain the controller fields below. Preserve the repository's established trace representation; flat `source_prd_*` / `source_spec_*` fields and nested `product_authority` / `specification_authority` mappings are equivalent.
 
 ```yaml
 ---
@@ -21,14 +20,27 @@ feature: <feature>
 mode: single_owner
 writer_strategy: sequential
 planning_analyst_id: <fresh-agent-id>
-source_prd_path: docs/features/<feature>/product-requirements.md
+source_prd_path: <repository-relative-prd-path>
 source_prd_revision: <revision>
 source_prd_sha256: <64 lowercase hex>
-source_spec_path: docs/features/<feature>/technical-specification.md
+source_spec_path: <repository-relative-spec-path>
 source_spec_revision: <revision>
 source_spec_sha256: <64 lowercase hex>
 slice_count: 1
 ---
+```
+
+Equivalent nested trace fields are:
+
+```yaml
+product_authority:
+  path: <repository-relative-prd-path>
+  revision: <revision>
+  sha256: <64 lowercase hex>
+specification_authority:
+  path: <repository-relative-spec-path>
+  revision: <revision>
+  sha256: <64 lowercase hex>
 ```
 
 Only `single_owner` and `sequential_slices` are valid modes. `writer_strategy` is always `sequential`. The controller adds `approved_by` and `approved_at` only after explicit approval of the submitted draft SHA.

@@ -81,21 +81,46 @@ def parse_frontmatter(path: Path, label: str) -> tuple[dict[str, str], str]:
     if len(parts) < 3:
         raise DevelopmentPlanError(f"{label} has unterminated frontmatter")
     fields: dict[str, str] = {}
+    parent: str | None = None
     for line in parts[1].splitlines():
         if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
             continue
-        key, value = line.split(":", 1)
-        fields[key.strip()] = value.strip().strip("\"'")
+        indentation = len(line) - len(line.lstrip())
+        key, value = line.strip().split(":", 1)
+        value = value.strip().strip("\"'")
+        if indentation == 0:
+            parent = key if not value else None
+            if value:
+                fields[key] = value
+        elif parent and value:
+            fields[f"{parent}.{key}"] = value
     return fields, parts[2].lstrip("\r\n")
 
 
-def canonical_paths(root: Path, feature: str) -> tuple[Path, Path, Path]:
-    feature_dir = root / "docs" / "features" / feature
-    return (
-        feature_dir / "product-requirements.md",
-        feature_dir / "technical-specification.md",
-        feature_dir / "development-plan.md",
-    )
+def resolve_project_path(root: Path, supplied: str, label: str) -> Path:
+    path = Path(supplied)
+    if not path.is_absolute():
+        path = root / path
+    path = path.resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise DevelopmentPlanError(
+            f"{label} must stay inside the project root: {path}"
+        ) from error
+    return path
+
+
+def authority_trace(
+    meta: dict[str, str], flat_prefix: str, nested_names: tuple[str, ...]
+) -> dict[str, str | None]:
+    result: dict[str, str | None] = {}
+    for field in ("path", "revision", "sha256"):
+        value = meta.get(f"{flat_prefix}_{field}")
+        for nested_name in nested_names:
+            value = value or meta.get(f"{nested_name}.{field}")
+        result[field] = value
+    return result
 
 
 def state_path(root: Path) -> Path:
@@ -126,8 +151,12 @@ def save_state(root: Path, state: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def require_sources(root: Path, feature: str) -> dict[str, Any]:
-    prd, spec, plan = canonical_paths(root, feature)
+def require_sources(
+    root: Path, feature: str, prd_path: str, spec_path: str, plan_path: str
+) -> dict[str, Any]:
+    prd = resolve_project_path(root, prd_path, "PRD")
+    spec = resolve_project_path(root, spec_path, "specification")
+    plan = resolve_project_path(root, plan_path, "development plan")
     prd_meta, _ = parse_frontmatter(prd, "PRD")
     if prd_meta.get("document_type") != "product-requirements":
         raise DevelopmentPlanError("PRD document_type must be product-requirements")
@@ -143,17 +172,28 @@ def require_sources(root: Path, feature: str) -> dict[str, Any]:
     prd_hash = sha256(prd)
     spec_hash = sha256(spec)
     expected_prd_path = prd.relative_to(root).as_posix()
-    if (
-        spec_meta.get("source_prd_path") != expected_prd_path
-        or spec_meta.get("source_prd_revision") != prd_meta["revision"]
-        or spec_meta.get("source_prd_sha256") != prd_hash
-    ):
+    spec_product_trace = authority_trace(
+        spec_meta, "source_prd", ("product_authority",)
+    )
+    if spec_product_trace != {
+        "path": expected_prd_path,
+        "revision": prd_meta["revision"],
+        "sha256": prd_hash,
+    }:
         raise DevelopmentPlanError("specification does not trace the exact current approved PRD")
 
     specification_state = load_json(root / SPEC_STATE_RELATIVE_PATH, "specification state")
     ready = specification_state.get("ready") or {}
     if specification_state.get("feature") != feature or specification_state.get("status") != "spec_ready":
         raise DevelopmentPlanError("specification state is not SPEC_READY for this feature")
+    if (
+        specification_state.get("prd", {}).get("path") != expected_prd_path
+        or specification_state.get("specification", {}).get("path")
+        != spec.relative_to(root).as_posix()
+    ):
+        raise DevelopmentPlanError(
+            "SPEC_READY evidence refers to different repository-owned artifact paths"
+        )
     if ready.get("prd_sha256") != prd_hash or ready.get("spec_sha256") != spec_hash:
         raise DevelopmentPlanError("SPEC_READY evidence does not match current PRD/specification bytes")
 
@@ -174,7 +214,13 @@ def require_sources(root: Path, feature: str) -> dict[str, Any]:
 
 def source_drift(root: Path, state: dict[str, Any]) -> list[str]:
     try:
-        current = require_sources(root, state["feature"])
+        current = require_sources(
+            root,
+            state["feature"],
+            state["prd"]["path"],
+            state["specification"]["path"],
+            state["plan_path"],
+        )
     except (OSError, ValueError, json.JSONDecodeError, DevelopmentPlanError) as error:
         return [str(error)]
     drift: list[str] = []
@@ -227,16 +273,42 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         "mode": state.get("analysis", {}).get("mode"),
         "writer_strategy": "sequential",
         "planning_analyst_id": state["analyst_id"],
-        "source_prd_path": state["prd"]["path"],
-        "source_prd_revision": state["prd"]["revision"],
-        "source_prd_sha256": state["prd"]["sha256"],
-        "source_spec_path": state["specification"]["path"],
-        "source_spec_revision": state["specification"]["revision"],
-        "source_spec_sha256": state["specification"]["sha256"],
     }
     for key, value in expected_meta.items():
         if meta.get(key) != value:
             errors.append(f"frontmatter {key}: expected {value!r}, got {meta.get(key)!r}")
+    product_trace = authority_trace(meta, "source_prd", ("product_authority",))
+    specification_trace = authority_trace(
+        meta,
+        "source_spec",
+        ("specification_authority", "technical_authority"),
+    )
+    for label, actual, expected in (
+        (
+            "product authority",
+            product_trace,
+            {
+                "path": state["prd"]["path"],
+                "revision": state["prd"]["revision"],
+                "sha256": state["prd"]["sha256"],
+            },
+        ),
+        (
+            "specification authority",
+            specification_trace,
+            {
+                "path": state["specification"]["path"],
+                "revision": state["specification"]["revision"],
+                "sha256": state["specification"]["sha256"],
+            },
+        ),
+    ):
+        for field, expected_value in expected.items():
+            if actual.get(field) != expected_value:
+                errors.append(
+                    f"frontmatter {label} {field}: expected {expected_value!r}, "
+                    f"got {actual.get(field)!r}"
+                )
     if not re.fullmatch(r"[1-9][0-9]*", meta.get("revision", "")):
         errors.append("frontmatter revision must be a positive integer")
     if meta.get("mode") not in MODES:
@@ -401,10 +473,24 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
 def command_init(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     feature = require_slug(args.feature)
+    requested_paths = (
+        resolve_project_path(root, args.prd, "PRD").relative_to(root).as_posix(),
+        resolve_project_path(root, args.spec, "specification").relative_to(root).as_posix(),
+        resolve_project_path(root, args.plan, "development plan").relative_to(root).as_posix(),
+    )
     if state_path(root).is_file():
         state = load_state(root)
         if state["feature"] != feature:
             raise DevelopmentPlanError("development-plan state already belongs to another feature")
+        recorded_paths = (
+            state["prd"]["path"],
+            state["specification"]["path"],
+            state["plan_path"],
+        )
+        if requested_paths != recorded_paths:
+            raise DevelopmentPlanError(
+                "development-plan state already exists with different repository-owned paths"
+            )
         drift = source_drift(root, state)
         if drift:
             state["status"] = "stale"
@@ -414,7 +500,7 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         return state
     if not args.analyst_id.strip():
         raise DevelopmentPlanError("a fresh Planning Analyst identity is required")
-    sources = require_sources(root, feature)
+    sources = require_sources(root, feature, *requested_paths)
     now = utc_now()
     state = {
         "schema_version": SCHEMA_VERSION,
@@ -450,7 +536,13 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
         raise DevelopmentPlanError(
             "reinitialize requires a Planning Analyst identity fresh across all planning history"
         )
-    sources = require_sources(root, state["feature"])
+    sources = require_sources(
+        root,
+        state["feature"],
+        getattr(args, "prd", None) or state["prd"]["path"],
+        getattr(args, "spec", None) or state["specification"]["path"],
+        getattr(args, "plan", None) or state["plan_path"],
+    )
     now = utc_now()
     history = list(state.get("history", []))
     history.append(
@@ -605,11 +697,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = commands.add_parser("init")
     init.add_argument("--feature", required=True)
+    init.add_argument("--prd", required=True)
+    init.add_argument("--spec", required=True)
+    init.add_argument("--plan", required=True)
     init.add_argument("--analyst-id", required=True)
     init.set_defaults(handler=command_init)
 
     reinitialize = commands.add_parser("reinitialize")
     reinitialize.add_argument("--analyst-id", required=True)
+    reinitialize.add_argument("--prd")
+    reinitialize.add_argument("--spec")
+    reinitialize.add_argument("--plan")
     reinitialize.set_defaults(handler=command_reinitialize)
 
     analysis = commands.add_parser("accept-analysis")

@@ -16,10 +16,12 @@ Before acting, read [development-plan-contract.md](references/development-plan-c
 ## Establish authority
 
 1. Resolve `<project-root>` and lowercase `<feature>`.
-2. Require the canonical approved PRD, approved specification, and `.agentic-pipeline/specification-state.json` whose `spec_ready` evidence exactly matches both current files.
-3. Initialize `.agentic-pipeline/development-plan-state.json` with `init` and exact source hashes.
-4. Spawn exactly one fresh, read-only Planning Analyst. Give it the canonical files, exact hashes, project rules, and a bounded request to assess solution size, complexity, context working set, integration seams, ownership, and dependencies.
-5. Record the result with `accept-analysis`. Do not reuse a prior implementation or specification worker as the Analyst.
+2. Resolve the repository-owned PRD, specification, and plan paths from explicit user context, repository instructions, feature manifests/indexes, existing feature artifacts, and unambiguous sibling relationships. Preserve path case. Never create a copy, symlink, move, or parallel namespace to satisfy this plugin.
+3. If multiple plausible paths remain, ask one concise path question. If the project is empty and defines no convention, recommend sibling `product-requirements.md`, `technical-specification.md`, and `development-plan.md` files under `docs/features/<feature>/` as a proposed layout and wait for confirmation.
+4. Require the resolved approved PRD, approved specification, and `.agentic-pipeline/specification-state.json` whose `spec_ready` evidence exactly matches both current files and paths.
+5. Initialize `.agentic-pipeline/development-plan-state.json` with `init --prd <resolved-prd> --spec <resolved-spec> --plan <resolved-plan>` and exact source hashes.
+6. Spawn exactly one fresh, read-only Planning Analyst. Give it the resolved canonical files, exact hashes, project rules, and a bounded request to assess solution size, complexity, context working set, integration seams, ownership, and dependencies.
+7. Record the result with `accept-analysis`. Do not reuse a prior implementation or specification worker as the Analyst.
 
 ## Choose ownership shape
 
@@ -33,7 +35,7 @@ The Analyst returns a compact decision packet: mode, complexity and working-set 
 
 ## Draft and validate
 
-Write only `docs/features/<feature>/development-plan.md`. Keep `status: draft` until the user explicitly approves the exact submitted SHA. Include every field required by the contract, especially the machine-readable per-slice acceptance allowlist, editable paths, structured shared touchpoints, exclusions, product file/line budgets, verification scope, exact scope baseline revision, bounded research briefs, verification/exit criteria, rollback/recovery, and downstream consumers.
+Write only the resolved repository-owned development-plan path. Keep `status: draft` until the user explicitly approves the exact submitted SHA. Preserve the repository's existing flat or nested source-trace convention. Include every field required by the contract, especially the machine-readable per-slice acceptance allowlist, editable paths, structured shared touchpoints, exclusions, product file/line budgets, verification scope, exact scope baseline revision, bounded research briefs, verification/exit criteria, rollback/recovery, and downstream consumers.
 
 Run `submit` only after `validate-plan` passes. Present the decision, ordering, boundaries, budgets, risks, and exact draft SHA to the user. Discuss and revise as needed; each edit requires resubmission. Do not interpret silence or approval of the PRD/specification as approval of the plan.
 
