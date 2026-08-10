@@ -7,10 +7,15 @@
 
 ## [Unreleased]
 
-### Изменено
+## [0.3.1] - 2026-08-10
+
+### Исправлено
 
 - Контроллеры больше не требуют `docs/features/<feature>/...`: они принимают явные repository-owned пути внутри project root, сохраняют регистр и namespace проекта и останавливаются для уточнения только при неоднозначности.
 - Для пустого репозитория прежний layout остаётся рекомендацией, требующей подтверждения, а не автоматически создаваемой схемой.
+
+### Изменено
+
 - Specification, planning и production controllers принимают как плоские `source_prd_*` / `source_spec_*`, так и вложенные `product_authority` / `specification_authority` trace-контракты.
 
 ### Проверено
@@ -43,5 +48,6 @@
 - Полный набор из 97 тестов контроллеров, активации и межрежимных контрактов.
 - Валидация manifest плагина и всех восьми skill-пакетов.
 
-[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/teano/agentic_game_development_pipeline_codex/releases/tag/v0.3.0
