@@ -12,6 +12,7 @@ source_prd_sha256: PRD_SHA256
 source_spec_path: SPEC_PATH
 source_spec_revision: SPEC_REVISION
 source_spec_sha256: SPEC_SHA256
+decision_ledger_path: DECISION_LEDGER_PATH
 slice_count: 1
 ---
 
@@ -20,6 +21,7 @@ slice_count: 1
 ## Decision
 
 Writer sequencing: one-at-a-time
+Ownership meaning: phase-scoped write lease
 Mode, rationale, and rejected decompositions.
 
 ## Planning Analysis
@@ -30,9 +32,36 @@ Complexity, system breadth, seams, dependencies, conflict surface, and verificat
 
 Feature scope, non-goals, protected systems, and authorized shared boundaries.
 
+## Decision Ledger
+
+- ledger_path: DECISION_LEDGER_PATH
+- active_decision_ids: DEC-001 | none
+- new_decision_route: explicit authority -> Decision Recorder -> controller append validation
+
+## Coverage Strategy
+
+- manifest_path: tests/FEATURE_SLUG/verification/coverage-schema-2.json
+- automated_identity_namespace: AUTO-FEATURE-*
+- manual_identity_namespace: MANUAL-FEATURE-*
+- mandatory_rule: explicit identity registration mapped to approved PRD-AC IDs
+- automation_feasibility: exact boundary
+- capability_prerequisites: exact runtime/manual capabilities
+- gates: plan-before-engineering, finalize-after-code-freeze, qa-updated
+
+## Documentation Strategy
+
+- normative_pre_review: exact behavior-defining paths | not_required with policy evidence
+- derived_post_qa: exact support paths | not_required with policy evidence
+- source_rule: active DEC/PRD/spec IDs and exact verified evidence only
+
 ## Context Budget
 
-Estimated files, symbols, tests, research packets, and evidence working set per owner.
+- max_authority_files: 12
+- max_evidence_files: 20
+- max_total_files: 32
+- max_payload_bytes: 250000
+- max_estimated_tokens: 60000
+- estimation_recipe: ceil((canonical capsule UTF-8 bytes + exact referenced authority/evidence bytes) / 4)
 
 ## Integration Milestones
 
@@ -60,7 +89,7 @@ Exact input revision, assumptions, and prerequisite evidence.
 
 ### Handoff Contract
 
-Exact outputs, hashes, checks, unresolved risks, and evidence passed downstream.
+Controller-generated schema-2 handoff with exact revisions/change evidence plus decision_ids, coverage_state, documentation_state, and open_assumptions.
 
 ### Owned Paths
 
@@ -90,6 +119,35 @@ Exact outputs, hashes, checks, unresolved risks, and evidence passed downstream.
 ### Research Briefs
 
 - RESEARCH-001 | question=exact bounded question | paths=bounded/path | exclusions=unrelated areas | evidence=entry points and contracts | stop=question answered
+
+### Coverage Contract
+
+- acceptance_ids: PRD-AC-001
+- automated_identity_namespace: AUTO-SLICE-001-*
+- manual_identity_namespace: MANUAL-SLICE-001-*
+- mandatory_identity_ids: exact IDs or controller-validated derivation source
+- automation_feasibility: exact automated boundary
+- capability_prerequisites: exact runtime/DataStore/operator requirements
+- planned_manifest: tests/FEATURE_SLUG/verification/SLICE-001-coverage-planned.json
+- finalized_manifest: tests/FEATURE_SLUG/verification/SLICE-001-coverage-finalized.json
+- amendment_authorities: DEC-*, normalized finding IDs, or approved scope rebaseline only
+
+### Documentation Contract
+
+- normative_pre_review_paths: exact/path | not_required with policy evidence
+- derived_post_qa_paths: exact/support/path | not_required with policy evidence
+- decision_ids: DEC-001 | none
+- evidence_sources: exact controller/Review/QA IDs
+
+### Context Capsule Budget
+
+- max_authority_files: 8
+- max_evidence_files: 12
+- max_total_files: 20
+- max_payload_bytes: 160000
+- max_estimated_tokens: 40000
+- authority_paths: exact bounded paths
+- evidence_paths: exact bounded paths
 
 ### Verification and Exit Criteria
 

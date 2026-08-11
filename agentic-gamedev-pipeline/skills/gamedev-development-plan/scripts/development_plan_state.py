@@ -22,6 +22,9 @@ REQUIRED_GLOBAL_SECTIONS = {
     "Decision",
     "Planning Analysis",
     "Scope Boundaries",
+    "Decision Ledger",
+    "Coverage Strategy",
+    "Documentation Strategy",
     "Context Budget",
 }
 REQUIRED_SLICE_SECTIONS = {
@@ -35,6 +38,9 @@ REQUIRED_SLICE_SECTIONS = {
     "Forbidden Scope",
     "Scope Contract",
     "Research Briefs",
+    "Coverage Contract",
+    "Documentation Contract",
+    "Context Capsule Budget",
     "Verification and Exit Criteria",
     "Rollback and Recovery",
     "Downstream Consumers",
@@ -51,6 +57,13 @@ REQUIRED_SCOPE_FIELDS = {
     "scope_baseline_revision",
 }
 REQUIRED_RESEARCH_FIELDS = {"question", "paths", "exclusions", "evidence", "stop"}
+CONTEXT_LIMITS = {
+    "max_authority_files",
+    "max_evidence_files",
+    "max_total_files",
+    "max_payload_bytes",
+    "max_estimated_tokens",
+}
 
 
 class DevelopmentPlanError(RuntimeError):
@@ -152,11 +165,21 @@ def save_state(root: Path, state: dict[str, Any]) -> None:
 
 
 def require_sources(
-    root: Path, feature: str, prd_path: str, spec_path: str, plan_path: str
+    root: Path,
+    feature: str,
+    prd_path: str,
+    spec_path: str,
+    plan_path: str,
+    decision_ledger_path: str,
 ) -> dict[str, Any]:
     prd = resolve_project_path(root, prd_path, "PRD")
     spec = resolve_project_path(root, spec_path, "specification")
     plan = resolve_project_path(root, plan_path, "development plan")
+    decision_ledger = resolve_project_path(
+        root, decision_ledger_path, "decision ledger"
+    )
+    if decision_ledger.exists() and not decision_ledger.is_file():
+        raise DevelopmentPlanError("decision ledger path must be a file or a creatable file path")
     prd_meta, _ = parse_frontmatter(prd, "PRD")
     if prd_meta.get("document_type") != "product-requirements":
         raise DevelopmentPlanError("PRD document_type must be product-requirements")
@@ -209,6 +232,7 @@ def require_sources(
             "sha256": spec_hash,
         },
         "plan_path": plan.relative_to(root).as_posix(),
+        "decision_ledger_path": decision_ledger.relative_to(root).as_posix(),
     }
 
 
@@ -220,6 +244,7 @@ def source_drift(root: Path, state: dict[str, Any]) -> list[str]:
             state["prd"]["path"],
             state["specification"]["path"],
             state["plan_path"],
+            state["decision_ledger_path"],
         )
     except (OSError, ValueError, json.JSONDecodeError, DevelopmentPlanError) as error:
         return [str(error)]
@@ -332,6 +357,67 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         global_sections.get("Decision", ""),
     ):
         errors.append("Decision must declare Writer sequencing: one-at-a-time")
+    if not re.search(
+        r"(?im)^Ownership meaning:\s*phase-scoped write lease\s*$",
+        global_sections.get("Decision", ""),
+    ):
+        errors.append("Decision must declare Ownership meaning: phase-scoped write lease")
+
+    ledger_path = meta.get("decision_ledger_path")
+    if ledger_path != state.get("decision_ledger_path"):
+        errors.append(
+            "frontmatter decision_ledger_path must equal the resolved repository-owned ledger path"
+        )
+    ledger_section = global_sections.get("Decision Ledger", "")
+    if state.get("decision_ledger_path") not in ledger_section:
+        errors.append("Decision Ledger must name the exact resolved ledger path")
+    if not re.search(r"\bDEC-[A-Za-z0-9-]+\b|\bnone\b", ledger_section, re.I):
+        errors.append("Decision Ledger must list active DEC-* IDs or none")
+    if "Decision Recorder" not in ledger_section:
+        errors.append("Decision Ledger must state the Decision Recorder route")
+
+    def validate_context_budget(section: str, label: str) -> dict[str, int]:
+        found: dict[str, int] = {}
+        seen: set[str] = set()
+        for key, raw in re.findall(r"(?m)^\s*-\s*([a-z_]+):\s*([0-9]+)\s*$", section):
+            if key.startswith("max_") and key not in CONTEXT_LIMITS:
+                errors.append(f"{label} contains unsupported numeric limit: {key}")
+            if key in CONTEXT_LIMITS:
+                if key in seen:
+                    errors.append(f"{label} repeats numeric limit: {key}")
+                seen.add(key)
+                found[key] = int(raw)
+        missing = sorted(CONTEXT_LIMITS - set(found))
+        if missing:
+            errors.append(f"{label} lacks numeric limits: {', '.join(missing)}")
+        nonpositive = sorted(key for key, value in found.items() if value < 1)
+        if nonpositive:
+            errors.append(f"{label} limits must be positive: {', '.join(nonpositive)}")
+        if found.get("max_total_files", 0) < max(
+            found.get("max_authority_files", 0), found.get("max_evidence_files", 0)
+        ):
+            errors.append(f"{label} max_total_files cannot be smaller than a component file limit")
+        return found
+
+    global_context_budget = validate_context_budget(
+        global_sections.get("Context Budget", ""), "Context Budget"
+    )
+    coverage_strategy = global_sections.get("Coverage Strategy", "")
+    for required_text in (
+        "manifest_path",
+        "automated_identity_namespace",
+        "manual_identity_namespace",
+        "mandatory_rule",
+        "capability_prerequisites",
+        "plan-before-engineering",
+        "finalize-after-code-freeze",
+    ):
+        if required_text not in coverage_strategy:
+            errors.append(f"Coverage Strategy must contain {required_text}")
+    documentation_strategy = global_sections.get("Documentation Strategy", "")
+    for required_text in ("normative_pre_review", "derived_post_qa"):
+        if required_text not in documentation_strategy:
+            errors.append(f"Documentation Strategy must contain {required_text}")
 
     slices = slice_blocks(body)
     slice_ids = [item[0] for item in slices]
@@ -459,6 +545,58 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
             if missing:
                 errors.append(f"{slice_id} {research_id} lacks: {', '.join(missing)}")
 
+        coverage = sections.get("Coverage Contract", "")
+        for required_text in (
+            "acceptance_ids",
+            "automated_identity_namespace",
+            "manual_identity_namespace",
+            "mandatory_identity_ids",
+            "automation_feasibility",
+            "capability_prerequisites",
+            "planned_manifest",
+            "finalized_manifest",
+            "amendment_authorities",
+        ):
+            if required_text not in coverage:
+                errors.append(f"{slice_id} Coverage Contract must contain {required_text}")
+        documentation = sections.get("Documentation Contract", "")
+        for required_text in (
+            "normative_pre_review_paths",
+            "derived_post_qa_paths",
+            "decision_ids",
+            "evidence_sources",
+        ):
+            if required_text not in documentation:
+                errors.append(f"{slice_id} Documentation Contract must contain {required_text}")
+        capsule_budget = sections.get("Context Capsule Budget", "")
+        slice_context_budget = validate_context_budget(
+            capsule_budget, f"{slice_id} Context Capsule Budget"
+        )
+        exceeded = sorted(
+            key
+            for key, value in slice_context_budget.items()
+            if key in global_context_budget and value > global_context_budget[key]
+        )
+        if exceeded:
+            errors.append(
+                f"{slice_id} Context Capsule Budget exceeds global limits: "
+                + ", ".join(exceeded)
+            )
+        if "authority_paths" not in capsule_budget or "evidence_paths" not in capsule_budget:
+            errors.append(
+                f"{slice_id} Context Capsule Budget must bound authority_paths and evidence_paths"
+            )
+        handoff = sections.get("Handoff Contract", "")
+        for required_text in (
+            "schema-2",
+            "decision_ids",
+            "coverage_state",
+            "documentation_state",
+            "open_assumptions",
+        ):
+            if required_text not in handoff:
+                errors.append(f"{slice_id} Handoff Contract must contain {required_text}")
+
     if errors:
         raise DevelopmentPlanError("invalid development plan: " + "; ".join(errors))
     return {
@@ -477,6 +615,9 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         resolve_project_path(root, args.prd, "PRD").relative_to(root).as_posix(),
         resolve_project_path(root, args.spec, "specification").relative_to(root).as_posix(),
         resolve_project_path(root, args.plan, "development plan").relative_to(root).as_posix(),
+        resolve_project_path(root, args.decision_ledger, "decision ledger")
+        .relative_to(root)
+        .as_posix(),
     )
     if state_path(root).is_file():
         state = load_state(root)
@@ -486,6 +627,7 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
             state["prd"]["path"],
             state["specification"]["path"],
             state["plan_path"],
+            state["decision_ledger_path"],
         )
         if requested_paths != recorded_paths:
             raise DevelopmentPlanError(
@@ -510,6 +652,7 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         "prd": sources["prd"],
         "specification": sources["specification"],
         "plan_path": sources["plan_path"],
+        "decision_ledger_path": sources["decision_ledger_path"],
         "analysis": None,
         "submission": None,
         "approval": None,
@@ -542,6 +685,7 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
         getattr(args, "prd", None) or state["prd"]["path"],
         getattr(args, "spec", None) or state["specification"]["path"],
         getattr(args, "plan", None) or state["plan_path"],
+        getattr(args, "decision_ledger", None) or state["decision_ledger_path"],
     )
     now = utc_now()
     history = list(state.get("history", []))
@@ -560,6 +704,7 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
         "prd": sources["prd"],
         "specification": sources["specification"],
         "plan_path": sources["plan_path"],
+        "decision_ledger_path": sources["decision_ledger_path"],
         "analysis": None,
         "submission": None,
         "approval": None,
@@ -700,6 +845,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--prd", required=True)
     init.add_argument("--spec", required=True)
     init.add_argument("--plan", required=True)
+    init.add_argument("--decision-ledger", required=True)
     init.add_argument("--analyst-id", required=True)
     init.set_defaults(handler=command_init)
 
@@ -708,6 +854,7 @@ def build_parser() -> argparse.ArgumentParser:
     reinitialize.add_argument("--prd")
     reinitialize.add_argument("--spec")
     reinitialize.add_argument("--plan")
+    reinitialize.add_argument("--decision-ledger")
     reinitialize.set_defaults(handler=command_reinitialize)
 
     analysis = commands.add_parser("accept-analysis")

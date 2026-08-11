@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Production Pipeline"
   short_description: "Explicit-only bounded GameDev production pipeline"
-  default_prompt: "Use $gamedev-pipeline to run the approved feature through director preflight, one persistent writing owner, parallel read-only convergence, risk-based Review closure, support/evidence recovery, runtime QA, and production-readiness within the configured worker budget."
+  default_prompt: "Use $gamedev-pipeline to run an approved feature through phase-scoped writers, bounded context capsules, exact decisions/coverage/docs, immutable Review and QA, and production-readiness."
 policy:
   allow_implicit_invocation: false

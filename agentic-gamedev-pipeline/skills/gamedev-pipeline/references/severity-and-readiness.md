@@ -53,7 +53,7 @@ Do not create a finding for unavailable tools, permissions, credentials, publica
 - `blocked_environment`: a required runtime, client, device, service, or tool is unavailable;
 - `error_test`: setup, harness, automation, or observation failed before product behavior could be judged.
 
-Each gate records the exact revision, pending scenario IDs, completed reusable evidence, reason, and minimum resume action. Gates have no product severity. Only `blocked_user` inherently requires user input.
+Each gate records the exact product/evidence revision, pending registered manual identity IDs, completed reusable evidence, reason, and minimum resume action. Gates have no product severity. Only `blocked_user` inherently requires user input.
 
 Before QA spawn, the controller requires a complete capability probe on the exact reviewed revision: Studio/editor sync, single play, mandatory Test Server server plus two clients, stable window/control or declared human operator, logging/screenshots, persistence/DataStore, publication/place topology, and configuration/credentials. Known unavailable capability means no QA spawn. `blocked_environment` and `error_test` require the recorded failed probe plus a minimum resume action; they cannot be inferred from an unexecuted scenario.
 
@@ -62,20 +62,27 @@ Before QA spawn, the controller requires a complete capability probe on the exac
 Require all of the following:
 
 - current approved PRD, traced technical specification, and approved development plan;
+- current append-only decision ledger (possibly zero-entry) with every referenced `DEC-*` active and exact, plus every policy-required ADR or plan-proven ADR `not_required`;
 - passed resource-budget preflight and a recorded runtime capability/manual-operator plan;
-- every repository-required supporting product document, including an ADR when policy requires one;
+- passed schema-1 context budget gates with preserved file/byte/token metrics for every specialized worker;
+- no active/overlapping write lease and a complete append-only lease history;
+- every repository-required normative product document completed before Review and current derived support document completed after QA, or exact plan/policy evidence that each class is not required;
 - no source drift;
-- current-revision passing machine/engine verification and complete coverage manifest;
+- `implementation_state=pass` independently of `feature_verification_state`;
+- a current schema-2 coverage manifest with every approved acceptance ID mapped, exact expected/actual identity set equality, separate exact mandatory-set registration equality, no coverage gap, and every mandatory automated identity executed/passed;
 - one passed parallel read-only convergence wave on the current product revision;
 - no slice has exceeded two append-only full convergence waves; local remediation is closed by one fresh targeted reviewer unless an allowed material full-wave trigger is recorded;
 - valid component Review credits keyed by component product hash, contract hash, lenses, and review revision, with unchanged components reused and Final Review composition/new-boundary coverage recorded;
 - two distinct passed full Reviews on the current identities, their preserved reports plus one passed targeted local-product closure reviewer, or their preserved same-product reports plus one passed support/evidence recovery reviewer;
-- a passed exact-revision QA capability probe and feature-focused runtime QA `pass` on that revision;
+- a passed exact-product/evidence QA capability probe and feature-focused runtime QA `pass` with every mandatory manual identity executed/passed and none deferred/blocked;
+- when derived support changed after QA, unchanged exact QA product/evidence identities plus one fresh passed `documentation-closure` Review on the current support revision;
+- a controller-generated schema-2 terminal handoff containing exact `decision_ids`, `coverage_state`, `documentation_state`, and `open_assumptions`;
 - no open controller-classified blocking finding;
 - no unaccepted minor finding;
 - no open gate hiding a mandatory scenario;
 - no unavailable required preflight capability;
 - worker and full-Review budgets either remain within their configured limits or have an explicit director authorization;
+- `feature_verification_state=pass` on the current product/support/evidence identities and preserved exact QA/support-closure credits;
 - controller phase `ready` and successful `ready` command.
 
 This verdict is a production-ready candidate, not authorization to publish, deploy, migrate, spend, submit, or accept risk.

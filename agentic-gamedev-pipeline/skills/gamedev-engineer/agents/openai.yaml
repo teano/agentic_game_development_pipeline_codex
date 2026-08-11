@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Engineer"
   short_description: "Explicit-only bounded GameDev engineering pass"
-  default_prompt: "Use $gamedev-engineer as the assigned persistent writing owner to complete one scope-wide product pass or one support/evidence recovery batch, run the required checks, compute exact revisions, and return verified manifests and reports."
+  default_prompt: "Use $gamedev-engineer for one exclusive production implementation or root-cause remediation pass with tightly coupled automated tests, targeted checks, final diff inspection, and a short semantic handoff."
 policy:
   allow_implicit_invocation: false

@@ -1,66 +1,60 @@
 ---
 name: gamedev-review
-description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-review` by name, explicitly asks for the Agentic GameDev Pipeline Review mode, or an explicitly user-invoked `$gamedev-pipeline` delegates a review assignment. Perform one independent read-only convergence audit, scope-complete final Review, targeted local-product closure Review, or support/evidence recovery closure Review on an exact game revision. Do not infer activation from generic code review, audit, verification, or game-development work.
+description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-review` by name, explicitly asks for the Agentic GameDev Pipeline Review mode, or an explicitly user-invoked `$gamedev-pipeline` delegates an immutable review assignment. Perform one independent read-only convergence audit, scope-complete Final Review, targeted product closure, support/evidence recovery closure, or post-QA derived-documentation closure on exact revisions. Do not infer activation from ordinary code review or audit work.
 ---
 
-# GameDev Final Review
+# GameDev Independent Review
 
 ## Activation gate
 
-Proceed only when the current user explicitly requests `$gamedev-review` by name, clearly asks for the Agentic GameDev Pipeline Review mode, or this is a review assignment delegated by an active `$gamedev-pipeline` that the user explicitly invoked. A request for ordinary code review, audit, verification, or game-development feedback is not authorization. If this gate is not satisfied, do not emit pipeline Review contracts or create pipeline review artifacts; continue under ordinary review instructions and only other explicitly requested skills.
+Proceed only when the current user explicitly requests `$gamedev-review` by name, clearly asks for the Agentic GameDev Pipeline Review mode, or this is a review assignment delegated by an active `$gamedev-pipeline` that the user explicitly invoked. Ordinary review, audit, verification, or game-development feedback is not authorization.
 
-Remain read-only with respect to product code, tests, configuration, approved documents, and pipeline state. Write only the assigned report under `tests/<feature>/reviews/<revision>/<reviewer-id>/`.
+Remain immutable with respect to product code, tests, configuration, approved documents, decision records, coverage artifacts, support documents, and pipeline state. Write only the assigned report under `tests/<feature>/reviews/<revision>/<reviewer-id>/`. Require a controller-validated bounded context capsule with exact paths/SHAs/IDs/evidence and no sibling conclusions or long chat history.
 
 Use one mode:
 
-- `risk-audit`: one assigned read-only convergence lens on the complete immutable candidate;
-- `full`: independently review the entire assigned slice on the clean revision;
-- `targeted-product-closure`: verify a frozen local product batch, its changed impact surface, and preserved complementary full-Review evidence;
-- `recovery-verification`: verify only a completed support/evidence recovery batch while relying on the preserved full Reviews.
+- `risk-audit`: one assigned read-only convergence lens on the complete immutable product candidate;
+- `full`: one member of the mandatory independent Final Review pair;
+- `targeted-product-closure`: verify a frozen local product remediation and induced boundaries;
+- `recovery-verification`: verify a bounded support/evidence recovery while relying on preserved product Reviews;
+- `documentation-closure`: after QA, verify only derived support changes against immutable sources while proving unchanged product/evidence.
 
-Every mode receives a component-credit manifest path. For each component record its product hash, contract hash, exact lens set, review revision, and `fresh` or `reused` mode. If a valid credit already has the same component product hash, contract hash, and lenses, reuse it; a full reread is forbidden. Revision drift alone does not invalidate credit. Only affected component product-hash or contract-hash drift invalidates that credit.
+Every mode receives a controller-validated component-credit manifest. Reuse an exact component product hash + contract hash + lens credit; a fresh full reread is forbidden. Overall composite drift alone does not invalidate product credit. Only relevant product/contract drift invalidates it.
 
-## Risk audit
+## Convergence and Final Review
 
-Inspect the assigned slice/component inventory through the assigned persistence/lifecycle, config/security/capacity, or integration/runtime/docs lens. Reuse valid component credits and inspect only invalidated components plus newly composed boundaries. Write findings and the report only; never remediate. Do not read sibling audit conclusions. The technical director aggregates the complete wave and returns one frozen blocking batch to the persistent writing owner.
+For `risk-audit`, inspect only the assigned persistence/lifecycle, config/security/capacity, or integration/runtime/docs lens, invalidated components, and new composition boundaries. Never read sibling reports or remediate.
 
-## Full Review
+For `full`:
 
-1. Read repository policy, approved feature documents, assigned acceptance IDs, exact revisions, verification report, revision manifest, and coverage manifest.
-2. Read the approved slice Scope Contract, controller scope history/churn, verified change-manifest, and diff-summary. Reject stale or missing scope artifacts as `INCOMPLETE`. Fail an unmapped product file/symbol, forbidden component, unapproved shared touchpoint, drive-by cleanup/refactor, material lifecycle/ownership/public-contract change, or budget breach that the controller did not already hold.
-3. Reject missing, stale, or mismatched inputs as `INCOMPLETE`; do not turn them into product findings.
-4. This is the mandatory final whole-feature pair after all slices. Reuse valid per-component credits, trace every acceptance criterion, and freshly audit cross-slice composition and every new boundary. Continue after each defect until the candidate inventory is complete.
-5. Apply the assigned deep lens while covering the full slice:
-   - architecture/correctness: ownership, lifecycle, state, concurrency, trust, persistence, performance, and extensibility;
-   - verification/integration: boundaries, negative/recovery behavior, coverage quality, platform constraints, regression risk, and operational safety.
-6. Check repository-required supporting product documents, including ADR applicability when policy requires it.
+1. Verify repository policy, approved feature documents, active decision ledger/ADRs, exact revisions, controller-generated revision/change/diff/handoff manifests, schema-2 finalized coverage manifest, and `documentation_state.normative` complete/not-required.
+2. Reject stale, missing, hash-mismatched, over-budget, or controller-unvalidated mechanics as `INCOMPLETE`; do not turn an input gap into a product finding.
+3. Check Scope Contract mapping and inspect every assigned acceptance criterion. Reuse valid component credits, then freshly audit cross-slice composition and new boundaries.
+4. Apply the assigned architecture/correctness or verification/integration lens. Treat Coverage Steward semantics as an input, but report an evidence candidate when exact code/test facts show it can miss accepted behavior.
+5. Verify normative documentation matches active accepted decisions. Do not invent the missing decision or write documentation.
 
-Do not read the other reviewer's conclusions. Do not edit, request early remediation, launch Studio/game/Computer Use, or rerun the full automated suite. Run only cheap read-only diagnostics that resolve a specific question.
+Do not read the other reviewer's conclusions. Do not edit, request early remediation, launch runtime/Computer Use, or rerun full green suites. Run only cheap read-only diagnostics for a specific question. Finish the complete inventory before returning.
 
-## Recovery verification
+## Closure modes
 
-Read the two preserved full reports, aggregate normalized support/evidence findings, remediation diff/report, revision and coverage manifests, and affected/aggregate results. Verify every frozen finding and every changed support/evidence file. Runtime product hash drift or a reproduced product defect exits recovery to the engineering owner; do not repeat the architecture Review.
+For `targeted-product-closure`, verify only the frozen findings, changed components, induced boundaries, and preserved complementary credits. Request a new full wave only for an actual architecture, lifecycle, ownership, public-contract, expanded shared-touchpoint, or broad/high-risk change.
 
-## Targeted product closure
+For `recovery-verification`, verify every frozen support/evidence finding and changed input. Runtime product drift or a reproduced product defect exits recovery; do not repeat architecture Review.
 
-Read the preserved applicable reports/credits, frozen local product finding batch, owner remediation diff/report, regressions, and the complete changed impact surface. Be one fresh identity independent of the writer and base wave. Verify only frozen findings, changed components, and induced boundaries; do not repeat the full audit. Minor, hardening, deferred, and controller-nonblocking candidates never start remediation. Require a new full convergence wave only for actual architecture, lifecycle, ownership, public-contract, expanded approved shared-touchpoint, or broad/high-risk change.
+For `documentation-closure`, require passed QA plus exact QA product/evidence revisions equal to current product/evidence revisions. Inspect every changed support statement against named decision, normative, controller, Review, QA, or capability evidence. Fail any new decision, normative claim, rewritten QA result, unsupported operator step, stale reference, or non-support drift. This one fresh reviewer grants only current-support closure credit; it never rewrites or replaces independent Final Review/QA credit.
 
 ## Return one contract
 
 Return:
 
-- `REVIEW_COMPLETE: yes|no`;
-- mode, composite/product/support/evidence revisions, and reviewer ID;
+- `REVIEW_COMPLETE: yes|no`, mode, reviewer/capsule IDs, and exact input revisions;
 - `PASS`, `FAIL`, or `INCOMPLETE`;
-- inspected scope and acceptance IDs;
-- verification identities checked;
-- scope contract SHA/baseline, change-manifest/diff-summary identities, mapped touchpoints, budget use, and scope-churn checked;
-- complete candidate findings with `finding_kind`, severity, `scope_relation`, `introduced_by_candidate`, `production_reachability`, exact approved `blocks_acceptance_ids`, required-invariant boolean/evidence, exact revision evidence, and failure/reproduction path;
-- for every supported nonblocking out-of-scope candidate, the component, contract, root cause, failure mode, effect, conditions, impacts, evidence, and independent occurrence identity needed for Director `backlog-upsert`;
-- input gaps and exclusions;
-- report path.
-- component-credit manifest path, fresh/reused credit IDs, invalidated component hashes/contracts, and for Final Review explicit cross-slice composition/new-boundary coverage.
+- inspected scope, acceptance/decision/coverage/documentation IDs, exclusions, and context metrics;
+- controller manifest/credit identities checked and fresh/reused/invalidated credits;
+- complete candidate findings with all classification dimensions and exact revision evidence;
+- compact supported deferred candidates for Director upsert;
+- source gaps and report path;
+- for Final Review, explicit cross-slice composition/new-boundary coverage;
+- for documentation closure, exact changed support paths, source mappings, unchanged product/evidence proof, and current support revision.
 
-Never set `blocking`, edit/deduplicate the deferred backlog, or prescribe an Engineer wave. The controller derives blocking and only the technical director upserts supported deferred candidates. Use unknown reachability only for a bounded triage question. Evidence Major requires proof that no other mandatory core-acceptance evidence exists and that the current test can miss a real product defect; otherwise use Minor or `support`. `PASS` requires complete unchanged-revision coverage with no controller-blocking candidate. `FAIL` requires a candidate whose complete dimensions allow the controller to block. `INCOMPLETE` means the same reviewer must resume.
-
-Do not demand duplicate proof without an approved requirement or demonstrated coverage failure. Do not classify unavailable tools or unexecuted checks as product defects, accept risk, edit controller state, declare readiness, or spawn agents.
+Never set `blocking`, edit/deduplicate deferred findings, prescribe an Engineer wave, decide missing behavior, accept risk, edit controller state, declare readiness, or spawn agents. `PASS` requires immutable scope-complete work with no candidate that the controller can classify blocking. `FAIL` requires complete evidence/dimensions. `INCOMPLETE` resumes the same reviewer.

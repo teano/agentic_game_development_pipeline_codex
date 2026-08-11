@@ -1,0 +1,6 @@
+interface:
+  display_name: "GameDev Decision Recorder"
+  short_description: "Record accepted decisions without inventing them"
+  default_prompt: "Use $gamedev-decision-recorder to append only already-authorized decisions to the exact project decision ledger without making or expanding any decision."
+policy:
+  allow_implicit_invocation: false

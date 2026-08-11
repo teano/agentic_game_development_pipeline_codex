@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -32,8 +34,8 @@ except ImportError:  # pragma: no cover - package-style imports used by some tes
 
 
 STATE_DIR = ".agentic-pipeline"
-SCHEMA_VERSION = 8
-CONTRACT_VERSION = "2026-08-09-bounded-review-qa-v1"
+SCHEMA_VERSION = 9
+CONTRACT_VERSION = "2026-08-11-role-artifacts-coverage-docs-v2"
 DEVELOPMENT_PLAN_STATE = Path(STATE_DIR) / "development-plan-state.json"
 FINDING_KINDS = {"product", "evidence", "support", "hardening"}
 BLOCKING_SCOPE_RELATIONS = {
@@ -103,6 +105,35 @@ QA_CAPABILITY_BLOCKING_STATUSES = {
     "blocked_environment",
     "error_test",
 }
+WRITE_ROLES = {
+    "decision_recorder",
+    "engineer",
+    "documentation_finisher",
+    "recovery_remediator",
+}
+CAPSULE_ROLES = WRITE_ROLES | {
+    "researcher",
+    "coverage_steward",
+    "reviewer",
+    "qa",
+}
+LEASE_PHASES = {
+    "decision_recorder": {"decision_recording"},
+    "engineer": {"slice_engineering", "engineering"},
+    "documentation_finisher": {"normative_documentation", "derived_documentation"},
+    "recovery_remediator": {"evidence_recovery"},
+}
+CONTEXT_LIMIT_NAMES = (
+    "max_authority_files",
+    "max_evidence_files",
+    "max_total_files",
+    "max_payload_bytes",
+    "max_estimated_tokens",
+)
+EXCLUDED_REVISION_PREFIXES = (
+    f"{STATE_DIR}/",
+    ".git/",
+)
 
 
 class PipelineError(RuntimeError):
@@ -359,6 +390,112 @@ def plan_slice_blocks(text: str) -> list[dict[str, Any]]:
     return slices
 
 
+def markdown_sections(text: str, level: int) -> dict[str, str]:
+    marker = "#" * level
+    pattern = re.compile(
+        rf"(?ms)^{re.escape(marker)} ([^\r\n]+)\r?\n(.*?)(?=^{re.escape(marker)} |\Z)"
+    )
+    result: dict[str, str] = {}
+    for name, content in pattern.findall(text):
+        if name in result:
+            raise PipelineError(f"Development plan repeats section: {name}")
+        result[name] = content.strip()
+    return result
+
+
+def contract_scalars(section: str, label: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for key, value in re.findall(r"(?m)^\s*-\s*([a-z_]+):\s*(.+?)\s*$", section):
+        if key in result:
+            raise PipelineError(f"{label} repeats field: {key}")
+        result[key] = value.strip()
+    return result
+
+
+def runtime_plan_contracts(text: str, slices: list[dict[str, Any]]) -> dict[str, Any]:
+    body = text.split("---", 2)[2] if text.startswith("---") else text
+    global_sections = markdown_sections(body, 2)
+    global_budget_raw = contract_scalars(global_sections["Context Budget"], "Context Budget")
+    global_budget = {key: int(global_budget_raw[key]) for key in CONTEXT_LIMIT_NAMES}
+    slice_sections = {
+        slice_id: markdown_sections(content, 3)
+        for slice_id, content in re.findall(
+            r"(?ms)^## Slice (SLICE-\d{3})\r?\n(.*?)(?=^## |\Z)", body
+        )
+    }
+    per_slice: dict[str, Any] = {}
+    for item in slices:
+        slice_id = item["id"]
+        sections = slice_sections[slice_id]
+        budget_raw = contract_scalars(
+            sections["Context Capsule Budget"], f"{slice_id} Context Capsule Budget"
+        )
+        per_slice[slice_id] = {
+            "context_budget": {key: int(budget_raw[key]) for key in CONTEXT_LIMIT_NAMES},
+            "coverage": contract_scalars(
+                sections["Coverage Contract"], f"{slice_id} Coverage Contract"
+            ),
+            "documentation": contract_scalars(
+                sections["Documentation Contract"], f"{slice_id} Documentation Contract"
+            ),
+        }
+    return {
+        "context_budget": global_budget,
+        "coverage_strategy": contract_scalars(
+            global_sections["Coverage Strategy"], "Coverage Strategy"
+        ),
+        "documentation_strategy": contract_scalars(
+            global_sections["Documentation Strategy"], "Documentation Strategy"
+        ),
+        "slices": per_slice,
+    }
+
+
+def documentation_policy_reference(state: dict[str, Any], lane: str) -> str:
+    global_key = "normative_pre_review" if lane == "normative" else "derived_post_qa"
+    slice_key = (
+        "normative_pre_review_paths"
+        if lane == "normative"
+        else "derived_post_qa_paths"
+    )
+    values = [state["plan_contracts"]["documentation_strategy"].get(global_key, "")]
+    values.extend(
+        contract["documentation"].get(slice_key, "")
+        for contract in state["plan_contracts"]["slices"].values()
+    )
+    references: list[str] = []
+    for value in values:
+        match = re.fullmatch(r"not_required\s*\|\s*policy=(\S(?:.*\S)?)", value)
+        if not match:
+            raise PipelineError(
+                f"Approved plan does not authorize {lane} documentation as not_required"
+            )
+        references.append(match.group(1))
+    if len(set(references)) != 1:
+        raise PipelineError(
+            f"Approved plan has inconsistent {lane} documentation policy authorities"
+        )
+    return references[0]
+
+
+def validate_plan_with_shared_planner(root: Path, planning_state: dict[str, Any]) -> None:
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "gamedev-development-plan"
+        / "scripts"
+        / "development_plan_state.py"
+    )
+    spec = importlib.util.spec_from_file_location("gamedev_development_plan_state", module_path)
+    if spec is None or spec.loader is None:
+        raise PipelineError("Cannot load the development-plan validator")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module.validate_plan(root, planning_state, required_status="approved")
+    except module.DevelopmentPlanError as exc:
+        raise PipelineError(str(exc)) from exc
+
+
 def require_development_plan(
     root: Path,
     feature: str,
@@ -379,6 +516,10 @@ def require_development_plan(
         raise PipelineError("development-plan.md feature does not match the pipeline feature")
     if plan_meta.get("writer_strategy") != "sequential":
         raise PipelineError("development-plan.md must declare writer_strategy: sequential")
+    decision_ledger_path = plan_meta.get("decision_ledger_path")
+    if not decision_ledger_path:
+        raise PipelineError("development-plan.md must declare decision_ledger_path")
+    decision_ledger_path = scope_path(decision_ledger_path, "decision ledger")
     mode = plan_meta.get("mode")
     if mode not in {"single_owner", "sequential_slices"}:
         raise PipelineError("development-plan.md mode must be single_owner or sequential_slices")
@@ -436,11 +577,14 @@ def require_development_plan(
             != spec.relative_to(root).as_posix()
         )
         or planning_state.get("specification", {}).get("sha256") != file_sha256(spec)
+        or planning_state.get("decision_ledger_path") != decision_ledger_path
     ):
         raise PipelineError(
             "development-plan-state.json does not prove approval of the exact current plan/PRD/spec"
         )
-    slices = plan_slice_blocks(plan.read_text(encoding="utf-8"))
+    validate_plan_with_shared_planner(root, planning_state)
+    plan_text = plan.read_text(encoding="utf-8")
+    slices = plan_slice_blocks(plan_text)
     slice_ids = [item["id"] for item in slices]
     if mode == "single_owner" and len(slices) != 1:
         raise PipelineError("single_owner development plan must contain exactly one slice")
@@ -460,6 +604,8 @@ def require_development_plan(
         "sha256": approved_hash,
         "mode": mode,
         "slices": slices,
+        "decision_ledger_path": decision_ledger_path,
+        "contracts": runtime_plan_contracts(plan_text, slices),
         "approval": approval,
     }
 
@@ -520,6 +666,338 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
         json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     os.replace(temporary, path)
+
+
+def resolve_project_output(root: Path, supplied: str, label: str) -> tuple[Path, str]:
+    path = Path(supplied)
+    if not path.is_absolute():
+        path = root / path
+    path = path.resolve()
+    try:
+        relative = path.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise PipelineError(f"{label} must stay inside the project root: {path}") from exc
+    if relative == STATE_DIR or relative.startswith(f"{STATE_DIR}/"):
+        raise PipelineError(f"{label} must not overwrite controller state")
+    return path, relative
+
+
+def read_decision_ledger(path: Path) -> tuple[list[dict[str, Any]], bytes]:
+    if not path.is_file():
+        raise PipelineError(f"Decision ledger does not exist: {path}")
+    raw = path.read_bytes()
+    if not raw:
+        return [], raw
+    entries: list[dict[str, Any]] = []
+    prefix = b""
+    active: set[str] = set()
+    semantic_fields = {
+        "schema",
+        "decision_id",
+        "status",
+        "statement",
+        "rationale",
+        "consequences",
+        "scope_ids",
+        "authority",
+        "supersedes",
+    }
+    mechanical_fields = {
+        "sequence",
+        "recorded_at",
+        "recorder_id",
+        "prior_ledger_sha256",
+        "input_product_revision",
+    }
+    for index, line in enumerate(raw.splitlines(keepends=True), start=1):
+        if not line.strip():
+            raise PipelineError("Decision ledger cannot contain blank JSONL records")
+        try:
+            item = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PipelineError(f"Decision ledger line {index} is invalid JSON") from exc
+        if not isinstance(item, dict) or set(item) != semantic_fields | mechanical_fields:
+            raise PipelineError(
+                f"Decision ledger line {index} does not use the exact schema-1 entry fields"
+            )
+        decision_id = item.get("decision_id")
+        if (
+            item.get("schema") != 1
+            or item.get("sequence") != index
+            or item.get("status") != "accepted"
+            or not isinstance(decision_id, str)
+            or not re.fullmatch(r"DEC-[A-Za-z0-9-]+", decision_id)
+            or decision_id in {entry["decision_id"] for entry in entries}
+        ):
+            raise PipelineError(f"Decision ledger line {index} has invalid identity/order/status")
+        if item.get("prior_ledger_sha256") != hashlib.sha256(prefix).hexdigest():
+            raise PipelineError(f"Decision ledger line {index} breaks append-only hash history")
+        supersedes = require_string_list(
+            item.get("supersedes"), f"Decision ledger line {index} supersedes"
+        )
+        if any(target not in active for target in supersedes):
+            raise PipelineError(
+                f"Decision ledger line {index} supersedes an absent or inactive decision"
+            )
+        active.difference_update(supersedes)
+        active.add(decision_id)
+        entries.append(item)
+        prefix += line
+    return entries, raw
+
+
+def decision_ledger_state(path: Path, relative: str) -> dict[str, Any]:
+    entries, raw = read_decision_ledger(path)
+    superseded = sorted(
+        {decision_id for item in entries for decision_id in item.get("supersedes", [])}
+    )
+    active = sorted(
+        {item["decision_id"] for item in entries} - set(superseded)
+    )
+    return {
+        "path": relative,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "entry_count": len(entries),
+        "active_decision_ids": active,
+        "superseded_decision_ids": superseded,
+    }
+
+
+def user_authority_digest(authority_id: str, approval_reference: str, statement: str) -> str:
+    return canonical_json_sha256(
+        {
+            "kind": "user",
+            "authority_id": authority_id,
+            "approval_reference": approval_reference,
+            "statement": statement,
+        }
+    )
+
+
+def validate_user_authority_registry(root: Path, state: dict[str, Any]) -> None:
+    registry = state.get("user_authorities")
+    if not isinstance(registry, list):
+        raise PipelineError("Schema 9 state lacks the append-only user authority registry")
+    seen: set[str] = set()
+    exact = {
+        "authority_id",
+        "approval_reference",
+        "statement",
+        "sha256",
+        "receipt_path",
+        "receipt_sha256",
+        "recorded_at",
+    }
+    for record in registry:
+        if not isinstance(record, dict) or set(record) != exact:
+            raise PipelineError("User authority registry record is malformed")
+        authority_id = record["authority_id"]
+        if (
+            not isinstance(authority_id, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9._:-]*", authority_id)
+            or authority_id in seen
+        ):
+            raise PipelineError("User authority IDs are unique append-only identifiers")
+        seen.add(authority_id)
+        expected_digest = user_authority_digest(
+            authority_id, record["approval_reference"], record["statement"]
+        )
+        if record["sha256"] != expected_digest:
+            raise PipelineError("User authority registry digest does not bind its exact checkpoint")
+        receipt_path = resolve_project_file(root, record["receipt_path"], "User authority receipt")
+        if file_sha256(receipt_path) != record["receipt_sha256"]:
+            raise PipelineError("User authority receipt bytes drifted outside the controller")
+        receipt = read_json(receipt_path)
+        if receipt != {
+            "schema": 1,
+            "authority_id": authority_id,
+            "approval_reference": record["approval_reference"],
+            "statement": record["statement"],
+            "sha256": record["sha256"],
+            "recorded_at": record["recorded_at"],
+        }:
+            raise PipelineError("User authority receipt does not match its immutable registry record")
+
+
+def empty_documentation_state() -> dict[str, Any]:
+    return {
+        "normative": {
+            "status": "pending",
+            "product_revision": None,
+            "paths": [],
+            "decision_ids": [],
+            "report_path": None,
+            "report_sha256": None,
+        },
+        "derived": {
+            "status": "pending",
+            "support_revision": None,
+            "paths": [],
+            "source_evidence_ids": [],
+            "report_path": None,
+            "report_sha256": None,
+            "closure_review_id": "pending",
+        },
+    }
+
+
+def empty_coverage_scope() -> dict[str, Any]:
+    return {
+        "planned_manifest": None,
+        "finalized_manifest": None,
+        "state": {
+            "status": "pending",
+            "ac_mapped": False,
+            "identities_registered": "pending",
+            "mandatory_registration": "pending",
+            "automated": "pending",
+            "manual": "pending",
+            "implementation_eligible": False,
+            "feature_verification_eligible": False,
+            "readiness_class": None,
+            "gaps": [],
+        },
+    }
+
+
+def revision_records(root: Path, paths: list[str], label: str) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for relative in sorted(paths):
+        path = (root / relative).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise PipelineError(f"{label} inventory escapes the project root: {relative}") from exc
+        if not path.is_file():
+            raise PipelineError(f"{label} inventory path is missing: {relative}")
+        records.append({"path": relative, "sha256": file_sha256(path)})
+    return records
+
+
+def compute_inventory_revisions(root: Path, state: dict[str, Any]) -> dict[str, Any]:
+    inventory = state.get("revision_inventory")
+    if not isinstance(inventory, dict):
+        raise PipelineError("Schema 9 state lacks the controller revision inventory")
+    assigned: set[str] = set()
+    domains: dict[str, list[dict[str, str]]] = {}
+    for domain in ("product", "support", "evidence"):
+        values = inventory.get(domain)
+        if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+            raise PipelineError(f"revision_inventory.{domain} must be a path list")
+        duplicate = assigned.intersection(values)
+        if duplicate:
+            raise PipelineError(
+                "Revision inventory assigns paths to multiple domains: "
+                + ", ".join(sorted(duplicate))
+            )
+        assigned.update(values)
+        domains[domain] = revision_records(root, values, domain)
+    base = state["revision_base_revision"]
+    product_revision = revision_for_domain(base, domains["product"])
+    support_revision = revision_for_domain(base, domains["support"])
+    evidence_revision = revision_for_domain(base, domains["evidence"])
+    revision = hashlib.sha256(
+        (
+            f"product:{product_revision}\n"
+            f"support:{support_revision}\n"
+            f"evidence:{evidence_revision}\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "revision": revision,
+        "product_revision": product_revision,
+        "support_revision": support_revision,
+        "evidence_revision": evidence_revision,
+        "records": domains,
+    }
+
+
+def checkout_snapshot(root: Path, feature: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    ignored_tests = f"tests/{feature}/"
+    for directory, directories, files in os.walk(root):
+        directory_path = Path(directory)
+        relative_dir = directory_path.relative_to(root).as_posix()
+        directories[:] = [
+            name
+            for name in directories
+            if name not in {".git", STATE_DIR, "__pycache__"}
+            and not (
+                (relative_dir + "/" + name).lstrip("./") == f"tests/{feature}"
+                or (relative_dir + "/" + name).lstrip("./").startswith(ignored_tests)
+            )
+        ]
+        for name in files:
+            path = directory_path / name
+            relative = path.relative_to(root).as_posix()
+            if relative.startswith(ignored_tests) or relative.endswith((".pyc", ".tmp")):
+                continue
+            result[relative] = file_sha256(path)
+    return result
+
+
+def changed_checkout_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    return sorted(
+        path
+        for path in set(before) | set(after)
+        if before.get(path) != after.get(path)
+    )
+
+
+def checkout_text_snapshot(root: Path, feature: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for relative in checkout_snapshot(root, feature):
+        path = root / relative
+        try:
+            result[relative] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            result[relative] = ""
+    return result
+
+
+def changed_line_count(before: str, after: str) -> int:
+    count = 0
+    for tag, before_start, before_end, after_start, after_end in difflib.SequenceMatcher(
+        a=before.splitlines(), b=after.splitlines(), autojunk=False
+    ).get_opcodes():
+        if tag != "equal":
+            count += (before_end - before_start) + (after_end - after_start)
+    return count
+
+
+def validate_schema9_runtime(state: dict[str, Any], findings: dict[str, Any]) -> None:
+    required = {
+        "implementation_state",
+        "feature_verification_state",
+        "active_write_lease",
+        "write_lease_history",
+        "decision_ledger",
+        "coverage",
+        "documentation",
+        "context_capsules",
+        "handoffs",
+        "lease_snapshots",
+        "revision_inventory",
+        "revision_base_revision",
+        "plan_contracts",
+        "user_authorities",
+    }
+    missing = sorted(required - set(state))
+    if missing:
+        raise PipelineError(
+            "Schema 9 state is incomplete and cannot be inferred; reinitialize explicitly: "
+            + ", ".join(missing)
+        )
+    if not isinstance(state["write_lease_history"], list) or not isinstance(
+        state["context_capsules"], list
+    ) or not isinstance(state["handoffs"], list):
+        raise PipelineError("Schema 9 append-only histories must be arrays")
+    if state["active_write_lease"] is not None and not isinstance(
+        state["active_write_lease"], dict
+    ):
+        raise PipelineError("active_write_lease must be null or a schema-1 lease")
+    if findings.get("schema_version") != SCHEMA_VERSION:
+        raise PipelineError("Schema-8 findings require explicit pipeline reinitialization")
 
 
 def empty_scope_churn() -> dict[str, Any]:
@@ -764,15 +1242,68 @@ def normalize_runtime(state: dict[str, Any], findings: dict[str, Any]) -> None:
     state.setdefault("finding_triage", None)
 
 
-def load_runtime(project_root: str) -> tuple[Path, Path, Path, dict[str, Any], dict[str, Any]]:
+def require_revision_inventory_current(root: Path, state: dict[str, Any]) -> None:
+    computed = compute_inventory_revisions(root, state)
+    stale = [
+        key
+        for key in ("revision", "product_revision", "support_revision", "evidence_revision")
+        if computed[key] != state.get(key)
+    ]
+    if stale:
+        raise PipelineError(
+            "Controller revision inventory drifted outside an active writer completion: "
+            + ", ".join(stale)
+        )
+
+
+def load_runtime(
+    project_root: str,
+    *,
+    allow_active_writer_completion_drift: bool = False,
+) -> tuple[Path, Path, Path, dict[str, Any], dict[str, Any]]:
     root, state_path, findings_path = runtime_paths(project_root)
     state = read_json(state_path)
     findings = read_json(findings_path)
     if state.get("schema_version") != SCHEMA_VERSION or findings.get("schema_version") != SCHEMA_VERSION:
-        raise PipelineError("Unsupported pipeline state; reinitialize it for the Review workflow")
+        raise PipelineError(
+            "Unsupported pre-v9 pipeline state; schema 8 and earlier must be reinitialized "
+            "explicitly because leases, decisions, coverage, documentation, capsules, and "
+            "handoffs cannot be inferred safely"
+        )
     if state.get("contract_version") != CONTRACT_VERSION:
         raise PipelineError("Pipeline contract changed after initialization; reinitialize explicitly")
+    validate_schema9_runtime(state, findings)
+    ledger = state["decision_ledger"]
+    ledger_path = (root / ledger["path"]).resolve()
+    entries, _ = read_decision_ledger(ledger_path)
+    if decision_ledger_state(ledger_path, ledger["path"]) != ledger:
+        raise PipelineError(
+            "Decision ledger bytes/history drifted outside the controller; reinitialize or "
+            "record a controller-authorized append"
+        )
     normalize_runtime(state, findings)
+    validate_user_authority_registry(root, state)
+    for entry in entries:
+        authority = entry.get("authority")
+        if not isinstance(authority, dict) or set(authority) != {
+            "kind",
+            "reference",
+            "path",
+            "sha256",
+            "section_or_id",
+        }:
+            raise PipelineError(
+                f"Decision ledger entry {entry.get('decision_id')} has malformed authority"
+            )
+        validate_decision_authority(root, state, authority, entry["statement"], None)
+    if allow_active_writer_completion_drift:
+        lease = state.get("active_write_lease")
+        if not isinstance(lease, dict) or lease.get("status") != "active":
+            raise PipelineError(
+                "Revision-drift bypass is valid only inside an exact active writer completion"
+            )
+    else:
+        require_revision_inventory_current(root, state)
     return root, state_path, findings_path, state, findings
 
 
@@ -1191,6 +1722,19 @@ def review_credit_id(
     return "RC-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16].upper()
 
 
+def exact_inventory_digest(root: Path, paths: list[str], label: str) -> str:
+    if not paths:
+        raise PipelineError(f"{label} must name at least one repository file")
+    normalized = [scope_path(item, label) for item in paths]
+    if len(normalized) != len(set(normalized)):
+        raise PipelineError(f"{label} repeats a path")
+    rows: list[str] = []
+    for relative in sorted(normalized):
+        path = resolve_project_file(root, relative, label)
+        rows.append(f"{relative}\0{file_sha256(path)}\n")
+    return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
+
+
 def resolve_review_credit_manifest(
     root: Path,
     state: dict[str, Any],
@@ -1230,16 +1774,52 @@ def resolve_review_credit_manifest(
     planned: list[dict[str, Any]] = []
     ids: list[str] = []
     seen_keys: set[tuple[str, str, str, tuple[str, ...]]] = set()
+    represented_product_paths: set[str] = set()
     for item in components:
-        if not isinstance(item, dict):
-            raise PipelineError("Every component Review credit must be an object")
+        if not isinstance(item, dict) or set(item) != {
+            "component",
+            "product_paths",
+            "contract_paths",
+            "product_hash",
+            "contract_hash",
+            "lenses",
+            "mode",
+            "source_credit_id",
+        }:
+            raise PipelineError(
+                "Every component Review credit must use the exact inventory-backed fields"
+            )
         component = str(item.get("component", "")).strip()
         product_hash = str(item.get("product_hash", "")).strip()
         contract_hash = str(item.get("contract_hash", "")).strip()
+        product_paths = require_string_list(
+            item.get("product_paths"),
+            f"Component {component or '<unknown>'} product_paths",
+            allow_empty=False,
+        )
+        contract_paths = require_string_list(
+            item.get("contract_paths"),
+            f"Component {component or '<unknown>'} contract_paths",
+            allow_empty=False,
+        )
+        normalized_product_paths = [scope_path(path, "Component product path") for path in product_paths]
+        normalized_contract_paths = [scope_path(path, "Component contract path") for path in contract_paths]
+        current_inventory = set(state["revision_inventory"]["product"])
+        if not set(normalized_product_paths).issubset(current_inventory) or not set(
+            normalized_contract_paths
+        ).issubset(current_inventory):
+            raise PipelineError("Component Review paths must come from current product inventory")
+        if product_hash != exact_inventory_digest(root, normalized_product_paths, "Component product inventory"):
+            raise PipelineError(f"Component Review product_hash is stale for {component}")
+        if contract_hash != exact_inventory_digest(root, normalized_contract_paths, "Component contract inventory"):
+            raise PipelineError(f"Component Review contract_hash is stale for {component}")
+        represented_product_paths.update(normalized_product_paths)
         lenses = require_string_list(
             item.get("lenses"), "Component Review credit lenses", allow_empty=False
         )
         lenses = sorted(set(lenses))
+        if any(lens not in CONVERGENCE_LENSES for lens in lenses):
+            raise PipelineError(f"Component Review credit has an unsupported lens: {component}")
         if not component or not product_hash or not contract_hash:
             raise PipelineError(
                 "Component Review credit requires component, product_hash, and contract_hash"
@@ -1291,6 +1871,8 @@ def resolve_review_credit_manifest(
                 "component": component,
                 "product_hash": product_hash,
                 "contract_hash": contract_hash,
+                "product_paths": sorted(normalized_product_paths),
+                "contract_paths": sorted(normalized_contract_paths),
                 "lenses": lenses,
                 "review_revision": state["revision"],
                 "reviewer_id": reviewer_id,
@@ -1302,6 +1884,15 @@ def resolve_review_credit_manifest(
             }
         )
         ids.append(credit_id)
+    if represented_product_paths != set(state["revision_inventory"]["product"]):
+        missing = sorted(set(state["revision_inventory"]["product"]) - represented_product_paths)
+        extra = sorted(represented_product_paths - set(state["revision_inventory"]["product"]))
+        raise PipelineError(
+            "Component Review manifest must cover exact current product inventory; missing="
+            + ",".join(missing)
+            + " extra="
+            + ",".join(extra)
+        )
     for new_credit in planned:
         for old_credit in existing:
             if (
@@ -1503,47 +2094,610 @@ def resolve_coverage_manifest(
 ) -> str:
     manifest_path = resolve_report(root, state, supplied, "Coverage manifest")
     manifest = read_json(Path(manifest_path))
-    if manifest.get("schema_version") != 1:
-        raise PipelineError("Coverage manifest must use schema_version 1")
-    if manifest.get("product_revision") != product_revision:
-        raise PipelineError("Coverage manifest product_revision does not match the pass")
-    if manifest.get("support_revision") != support_revision:
-        raise PipelineError("Coverage manifest support_revision does not match the pass")
-    if manifest.get("evidence_revision") != evidence_revision:
-        raise PipelineError("Coverage manifest evidence_revision does not match the pass")
-    entries = manifest.get("entries")
-    if not isinstance(entries, list) or not entries:
-        raise PipelineError("Coverage manifest must contain at least one requirement entry")
-    seen: set[str] = set()
-    for entry in entries:
-        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
-            raise PipelineError("Every coverage entry must have a string id")
-        entry_id = entry["id"]
-        if entry_id in seen:
-            raise PipelineError(f"Duplicate coverage entry: {entry_id}")
-        seen.add(entry_id)
-        status = entry.get("status")
-        if status not in {"covered", "finding", "not_applicable"}:
-            raise PipelineError(f"Coverage entry {entry_id} has invalid status")
-        if status == "covered":
-            if not entry.get("implementation_evidence"):
-                raise PipelineError(
-                    f"Covered entry {entry_id} must record implementation_evidence"
-                )
-            tests = entry.get("tests")
-            if not isinstance(tests, list) or not tests:
-                raise PipelineError(f"Covered entry {entry_id} must record exact tests")
-            for test in tests:
-                required = {"file", "suite", "symbol", "assertions", "execution", "evidence"}
-                if not isinstance(test, dict) or any(not test.get(field) for field in required):
-                    raise PipelineError(
-                        f"Coverage entry {entry_id} has an incomplete exact-test record"
-                    )
-        elif status == "finding" and not entry.get("finding_ids"):
-            raise PipelineError(f"Finding entry {entry_id} must record finding_ids")
-        elif status == "not_applicable" and not entry.get("reason"):
-            raise PipelineError(f"Not-applicable entry {entry_id} must record a reason")
+    validate_coverage_manifest(
+        root,
+        state,
+        manifest,
+        expected_product_revision=product_revision,
+        expected_support_revision=support_revision,
+        expected_evidence_revision=evidence_revision,
+        require_finalized=True,
+    )
     return manifest_path
+
+
+def validate_identity_coordinates(identity: dict[str, Any], label: str) -> None:
+    required = {
+        "identity_id",
+        "kind",
+        "mandatory",
+        "slice_id",
+        "requirement_ids",
+        "acceptance_ids",
+        "coordinates",
+        "planned_assertion_or_observation",
+        "capability_prerequisites",
+    }
+    if not isinstance(identity, dict) or set(identity) != required:
+        raise PipelineError(f"{label} must use the exact schema-2 identity fields")
+    if not isinstance(identity["identity_id"], str) or not identity["identity_id"]:
+        raise PipelineError(f"{label} identity_id is required")
+    if identity["kind"] not in {"automated", "manual"} or not isinstance(
+        identity["mandatory"], bool
+    ):
+        raise PipelineError(f"{label} kind/mandatory is invalid")
+    for field in ("requirement_ids", "acceptance_ids", "capability_prerequisites"):
+        require_string_list(identity[field], f"{label} {field}")
+    coordinates = identity["coordinates"]
+    if not isinstance(coordinates, dict):
+        raise PipelineError(f"{label} coordinates must be an object")
+    required_coordinates = (
+        {"file", "suite", "symbol", "case"}
+        if identity["kind"] == "automated"
+        else {"scenario_id", "topology", "setup", "action", "observation", "evidence_kind"}
+    )
+    if set(coordinates) != required_coordinates or any(
+        not isinstance(coordinates[field], str) or not coordinates[field].strip()
+        for field in required_coordinates
+    ):
+        raise PipelineError(f"{label} has incomplete exact coordinates")
+    if not isinstance(identity["planned_assertion_or_observation"], str) or not identity[
+        "planned_assertion_or_observation"
+    ].strip():
+        raise PipelineError(f"{label} planned assertion/observation is required")
+
+
+def coverage_plan_body_digest(manifest: dict[str, Any]) -> str:
+    return canonical_json_sha256(
+        {
+            "ac_mappings": manifest["ac_mappings"],
+            "expected_identities": manifest["expected_identities"],
+            "mandatory_expected_identity_ids": manifest[
+                "mandatory_expected_identity_ids"
+            ],
+        }
+    )
+
+
+def coverage_semantic_projection(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    mappings = {
+        item["acceptance_id"]: item
+        for item in manifest.get("ac_mappings", [])
+        if isinstance(item, dict) and isinstance(item.get("acceptance_id"), str)
+    }
+    identities = {
+        item["identity_id"]: item
+        for item in manifest.get("expected_identities", [])
+        if isinstance(item, dict) and isinstance(item.get("identity_id"), str)
+    }
+    mandatory = set(manifest.get("mandatory_expected_identity_ids", []))
+    acceptance_ids = set(mappings)
+    for identity in identities.values():
+        acceptance_ids.update(identity.get("acceptance_ids", []))
+    projection: dict[str, dict[str, Any]] = {}
+    for acceptance_id in acceptance_ids:
+        mapping = mappings.get(acceptance_id)
+        related_ids = {
+            identity_id
+            for identity_id, identity in identities.items()
+            if acceptance_id in identity.get("acceptance_ids", [])
+            or (mapping and identity_id in mapping.get("identity_ids", []))
+        }
+        projection[acceptance_id] = {
+            "mapping": mapping,
+            "expected_identities": [identities[item] for item in sorted(related_ids)],
+            "mandatory_expected_identity_ids": sorted(related_ids.intersection(mandatory)),
+        }
+    return projection
+
+
+def validate_coverage_amendment_authority(
+    state: dict[str, Any], authority_id: str, affected: set[str], *, appended: bool
+) -> None:
+    root = Path(state["project_root"])
+    ledger_entries, _ = read_decision_ledger(root / state["decision_ledger"]["path"])
+    decisions = {entry["decision_id"]: entry for entry in ledger_entries}
+    decision = decisions.get(authority_id)
+    if decision is not None:
+        if appended and authority_id not in state["decision_ledger"]["active_decision_ids"]:
+            raise PipelineError("New coverage amendment requires an active accepted decision")
+        if not affected.issubset(set(decision["scope_ids"])):
+            raise PipelineError(
+                "Coverage amendment decision must explicitly scope every affected acceptance ID"
+            )
+        return
+
+    findings = read_json(root / STATE_DIR / "findings.json")
+    finding = next(
+        (item for item in findings.get("items", []) if item.get("id") == authority_id), None
+    )
+    if finding is not None:
+        normalized_fields = {
+            "id", "source", "finding_kind", "severity", "scope_relation",
+            "introduced_by_candidate", "production_reachability",
+            "blocks_acceptance_ids", "violates_required_invariant",
+            "required_invariant_evidence", "mandatory_core_acceptance_evidence_missing",
+            "test_can_miss_product_defect", "deferred_reference", "title", "evidence",
+            "revision", "origin_slice", "remediation_route", "status", "created_at",
+            "resolved_revision", "blocking",
+        }
+        if not normalized_fields.issubset(finding):
+            raise PipelineError("Coverage amendment finding authority is not normalized")
+        normalized = dict(finding)
+        recorded_blocking = normalized.get("blocking")
+        validate_finding_dimensions(state, normalized)
+        if normalized.get("blocking") != recorded_blocking:
+            raise PipelineError("Coverage amendment finding classification is stale")
+        if not affected.issubset(set(finding.get("blocks_acceptance_ids", []))):
+            raise PipelineError(
+                "Coverage amendment finding must block every affected acceptance ID"
+            )
+        return
+
+    for event in state.get("scope_guard", {}).get("rebaseline_history", []):
+        if authority_id not in {
+            event.get("user_scope_approval"),
+            event.get("approved_plan_sha256"),
+        }:
+            continue
+        slice_item = state.get("slices", {}).get(event.get("slice_id"), {})
+        approved_acceptance = set(
+            (slice_item.get("scope_contract") or {}).get("acceptance_ids", [])
+        )
+        if not affected.issubset(approved_acceptance):
+            raise PipelineError(
+                "Coverage amendment rebaseline authority does not cover every affected acceptance ID"
+            )
+        return
+    raise PipelineError("Coverage amendment authority is not controller-registered")
+
+
+def validate_coverage_continuity(
+    state: dict[str, Any],
+    planned: dict[str, Any],
+    finalized: dict[str, Any],
+    *,
+    authorized_new_ids: set[str],
+) -> str:
+    planned_amendments = planned.get("amendments", [])
+    finalized_amendments = finalized.get("amendments", [])
+    if not isinstance(planned_amendments, list) or not isinstance(finalized_amendments, list):
+        raise PipelineError("Coverage amendments must be append-only lists")
+    if finalized_amendments[: len(planned_amendments)] != planned_amendments:
+        raise PipelineError("Coverage amendments must preserve the planned append-only prefix")
+    before = coverage_plan_body_digest(planned)
+    after = coverage_plan_body_digest(finalized)
+    appended = finalized_amendments[len(planned_amendments) :]
+    if before == after and appended:
+        raise PipelineError("Coverage amendment cannot be appended without a plan-body change")
+    if before != after and not appended:
+        raise PipelineError(
+            "Finalized coverage changed its planned body without an authorized append-only amendment"
+        )
+    exact = {
+        "amendment_id",
+        "authority_id",
+        "before_digest",
+        "after_digest",
+        "affected_acceptance_ids",
+        "reason",
+    }
+    seen_amendment_ids: set[str] = set()
+    previous_prefix_after: str | None = None
+    for amendment_index, item in enumerate(finalized_amendments):
+        if not isinstance(item, dict) or set(item) != exact:
+            raise PipelineError("Coverage amendment must use the exact append-only schema")
+        if (
+            not re.fullmatch(r"COV-AMEND-[A-Za-z0-9-]+", str(item["amendment_id"]))
+            or item["amendment_id"] in seen_amendment_ids
+            or not re.fullmatch(r"[0-9a-f]{64}", str(item["before_digest"]))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(item["after_digest"]))
+            or not isinstance(item["reason"], str)
+            or not item["reason"].strip()
+        ):
+            raise PipelineError("Coverage amendment identity/hash chain is invalid")
+        seen_amendment_ids.add(item["amendment_id"])
+        if previous_prefix_after is not None and item["before_digest"] != previous_prefix_after:
+            raise PipelineError("Coverage amendment append-only hash chain is discontinuous")
+        affected = set(
+            require_string_list(
+                item["affected_acceptance_ids"],
+                "Coverage amendment affected_acceptance_ids",
+                allow_empty=False,
+            )
+        )
+        if len(affected) != len(item["affected_acceptance_ids"]):
+            raise PipelineError("Coverage amendment affected acceptance IDs must be distinct")
+        if not affected.issubset(planned_acceptance_ids(state)):
+            raise PipelineError("Coverage amendment names acceptance IDs outside the approved plan")
+        is_appended = amendment_index >= len(planned_amendments)
+        validate_coverage_amendment_authority(
+            state, item["authority_id"], affected, appended=is_appended
+        )
+        if is_appended and item["authority_id"] not in authorized_new_ids:
+            raise PipelineError(
+                "New coverage amendment authority must be assigned to the current Steward capsule"
+            )
+        previous_prefix_after = item["after_digest"]
+
+    if planned_amendments and planned_amendments[-1]["after_digest"] != before:
+        raise PipelineError("Planned coverage amendment prefix does not end at its body digest")
+
+    previous = before
+    affected_union: set[str] = set()
+    for item in appended:
+        if item["before_digest"] != previous:
+            raise PipelineError("Coverage amendment authority/hash chain is invalid")
+        affected = set(
+            require_string_list(
+                item["affected_acceptance_ids"],
+                "Coverage amendment affected_acceptance_ids",
+                allow_empty=False,
+            )
+        )
+        affected_union.update(affected)
+        previous = item["after_digest"]
+    if previous != after:
+        raise PipelineError("Coverage amendment chain does not end at the finalized plan body")
+    planned_projection = coverage_semantic_projection(planned)
+    finalized_projection = coverage_semantic_projection(finalized)
+    semantically_changed = {
+        acceptance_id
+        for acceptance_id in set(planned_projection).union(finalized_projection)
+        if planned_projection.get(acceptance_id) != finalized_projection.get(acceptance_id)
+    }
+    if affected_union != semantically_changed:
+        raise PipelineError(
+            "Coverage amendment affected_acceptance_ids must exactly equal the controller-derived "
+            "planned-to-final semantic AC change set"
+        )
+    return after
+
+
+def validate_coverage_manifest(
+    root: Path,
+    state: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    scope_id: str | None = None,
+    require_finalized: bool = False,
+    expected_product_revision: str | None = None,
+    expected_support_revision: str | None = None,
+    expected_evidence_revision: str | None = None,
+    expected_revision: str | None = None,
+) -> dict[str, Any]:
+    exact_fields = {
+        "schema",
+        "feature",
+        "slice_id",
+        "mode",
+        "authority",
+        "revisions",
+        "ac_mappings",
+        "expected_identities",
+        "actual_identities",
+        "mandatory_expected_identity_ids",
+        "mandatory_actual_identity_ids",
+        "automated_execution",
+        "manual_execution",
+        "amendments",
+        "gaps",
+        "summary",
+    }
+    if set(manifest) != exact_fields or manifest.get("schema") != 2:
+        raise PipelineError("Coverage manifest must use the exact schema 2 shape")
+    if manifest.get("feature") != state["feature"]:
+        raise PipelineError("Coverage manifest feature mismatch")
+    if manifest.get("mode") not in {"planned", "finalized", "qa_updated"}:
+        raise PipelineError("Coverage manifest mode is invalid")
+    if require_finalized and manifest.get("mode") not in {"finalized", "qa_updated"}:
+        raise PipelineError("A finalized schema-2 coverage manifest is required")
+    if scope_id and manifest.get("slice_id") != scope_id:
+        raise PipelineError("Coverage manifest scope identity mismatch")
+    authority = manifest.get("authority")
+    if not isinstance(authority, dict) or set(authority) != {
+        "plan_path",
+        "plan_sha256",
+        "prd_path",
+        "prd_sha256",
+        "spec_path",
+        "spec_sha256",
+    }:
+        raise PipelineError("Coverage authority must use exact plan/PRD/spec path and SHA fields")
+    expected_authority = {
+        "plan_path": Path(state["development_plan_path"]).resolve().relative_to(root).as_posix(),
+        "plan_sha256": state["development_plan_sha256"],
+        "prd_path": Path(state["requirements_path"]).resolve().relative_to(root).as_posix(),
+        "prd_sha256": state["requirements_sha256"],
+        "spec_path": Path(state["spec_path"]).resolve().relative_to(root).as_posix(),
+        "spec_sha256": state["spec_sha256"],
+    }
+    if authority != expected_authority:
+        raise PipelineError("Coverage manifest authority is stale or points elsewhere")
+    revisions = manifest.get("revisions")
+    if not isinstance(revisions, dict) or set(revisions) != {
+        "revision",
+        "product_revision",
+        "support_revision",
+        "evidence_revision",
+    }:
+        raise PipelineError("Coverage revisions must use all four exact identities")
+    expected = {
+        "revision": expected_revision or state["revision"],
+        "product_revision": expected_product_revision or state["product_revision"],
+        "support_revision": expected_support_revision or state["support_revision"],
+        "evidence_revision": expected_evidence_revision or state["evidence_revision"],
+    }
+    if revisions != expected:
+        raise PipelineError("Coverage manifest revision identities do not match current state")
+    assigned_acceptance = (
+        planned_acceptance_ids(state)
+        if manifest["slice_id"] == "feature"
+        else set(
+            (state.get("slices", {}).get(manifest["slice_id"], {}).get("scope_contract") or {}).get(
+                "acceptance_ids", []
+            )
+        )
+    )
+    mappings = manifest.get("ac_mappings")
+    if not isinstance(mappings, list):
+        raise PipelineError("Coverage ac_mappings must be a list")
+    mapping_ids = [item.get("acceptance_id") for item in mappings if isinstance(item, dict)]
+    if len(mapping_ids) != len(mappings) or len(set(mapping_ids)) != len(mapping_ids):
+        raise PipelineError("Coverage acceptance mappings must be distinct")
+    if set(mapping_ids) != assigned_acceptance:
+        raise PipelineError("Coverage acceptance mappings must equal the approved scope set")
+    ledger_entries, _ = read_decision_ledger(root / state["decision_ledger"]["path"])
+    decisions = {item["decision_id"]: item for item in ledger_entries}
+    mapping_gaps: list[str] = []
+    for item in mappings:
+        if set(item) != {"acceptance_id", "status", "identity_ids", "authority_id"}:
+            raise PipelineError("Every acceptance mapping must use exact schema-2 fields")
+        ids = require_string_list(item["identity_ids"], "Coverage mapping identity_ids")
+        if item["status"] not in {"mapped", "gap", "not_applicable"}:
+            raise PipelineError("Coverage acceptance mapping status is invalid")
+        if item["status"] == "mapped" and not ids:
+            raise PipelineError("A mapped acceptance criterion requires an identity")
+        if item["status"] in {"mapped", "gap"} and item["authority_id"] is not None:
+            raise PipelineError("mapped/gap coverage must use authority_id=null")
+        if item["status"] == "not_applicable":
+            if ids:
+                raise PipelineError("not_applicable coverage must not register identity_ids")
+            if item["authority_id"] not in state["decision_ledger"]["active_decision_ids"]:
+                raise PipelineError("not_applicable coverage requires an active accepted decision")
+            if item["acceptance_id"] not in decisions[item["authority_id"]]["scope_ids"]:
+                raise PipelineError(
+                    "not_applicable decision authority must explicitly scope the concrete acceptance ID"
+                )
+        if item["status"] == "gap":
+            mapping_gaps.append(item["acceptance_id"])
+    identities: dict[str, dict[str, Any]] = {}
+    expected_identities: dict[str, dict[str, Any]] = {}
+    identity_sets: dict[str, list[str]] = {}
+    for group in ("expected_identities", "actual_identities"):
+        values = manifest.get(group)
+        if not isinstance(values, list):
+            raise PipelineError(f"Coverage {group} must be a list")
+        ids: list[str] = []
+        for index, identity in enumerate(values):
+            validate_identity_coordinates(identity, f"Coverage {group}[{index}]")
+            identity_id = identity["identity_id"]
+            if identity_id in ids:
+                raise PipelineError(f"Coverage {group} contains duplicate identity {identity_id}")
+            ids.append(identity_id)
+            if group == "actual_identities":
+                identities[identity_id] = identity
+            else:
+                expected_identities[identity_id] = identity
+            if manifest["slice_id"] == "feature":
+                if identity["slice_id"] not in state["ordered_slices"]:
+                    raise PipelineError("Feature coverage identity names an unknown owning slice")
+                owning_slice = state["slices"][identity["slice_id"]]
+            else:
+                if identity["slice_id"] != manifest["slice_id"]:
+                    raise PipelineError("Coverage identity slice_id must equal its manifest scope")
+                owning_slice = state["slices"].get(identity["slice_id"])
+            if not owning_slice:
+                raise PipelineError("Coverage identity names an unknown slice")
+            if not set(identity["requirement_ids"]).issubset(
+                set(owning_slice["requirement_ids"])
+            ) or not set(identity["acceptance_ids"]).issubset(
+                set(owning_slice["scope_contract"]["acceptance_ids"])
+            ):
+                raise PipelineError("Coverage identity coordinates map outside its approved slice")
+        identity_sets[group] = ids
+    expected_ids = set(identity_sets["expected_identities"])
+    actual_ids = set(identity_sets["actual_identities"])
+    for item in mappings:
+        if not set(item["identity_ids"]).issubset(expected_ids):
+            raise PipelineError("Acceptance mapping cites an unregistered expected identity")
+    mandatory_expected = require_string_list(
+        manifest.get("mandatory_expected_identity_ids"), "mandatory expected identities"
+    )
+    mandatory_actual = require_string_list(
+        manifest.get("mandatory_actual_identity_ids"), "mandatory actual identities"
+    )
+    if len(set(mandatory_expected)) != len(mandatory_expected) or len(set(mandatory_actual)) != len(
+        mandatory_actual
+    ):
+        raise PipelineError("Coverage mandatory identity sets reject duplicates")
+    explicit_expected = {
+        item["identity_id"] for item in manifest["expected_identities"] if item["mandatory"]
+    }
+    explicit_actual = {
+        item["identity_id"] for item in manifest["actual_identities"] if item["mandatory"]
+    }
+    mandatory_registration_ok = (
+        set(mandatory_expected) == explicit_expected
+        and set(mandatory_actual) == explicit_actual
+        and set(mandatory_expected) == set(mandatory_actual)
+    )
+    registration_ok = expected_ids == actual_ids
+    if registration_ok and any(
+        expected_identities[identity_id] != identities[identity_id]
+        for identity_id in expected_ids
+    ):
+        raise PipelineError("Expected and actual coverage identity bodies must match exactly")
+    mapping_by_acceptance = {item["acceptance_id"]: item for item in mappings}
+    for acceptance_id, mapping in mapping_by_acceptance.items():
+        for identity_id in mapping["identity_ids"]:
+            if acceptance_id not in expected_identities[identity_id]["acceptance_ids"]:
+                raise PipelineError("Coverage AC mapping is not reflected by its expected identity")
+    for identity_id, identity in expected_identities.items():
+        for acceptance_id in identity["acceptance_ids"]:
+            if identity_id not in mapping_by_acceptance[acceptance_id]["identity_ids"]:
+                raise PipelineError("Expected coverage identity is missing its reverse AC mapping")
+    automated_rows = manifest.get("automated_execution")
+    manual_rows = manifest.get("manual_execution")
+    if not isinstance(automated_rows, list) or not isinstance(manual_rows, list):
+        raise PipelineError("Coverage execution dimensions must be lists")
+    auto_by_id: dict[str, dict[str, Any]] = {}
+    for row in automated_rows:
+        if not isinstance(row, dict) or set(row) != {
+            "identity_id",
+            "executed",
+            "passed",
+            "command",
+            "evidence_path",
+            "evidence_sha256",
+        }:
+            raise PipelineError("Automated execution row has invalid schema")
+        identity_id = row["identity_id"]
+        if identity_id in auto_by_id or identities.get(identity_id, {}).get("kind") != "automated":
+            raise PipelineError("Automated execution must name each actual automated identity once")
+        if not isinstance(row["executed"], bool) or row["passed"] not in {True, False, None}:
+            raise PipelineError("Automated executed/passed dimensions are invalid")
+        if row["passed"] is True and row["executed"] is not True:
+            raise PipelineError("Automated passed=true requires executed=true")
+        if row["executed"] and (
+            not isinstance(row["command"], str)
+            or not row["command"].strip()
+            or not row["evidence_path"]
+            or not re.fullmatch(r"[0-9a-f]{64}", str(row["evidence_sha256"]))
+        ):
+            raise PipelineError(
+                "Executed automated identity requires a non-empty command and exact evidence path/SHA"
+            )
+        if row["evidence_path"]:
+            evidence_path = resolve_project_file(root, row["evidence_path"], "Automated evidence")
+            if file_sha256(evidence_path) != row["evidence_sha256"]:
+                raise PipelineError("Automated execution evidence SHA mismatch")
+        auto_by_id[identity_id] = row
+    manual_by_id: dict[str, dict[str, Any]] = {}
+    for row in manual_rows:
+        if not isinstance(row, dict) or set(row) != {
+            "identity_id",
+            "executed",
+            "passed",
+            "deferred",
+            "blocked_by_finding",
+            "qa_evidence",
+            "gate",
+            "minimum_resume_action",
+        }:
+            raise PipelineError("Manual execution row has invalid schema")
+        identity_id = row["identity_id"]
+        if identity_id in manual_by_id or identities.get(identity_id, {}).get("kind") != "manual":
+            raise PipelineError("Manual execution must name an actual manual identity")
+        if not isinstance(row["executed"], bool) or row["passed"] not in {True, False, None} or not isinstance(
+            row["deferred"], bool
+        ):
+            raise PipelineError("Manual executed/passed/deferred dimensions are invalid")
+        if row["passed"] is True and not row["executed"]:
+            raise PipelineError("Manual passed=true requires executed=true")
+        if row["deferred"]:
+            if row["executed"] or row["passed"] is not None or row["gate"] not in QA_GATE_STATUSES or not row[
+                "minimum_resume_action"
+            ]:
+                raise PipelineError("Deferred manual identity requires a gate and resume action")
+        if row["blocked_by_finding"] and row["deferred"]:
+            raise PipelineError("blocked_by_finding is not a deferred user/environment/test gate")
+        if row["executed"]:
+            evidence = row["qa_evidence"]
+            if not isinstance(evidence, dict) or set(evidence) != {"path", "sha256"}:
+                raise PipelineError(
+                    "Executed manual coverage identity requires immutable QA evidence path/SHA"
+                )
+            evidence_path = resolve_project_file(root, evidence["path"], "Manual QA evidence")
+            try:
+                evidence_path.relative_to(Path(state["tests_path"]).resolve())
+            except ValueError as exc:
+                raise PipelineError(
+                    "Manual QA evidence must stay under feature test artifacts"
+                ) from exc
+            if (
+                not re.fullmatch(r"[0-9a-f]{64}", str(evidence["sha256"]))
+                or file_sha256(evidence_path) != evidence["sha256"]
+            ):
+                raise PipelineError("Manual QA evidence SHA does not match immutable bytes")
+        elif row["qa_evidence"] is not None:
+            raise PipelineError("Unexecuted manual coverage identity cannot claim QA evidence")
+        manual_by_id[identity_id] = row
+    mandatory_auto = {
+        identity_id
+        for identity_id in mandatory_actual
+        if identities.get(identity_id, {}).get("kind") == "automated"
+    }
+    automated_ok = all(
+        auto_by_id.get(identity_id, {}).get("executed") is True
+        and auto_by_id.get(identity_id, {}).get("passed") is True
+        for identity_id in mandatory_auto
+    )
+    mandatory_manual = {
+        identity_id
+        for identity_id in mandatory_actual
+        if identities.get(identity_id, {}).get("kind") == "manual"
+    }
+    manual_ok = all(
+        manual_by_id.get(identity_id, {}).get("executed") is True
+        and manual_by_id.get(identity_id, {}).get("passed") is True
+        and manual_by_id.get(identity_id, {}).get("deferred") is False
+        and not manual_by_id.get(identity_id, {}).get("blocked_by_finding")
+        for identity_id in mandatory_manual
+    )
+    if manifest["mode"] == "planned":
+        automated_ok = False
+        manual_ok = False
+    declared_gaps = require_string_list(manifest.get("gaps"), "Coverage gaps")
+    all_mapped = not mapping_gaps and all(item["status"] != "gap" for item in mappings)
+    implementation_eligible = (
+        all_mapped
+        and registration_ok
+        and mandatory_registration_ok
+        and not declared_gaps
+        and automated_ok
+    )
+    feature_eligible = implementation_eligible and manual_ok
+    derived_summary = {
+        "ac_mapped": all_mapped,
+        "identities_registered": "complete" if registration_ok else "mismatch",
+        "expected_count": len(expected_ids),
+        "actual_count": len(actual_ids),
+        "mandatory_expected_count": len(mandatory_expected),
+        "mandatory_actual_count": len(mandatory_actual),
+        "automated": "passed" if automated_ok else "pending",
+        "manual": "passed" if manual_ok else (
+            "deferred" if any(row["deferred"] for row in manual_rows) else "pending"
+        ),
+        "implementation_eligible": implementation_eligible,
+        "feature_verification_eligible": feature_eligible,
+    }
+    if manifest.get("summary") != derived_summary:
+        raise PipelineError("Coverage summary does not match controller-derived dimensions")
+    return {
+        "summary": derived_summary,
+        "registration_ok": registration_ok,
+        "mandatory_registration_ok": mandatory_registration_ok,
+        "automated_ok": automated_ok,
+        "manual_ok": manual_ok,
+        "gaps": sorted(set(declared_gaps + mapping_gaps)),
+        "expected_ids": sorted(expected_ids),
+        "actual_ids": sorted(actual_ids),
+        "mandatory_expected_ids": sorted(mandatory_expected),
+        "mandatory_actual_ids": sorted(mandatory_actual),
+        "manual_by_id": manual_by_id,
+        "actual_identities": identities,
+    }
 
 
 def resolve_handoff_manifest(
@@ -2170,6 +3324,13 @@ def next_action(
             "base_revision": (active or {}).get("base_revision"),
             "required_bundle_count": "1-3",
         }
+    if phase == "slice_coverage_planning":
+        return {
+            "action": "run_pre_engineering_coverage_steward",
+            "owner": "technical_director",
+            "user_input_required": False,
+            "active_slice": state.get("active_slice"),
+        }
     if phase == "slice_engineering":
         return {
             "action": (
@@ -2181,6 +3342,37 @@ def next_action(
             "user_input_required": False,
             "engineering_owner_id": state.get("engineering_owner_id"),
             "active_slice": state.get("active_slice"),
+        }
+    if phase == "slice_coverage_finalization":
+        return {
+            "action": "run_slice_coverage_finalization",
+            "owner": "technical_director",
+            "user_input_required": False,
+            "active_slice": state.get("active_slice"),
+        }
+    if phase == "implementation_complete":
+        return {
+            "action": "finish_normative_documentation",
+            "owner": "technical_director",
+            "user_input_required": False,
+        }
+    if phase == "normative_documentation":
+        return {
+            "action": "complete_normative_documentation",
+            "owner": "technical_director",
+            "user_input_required": False,
+        }
+    if phase == "coverage_finalization":
+        return {
+            "action": "run_feature_coverage_finalization",
+            "owner": "technical_director",
+            "user_input_required": False,
+        }
+    if phase == "decision_recording":
+        return {
+            "action": "complete_accepted_decision_recording",
+            "owner": "technical_director",
+            "user_input_required": False,
         }
     if phase == "engineering":
         return {
@@ -2303,6 +3495,18 @@ def next_action(
             "owner": "user" if user_gate else "technical_director",
             "user_input_required": user_gate,
         }
+    if phase == "derived_documentation":
+        return {
+            "action": "finish_derived_post_qa_documentation",
+            "owner": "technical_director",
+            "user_input_required": False,
+        }
+    if phase == "documentation_review":
+        return {
+            "action": "run_documentation_closure_review",
+            "owner": "technical_director",
+            "user_input_required": False,
+        }
     if phase == "ready":
         open_minor = [
             item
@@ -2354,6 +3558,23 @@ def cmd_init(args: argparse.Namespace) -> int:
     plan = require_development_plan(
         root, feature, requirements, spec, args.plan, args.plan_sha256
     )
+    supplied_ledger = args.decision_ledger or plan["decision_ledger_path"]
+    supplied_ledger = scope_path(supplied_ledger, "decision ledger")
+    if supplied_ledger != plan["decision_ledger_path"]:
+        raise PipelineError(
+            "--decision-ledger must equal the exact path approved in development-plan.md"
+        )
+    ledger_path = (root / supplied_ledger).resolve()
+    try:
+        ledger_path.relative_to(root)
+    except ValueError as exc:
+        raise PipelineError("Decision ledger must stay inside the project root") from exc
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    if not ledger_path.exists():
+        temporary_ledger = ledger_path.with_suffix(ledger_path.suffix + ".tmp")
+        temporary_ledger.write_bytes(b"")
+        os.replace(temporary_ledger, ledger_path)
+    ledger_state = decision_ledger_state(ledger_path, supplied_ledger)
     if args.slice and args.slice not in {plan["slices"][0]["id"], "slice-1"}:
         raise PipelineError(
             "--slice is a compatibility alias and must identify the first approved plan slice"
@@ -2382,6 +3603,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         "development_plan_path": plan["path"],
         "development_plan_sha256": plan["sha256"],
         "development_mode": plan["mode"],
+        "plan_contracts": plan["contracts"],
         "ordered_slices": [item["id"] for item in plan["slices"]],
         "active_slice": plan["slices"][0]["id"],
         "slices": {
@@ -2414,10 +3636,46 @@ def cmd_init(args: argparse.Namespace) -> int:
         "spec_sha256": file_sha256(spec),
         "tests_path": str(tests_root),
         "phase": "preflight",
-        "revision": args.base_revision,
-        "product_revision": args.base_revision,
-        "support_revision": args.base_revision,
-        "evidence_revision": args.base_revision,
+        "revision_base_revision": args.base_revision,
+        "revision_inventory": {
+            "product": sorted(
+                {
+                    requirements.relative_to(root).as_posix(),
+                    spec.relative_to(root).as_posix(),
+                    Path(plan["path"]).resolve().relative_to(root).as_posix(),
+                    supplied_ledger,
+                }
+            ),
+            "support": [],
+            "evidence": [],
+        },
+        "revision": None,
+        "product_revision": None,
+        "support_revision": None,
+        "evidence_revision": None,
+        "implementation_state": {
+            "status": "pending",
+            "revision": None,
+            "coverage_manifest": None,
+        },
+        "feature_verification_state": {
+            "status": "pending",
+            "product_revision": None,
+            "support_revision": None,
+            "evidence_revision": None,
+        },
+        "active_write_lease": None,
+        "write_lease_history": [],
+        "lease_snapshots": {},
+        "decision_ledger": ledger_state,
+        "user_authorities": [],
+        "coverage": {
+            item["id"]: empty_coverage_scope() for item in plan["slices"]
+        },
+        "documentation": empty_documentation_state(),
+        "context_capsules": [],
+        "handoffs": [],
+        "decision_recording": None,
         "coverage_manifest": None,
         "last_engineer_run_id": None,
         "last_engineer_outcome": None,
@@ -2457,14 +3715,17 @@ def cmd_init(args: argparse.Namespace) -> int:
         "created_at": now,
         "updated_at": now,
     }
+    initial_revisions = compute_inventory_revisions(root, state)
+    for key in ("revision", "product_revision", "support_revision", "evidence_revision"):
+        state[key] = initial_revisions[key]
     findings = {"schema_version": SCHEMA_VERSION, "items": []}
     set_active_slice(
         state,
         plan["slices"][0]["id"],
-        base_revision=args.base_revision,
-        base_product_revision=args.base_revision,
-        base_support_revision=args.base_revision,
-        base_evidence_revision=args.base_revision,
+        base_revision=state["revision"],
+        base_product_revision=state["product_revision"],
+        base_support_revision=state["support_revision"],
+        base_evidence_revision=state["evidence_revision"],
     )
     write_json(state_path, state)
     write_json(findings_path, findings)
@@ -2569,6 +3830,17 @@ def cmd_status(args: argparse.Namespace) -> int:
         "product_revision": state["product_revision"],
         "support_revision": state["support_revision"],
         "evidence_revision": state["evidence_revision"],
+        "implementation_state": state["implementation_state"],
+        "feature_verification_state": state["feature_verification_state"],
+        "active_write_lease": state["active_write_lease"],
+        "write_lease_history": state["write_lease_history"],
+        "decision_ledger": state["decision_ledger"],
+        "user_authorities": state["user_authorities"],
+        "coverage": state["coverage"],
+        "documentation": state["documentation"],
+        "plan_contracts": state["plan_contracts"],
+        "context_capsules": state["context_capsules"],
+        "handoffs": state["handoffs"],
         "phase": state["phase"],
         "last_engineer_outcome": state["last_engineer_outcome"],
         "machine_checks": state["machine_checks"],
@@ -2591,6 +3863,462 @@ def cmd_status(args: argparse.Namespace) -> int:
         "next_action": next_action(state, findings),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def parse_capsule_reference(root: Path, value: str, label: str) -> dict[str, Any]:
+    if "=" not in value:
+        raise PipelineError(f"{label} must use path=sha256:ID,ID")
+    supplied_path, digest_and_ids = value.split("=", 1)
+    digest, separator, ids_text = digest_and_ids.partition(":")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise PipelineError(f"{label} must contain a lowercase SHA-256")
+    ids = [item.strip() for item in ids_text.split(",") if item.strip()] if separator else []
+    if len(ids) != len(set(ids)):
+        raise PipelineError(f"{label} contains duplicate IDs")
+    if supplied_path == "not_applicable":
+        if "authority" not in label.casefold() or not ids:
+            raise PipelineError(
+                "not_applicable is valid only for an ID-bound capsule authority digest"
+            )
+        return {"path": "not_applicable", "sha256": digest, "ids": ids}
+    path = resolve_project_file(root, supplied_path, label)
+    relative = path.relative_to(root).as_posix()
+    if file_sha256(path) != digest:
+        raise PipelineError(f"{label} SHA-256 does not match current bytes: {relative}")
+    if ids:
+        text_value = path.read_text(encoding="utf-8", errors="replace")
+        missing = [item for item in ids if item not in text_value]
+        if missing:
+            raise PipelineError(
+                f"{label} IDs are absent from {relative}: " + ", ".join(missing)
+            )
+    return {"path": relative, "sha256": digest, "ids": ids}
+
+
+def capsule_digest(value: dict[str, Any]) -> str:
+    payload = {key: item for key, item in value.items() if key != "capsule_sha256"}
+    return canonical_json_sha256(payload)
+
+
+def capsule_metrics(
+    value: dict[str, Any], root: Path
+) -> dict[str, int]:
+    payload = {
+        key: item
+        for key, item in value.items()
+        if key not in {"metrics", "capsule_sha256"}
+    }
+    referenced = {
+        item["path"]
+        for field in ("authority", "evidence")
+        for item in value[field]
+        if item["path"] != "not_applicable"
+    }
+    payload_bytes = len(
+        json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ) + sum((root / path).stat().st_size for path in referenced)
+    return {
+        "authority_files": len(
+            {item["path"] for item in value["authority"] if item["path"] != "not_applicable"}
+        ),
+        "evidence_files": len({item["path"] for item in value["evidence"]}),
+        "total_files": len(referenced),
+        "payload_bytes": payload_bytes,
+        "estimated_tokens": (payload_bytes + 3) // 4,
+    }
+
+
+def approved_capsule_budget(state: dict[str, Any], phase: str) -> dict[str, int]:
+    slice_scoped = {
+        "slice_research",
+        "slice_coverage_planning",
+        "slice_engineering",
+        "slice_coverage_finalization",
+    }
+    active_slice = state.get("active_slice")
+    if phase in slice_scoped and active_slice:
+        return dict(state["plan_contracts"]["slices"][active_slice]["context_budget"])
+    return dict(state["plan_contracts"]["context_budget"])
+
+
+def validate_capsule_value(
+    root: Path, state: dict[str, Any], value: dict[str, Any]
+) -> None:
+    required = {
+        "schema",
+        "capsule_id",
+        "role",
+        "phase",
+        "worker_id",
+        "plan_sha256",
+        "revisions",
+        "authority",
+        "decision_ids",
+        "finding_ids",
+        "coverage_identity_ids",
+        "evidence",
+        "allowed_paths",
+        "allowed_symbols",
+        "exclusions",
+        "commands",
+        "output_paths",
+        "stop_condition",
+        "budget",
+        "metrics",
+        "capsule_sha256",
+    }
+    if set(value) != required or value.get("schema") != 1:
+        raise PipelineError("Context capsule must use the exact schema-1 fields")
+    if value.get("role") not in CAPSULE_ROLES:
+        raise PipelineError("Context capsule role is invalid")
+    if not value.get("worker_id") or not value.get("phase") or not value.get("stop_condition"):
+        raise PipelineError("Context capsule worker, phase, and stop condition are required")
+    if value.get("plan_sha256") != state.get("development_plan_sha256"):
+        raise PipelineError("Context capsule approved-plan SHA is stale")
+    revisions = value.get("revisions")
+    expected_revisions = {
+        "revision": state.get("revision"),
+        "product_revision": state.get("product_revision"),
+        "support_revision": state.get("support_revision"),
+        "evidence_revision": state.get("evidence_revision"),
+    }
+    if revisions != expected_revisions:
+        raise PipelineError("Context capsule revision identities are stale")
+    for field in ("authority", "evidence"):
+        if not isinstance(value.get(field), list):
+            raise PipelineError(f"Context capsule {field} must be a list")
+        seen: set[str] = set()
+        for item in value[field]:
+            if not isinstance(item, dict) or set(item) != {"path", "sha256", "ids"}:
+                raise PipelineError(f"Context capsule {field} entry is malformed")
+            if item["path"] == "not_applicable":
+                if field != "authority" or not item["ids"] or not re.fullmatch(
+                    r"[0-9a-f]{64}", str(item["sha256"])
+                ):
+                    raise PipelineError("Capsule non-file authority digest is malformed")
+                if len(item["ids"]) != 1 or not any(
+                    record["authority_id"] == item["ids"][0]
+                    and record["sha256"] == item["sha256"]
+                    for record in state["user_authorities"]
+                ):
+                    raise PipelineError(
+                        "Capsule non-file authority must cite one prior controller-registered user authority"
+                    )
+            else:
+                path = resolve_project_file(root, item["path"], f"Capsule {field}")
+                if file_sha256(path) != item["sha256"]:
+                    raise PipelineError(f"Context capsule {field} reference is stale: {item['path']}")
+            if item["path"] in seen:
+                raise PipelineError(f"Context capsule repeats {field} path: {item['path']}")
+            seen.add(item["path"])
+    for field in (
+        "decision_ids",
+        "finding_ids",
+        "coverage_identity_ids",
+        "allowed_paths",
+        "allowed_symbols",
+        "exclusions",
+        "commands",
+        "output_paths",
+    ):
+        require_string_list(value.get(field), f"Context capsule {field}")
+    unknown_decisions = sorted(
+        set(value["decision_ids"]) - set(state["decision_ledger"]["active_decision_ids"])
+    )
+    if unknown_decisions:
+        raise PipelineError(
+            "Context capsule cites inactive decision IDs: " + ", ".join(unknown_decisions)
+        )
+    budget = value.get("budget")
+    if not isinstance(budget, dict) or set(budget) != set(CONTEXT_LIMIT_NAMES):
+        raise PipelineError("Context capsule budget must contain all five exact limits")
+    if any(not isinstance(budget[name], int) or budget[name] < 1 for name in CONTEXT_LIMIT_NAMES):
+        raise PipelineError("Every context capsule limit must be a positive integer")
+    if budget != approved_capsule_budget(state, value["phase"]):
+        raise PipelineError(
+            "Context capsule limits must exactly match the approved development-plan budget"
+        )
+    metrics = capsule_metrics(value, root)
+    if value.get("metrics") != metrics:
+        raise PipelineError("Context capsule metrics do not match controller calculation")
+    limits = {
+        "authority_files": budget["max_authority_files"],
+        "evidence_files": budget["max_evidence_files"],
+        "total_files": budget["max_total_files"],
+        "payload_bytes": budget["max_payload_bytes"],
+        "estimated_tokens": budget["max_estimated_tokens"],
+    }
+    exceeded = [name for name, actual in metrics.items() if actual > limits[name]]
+    if exceeded:
+        raise PipelineError("Context capsule exceeds approved limits: " + ", ".join(exceeded))
+    if value.get("capsule_sha256") != capsule_digest(value):
+        raise PipelineError("Context capsule digest is invalid")
+
+
+def resolve_validated_capsule(
+    root: Path,
+    state: dict[str, Any],
+    supplied: str,
+    *,
+    role: str | None = None,
+    worker_id: str | None = None,
+    phase: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    path = resolve_project_file(root, supplied, "Context capsule")
+    relative = path.relative_to(root).as_posix()
+    value = read_json(path)
+    validate_capsule_value(root, state, value)
+    if role and value["role"] != role:
+        raise PipelineError(f"Context capsule role must be {role}")
+    if worker_id and value["worker_id"] != worker_id:
+        raise PipelineError("Context capsule worker identity mismatch")
+    if phase and value["phase"] != phase:
+        raise PipelineError("Context capsule phase mismatch")
+    recorded = next(
+        (
+            item
+            for item in state["context_capsules"]
+            if item.get("capsule_id") == value["capsule_id"]
+        ),
+        None,
+    )
+    if (
+        not recorded
+        or recorded.get("path") != relative
+        or recorded.get("sha256") != file_sha256(path)
+        or recorded.get("capsule_sha256") != value["capsule_sha256"]
+    ):
+        raise PipelineError("Context capsule was not created and preserved by this controller")
+    return relative, value
+
+
+def cmd_context_capsule_create(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    require_sources_current(state)
+    require_current_revision(state, args.revision)
+    if args.role not in CAPSULE_ROLES:
+        raise PipelineError("Unsupported context capsule role")
+    supplied_budget = {name: getattr(args, name) for name in CONTEXT_LIMIT_NAMES}
+    if supplied_budget != approved_capsule_budget(state, args.phase):
+        raise PipelineError(
+            "Context capsule CLI limits cannot invent or override the approved plan budget"
+        )
+    authority = [
+        parse_capsule_reference(root, value, "Capsule authority")
+        for value in (args.authority or [])
+    ]
+    evidence = [
+        parse_capsule_reference(root, value, "Capsule evidence")
+        for value in (args.evidence or [])
+    ]
+    output_path, output_relative = resolve_project_output(root, args.output, "Capsule output")
+    for target in args.output_path or []:
+        resolve_project_output(root, target, "Capsule delegated output")
+    capsule_id = f"CAP-{len(state['context_capsules']) + 1:04d}"
+    value: dict[str, Any] = {
+        "schema": 1,
+        "capsule_id": capsule_id,
+        "role": args.role,
+        "phase": args.phase,
+        "worker_id": args.worker_id,
+        "plan_sha256": args.plan_sha256,
+        "revisions": {
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        },
+        "authority": authority,
+        "decision_ids": sorted(set(args.decision_id or [])),
+        "finding_ids": sorted(set(args.finding_id or [])),
+        "coverage_identity_ids": sorted(set(args.coverage_identity_id or [])),
+        "evidence": evidence,
+        "allowed_paths": [scope_path(item, "capsule allowed") for item in (args.allowed_path or [])],
+        "allowed_symbols": sorted(set(args.allowed_symbol or [])),
+        "exclusions": sorted(set(args.exclusion or [])),
+        "commands": list(args.command or []),
+        "output_paths": [
+            resolve_project_output(root, target, "Capsule delegated output")[1]
+            for target in (args.output_path or [])
+        ],
+        "stop_condition": args.stop_condition,
+        "budget": supplied_budget,
+        "metrics": {},
+        "capsule_sha256": "",
+    }
+    value["metrics"] = capsule_metrics(value, root)
+    value["capsule_sha256"] = capsule_digest(value)
+    validate_capsule_value(root, state, value)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(output_path, value)
+    state["context_capsules"].append(
+        {
+            "capsule_id": capsule_id,
+            "path": output_relative,
+            "sha256": file_sha256(output_path),
+            "capsule_sha256": value["capsule_sha256"],
+            "role": args.role,
+            "phase": args.phase,
+            "worker_id": args.worker_id,
+            "revision": state["revision"],
+            "metrics": value["metrics"],
+            "created_at": utc_now(),
+        }
+    )
+    save_runtime(state_path, findings_path, state, findings)
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_context_capsule_check(args: argparse.Namespace) -> int:
+    root, _, _, state, _ = load_runtime(args.project_root)
+    relative, value = resolve_validated_capsule(root, state, args.capsule)
+    print(
+        json.dumps(
+            {
+                "valid": True,
+                "path": relative,
+                "capsule_id": value["capsule_id"],
+                "metrics": value["metrics"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def release_active_lease(
+    state: dict[str, Any], *, result: str, reason: str
+) -> dict[str, Any]:
+    lease = state.get("active_write_lease")
+    if not lease:
+        raise PipelineError("No active write lease")
+    released = dict(lease)
+    released["status"] = "revoked" if result == "revoked" else "released"
+    released["result"] = result
+    released["reason"] = reason
+    released["released_at"] = utc_now()
+    state["write_lease_history"].append(released)
+    state["active_write_lease"] = None
+    state["lease_snapshots"].pop(lease["lease_id"], None)
+    return released
+
+
+def cmd_acquire_write_lease(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    require_sources_current(state)
+    if args.role not in WRITE_ROLES or args.phase not in LEASE_PHASES[args.role]:
+        raise PipelineError("Write lease role/phase combination is invalid")
+    if state.get("active_write_lease") is not None:
+        raise PipelineError("A write-capable lease is already active in this checkout")
+    current_phase = state["phase"]
+    if args.phase == "normative_documentation" and current_phase == "implementation_complete":
+        state["phase"] = "normative_documentation"
+    elif args.phase == "decision_recording":
+        safe_decision_boundaries = {
+            "preflight",
+            "slice_research",
+            "slice_coverage_planning",
+        }
+        if current_phase not in safe_decision_boundaries:
+            raise PipelineError(
+                "Decision recording is allowed only before implementation begins; late decisions require replan/reinitialization"
+            )
+        state["decision_recording"] = {"resume_phase": current_phase}
+        state["phase"] = "decision_recording"
+    elif current_phase != args.phase:
+        raise PipelineError(
+            f"Write lease phase {args.phase} does not match controller phase {current_phase}"
+        )
+    if args.role == "engineer" and args.phase == "slice_engineering":
+        active_scope = state["coverage"].get(state.get("active_slice"), {})
+        if not active_scope.get("planned_manifest"):
+            raise PipelineError("Engineer lease requires accepted schema-2 coverage planning")
+    capsule_path, capsule = resolve_validated_capsule(
+        root,
+        state,
+        args.capsule,
+        role=args.role,
+        worker_id=args.worker_id,
+        phase=args.phase,
+    )
+    if not args.write_scope.strip():
+        raise PipelineError("Write lease requires an exact non-empty write scope")
+    if not capsule["allowed_paths"]:
+        raise PipelineError("Write-capable context capsule requires a non-empty allowed_paths scope")
+    lease_id = f"LEASE-{len(state['write_lease_history']) + 1:04d}"
+    carried = state.get("scope_guard", {}).get("rebaseline_candidate")
+    if carried and (
+        args.role != "engineer"
+        or args.write_scope != carried["slice_id"]
+        or args.phase != state["phase"]
+    ):
+        raise PipelineError(
+            "A rebaselined candidate requires the next fresh lease for its exact Engineer scope"
+        )
+    lease = {
+        "lease_id": lease_id,
+        "phase": args.phase,
+        "write_scope": args.write_scope,
+        "role": args.role,
+        "worker_id": args.worker_id,
+        "base_revision": (
+            carried["base_revisions"]["revision"] if carried else state["revision"]
+        ),
+        "allowed_paths": capsule["allowed_paths"],
+        "allowed_symbols": capsule["allowed_symbols"],
+        "exclusions": capsule["exclusions"],
+        "status": "active",
+        "rebaseline_carried": bool(carried),
+    }
+    state["active_write_lease"] = lease
+    state["lease_snapshots"][lease_id] = {
+        "capsule_path": capsule_path,
+        "capsule_sha256": capsule["capsule_sha256"],
+        "checkout": (
+            carried["snapshot"]["checkout"]
+            if carried
+            else checkout_snapshot(root, state["feature"])
+        ),
+        "checkout_text": (
+            carried["snapshot"]["checkout_text"]
+            if carried
+            else checkout_text_snapshot(root, state["feature"])
+        ),
+        "rebaseline_carried": bool(carried),
+        "created_at": utc_now(),
+    }
+    save_runtime(state_path, findings_path, state, findings)
+    print(json.dumps(lease, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_release_write_lease(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    lease = state.get("active_write_lease")
+    if not lease or lease.get("lease_id") != args.lease_id:
+        raise PipelineError("release-write-lease does not match the active lease")
+    if args.result == "complete":
+        raise PipelineError(
+            "Successful role completion releases its lease atomically; explicit complete release is forbidden"
+        )
+    snapshot = state["lease_snapshots"].get(args.lease_id, {}).get("checkout", {})
+    changed = changed_checkout_paths(snapshot, checkout_snapshot(root, state["feature"]))
+    if changed:
+        raise PipelineError(
+            "Cannot release an incomplete/blocked/revoked pass with unaccepted checkout drift: "
+            + ", ".join(changed)
+        )
+    released = release_active_lease(state, result=args.result, reason=args.reason)
+    if lease["phase"] == "decision_recording" and state.get("decision_recording"):
+        state["phase"] = state["decision_recording"]["resume_phase"]
+        state["decision_recording"] = None
+    save_runtime(state_path, findings_path, state, findings)
+    print(json.dumps(released, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -2650,7 +4378,7 @@ def cmd_slice_research_complete(args: argparse.Namespace) -> int:
     active["owner_id"] = args.owner_id
     if state.get("integration_owner") is None:
         state["integration_owner"] = args.owner_id
-    state["phase"] = "slice_engineering"
+    state["phase"] = "slice_coverage_planning"
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
@@ -2711,6 +4439,22 @@ def cmd_qa_capability_probe(args: argparse.Namespace) -> int:
         "probe_id": args.probe_id,
         "revision": args.revision,
         "capabilities": capabilities,
+        "capability_dimensions": {
+            name: (
+                "authorization"
+                if status == "blocked_user"
+                else "environment"
+                if status == "blocked_environment"
+                else "operator"
+                if status == "planned_manual"
+                else "executed"
+                if status == "available"
+                else "not_required"
+                if status == "not_required"
+                else "test_execution"
+            )
+            for name, status in capabilities.items()
+        },
         "minimum_resume_actions": resume_actions,
         "report": report,
         "status": "blocked" if blocked else "ready",
@@ -2723,6 +4467,7 @@ def cmd_qa_capability_probe(args: argparse.Namespace) -> int:
             "revision": args.revision,
             "probe_id": args.probe_id,
             "capabilities": capabilities,
+            "capability_dimensions": probe["capability_dimensions"],
             "minimum_resume_actions": resume_actions,
             "report": report,
         }
@@ -2800,7 +4545,446 @@ def cmd_slice_research_not_required(args: argparse.Namespace) -> int:
     active["owner_id"] = args.owner_id
     if state.get("integration_owner") is None:
         state["integration_owner"] = args.owner_id
+    state["phase"] = "slice_coverage_planning"
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+def coverage_state_from_validation(
+    manifest_path: str, manifest: dict[str, Any], validation: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "status": "finalized" if manifest["mode"] in {"finalized", "qa_updated"} else "planned",
+        "manifest_path": manifest_path,
+        "manifest_sha256": file_sha256(Path(manifest_path)),
+        "ac_mapped": validation["summary"]["ac_mapped"],
+        "identities_registered": validation["summary"]["identities_registered"],
+        "mandatory_registration": (
+            "complete" if validation["mandatory_registration_ok"] else "mismatch"
+        ),
+        "automated": validation["summary"]["automated"],
+        "manual": validation["summary"]["manual"],
+        "implementation_eligible": validation["summary"]["implementation_eligible"],
+        "feature_verification_eligible": validation["summary"]["feature_verification_eligible"],
+        "readiness_class": (
+            None if validation["summary"]["implementation_eligible"] else "EVIDENCE_CONTRACT_VIOLATION"
+        ),
+        "gaps": validation["gaps"],
+        "expected_identity_ids": validation["expected_ids"],
+        "actual_identity_ids": validation["actual_ids"],
+        "mandatory_expected_identity_ids": validation["mandatory_expected_ids"],
+        "mandatory_actual_identity_ids": validation["mandatory_actual_ids"],
+    }
+
+
+def cmd_coverage_plan_complete(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    require_sources_current(state)
+    if state.get("phase") != "slice_coverage_planning":
+        raise PipelineError("coverage-plan-complete requires slice_coverage_planning")
+    if args.slice_id != state.get("active_slice"):
+        raise PipelineError("Coverage planning must target the active slice")
+    require_worker_budget(state, args.steward_id)
+    if args.steward_id in state["worker_budget"].get("worker_ids", []):
+        raise PipelineError("Coverage planning requires a fresh Steward identity")
+    _, capsule = resolve_validated_capsule(
+        root,
+        state,
+        args.capsule,
+        role="coverage_steward",
+        worker_id=args.steward_id,
+        phase="slice_coverage_planning",
+    )
+    report = resolve_report(root, state, args.report, "Coverage planning report")
+    manifest_path = resolve_report(root, state, args.coverage_manifest, "Coverage planned manifest")
+    manifest = read_json(Path(manifest_path))
+    if manifest.get("mode") != "planned":
+        raise PipelineError("coverage-plan-complete requires mode planned")
+    validation = validate_coverage_manifest(
+        root, state, manifest, scope_id=args.slice_id, require_finalized=False
+    )
+    scope = state["coverage"][args.slice_id]
+    scope["planned_manifest"] = {
+        "path": manifest_path,
+        "sha256": file_sha256(Path(manifest_path)),
+        "revision": state["revision"],
+        "plan_body_digest": coverage_plan_body_digest(manifest),
+        "amendments": list(manifest["amendments"]),
+        "report": report,
+        "steward_id": args.steward_id,
+    }
+    scope["state"] = coverage_state_from_validation(manifest_path, manifest, validation)
+    state["implementation_state"]["status"] = "in_progress"
     state["phase"] = "slice_engineering"
+    record_worker(state, "coverage_steward_planning", args.steward_id)
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+def generate_schema2_handoff(
+    root: Path,
+    state: dict[str, Any],
+    pending: dict[str, Any],
+    coverage_record: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    index = len(state["handoffs"]) + 1
+    handoff_id = f"HANDOFF-{index:04d}"
+    output = root / "tests" / state["feature"] / "verification" / "controller" / f"{handoff_id}.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    assumptions = pending.get("open_assumptions", [])
+    for item in assumptions:
+        if not isinstance(item, dict) or set(item) != {
+            "assumption_id",
+            "statement",
+            "owner",
+            "validation_point",
+            "impact_if_false",
+        } or any(not item[field] for field in item):
+            raise PipelineError("Semantic handoff open_assumptions must use the exact schema")
+    value: dict[str, Any] = {
+        "schema": 2,
+        "handoff_id": handoff_id,
+        "phase": pending["phase"],
+        "writer_role": pending["writer_role"],
+        "writer_id": pending["writer_id"],
+        "lease_id": pending["lease_id"],
+        "slice_id": pending["slice_id"],
+        "base_revisions": pending["base_revisions"],
+        "result_revisions": pending["result_revisions"],
+        "change_manifest_path": pending["change_manifest"],
+        "diff_summary_path": pending["diff_summary"],
+        "semantic_report_path": pending["semantic_report"],
+        "decision_ids": list(state["decision_ledger"]["active_decision_ids"]),
+        "coverage_state": {
+            "manifest_path": coverage_record["manifest_path"],
+            "manifest_sha256": coverage_record["manifest_sha256"],
+            "ac_mapped": coverage_record["ac_mapped"],
+            "identities_registered": coverage_record["identities_registered"],
+            "automated": coverage_record["automated"],
+            "manual": coverage_record["manual"],
+        },
+        "documentation_state": {
+            "normative": state["documentation"]["normative"]["status"],
+            "derived": state["documentation"]["derived"]["status"],
+        },
+        "open_assumptions": assumptions,
+        "generated_at": utc_now(),
+        "handoff_sha256": "",
+    }
+    value["handoff_sha256"] = canonical_json_sha256(
+        {key: item for key, item in value.items() if key != "handoff_sha256"}
+    )
+    write_json(output, value)
+    return output.relative_to(root).as_posix(), value
+
+
+def coverage_summary_for_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    expected = {item["identity_id"]: item for item in manifest["expected_identities"]}
+    actual = {item["identity_id"]: item for item in manifest["actual_identities"]}
+    mandatory_expected = set(manifest["mandatory_expected_identity_ids"])
+    mandatory_actual = set(manifest["mandatory_actual_identity_ids"])
+    auto = {item["identity_id"]: item for item in manifest["automated_execution"]}
+    manual = {item["identity_id"]: item for item in manifest["manual_execution"]}
+    automated_ok = all(
+        auto.get(identity_id, {}).get("executed") is True
+        and auto.get(identity_id, {}).get("passed") is True
+        for identity_id in mandatory_actual
+        if actual.get(identity_id, {}).get("kind") == "automated"
+    )
+    mandatory_manual = {
+        identity_id
+        for identity_id in mandatory_actual
+        if actual.get(identity_id, {}).get("kind") == "manual"
+    }
+    manual_ok = all(
+        manual.get(identity_id, {}).get("executed") is True
+        and manual.get(identity_id, {}).get("passed") is True
+        and manual.get(identity_id, {}).get("deferred") is False
+        and not manual.get(identity_id, {}).get("blocked_by_finding")
+        for identity_id in mandatory_manual
+    )
+    mapped = all(item["status"] != "gap" for item in manifest["ac_mappings"])
+    registration = set(expected) == set(actual) and all(
+        expected[key] == actual[key] for key in expected.keys() & actual.keys()
+    )
+    mandatory_registration = (
+        mandatory_expected == mandatory_actual
+        == {key for key, item in actual.items() if item["mandatory"]}
+        == {key for key, item in expected.items() if item["mandatory"]}
+    )
+    implementation = (
+        mapped
+        and registration
+        and mandatory_registration
+        and not manifest["gaps"]
+        and automated_ok
+    )
+    return {
+        "ac_mapped": mapped,
+        "identities_registered": "complete" if registration else "mismatch",
+        "expected_count": len(expected),
+        "actual_count": len(actual),
+        "mandatory_expected_count": len(mandatory_expected),
+        "mandatory_actual_count": len(mandatory_actual),
+        "automated": "passed" if automated_ok else "pending",
+        "manual": "passed" if manual_ok else (
+            "deferred" if any(item["deferred"] for item in manual.values()) else "pending"
+        ),
+        "implementation_eligible": implementation,
+        "feature_verification_eligible": implementation and manual_ok,
+    }
+
+
+def write_feature_coverage_aggregate(
+    root: Path,
+    state: dict[str, Any],
+    *,
+    mode: str = "finalized",
+    manual_execution: list[dict[str, Any]] | None = None,
+    suffix: str = "finalized",
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    manifests: list[dict[str, Any]] = []
+    feature_record = state.get("coverage", {}).get("feature", {}).get("finalized_manifest")
+    if mode == "qa_updated" and feature_record:
+        path = Path(feature_record["path"])
+        if not path.is_file() or file_sha256(path) != feature_record["sha256"]:
+            raise PipelineError("Finalized feature coverage drifted before QA aggregation")
+        manifests.append(read_json(path))
+    else:
+        for scope_id in state["ordered_slices"]:
+            record = state["coverage"][scope_id].get("finalized_manifest")
+            if not record:
+                raise PipelineError(f"Feature coverage aggregate lacks finalized scope {scope_id}")
+            path = Path(record["path"])
+            if not path.is_file() or file_sha256(path) != record["sha256"]:
+                raise PipelineError(f"Finalized slice coverage drifted for {scope_id}")
+            manifests.append(read_json(path))
+    merged: dict[str, list[Any]] = {
+        key: []
+        for key in (
+            "ac_mappings",
+            "expected_identities",
+            "actual_identities",
+            "mandatory_expected_identity_ids",
+            "mandatory_actual_identity_ids",
+            "automated_execution",
+            "manual_execution",
+            "amendments",
+            "gaps",
+        )
+    }
+    for manifest in manifests:
+        for key in merged:
+            merged[key].extend(manifest[key])
+    if manual_execution is not None:
+        merged["manual_execution"] = manual_execution
+    value = {
+        "schema": 2,
+        "feature": state["feature"],
+        "slice_id": "feature",
+        "mode": mode,
+        "authority": {
+            "plan_path": Path(state["development_plan_path"])
+            .resolve()
+            .relative_to(root)
+            .as_posix(),
+            "plan_sha256": state["development_plan_sha256"],
+            "prd_path": Path(state["requirements_path"]).resolve().relative_to(root).as_posix(),
+            "prd_sha256": state["requirements_sha256"],
+            "spec_path": Path(state["spec_path"]).resolve().relative_to(root).as_posix(),
+            "spec_sha256": state["spec_sha256"],
+        },
+        "revisions": {
+            key: state[key]
+            for key in ("revision", "product_revision", "support_revision", "evidence_revision")
+        },
+        **merged,
+        "summary": {},
+    }
+    value["summary"] = coverage_summary_for_manifest(value)
+    controller_root = root / "tests" / state["feature"] / "verification" / "controller"
+    controller_root.mkdir(parents=True, exist_ok=True)
+    path = controller_root / f"coverage-feature-{suffix}.json"
+    write_json(path, value)
+    validation = validate_coverage_manifest(
+        root, state, value, scope_id="feature", require_finalized=True
+    )
+    relative = path.relative_to(root).as_posix()
+    coverage_state = coverage_state_from_validation(str(path), value, validation)
+    coverage_state.update(
+        {
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        }
+    )
+    return relative, value, coverage_state
+
+
+def cmd_coverage_finalize(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    require_sources_current(state)
+    expected_phase = (
+        "slice_coverage_finalization" if args.scope_id != "feature" else "coverage_finalization"
+    )
+    if state.get("phase") != expected_phase:
+        raise PipelineError(f"coverage-finalize requires {expected_phase}")
+    require_worker_budget(state, args.steward_id)
+    if args.steward_id in state["worker_budget"].get("worker_ids", []):
+        raise PipelineError("Coverage finalization requires a fresh Steward identity")
+    _, capsule = resolve_validated_capsule(
+        root,
+        state,
+        args.capsule,
+        role="coverage_steward",
+        worker_id=args.steward_id,
+        phase=expected_phase,
+    )
+    report = resolve_report(root, state, args.report, "Coverage finalization report")
+    manifest_path = resolve_report(root, state, args.coverage_manifest, "Coverage finalized manifest")
+    manifest = read_json(Path(manifest_path))
+    if manifest.get("mode") != "finalized":
+        raise PipelineError("coverage-finalize requires mode finalized")
+    validation = validate_coverage_manifest(
+        root, state, manifest, scope_id=args.scope_id, require_finalized=True
+    )
+    scope = state["coverage"].setdefault(args.scope_id, empty_coverage_scope())
+    planned_record = scope.get("planned_manifest") or (
+        scope.get("finalized_manifest") if args.scope_id == "feature" else None
+    )
+    if not planned_record:
+        raise PipelineError("Coverage finalization requires its controller-recorded planned manifest")
+    planned_path = Path(planned_record["path"])
+    if not planned_path.is_file() or file_sha256(planned_path) != planned_record["sha256"]:
+        raise PipelineError("Planned coverage manifest drifted before finalization")
+    planned_manifest = read_json(planned_path)
+    authorized_amendment_ids = set(capsule["decision_ids"]) | set(capsule["finding_ids"])
+    for authority_entry in capsule["authority"]:
+        authorized_amendment_ids.update(authority_entry["ids"])
+    final_plan_digest = validate_coverage_continuity(
+        state,
+        planned_manifest,
+        manifest,
+        authorized_new_ids=authorized_amendment_ids,
+    )
+    record = coverage_state_from_validation(manifest_path, manifest, validation)
+    record.update(
+        {
+            "report": report,
+            "steward_id": args.steward_id,
+            "plan_body_digest": final_plan_digest,
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        }
+    )
+    scope["finalized_manifest"] = {
+        "path": manifest_path,
+        "sha256": file_sha256(Path(manifest_path)),
+        "revision": state["revision"],
+        "report": report,
+        "steward_id": args.steward_id,
+    }
+    scope["state"] = record
+    controller_assertions = (
+        args.expected_actual_equality == "pass"
+        and args.mandatory_registration == "pass"
+        and args.automated_execution == "pass"
+    )
+    eligible = validation["summary"]["implementation_eligible"] and controller_assertions
+    if not eligible:
+        record["readiness_class"] = "EVIDENCE_CONTRACT_VIOLATION"
+        record["gaps"] = sorted(
+            set(record["gaps"] + ["schema-2 registration/mapping/automated execution gate failed"])
+        )
+        state["implementation_state"]["status"] = "invalidated"
+        save_runtime(state_path, findings_path, state, findings)
+        raise PipelineError(
+            "EVIDENCE_CONTRACT_VIOLATION: coverage does not satisfy exact AC, identity, "
+            "mandatory-set, gap-free, and automated-pass requirements; no product finding was created"
+        )
+    pending = state.get("pending_engineer_completion")
+    if not pending:
+        raise PipelineError("Coverage finalization lacks controller-owned Engineer mechanics")
+    handoff_path, handoff = generate_schema2_handoff(root, state, pending, record)
+    state["handoffs"].append(
+        {
+            "handoff_id": handoff["handoff_id"],
+            "path": handoff_path,
+            "sha256": file_sha256(root / handoff_path),
+            "handoff_sha256": handoff["handoff_sha256"],
+            "schema": 2,
+            "recorded_at": utc_now(),
+        }
+    )
+    state["handoff_manifests"].append(
+        {
+            "kind": "schema2_sealed",
+            "slice_id": pending["slice_id"],
+            "manifest": handoff_path,
+            "recorded_at": utc_now(),
+        }
+    )
+    if args.scope_id == "feature":
+        state["implementation_state"] = {
+            "status": "pass",
+            "revision": state["revision"],
+            "coverage_manifest": manifest_path,
+        }
+        state["phase"] = pending.get("post_coverage_phase", "convergence")
+    else:
+        slice_item = state["slices"][args.scope_id]
+        slice_item["status"] = "sealed"
+        slice_item["result_revision"] = state["revision"]
+        slice_item["result_product_revision"] = state["product_revision"]
+        slice_item["result_support_revision"] = state["support_revision"]
+        slice_item["result_evidence_revision"] = state["evidence_revision"]
+        slice_item["handoff_manifests"].append(handoff_path)
+        slice_item["sealed_at"] = utc_now()
+        current_index = state["ordered_slices"].index(args.scope_id)
+        if current_index + 1 < len(state["ordered_slices"]):
+            next_slice = state["ordered_slices"][current_index + 1]
+            set_active_slice(
+                state,
+                next_slice,
+                base_revision=state["revision"],
+                base_product_revision=state["product_revision"],
+                base_support_revision=state["support_revision"],
+                base_evidence_revision=state["evidence_revision"],
+            )
+            state["phase"] = "slice_research"
+        else:
+            state["active_slice"] = None
+            state["execution_stage"] = "feature_validation"
+            aggregate_path, _, aggregate_state = write_feature_coverage_aggregate(
+                root, state, suffix=f"implementation-{len(state['handoffs']) + 1:04d}"
+            )
+            aggregate_absolute = str(root / aggregate_path)
+            state["coverage"]["feature"] = {
+                "planned_manifest": None,
+                "finalized_manifest": {
+                    "path": aggregate_absolute,
+                    "sha256": file_sha256(root / aggregate_path),
+                    "revision": state["revision"],
+                    "report": "controller:feature-coverage-aggregate",
+                    "steward_id": "controller-aggregate",
+                },
+                "state": aggregate_state,
+            }
+            state["implementation_state"] = {
+                "status": "pass",
+                "revision": state["revision"],
+                "coverage_manifest": aggregate_absolute,
+            }
+            state["phase"] = "implementation_complete"
+    state["coverage_manifest"] = (
+        state["coverage"].get("feature", {}).get("finalized_manifest", {}).get("path")
+        or manifest_path
+    )
+    state["pending_engineer_completion"] = None
+    record_worker(state, "coverage_steward_finalization", args.steward_id)
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
@@ -2836,7 +5020,17 @@ def cmd_slice_scope_check(args: argparse.Namespace) -> int:
 
 
 def open_scope_expansion_hold(
-    state: dict[str, Any], slice_item: dict[str, Any], violations: list[str]
+    state: dict[str, Any],
+    slice_item: dict[str, Any],
+    violations: list[str],
+    *,
+    lease: dict[str, Any],
+    inventory: dict[str, list[str]],
+    changes: list[dict[str, Any]],
+    diff_files: list[dict[str, Any]],
+    semantic_report: str,
+    engineer_report: str,
+    run_id: str,
 ) -> None:
     previous_phase = state["phase"]
     hold = {
@@ -2845,6 +5039,23 @@ def open_scope_expansion_hold(
         "development_plan_sha256": state.get("development_plan_sha256"),
         "violations": violations,
         "resume_phase": previous_phase,
+        "lease_id": lease["lease_id"],
+        "candidate_paths": sorted(item["path"] for item in changes),
+        "candidate_inventory": inventory,
+        "candidate_changes": changes,
+        "candidate_diff_files": diff_files,
+        "semantic_report": semantic_report,
+        "engineer_report": engineer_report,
+        "run_id": run_id,
+        "base_revisions": {
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        },
+        "snapshot_sha256": canonical_json_sha256(
+            state["lease_snapshots"][lease["lease_id"]]["checkout"]
+        ),
         "opened_at": utc_now(),
     }
     state["phase"] = "scope_expansion_hold"
@@ -2855,7 +5066,9 @@ def open_scope_expansion_hold(
 
 
 def cmd_rebaseline_scope(args: argparse.Namespace) -> int:
-    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    root, state_path, findings_path, state, findings = load_runtime(
+        args.project_root, allow_active_writer_completion_drift=True
+    )
     if state.get("phase") != "scope_expansion_hold":
         raise PipelineError("rebaseline-scope requires an open scope_expansion_hold")
     if not args.user_scope_approval.strip():
@@ -2873,6 +5086,23 @@ def cmd_rebaseline_scope(args: argparse.Namespace) -> int:
     if [item["id"] for item in plan["slices"]] != state["ordered_slices"]:
         raise PipelineError("Scope rebaseline cannot change approved slice ordering in-place")
     hold = state["scope_guard"]["hold"]
+    lease = state.get("active_write_lease")
+    if not lease or lease.get("lease_id") != hold.get("lease_id"):
+        raise PipelineError("Scope hold lost its exact active writer lease")
+    snapshot = state["lease_snapshots"].get(lease["lease_id"])
+    if not snapshot or canonical_json_sha256(snapshot["checkout"]) != hold.get("snapshot_sha256"):
+        raise PipelineError("Scope hold lease snapshot is missing or changed")
+    current_paths = changed_checkout_paths(
+        snapshot["checkout"], checkout_snapshot(root, state["feature"])
+    )
+    plan_relative = Path(state["development_plan_path"]).resolve().relative_to(root).as_posix()
+    candidate_checkout_paths = sorted(
+        path for path in current_paths if path != plan_relative
+    )
+    if candidate_checkout_paths not in ([], hold["candidate_paths"]):
+        raise PipelineError(
+            "Scope hold checkout no longer matches either the preserved candidate or a recoverable rollback"
+        )
     active_id = hold["slice_id"]
     replacement = next(item for item in plan["slices"] if item["id"] == active_id)
     if replacement["scope_contract"]["scope_baseline_revision"] != state.get("revision"):
@@ -2888,17 +5118,64 @@ def cmd_rebaseline_scope(args: argparse.Namespace) -> int:
             raise PipelineError(
                 f"Updated plan cannot rewrite the sealed scope contract for {item['id']}"
             )
+    if candidate_checkout_paths:
+        remaining = scope_violations(
+            replacement,
+            hold["candidate_changes"],
+            hold["candidate_diff_files"],
+            material_change_approved=True,
+        )
+        if remaining:
+            raise PipelineError(
+                "Updated plan still does not authorize the preserved candidate: "
+                + "; ".join(remaining)
+            )
     for item in plan["slices"]:
         state["slices"][item["id"]]["scope_contract"] = item["scope_contract"]
         state["slices"][item["id"]]["requirement_ids"] = item["requirement_ids"]
         state["slices"][item["id"]]["scope_pre_edit_check"] = None
     state["development_plan_sha256"] = plan["sha256"]
+    state["plan_contracts"] = plan["contracts"]
+    candidate: dict[str, Any] | None = None
+    if candidate_checkout_paths:
+        state["revision_inventory"] = hold["candidate_inventory"]
+        computed = compute_inventory_revisions(root, state)
+        candidate = {
+            "slice_id": active_id,
+            "prior_lease_id": lease["lease_id"],
+            "snapshot": snapshot,
+            "changes": hold["candidate_changes"],
+            "diff_files": hold["candidate_diff_files"],
+            "inventory": hold["candidate_inventory"],
+            "base_revisions": hold["base_revisions"],
+            "result_revisions": {
+                key: computed[key]
+                for key in ("revision", "product_revision", "support_revision", "evidence_revision")
+            },
+            "semantic_report": hold["semantic_report"],
+            "engineer_report": hold["engineer_report"],
+            "run_id": hold["run_id"],
+        }
+        for key in candidate["result_revisions"]:
+            state[key] = candidate["result_revisions"][key]
+        state["implementation_state"]["status"] = "invalidated"
+        state["feature_verification_state"]["status"] = "invalidated"
+    else:
+        computed = compute_inventory_revisions(root, state)
+        for key in ("revision", "product_revision", "support_revision", "evidence_revision"):
+            state[key] = computed[key]
+        state["implementation_state"]["status"] = "invalidated"
+        state["feature_verification_state"]["status"] = "invalidated"
+    release_active_lease(state, result="revoked", reason="approved_scope_rebaseline")
     event = {
         "event": "scope_rebaseline",
         "slice_id": active_id,
         "prior_plan_sha256": hold["development_plan_sha256"],
         "approved_plan_sha256": plan["sha256"],
-        "baseline_revision": state.get("revision"),
+        "baseline_revision": (
+            candidate["base_revisions"]["revision"] if candidate else state.get("revision")
+        ),
+        "result_revision": state.get("revision"),
         "user_scope_approval": args.user_scope_approval,
         "recorded_at": utc_now(),
     }
@@ -2906,480 +5183,645 @@ def cmd_rebaseline_scope(args: argparse.Namespace) -> int:
     state["scope_guard"]["rebaseline_history"].append(event)
     state["scope_guard"]["hold"] = None
     state["scope_guard"]["status"] = "pending"
+    state["scope_guard"]["rebaseline_candidate"] = candidate
     state["phase"] = hold["resume_phase"]
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
 
-def cmd_engineer_complete(args: argparse.Namespace) -> int:
-    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
-    require_sources_current(state)
-    require_worker_budget(state, args.owner_id)
-    if state["phase"] not in {"slice_engineering", "engineering"}:
-        raise PipelineError(
-            "Full Engineer completion is valid only after slice research or in remediation engineering"
-        )
-    if state["phase"] == "slice_engineering":
-        active_research = (active_slice_state(state) or {}).get("research", {})
-        if active_research.get("status") not in RESEARCH_TERMINAL_STATUSES:
-            raise PipelineError("Production edits require the slice research gate to be closed")
-        if active_research.get("base_revision") != state.get("revision"):
-            raise PipelineError("Slice research evidence is stale for the current revision")
-    slice_execution = (
-        state.get("development_mode") == "sequential_slices"
-        and state.get("execution_stage") == "implementation"
-    )
-    active_slice = active_slice_state(state)
-    if slice_execution:
-        if active_slice is None:
-            raise PipelineError("Sequential implementation requires one active slice")
-        if args.slice_id != state.get("active_slice"):
-            raise PipelineError(
-                f"Engineer must identify active slice {state.get('active_slice')} with --slice-id"
-            )
-        if args.base_revision != active_slice.get("base_revision"):
-            raise PipelineError(
-                "Slice Engineer base revision does not match the exact sealed predecessor revision"
-            )
-        if args.base_revision != state.get("revision"):
-            raise PipelineError("Slice base revision is not the current pipeline revision")
-    if not args.audit_complete:
-        raise PipelineError("Engineer pass cannot complete before the full audit-remediation-resweep gate")
-    if any(run["run_id"] == args.run_id for run in state["engineer_runs"]):
-        raise PipelineError(f"Engineer run ID already recorded: {args.run_id}")
-    if state["iteration_control"].get("status") == "checkpoint_required":
-        raise PipelineError(
-            "Automatic convergence circuit breaker is open; run authorize-iteration first"
-        )
-    if state.get("engineering_owner_id") is None:
-        state["engineering_owner_id"] = args.owner_id
-    elif state["engineering_owner_id"] != args.owner_id:
-        raise PipelineError(
-            "Product remediation must resume the assigned engineering owner; "
-            "use transfer-engineering-owner for an explicit handoff"
-        )
-    if active_slice is not None:
-        assigned = state["owner_by_slice"].get(active_slice["id"])
-        if assigned and assigned != args.owner_id:
-            raise PipelineError("Only the recorded owner may write the active slice")
-        state["owner_by_slice"][active_slice["id"]] = args.owner_id
-        active_slice["owner_id"] = args.owner_id
-    if state.get("integration_owner") is None:
-        state["integration_owner"] = args.owner_id
-    report = resolve_report(root, state, args.report, "Engineer verification report")
 
-    input_revision = state.get("revision")
-    input_product_revision = state.get("product_revision")
-    input_support_revision = state.get("support_revision")
-    input_evidence_revision = state.get("evidence_revision")
-    product_revision = args.product_revision or args.revision
-    support_revision = args.support_revision or product_revision
-    evidence_revision = args.evidence_revision or args.revision
-    product_changed = input_product_revision != product_revision
-    support_changed = input_support_revision != support_revision
-    evidence_changed = input_evidence_revision != evidence_revision
-    revision_changed = input_revision != args.revision
-    if not args.change_manifest or not args.diff_summary:
+
+def validate_semantic_write_packet(
+    root: Path,
+    state: dict[str, Any],
+    lease: dict[str, Any],
+    packet: dict[str, Any],
+    *,
+    slice_item: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, list[str]], list[str]]:
+    exact_fields = {"schema", "inventory_complete", "domain_inventory", "changes", "open_assumptions"}
+    if set(packet) != exact_fields or packet.get("schema") != 1 or packet.get("inventory_complete") is not True:
         raise PipelineError(
-            "Engineer completion requires --change-manifest and --diff-summary after slice-scope-check"
+            "Semantic write packet must use schema 1 and attest inventory_complete=true; "
+            "the controller fails closed rather than guessing a partial domain inventory"
         )
+    forbidden_mechanics = {
+        "revision",
+        "product_revision",
+        "support_revision",
+        "evidence_revision",
+        "change_count",
+        "line_count",
+        "handoff_sha256",
+    }
+    if forbidden_mechanics.intersection(packet):
+        raise PipelineError("Workers cannot supply controller-owned revision/change/handoff mechanics")
+    inventory = packet.get("domain_inventory")
+    if not isinstance(inventory, dict) or set(inventory) != {"product", "support", "evidence"}:
+        raise PipelineError("Semantic packet domain_inventory must list product/support/evidence")
+    normalized_inventory: dict[str, list[str]] = {}
+    assigned: set[str] = set()
+    for domain in ("product", "support", "evidence"):
+        paths = require_string_list(inventory[domain], f"Semantic {domain} inventory")
+        normalized = [scope_path(path, f"semantic {domain} inventory") for path in paths]
+        if len(set(normalized)) != len(normalized):
+            raise PipelineError(f"Semantic {domain} inventory contains duplicates")
+        overlap = assigned.intersection(normalized)
+        if overlap:
+            raise PipelineError("Semantic domain inventory overlaps: " + ", ".join(sorted(overlap)))
+        assigned.update(normalized)
+        normalized_inventory[domain] = sorted(normalized)
+    changes = packet.get("changes")
+    if not isinstance(changes, list):
+        raise PipelineError("Semantic packet changes must be a list")
+    expected_change_fields = {
+        "path",
+        "domain",
+        "symbols",
+        "reason",
+        "change_kind",
+        "component",
+        "lifecycle_change",
+        "ownership_change",
+        "public_contract_change",
+        "requirement_ids",
+        "acceptance_ids",
+        "decision_ids",
+        "touchpoint_id",
+    }
+    normalized_changes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    role_domains = {
+        "engineer": {"product", "evidence"},
+        "documentation_finisher": (
+            {"product"} if lease.get("phase") == "normative_documentation" else {"support"}
+        ),
+        "recovery_remediator": {"support", "evidence"},
+    }
+    allowed_domains = role_domains.get(lease.get("role"))
+    if allowed_domains is None:
+        raise PipelineError("The active lease role cannot submit a semantic write packet")
+    approved_requirements = set(slice_item.get("requirement_ids", []))
+    approved_acceptance = set(slice_item.get("scope_contract", {}).get("acceptance_ids", []))
+    for change in changes:
+        if not isinstance(change, dict) or set(change) != expected_change_fields:
+            raise PipelineError("Every semantic change must use the exact controller annotation fields")
+        item = dict(change)
+        path = scope_path(item["path"], "semantic changed")
+        if path in seen:
+            raise PipelineError(f"Semantic packet repeats changed path: {path}")
+        seen.add(path)
+        item["path"] = path
+        if item["domain"] not in {"product", "support", "evidence"}:
+            raise PipelineError(f"Semantic change {path} has invalid domain")
+        if item["domain"] not in allowed_domains:
+            raise PipelineError(
+                f"{lease['role']} lease cannot change the {item['domain']} domain: {path}"
+            )
+        if item["change_kind"] == "delete":
+            if path in normalized_inventory[item["domain"]]:
+                raise PipelineError(f"Deleted path remains in {item['domain']} inventory: {path}")
+        elif path not in normalized_inventory[item["domain"]]:
+            raise PipelineError(f"Changed path is absent from {item['domain']} inventory: {path}")
+        for field in ("symbols", "requirement_ids", "acceptance_ids", "decision_ids"):
+            require_string_list(item[field], f"Semantic change {path} {field}")
+        requirement_ids = set(item["requirement_ids"])
+        acceptance_ids = set(item["acceptance_ids"])
+        if not requirement_ids or not requirement_ids.issubset(approved_requirements):
+            raise PipelineError(
+                f"Semantic change {path} must map to an approved PRD-REQ subset for {slice_item['id']}"
+            )
+        if not acceptance_ids or not acceptance_ids.issubset(approved_acceptance):
+            raise PipelineError(
+                f"Semantic change {path} must map to an approved PRD-AC subset for {slice_item['id']}"
+            )
+        if not item["reason"] or not item["change_kind"] or not item["component"]:
+            raise PipelineError(f"Semantic change {path} lacks reason/change_kind/component")
+        for flag in ("lifecycle_change", "ownership_change", "public_contract_change"):
+            if not isinstance(item[flag], bool):
+                raise PipelineError(f"Semantic change {path} {flag} must be boolean")
+        inactive = sorted(set(item["decision_ids"]) - set(state["decision_ledger"]["active_decision_ids"]))
+        if inactive:
+            raise PipelineError(f"Semantic change {path} cites inactive decisions: {', '.join(inactive)}")
+        normalized_changes.append(item)
+    snapshot = state["lease_snapshots"].get(lease["lease_id"], {}).get("checkout")
+    if not isinstance(snapshot, dict):
+        raise PipelineError("Active lease snapshot is missing")
+    actual_changed = changed_checkout_paths(snapshot, checkout_snapshot(root, state["feature"]))
+    if lease.get("rebaseline_carried") is True and state.get("scope_guard", {}).get(
+        "rebaseline_candidate"
+    ):
+        approved_plan_path = (
+            Path(state["development_plan_path"]).resolve().relative_to(root).as_posix()
+        )
+        actual_changed = [path for path in actual_changed if path != approved_plan_path]
+    if set(actual_changed) != seen:
+        raise PipelineError(
+            "Controller-observed checkout diff does not equal semantic changed paths; observed="
+            + ",".join(actual_changed)
+            + " semantic="
+            + ",".join(sorted(seen))
+        )
+    prior_inventory = state["revision_inventory"]
+    for domain in ("product", "support", "evidence"):
+        deleted = {
+            item["path"]
+            for item in normalized_changes
+            if item["domain"] == domain and item["change_kind"] == "delete"
+        }
+        missing_prior = set(prior_inventory[domain]) - deleted - set(normalized_inventory[domain])
+        if missing_prior:
+            raise PipelineError(
+                f"Semantic {domain} inventory silently drops prior inputs: "
+                + ", ".join(sorted(missing_prior))
+            )
+    for path in assigned:
+        if path == DEFERRED_BACKLOG_PATH.as_posix() or path.startswith(f"tests/{state['feature']}/"):
+            raise PipelineError(f"Controller evidence/backlog path cannot enter revision inventory: {path}")
+        if not (root / path).is_file():
+            raise PipelineError(f"Semantic revision inventory path is missing: {path}")
+    allowed = lease["allowed_paths"]
+    allowed_symbols = set(lease["allowed_symbols"])
+    exclusions = lease["exclusions"]
+    for item in normalized_changes:
+        path = item["path"]
+        if allowed and not any(
+            path_matches_scope(path, rule) for rule in allowed
+        ):
+            raise PipelineError(f"Changed path is outside the active lease allowlist: {path}")
+        if allowed_symbols and not set(item["symbols"]).issubset(allowed_symbols):
+            raise PipelineError(f"Changed symbols are outside the active lease allowlist: {path}")
+        if any(path_matches_scope(path, rule) for rule in exclusions if "/" in rule):
+            raise PipelineError(f"Changed path violates active lease exclusion: {path}")
+        if str(item["component"]).casefold() in {
+            value.casefold() for value in exclusions if "/" not in value
+        }:
+            raise PipelineError(f"Changed component violates active lease exclusion: {path}")
+    assumptions = packet.get("open_assumptions")
+    if not isinstance(assumptions, list):
+        raise PipelineError("Semantic open_assumptions must be a list")
+    return normalized_changes, normalized_inventory, actual_changed
+
+
+def write_controller_mechanics(
+    root: Path,
+    state: dict[str, Any],
+    *,
+    run_id: str,
+    lease: dict[str, Any],
+    slice_item: dict[str, Any],
+    changes: list[dict[str, Any]],
+    base_revisions: dict[str, str],
+    result_revisions: dict[str, str],
+) -> tuple[str, str, str, list[dict[str, Any]]]:
+    controller_root = root / "tests" / state["feature"] / "verification" / "controller"
+    controller_root.mkdir(parents=True, exist_ok=True)
+    safe_run = re.sub(r"[^A-Za-z0-9._-]+", "-", run_id)
+    change_path = controller_root / f"{safe_run}-change-manifest.json"
+    diff_path = controller_root / f"{safe_run}-diff-summary.json"
+    revision_path = controller_root / f"{safe_run}-revisions.json"
+    product_changes = [item for item in changes if item["domain"] == "product"]
+    change_rows = [
+        {
+            "path": item["path"],
+            "domain": item["domain"],
+            "symbols": item["symbols"],
+            "slice_id": slice_item["id"],
+            "scope_id": lease["write_scope"],
+            "requirement_ids": item["requirement_ids"],
+            "acceptance_ids": item["acceptance_ids"],
+            "decision_ids": item["decision_ids"],
+            "reason": item["reason"],
+            "change_kind": item["change_kind"],
+            "touchpoint_id": item["touchpoint_id"],
+        }
+        for item in changes
+    ]
+    change_manifest = {
+        "schema": 2,
+        "phase": lease["phase"],
+        "scope_id": lease["write_scope"],
+        "slice_id": slice_item["id"],
+        "role": lease["role"],
+        "worker_id": lease["worker_id"],
+        "lease_id": lease["lease_id"],
+        "base_revisions": base_revisions,
+        "result_revisions": result_revisions,
+        "change_manifest": change_rows,
+    }
+    base_text = state["lease_snapshots"].get(lease["lease_id"], {}).get("checkout_text", {})
+    diff_rows = [
+        {
+            "path": item["path"],
+            "symbols": item["symbols"],
+            "lines_changed": changed_line_count(
+                base_text.get(item["path"], ""),
+                (root / item["path"]).read_text(encoding="utf-8", errors="replace")
+                if (root / item["path"]).is_file()
+                else "",
+            ),
+            "component": item["component"],
+            "change_kind": item["change_kind"],
+            "lifecycle_change": item["lifecycle_change"],
+            "ownership_change": item["ownership_change"],
+            "public_contract_change": item["public_contract_change"],
+            "touchpoint_id": item["touchpoint_id"],
+        }
+        for item in product_changes
+    ]
+    diff_summary = {
+        "schema": 2,
+        "phase": lease["phase"],
+        "base_revisions": base_revisions,
+        "result_revisions": result_revisions,
+        "product_files": diff_rows,
+        "support_paths": sorted(item["path"] for item in changes if item["domain"] == "support"),
+        "evidence_paths": sorted(item["path"] for item in changes if item["domain"] == "evidence"),
+    }
+    revision_manifest = {
+        "schema": 2,
+        "base_revision": state["revision_base_revision"],
+        "inventory": state["revision_inventory"],
+        **result_revisions,
+    }
+    write_json(change_path, change_manifest)
+    write_json(diff_path, diff_summary)
+    write_json(revision_path, revision_manifest)
+    return (
+        change_path.relative_to(root).as_posix(),
+        diff_path.relative_to(root).as_posix(),
+        revision_path.relative_to(root).as_posix(),
+        diff_rows,
+    )
+
+
+def cmd_engineer_complete(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(
+        args.project_root, allow_active_writer_completion_drift=True
+    )
+    require_sources_current(state)
+    if state["phase"] not in {"slice_engineering", "engineering"}:
+        raise PipelineError("engineer-complete requires slice_engineering or engineering")
+    if args.engineering_status != "pass" or args.machine_checks != "pass" or args.diff_inspection != "pass":
+        raise PipelineError(
+            "ENGINEERING_PASS requires completed production work, targeted checks, and final diff inspection; "
+            "manual QA/DataStore/operator work is not part of this gate"
+        )
+    lease = state.get("active_write_lease")
+    carried = state.get("scope_guard", {}).get("rebaseline_candidate")
+    if (
+        not lease
+        or lease.get("lease_id") != args.lease_id
+        or lease.get("role") != "engineer"
+        or lease.get("worker_id") != args.owner_id
+        or lease.get("phase") != state["phase"]
+        or (
+            lease.get("base_revision") != state["revision"]
+            and not (
+                lease.get("rebaseline_carried") is True
+                and carried
+                and lease.get("base_revision") == carried["base_revisions"]["revision"]
+            )
+        )
+    ):
+        raise PipelineError("engineer-complete requires the exact active Engineer lease/base revision")
+    _, capsule = resolve_validated_capsule(
+        root,
+        state,
+        args.capsule,
+        role="engineer",
+        worker_id=args.owner_id,
+        phase=state["phase"],
+    )
+    snapshot_capsule = state["lease_snapshots"].get(lease["lease_id"], {}).get("capsule_sha256")
+    if capsule["capsule_sha256"] != snapshot_capsule:
+        raise PipelineError("Engineer capsule differs from the capsule that authorized the lease")
     slice_item = scope_slice_for_pass(state, args.slice_id)
     pre_edit = slice_item.get("scope_pre_edit_check") or {}
     if (
         pre_edit.get("status") != "passed"
         or pre_edit.get("owner_id") != args.owner_id
-        or pre_edit.get("base_revision") != input_revision
-        or pre_edit.get("development_plan_sha256") != state.get("development_plan_sha256")
+        or pre_edit.get("base_revision") != state["revision"]
     ):
-        raise PipelineError(
-            "Engineer edits require a current slice-scope-check by the assigned owner before editing"
-        )
-    change_manifest_path, change_manifest_value = resolve_scope_artifact(
-        root, state, args.change_manifest, "Engineer change manifest"
+        raise PipelineError("Engineer edits require a current exact-base slice-scope-check")
+    semantic_path = resolve_project_file(root, args.semantic_handoff, "Engineer semantic handoff")
+    semantic = read_json(semantic_path)
+    changes, inventory, _ = validate_semantic_write_packet(
+        root, state, lease, semantic, slice_item=slice_item
     )
-    diff_summary_path, diff_summary_value = resolve_scope_artifact(
-        root, state, args.diff_summary, "Engineer product diff summary"
-    )
-    changes = validate_change_manifest(
-        change_manifest_value,
-        slice_item=slice_item,
-        owner_id=args.owner_id,
-        base_revision=input_revision,
-        result_revision=args.revision,
-    )
-    diff_files = validate_diff_summary(
-        diff_summary_value,
-        slice_item=slice_item,
-        base_revision=input_revision,
-        result_revision=args.revision,
-    )
+    report = resolve_report(root, state, args.report, "Engineer report")
+    product_changes = [item for item in changes if item["domain"] == "product"]
+    if any(item["domain"] == "support" for item in changes):
+        raise PipelineError("Engineer cannot write derived support documentation")
+    mechanical_changes = [
+        {
+            "path": item["path"],
+            "symbols": item["symbols"],
+            "slice_id": slice_item["id"],
+            "requirement_ids": item["requirement_ids"],
+            "acceptance_ids": item["acceptance_ids"],
+            "decision_ids": item["decision_ids"],
+            "reason": item["reason"],
+            "change_kind": item["change_kind"],
+            "touchpoint_id": item["touchpoint_id"],
+        }
+        for item in product_changes
+    ]
+    base_text = state["lease_snapshots"].get(lease["lease_id"], {}).get("checkout_text", {})
+    diff_files = [
+        {
+            "path": item["path"],
+            "symbols": item["symbols"],
+            "lines_changed": changed_line_count(
+                base_text.get(item["path"], ""),
+                (root / item["path"]).read_text(encoding="utf-8", errors="replace")
+                if (root / item["path"]).is_file()
+                else "",
+            ),
+            "component": item["component"],
+            "change_kind": item["change_kind"],
+            "lifecycle_change": item["lifecycle_change"],
+            "ownership_change": item["ownership_change"],
+            "public_contract_change": item["public_contract_change"],
+            "touchpoint_id": item["touchpoint_id"],
+        }
+        for item in product_changes
+    ]
     matching_rebaseline = next(
         (
             event
             for event in reversed(state["scope_guard"].get("rebaseline_history", []))
             if event.get("slice_id") == slice_item["id"]
-            and event.get("baseline_revision") == input_revision
-            and event.get("approved_plan_sha256") == state.get("development_plan_sha256")
+            and event.get("baseline_revision") == lease["base_revision"]
+            and event.get("approved_plan_sha256") == state["development_plan_sha256"]
         ),
         None,
     )
-    material_change_approved = bool(
+    material_approved = bool(
         matching_rebaseline
         and args.scope_approval
         and args.scope_approval == matching_rebaseline.get("user_scope_approval")
     )
     violations = scope_violations(
-        slice_item,
-        changes,
-        diff_files,
-        material_change_approved=material_change_approved,
+        slice_item, mechanical_changes, diff_files, material_change_approved=material_approved
     )
-    if args.scope_approval and not material_change_approved:
-        violations.append(
-            "scope approval does not match the exact current-slice rebaseline event"
-        )
-    if args.production_change_scope == "architectural" and not material_change_approved:
-        violations.append(
-            "architectural scope classification requires an updated approved plan and rebaseline"
-        )
-    if bool(diff_files) != product_changed:
-        violations.append(
-            "product revision change classification does not match diff summary product_files"
-        )
-    computed_files_changed = len(diff_files)
-    computed_lines_changed = sum(item["lines_changed"] for item in diff_files)
-    if args.production_files_changed is not None and args.production_files_changed != computed_files_changed:
-        violations.append("reported production file count does not match diff summary")
-    if args.production_lines_changed is not None and args.production_lines_changed != computed_lines_changed:
-        violations.append("reported production line count does not match diff summary")
     if violations:
-        open_scope_expansion_hold(state, slice_item, sorted(set(violations)))
+        open_scope_expansion_hold(
+            state,
+            slice_item,
+            violations,
+            lease=lease,
+            inventory=inventory,
+            changes=changes,
+            diff_files=diff_files,
+            semantic_report=semantic_path.relative_to(root).as_posix(),
+            engineer_report=report,
+            run_id=args.run_id,
+        )
         save_runtime(state_path, findings_path, state, findings)
-        raise PipelineError(
-            "scope_expansion_hold: " + "; ".join(sorted(set(violations)))
+        raise PipelineError("scope_expansion_hold: " + "; ".join(violations))
+    base_revisions = (
+        dict(carried["base_revisions"])
+        if carried and lease.get("rebaseline_carried") is True
+        else {
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        }
+    )
+    state["revision_inventory"] = inventory
+    result = compute_inventory_revisions(root, state)
+    result_revisions = {key: result[key] for key in base_revisions}
+    product_changed = result["product_revision"] != base_revisions["product_revision"]
+    if product_changes and not product_changed:
+        raise PipelineError("Controller product diff did not change the product identity")
+    if product_changed:
+        state["iteration_control"]["consecutive_product_changes"] += 1
+        reset_validation(
+            state,
+            result["revision"],
+            result["product_revision"],
+            result["support_revision"],
+            result["evidence_revision"],
         )
-    record_scope_churn(state, slice_item, diff_files)
-    scope_event = {
-        "event": "scope_pass",
-        "slice_id": slice_item["id"],
-        "owner_id": args.owner_id,
-        "base_revision": input_revision,
-        "result_revision": args.revision,
-        "change_manifest": change_manifest_path,
-        "diff_summary": diff_summary_path,
-        "product_files_changed": computed_files_changed,
-        "product_lines_changed": computed_lines_changed,
-        "recorded_at": utc_now(),
-    }
-    state["scope_guard"]["status"] = "passed"
-    state["scope_guard"]["history"].append(scope_event)
-    slice_item["scope_history"].append(scope_event)
-    slice_item["scope_pre_edit_check"] = None
-    if not product_changed and (revision_changed or support_changed or evidence_changed):
-        raise PipelineError(
-            "Support/evidence-only changes must use recovery-remediation-complete; "
-            "a full Engineer pass must not invalidate clean product evidence"
-        )
-    if product_changed and args.machine_checks != "pass":
-        raise PipelineError(
-            "A product-changing Engineer must resume until required checks pass"
-        )
-    if product_changed and args.production_change_scope == "none":
-        raise PipelineError("A product change must be classified as local or architectural")
-    if not product_changed and args.production_change_scope != "none":
-        raise PipelineError("An unchanged product pass must use production-change-scope none")
-    coverage_manifest = resolve_coverage_manifest(
+        state["implementation_state"]["status"] = "invalidated"
+        state["feature_verification_state"]["status"] = "invalidated"
+    for key in base_revisions:
+        state[key] = result[key]
+    change_path, diff_path, revision_path, _ = write_controller_mechanics(
         root,
         state,
-        args.coverage_manifest,
-        product_revision,
-        support_revision,
-        evidence_revision,
+        run_id=args.run_id,
+        lease=lease,
+        slice_item=slice_item,
+        changes=changes,
+        base_revisions=base_revisions,
+        result_revisions=result_revisions,
     )
     resolved_ids = set(args.resolved_finding or [])
     active_batch = state.get("active_remediation_batch")
     if active_batch and resolved_ids != set(active_batch["finding_ids"]):
-        raise PipelineError(
-            "A remediation return must resolve the complete active origin-routed finding batch"
-        )
+        raise PipelineError("Engineer remediation must close the exact frozen product batch")
     if resolved_ids and not product_changed:
-        raise PipelineError("Resolving product findings requires a changed product revision")
-    if product_changed:
-        reset_validation(
-            state,
-            args.revision,
-            product_revision,
-            support_revision,
-            evidence_revision,
-        )
-
-    state["revision"] = args.revision
-    state["product_revision"] = product_revision
-    state["support_revision"] = support_revision
-    state["evidence_revision"] = evidence_revision
-    state["coverage_manifest"] = coverage_manifest
-    state["last_engineer_run_id"] = args.run_id
-    state["machine_checks"] = {
-        "status": args.machine_checks,
-        "revision": args.revision,
-        "product_revision": product_revision,
-        "support_revision": support_revision,
-        "evidence_revision": evidence_revision,
-        "report": report,
-        "coverage_manifest": coverage_manifest,
-    }
+        raise PipelineError("Resolving product findings requires changed product identity")
     resolve_product_findings(
-        findings, resolved_ids, args.revision, product_revision, evidence_revision
+        findings,
+        resolved_ids,
+        result["revision"],
+        result["product_revision"],
+        result["evidence_revision"],
     )
-
-    handoff_manifest = None
-    if slice_execution:
-        if args.machine_checks != "pass" or open_blocking(findings):
-            raise PipelineError(
-                "A sequential slice cannot be sealed until checks pass and blocking findings close"
-            )
-        if not args.handoff_manifest:
-            raise PipelineError("Sequential slice completion requires --handoff-manifest")
-        handoff_manifest = resolve_handoff_manifest(
-            root,
-            state,
-            args.handoff_manifest,
-            slice_id=active_slice["id"],
-            owner_id=args.owner_id,
-            base_revision=active_slice["base_revision"],
-            result_revision=args.revision,
-            expected_change_manifest=changes,
-        )
-        active_slice["status"] = "sealed"
-        active_slice["result_revision"] = args.revision
-        active_slice["result_product_revision"] = product_revision
-        active_slice["result_support_revision"] = support_revision
-        active_slice["result_evidence_revision"] = evidence_revision
-        active_slice["handoff_manifests"].append(handoff_manifest)
-        active_slice["sealed_at"] = utc_now()
-        state["handoff_manifests"].append(
-            {
-                "kind": "slice_seal",
-                "slice_id": active_slice["id"],
-                "owner_id": args.owner_id,
-                "base_revision": active_slice["base_revision"],
-                "result_revision": args.revision,
-                "manifest": handoff_manifest,
-                "recorded_at": utc_now(),
-            }
-        )
-        current_index = state["ordered_slices"].index(active_slice["id"])
-        if current_index + 1 < len(state["ordered_slices"]):
-            next_slice = state["ordered_slices"][current_index + 1]
-            set_active_slice(
-                state,
-                next_slice,
-                base_revision=args.revision,
-                base_product_revision=product_revision,
-                base_support_revision=support_revision,
-                base_evidence_revision=evidence_revision,
-            )
-            outcome = "slice_sealed"
-            state["phase"] = "slice_research"
+    post_coverage_phase = "convergence"
+    if active_batch and resolved_ids:
+        has_next = complete_remediation_batch(state, args.owner_id)
+        if has_next:
+            post_coverage_phase = "engineering"
         else:
-            state["active_slice"] = None
-            state["execution_stage"] = "feature_validation"
-            state["engineering_owner_id"] = state.get("integration_owner")
-            next_wave = state.get("convergence", {}).get("wave", 0) + 1
-            state["convergence"] = empty_convergence_state(
-                state["required_convergence_audits"],
-                args.revision,
-                product_revision,
-                support_revision,
-                evidence_revision,
-                next_wave,
-                list(state["ordered_slices"]),
-                "initial_implementation",
-            )
-            outcome = "changed" if product_changed else "clean"
-            state["phase"] = "convergence"
-    elif product_changed:
-        outcome = "changed"
-        iteration = state["iteration_control"]
-        iteration["consecutive_product_changes"] += 1
-        has_next_batch = False
-        if active_batch and resolved_ids == set(active_batch["finding_ids"]):
-            has_next_batch = complete_remediation_batch(state, args.owner_id)
-        revalidation = state.get("product_revalidation")
-        if has_next_batch:
-            state["iteration_control"]["resume_phase"] = None
-        elif revalidation and revalidation.get("mode") == "targeted":
-            state["closure_review"] = {
-                "status": "pending",
-                "mode": "targeted_product_closure",
-                "source": revalidation.get("source"),
-                "return_phase": (
-                    "review" if revalidation.get("source") == "convergence" else "qa"
-                ),
-                "revision": state["revision"],
-                "product_revision": state["product_revision"],
-                "support_revision": state["support_revision"],
-                "evidence_revision": state["evidence_revision"],
-                "base_review_runs": revalidation.get("base_review_runs", []),
-                "base_convergence_runs": revalidation.get(
-                    "base_convergence_runs", []
-                ),
-                "finding_ids": revalidation["finding_ids"],
-                "changed_impact_surface": {
-                    "paths": sorted(item["path"] for item in diff_files),
-                    "symbols": sorted(
-                        {
-                            symbol
-                            for item in diff_files
-                            for symbol in item.get("symbols", [])
-                        }
+            revalidation = state.get("product_revalidation") or {}
+            if revalidation.get("mode") == "targeted":
+                post_coverage_phase = "closure_review"
+                state["closure_review"] = {
+                    "status": "pending",
+                    "mode": "targeted_product_closure",
+                    "source": revalidation.get("source"),
+                    "return_phase": (
+                        "review" if revalidation.get("source") == "convergence" else "qa"
                     ),
-                },
-                "run": None,
-            }
-            iteration["status"] = "running"
-            iteration["reason"] = None
-            iteration["resume_phase"] = None
-            state["phase"] = "closure_review"
-        else:
-            slice_ids = (
-                list(revalidation.get("slice_ids", []))
-                if revalidation
-                else list(state.get("ordered_slices", []))
-            )
-            trigger = (
-                revalidation.get("full_wave_trigger")
-                if revalidation
-                else "initial_implementation"
-            )
-            require_full_convergence_budget(state, slice_ids)
-            next_wave = state.get("convergence", {}).get("wave", 0) + 1
-            state["convergence"] = empty_convergence_state(
-                state["required_convergence_audits"],
-                args.revision,
-                product_revision,
-                support_revision,
-                evidence_revision,
-                next_wave,
-                slice_ids,
-                trigger,
-            )
-            iteration["status"] = "running"
-            iteration["reason"] = None
-            iteration["resume_phase"] = None
-            state["phase"] = "convergence"
-    elif args.machine_checks != "pass" or open_blocking(findings):
-        outcome = "blocked"
-        reset_validation(
-            state,
-            args.revision,
-            product_revision,
-            support_revision,
-            evidence_revision,
-        )
-        state["phase"] = "engineering"
-    else:
-        outcome = "clean"
-        state["iteration_control"]["status"] = "running"
-        state["iteration_control"]["reason"] = None
-        state["iteration_control"]["consecutive_product_changes"] = 0
-        state["engineer_clean"] = {
-            "run_id": args.run_id,
-            "revision": args.revision,
-            "product_revision": product_revision,
-            "support_revision": support_revision,
-            "evidence_revision": evidence_revision,
-            "audit_complete": True,
-            "report": report,
-            "coverage_manifest": coverage_manifest,
-            "recorded_at": utc_now(),
-        }
-        state["review"] = empty_review_state(
-            state["required_reviews"],
-            args.revision,
-            product_revision,
-            support_revision,
-            evidence_revision,
-        )
-        state["qa"] = empty_qa_state()
-        state["phase"] = "review"
-
-    state["last_engineer_outcome"] = outcome
+                    **result_revisions,
+                    "base_review_runs": list(revalidation.get("base_review_runs", [])),
+                    "base_convergence_runs": list(
+                        revalidation.get("base_convergence_runs", [])
+                    ),
+                    "finding_ids": list(revalidation.get("finding_ids", [])),
+                    "changed_impact_surface": {
+                        "paths": sorted(item["path"] for item in diff_files),
+                        "symbols": sorted(
+                            {symbol for item in diff_files for symbol in item["symbols"]}
+                        ),
+                    },
+                    "run": None,
+                }
+            else:
+                post_coverage_phase = "convergence"
+                slice_ids = list(revalidation.get("slice_ids") or state["ordered_slices"])
+                require_full_convergence_budget(state, slice_ids)
+                state["convergence"] = empty_convergence_state(
+                    state["required_convergence_audits"],
+                    result["revision"],
+                    result["product_revision"],
+                    result["support_revision"],
+                    result["evidence_revision"],
+                    state.get("convergence", {}).get("wave", 0) + 1,
+                    slice_ids,
+                    revalidation.get("full_wave_trigger") or "product_remediation",
+                )
+            iteration = state["iteration_control"]
+            if (
+                product_changed
+                and iteration["consecutive_product_changes"]
+                >= iteration["max_consecutive_product_changes"]
+            ):
+                iteration["status"] = "checkpoint_required"
+                iteration["reason"] = "Consecutive product-change circuit breaker reached"
+                iteration["resume_phase"] = post_coverage_phase
+                post_coverage_phase = "convergence_hold"
+    state["pending_engineer_completion"] = {
+        "phase": lease["phase"],
+        "writer_role": "engineer",
+        "writer_id": args.owner_id,
+        "lease_id": lease["lease_id"],
+        "slice_id": slice_item["id"],
+        "base_revisions": base_revisions,
+        "result_revisions": result_revisions,
+        "change_manifest": change_path,
+        "diff_summary": diff_path,
+        "revision_manifest": revision_path,
+        "semantic_report": semantic_path.relative_to(root).as_posix(),
+        "open_assumptions": semantic["open_assumptions"],
+        "post_coverage_phase": post_coverage_phase,
+    }
+    record_scope_churn(state, slice_item, diff_files)
+    slice_item["scope_pre_edit_check"] = None
+    slice_item["status"] = "engineering_complete"
+    state["machine_checks"] = {
+        "status": "pass",
+        **result_revisions,
+        "report": report,
+        "diff_inspection": "pass",
+    }
+    state["last_engineer_run_id"] = args.run_id
+    state["last_engineer_outcome"] = "engineering_pass"
     state["engineer_runs"].append(
         {
             "run_id": args.run_id,
             "owner_id": args.owner_id,
-            "input_revision": input_revision,
-            "input_product_revision": input_product_revision,
-            "input_support_revision": input_support_revision,
-            "input_evidence_revision": input_evidence_revision,
-            "revision": args.revision,
-            "product_revision": product_revision,
-            "support_revision": support_revision,
-            "evidence_revision": evidence_revision,
-            "change_class": "product" if product_changed else "none",
-            "outcome": outcome,
-            "machine_checks": args.machine_checks,
+            "outcome": "engineering_pass",
+            "base_revisions": base_revisions,
+            "result_revisions": result_revisions,
             "report": report,
-            "coverage_manifest": coverage_manifest,
-            "production_change_scope": args.production_change_scope,
-            "production_files_changed": computed_files_changed,
-            "production_lines_changed": computed_lines_changed,
-            "scope_approval": args.scope_approval,
+            "semantic_handoff": semantic_path.relative_to(root).as_posix(),
+            "change_manifest": change_path,
+            "diff_summary": diff_path,
+            "revision_manifest": revision_path,
             "resolved_findings": sorted(resolved_ids),
-            "slice_id": args.slice_id or state.get("slice_id"),
-            "base_revision": args.base_revision or input_revision,
-            "handoff_manifest": handoff_manifest,
-            "change_manifest": change_manifest_path,
-            "diff_summary": diff_summary_path,
-            "audit_complete": True,
             "recorded_at": utc_now(),
         }
+    )
+    release_active_lease(state, result="complete", reason="ENGINEERING_PASS")
+    state["scope_guard"]["rebaseline_candidate"] = None
+    state["phase"] = (
+        "slice_coverage_finalization" if lease["phase"] == "slice_engineering" else "coverage_finalization"
     )
     record_worker(state, "engineer", args.owner_id)
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
 
+
+
 def cmd_transfer_engineering_owner(args: argparse.Namespace) -> int:
     root, state_path, findings_path, state, findings = load_runtime(args.project_root)
     if state["phase"] not in {"engineering", "owner_handoff_hold"}:
-        raise PipelineError("Engineering ownership can transfer only before a remediation pass")
+        raise PipelineError("Engineering owner transfer is valid only at a remediation boundary")
+    lease = state.get("active_write_lease")
+    if lease:
+        if lease.get("role") != "engineer" or lease.get("worker_id") != args.from_owner:
+            raise PipelineError("Active lease does not belong to from-owner")
+        snapshot = state["lease_snapshots"].get(lease["lease_id"], {}).get("checkout", {})
+        changed = changed_checkout_paths(snapshot, checkout_snapshot(root, state["feature"]))
+        if changed:
+            raise PipelineError("Cannot transfer ownership with unaccepted checkout drift")
+        lease_id = lease["lease_id"]
+        release_active_lease(state, result="revoked", reason=args.reason)
+    else:
+        lease_id = "no_write"
     if state.get("engineering_owner_id") != args.from_owner:
-        raise PipelineError("from-owner does not match the assigned engineering owner")
-    if args.from_owner == args.to_owner:
-        raise PipelineError("Engineering ownership transfer requires a different owner")
-    active_batch = state.get("active_remediation_batch")
-    route = (active_batch or {}).get("route") or args.slice_id or state.get("active_slice")
-    if args.slice_id and args.slice_id != route:
-        raise PipelineError("--slice-id does not match the active engineering route")
-    if args.to_owner in state.get("worker_budget", {}).get("worker_ids", []):
-        raise PipelineError("Engineering ownership handoff requires a fresh Engineer identity")
-    if not args.handoff_manifest:
-        raise PipelineError("Engineering ownership handoff requires --handoff-manifest")
-    manifest_path = resolve_owner_handoff_manifest(
-        root,
-        state,
-        args.handoff_manifest,
-        route=route,
-        from_owner=args.from_owner,
-        to_owner=args.to_owner,
-        reason=args.reason,
-        expected_finding_ids=(active_batch or {}).get("finding_ids"),
+        raise PipelineError("from-owner does not match the current route owner")
+    if args.from_owner == args.to_owner or args.to_owner in state["worker_budget"].get("worker_ids", []):
+        raise PipelineError("Ownership transfer requires a fresh distinct Engineer")
+    route = (state.get("active_remediation_batch") or {}).get("route") or args.slice_id
+    if not route:
+        raise PipelineError("Ownership transfer requires an exact route/slice")
+    controller_root = root / "tests" / state["feature"] / "verification" / "controller"
+    controller_root.mkdir(parents=True, exist_ok=True)
+    empty_change = controller_root / f"transfer-{len(state['handoffs']) + 1:04d}-change.json"
+    empty_diff = controller_root / f"transfer-{len(state['handoffs']) + 1:04d}-diff.json"
+    write_json(empty_change, {"schema": 2, "change_manifest": [], "revision": state["revision"]})
+    write_json(empty_diff, {"schema": 2, "product_files": [], "support_paths": [], "evidence_paths": []})
+    coverage_record = state["coverage"].get(route) or state["coverage"].get("feature") or empty_coverage_scope()
+    coverage_state = coverage_record.get("state", {})
+    pending = {
+        "phase": state["phase"],
+        "writer_role": "engineer",
+        "writer_id": args.from_owner,
+        "lease_id": lease_id,
+        "slice_id": route if route in state["slices"] else state["ordered_slices"][-1],
+        "base_revisions": {
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        },
+        "result_revisions": {
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        },
+        "change_manifest": empty_change.relative_to(root).as_posix(),
+        "diff_summary": empty_diff.relative_to(root).as_posix(),
+        "semantic_report": "controller:owner-transfer:" + args.reason,
+        "open_assumptions": [],
+    }
+    normalized_coverage = {
+        "manifest_path": coverage_state.get("manifest_path"),
+        "manifest_sha256": coverage_state.get("manifest_sha256"),
+        "ac_mapped": coverage_state.get("ac_mapped", False),
+        "identities_registered": coverage_state.get("identities_registered", "pending"),
+        "automated": coverage_state.get("automated", "pending"),
+        "manual": coverage_state.get("manual", "pending"),
+    }
+    handoff_path, handoff = generate_schema2_handoff(root, state, pending, normalized_coverage)
+    state["handoffs"].append(
+        {
+            "handoff_id": handoff["handoff_id"],
+            "path": handoff_path,
+            "sha256": file_sha256(root / handoff_path),
+            "handoff_sha256": handoff["handoff_sha256"],
+            "schema": 2,
+            "recorded_at": utc_now(),
+        }
     )
     state["engineering_owner_id"] = args.to_owner
     if route == "integration":
         state["integration_owner"] = args.to_owner
-    elif route in state.get("owner_by_slice", {}):
+    elif route in state["slices"]:
         state["owner_by_slice"][route] = args.to_owner
         state["slices"][route]["owner_id"] = args.to_owner
-    if active_batch:
-        active_batch["owner_id"] = args.to_owner
-        active_batch["returns_for_owner"] = 0
-        for queued in state.get("remediation_queue", []):
-            if queued.get("status") == "active" and queued.get("route") == route:
-                queued["owner_id"] = args.to_owner
-                queued["returns_for_owner"] = 0
+    if state.get("active_remediation_batch"):
+        state["active_remediation_batch"]["owner_id"] = args.to_owner
+        state["active_remediation_batch"]["returns_for_owner"] = 0
     if state["phase"] == "owner_handoff_hold":
         state["phase"] = "engineering"
     state.setdefault("owner_transfers", []).append(
@@ -3388,21 +5830,670 @@ def cmd_transfer_engineering_owner(args: argparse.Namespace) -> int:
             "to": args.to_owner,
             "reason": args.reason,
             "route": route,
-            "manifest": manifest_path,
+            "handoff": handoff_path,
             "recorded_at": utc_now(),
         }
     )
-    state["handoff_manifests"].append(
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+def cmd_user_authority_accept(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    require_sources_current(state)
+    if state.get("active_write_lease") is not None or state.get("phase") == "decision_recording":
+        raise PipelineError("User authority acceptance requires a separate lease-free checkpoint")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9._:-]*", args.authority_id):
+        raise PipelineError("User authority ID must be a stable machine-addressable identifier")
+    if not args.approval_reference.strip() or not args.statement.strip():
+        raise PipelineError("User authority acceptance requires exact approval reference and statement")
+    if any(
+        record["authority_id"] == args.authority_id
+        for record in state["user_authorities"]
+    ):
+        raise PipelineError("User authority IDs are append-only and cannot be reissued")
+    recorded_at = utc_now()
+    digest = user_authority_digest(
+        args.authority_id, args.approval_reference, args.statement
+    )
+    controller_root = root / "tests" / state["feature"] / "verification" / "controller"
+    controller_root.mkdir(parents=True, exist_ok=True)
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", args.authority_id)
+    receipt_path = controller_root / f"user-authority-{safe_id}.json"
+    if receipt_path.exists():
+        raise PipelineError("User authority receipt path already exists")
+    receipt = {
+        "schema": 1,
+        "authority_id": args.authority_id,
+        "approval_reference": args.approval_reference,
+        "statement": args.statement,
+        "sha256": digest,
+        "recorded_at": recorded_at,
+    }
+    write_json(receipt_path, receipt)
+    record = {
+        "authority_id": args.authority_id,
+        "approval_reference": args.approval_reference,
+        "statement": args.statement,
+        "sha256": digest,
+        "receipt_path": receipt_path.relative_to(root).as_posix(),
+        "receipt_sha256": file_sha256(receipt_path),
+        "recorded_at": recorded_at,
+    }
+    state["user_authorities"].append(record)
+    save_runtime(state_path, findings_path, state, findings)
+    print(json.dumps(record, ensure_ascii=False, indent=2))
+    return 0
+
+
+def validate_decision_authority(
+    root: Path,
+    state: dict[str, Any],
+    authority: dict[str, Any],
+    statement: str,
+    capsule: dict[str, Any] | None,
+) -> None:
+    if not re.fullmatch(r"[0-9a-f]{64}", str(authority["sha256"])):
+        raise PipelineError("Decision authority SHA must be 64 lowercase hexadecimal characters")
+    kind = authority["kind"]
+    if kind == "user":
+        record = next(
+            (
+                item
+                for item in state["user_authorities"]
+                if item["authority_id"] == authority["section_or_id"]
+            ),
+            None,
+        )
+        if (
+            authority["path"] != "not_applicable"
+            or not record
+            or record["approval_reference"] != authority["reference"]
+            or record["statement"] != statement
+            or record["sha256"] != authority["sha256"]
+        ):
+            raise PipelineError(
+                "User decision authority must match a prior immutable controller acceptance receipt"
+            )
+    else:
+        expected_paths = {
+            "prd": Path(state["requirements_path"]).resolve().relative_to(root).as_posix(),
+            "specification": Path(state["spec_path"]).resolve().relative_to(root).as_posix(),
+            "development_plan": Path(state["development_plan_path"])
+            .resolve()
+            .relative_to(root)
+            .as_posix(),
+        }
+        relative = scope_path(authority["path"], "Decision authority")
+        if kind in expected_paths and relative != expected_paths[kind]:
+            raise PipelineError(f"Decision {kind} authority points outside its canonical artifact")
+        path = resolve_project_file(root, relative, "Decision authority")
+        if file_sha256(path) != authority["sha256"]:
+            raise PipelineError("Decision authority SHA does not match exact current bytes")
+        if authority["section_or_id"] not in path.read_text(
+            encoding="utf-8", errors="replace"
+        ):
+            raise PipelineError("Decision authority section/ID is absent from its exact artifact")
+    if capsule is not None and not any(
+        entry["path"] == authority["path"]
+        and entry["sha256"] == authority["sha256"]
+        and authority["section_or_id"] in entry["ids"]
+        for entry in capsule["authority"]
+    ):
+        raise PipelineError("Decision authority was not assigned by the exact context capsule")
+
+
+def validate_decision_semantic_packet(
+    root: Path,
+    state: dict[str, Any],
+    packet: dict[str, Any],
+    capsule: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if set(packet) != {"schema", "items"} or packet.get("schema") != 1 or not isinstance(
+        packet.get("items"), list
+    ) or not packet["items"]:
+        raise PipelineError("Decision semantic packet must be schema 1 with non-empty items")
+    exact = {
+        "schema",
+        "decision_id",
+        "status",
+        "statement",
+        "rationale",
+        "consequences",
+        "scope_ids",
+        "authority",
+        "supersedes",
+    }
+    existing = set(state["decision_ledger"]["active_decision_ids"]) | set(
+        state["decision_ledger"]["superseded_decision_ids"]
+    )
+    active = set(state["decision_ledger"]["active_decision_ids"])
+    seen: set[str] = set()
+    for item in packet["items"]:
+        if not isinstance(item, dict) or set(item) != exact or item.get("schema") != 1:
+            raise PipelineError("Every decision item must use the exact schema-1 semantic fields")
+        decision_id = item.get("decision_id")
+        if not isinstance(decision_id, str) or not re.fullmatch(r"DEC-[A-Za-z0-9-]+", decision_id):
+            raise PipelineError("Decision ID must use DEC-*")
+        if decision_id in existing or decision_id in seen:
+            raise PipelineError("Decision IDs are append-only and cannot be duplicated or mutated")
+        seen.add(decision_id)
+        if (
+            item.get("status") != "accepted"
+            or not item.get("statement")
+            or not isinstance(item.get("rationale"), str)
+            or not item["rationale"].strip()
+        ):
+            raise PipelineError("Decision Recorder may append accepted non-empty decisions only")
+        require_string_list(item.get("consequences"), f"Decision {decision_id} consequences")
+        scope_ids = set(
+            require_string_list(
+                item.get("scope_ids"), f"Decision {decision_id} scope_ids", allow_empty=False
+            )
+        )
+        approved_scope_ids = set(state["ordered_slices"]) | planned_acceptance_ids(state) | {
+            requirement
+            for slice_item in state["slices"].values()
+            for requirement in slice_item["requirement_ids"]
+        }
+        if not scope_ids.issubset(approved_scope_ids):
+            raise PipelineError("Decision scope_ids must be an approved PRD/slice subset")
+        supersedes = require_string_list(item.get("supersedes"), f"Decision {decision_id} supersedes")
+        if any(target not in active for target in supersedes):
+            raise PipelineError("Decision supersedes only currently active ledger entries")
+        authority = item.get("authority")
+        if not isinstance(authority, dict) or set(authority) != {
+            "kind",
+            "reference",
+            "path",
+            "sha256",
+            "section_or_id",
+        } or authority.get("kind") not in {
+            "user",
+            "prd",
+            "specification",
+            "development_plan",
+            "controller_resolution",
+        } or any(not authority.get(field) for field in authority):
+            raise PipelineError("Decision authority must be exact, accepted, and complete")
+        validate_decision_authority(root, state, authority, item["statement"], capsule)
+        active.difference_update(supersedes)
+        active.add(decision_id)
+    return packet["items"]
+
+
+def cmd_decision_record_complete(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(
+        args.project_root, allow_active_writer_completion_drift=True
+    )
+    lease = state.get("active_write_lease")
+    if (
+        state["phase"] != "decision_recording"
+        or not lease
+        or lease.get("lease_id") != args.lease_id
+        or lease.get("role") != "decision_recorder"
+        or lease.get("worker_id") != args.recorder_id
+    ):
+        raise PipelineError("decision-record-complete requires the exact active recorder lease")
+    _, capsule = resolve_validated_capsule(
+        root,
+        state,
+        args.capsule,
+        role="decision_recorder",
+        worker_id=args.recorder_id,
+        phase="decision_recording",
+    )
+    packet_path = resolve_project_file(root, args.semantic_packet, "Decision semantic packet")
+    items = validate_decision_semantic_packet(
+        root, state, read_json(packet_path), capsule
+    )
+    report = resolve_report(root, state, args.report, "Decision Recorder report")
+    snapshot = state["lease_snapshots"][lease["lease_id"]]["checkout"]
+    before = checkout_snapshot(root, state["feature"])
+    preexisting_drift = changed_checkout_paths(snapshot, before)
+    allowed_adr = sorted(scope_path(path, "ADR") for path in (args.adr_path or []))
+    if len(allowed_adr) != len(set(allowed_adr)):
+        raise PipelineError("Decision recording repeats an ADR path")
+    ledger_relative = state["decision_ledger"]["path"]
+    assigned_outputs = set(capsule["output_paths"])
+    assigned_paths = set(lease["allowed_paths"])
+    for adr in allowed_adr:
+        if not adr.startswith("docs/") or Path(adr).suffix.casefold() not in {".md", ".mdx"}:
+            raise PipelineError("ADR synchronization is confined to repository documentation paths")
+        if adr not in assigned_outputs or not any(
+            path_matches_scope(adr, rule) for rule in assigned_paths
+        ):
+            raise PipelineError("ADR path is outside exact capsule/lease output authority")
+        if not (root / adr).is_file():
+            raise PipelineError(f"Assigned ADR output does not exist: {adr}")
+    if ledger_relative not in assigned_outputs or not any(
+        path_matches_scope(ledger_relative, rule) for rule in assigned_paths
+    ):
+        raise PipelineError("Decision ledger append is outside exact capsule/lease output authority")
+    if set(preexisting_drift) != set(allowed_adr):
+        raise PipelineError(
+            "Decision recording checkout drift must equal the exact explicitly assigned ADR set"
+        )
+    ledger_path = root / ledger_relative
+    _, prior_raw = read_decision_ledger(ledger_path)
+    prefix = prior_raw
+    sequence = state["decision_ledger"]["entry_count"]
+    lines: list[bytes] = []
+    recorded_at = utc_now()
+    for semantic in items:
+        sequence += 1
+        entry = {
+            **semantic,
+            "sequence": sequence,
+            "recorded_at": recorded_at,
+            "recorder_id": args.recorder_id,
+            "prior_ledger_sha256": hashlib.sha256(prefix + b"".join(lines)).hexdigest(),
+            "input_product_revision": state["product_revision"],
+        }
+        lines.append(
+            json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+    temporary = ledger_path.with_suffix(ledger_path.suffix + ".tmp")
+    temporary.write_bytes(prefix + b"".join(lines))
+    os.replace(temporary, ledger_path)
+    state["decision_ledger"] = decision_ledger_state(
+        ledger_path, state["decision_ledger"]["path"]
+    )
+    for adr in allowed_adr:
+        if adr not in state["revision_inventory"]["product"]:
+            state["revision_inventory"]["product"].append(adr)
+    state["revision_inventory"]["product"] = sorted(state["revision_inventory"]["product"])
+    base = {
+        "revision": state["revision"],
+        "product_revision": state["product_revision"],
+        "support_revision": state["support_revision"],
+        "evidence_revision": state["evidence_revision"],
+    }
+    current = compute_inventory_revisions(root, state)
+    for key in base:
+        state[key] = current[key]
+    controller_root = root / "tests" / state["feature"] / "verification" / "controller"
+    controller_root.mkdir(parents=True, exist_ok=True)
+    receipt = controller_root / f"decision-{sequence:04d}-append-receipt.json"
+    write_json(
+        receipt,
         {
-            "kind": "owner_transfer",
-            "route": route,
-            "from_owner": args.from_owner,
-            "to_owner": args.to_owner,
-            "revision": state.get("revision"),
-            "manifest": manifest_path,
+            "schema": 1,
+            "decision_ids": [item["decision_id"] for item in items],
+            "prior_ledger_sha256": hashlib.sha256(prior_raw).hexdigest(),
+            "ledger_sha256": state["decision_ledger"]["sha256"],
+            "base_revisions": base,
+            "result_revisions": {key: current[key] for key in base},
+            "report": report,
+        },
+    )
+    change_path = controller_root / f"decision-{sequence:04d}-change-manifest.json"
+    diff_path = controller_root / f"decision-{sequence:04d}-diff-summary.json"
+    decision_paths = [state["decision_ledger"]["path"], *allowed_adr]
+    write_json(
+        change_path,
+        {
+            "schema": 2,
+            "phase": "decision_recording",
+            "role": "decision_recorder",
+            "worker_id": args.recorder_id,
+            "lease_id": lease["lease_id"],
+            "base_revisions": base,
+            "result_revisions": {key: current[key] for key in base},
+            "change_manifest": [
+                {
+                    "path": path,
+                    "domain": "product",
+                    "decision_ids": [item["decision_id"] for item in items],
+                    "reason": "accepted decision ledger append or assigned ADR synchronization",
+                    "change_kind": "append" if path == state["decision_ledger"]["path"] else "adr_sync",
+                }
+                for path in decision_paths
+            ],
+        },
+    )
+    write_json(
+        diff_path,
+        {
+            "schema": 2,
+            "phase": "decision_recording",
+            "base_revisions": base,
+            "result_revisions": {key: current[key] for key in base},
+            "product_files": decision_paths,
+            "support_paths": [],
+            "evidence_paths": [],
+        },
+    )
+    scope_id = state.get("active_slice") or state["ordered_slices"][-1]
+    coverage_record = state["coverage"].get(scope_id, empty_coverage_scope())["state"]
+    coverage_for_handoff = {
+        "manifest_path": coverage_record.get("manifest_path"),
+        "manifest_sha256": coverage_record.get("manifest_sha256"),
+        "ac_mapped": coverage_record.get("ac_mapped", False),
+        "identities_registered": coverage_record.get("identities_registered", "pending"),
+        "automated": coverage_record.get("automated", "pending"),
+        "manual": coverage_record.get("manual", "pending"),
+    }
+    pending = {
+        "phase": "decision_recording",
+        "writer_role": "decision_recorder",
+        "writer_id": args.recorder_id,
+        "lease_id": lease["lease_id"],
+        "slice_id": scope_id,
+        "base_revisions": base,
+        "result_revisions": {key: current[key] for key in base},
+        "change_manifest": change_path.relative_to(root).as_posix(),
+        "diff_summary": diff_path.relative_to(root).as_posix(),
+        "semantic_report": packet_path.relative_to(root).as_posix(),
+        "open_assumptions": [],
+    }
+    handoff_path, handoff = generate_schema2_handoff(
+        root, state, pending, coverage_for_handoff
+    )
+    state["handoffs"].append(
+        {
+            "handoff_id": handoff["handoff_id"],
+            "path": handoff_path,
+            "sha256": file_sha256(root / handoff_path),
+            "handoff_sha256": handoff["handoff_sha256"],
+            "schema": 2,
             "recorded_at": utc_now(),
         }
     )
+    release_active_lease(state, result="complete", reason="DECISION_RECORDING_COMPLETE")
+    resume = (state.get("decision_recording") or {}).get("resume_phase")
+    state["decision_recording"] = None
+    if resume == "preflight":
+        state["phase"] = "preflight"
+    else:
+        active = state.get("active_slice")
+        if not active:
+            raise PipelineError("Early decision recording lost its active slice route")
+        slice_item = state["slices"][active]
+        slice_item["base_revision"] = state["revision"]
+        slice_item["base_product_revision"] = state["product_revision"]
+        slice_item["base_support_revision"] = state["support_revision"]
+        slice_item["base_evidence_revision"] = state["evidence_revision"]
+        slice_item["scope_pre_edit_check"] = None
+        slice_item["research"] = {
+            "status": "pending",
+            "base_revision": state["revision"],
+            "bundles": [],
+            "reason": None,
+            "completed_at": None,
+        }
+        state["coverage"][active] = empty_coverage_scope()
+        state["pending_engineer_completion"] = None
+        state["phase"] = "slice_research"
+    state["implementation_state"] = {
+        "status": "pending",
+        "revision": None,
+        "coverage_manifest": None,
+    }
+    state["feature_verification_state"] = {
+        "status": "pending",
+        "product_revision": None,
+        "support_revision": None,
+        "evidence_revision": None,
+    }
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+def cmd_documentation_complete(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(
+        args.project_root, allow_active_writer_completion_drift=True
+    )
+    phase = "normative_documentation" if args.mode == "normative_pre_review" else "derived_documentation"
+    lane = "normative" if args.mode == "normative_pre_review" else "derived"
+    lease = state.get("active_write_lease")
+    if (
+        state["phase"] != phase
+        or not lease
+        or lease.get("lease_id") != args.lease_id
+        or lease.get("role") != "documentation_finisher"
+        or lease.get("worker_id") != args.worker_id
+    ):
+        raise PipelineError("documentation-complete requires the exact active Finisher lease/lane")
+    resolve_validated_capsule(
+        root,
+        state,
+        args.capsule,
+        role="documentation_finisher",
+        worker_id=args.worker_id,
+        phase=phase,
+    )
+    source_map_path = resolve_project_file(root, args.source_map, "Documentation semantic source map")
+    packet = read_json(source_map_path)
+    slice_item = state["slices"][state.get("active_slice") or state["ordered_slices"][-1]]
+    changes, inventory, _ = validate_semantic_write_packet(
+        root, state, lease, packet, slice_item=slice_item
+    )
+    expected_domain = "product" if lane == "normative" else "support"
+    if not changes or any(item["domain"] != expected_domain for item in changes):
+        raise PipelineError(
+            f"{args.mode} may change only non-empty {expected_domain}-domain assigned outputs"
+        )
+    if lane == "derived":
+        qa = state["qa"]
+        if (
+            qa.get("status") != "pass"
+            or qa.get("product_revision") != state["product_revision"]
+            or qa.get("evidence_revision") != state["evidence_revision"]
+        ):
+            raise PipelineError("Derived documentation requires unchanged passed-QA product/evidence")
+    report = resolve_report(root, state, args.report, "Documentation Finisher report")
+    base = {
+        "revision": state["revision"],
+        "product_revision": state["product_revision"],
+        "support_revision": state["support_revision"],
+        "evidence_revision": state["evidence_revision"],
+    }
+    state["revision_inventory"] = inventory
+    current = compute_inventory_revisions(root, state)
+    for key in base:
+        state[key] = current[key]
+    if lane == "derived":
+        aggregate_path, _, aggregate_state = write_feature_coverage_aggregate(
+            root,
+            state,
+            mode="qa_updated",
+            suffix=f"docs-{args.worker_id}-{len(state['handoffs']) + 1:04d}",
+        )
+        aggregate_absolute = str(root / aggregate_path)
+        state["coverage"]["feature"]["finalized_manifest"] = {
+            "path": aggregate_absolute,
+            "sha256": file_sha256(root / aggregate_path),
+            "revision": state["revision"],
+            "report": "controller:derived-documentation-coverage-rebind",
+            "steward_id": "controller-aggregate",
+        }
+        state["coverage"]["feature"]["state"] = aggregate_state
+        state["coverage_manifest"] = aggregate_absolute
+    change_path, diff_path, revision_path, _ = write_controller_mechanics(
+        root,
+        state,
+        run_id=f"docs-{args.worker_id}-{len(state['handoffs']) + 1}",
+        lease=lease,
+        slice_item=slice_item,
+        changes=changes,
+        base_revisions=base,
+        result_revisions={key: current[key] for key in base},
+    )
+    changed_paths = sorted(item["path"] for item in changes)
+    decision_ids = sorted({decision for item in changes for decision in item["decision_ids"]})
+    documentation = state["documentation"][lane]
+    documentation.update(
+        {
+            "status": "required_complete",
+            "paths": changed_paths,
+            "report_path": report,
+            "report_sha256": file_sha256(root / report),
+        }
+    )
+    if lane == "normative":
+        documentation["product_revision"] = state["product_revision"]
+        documentation["decision_ids"] = decision_ids
+        state["implementation_state"]["revision"] = state["revision"]
+        state["feature_verification_state"]["status"] = "invalidated"
+        next_wave = state.get("convergence", {}).get("wave", 0) + 1
+        state["convergence"] = empty_convergence_state(
+            state["required_convergence_audits"],
+            state["revision"],
+            state["product_revision"],
+            state["support_revision"],
+            state["evidence_revision"],
+            next_wave,
+            list(state["ordered_slices"]),
+            "initial_implementation",
+        )
+        state["phase"] = "convergence"
+    else:
+        documentation["support_revision"] = state["support_revision"]
+        documentation["source_evidence_ids"] = sorted(
+            {source for item in changes for source in item["acceptance_ids"] + item["decision_ids"]}
+        )
+        documentation["closure_review_id"] = "pending"
+        state["phase"] = "documentation_review"
+    pending = {
+        "phase": phase,
+        "writer_role": "documentation_finisher",
+        "writer_id": args.worker_id,
+        "lease_id": lease["lease_id"],
+        "slice_id": slice_item["id"],
+        "base_revisions": base,
+        "result_revisions": {key: current[key] for key in base},
+        "change_manifest": change_path,
+        "diff_summary": diff_path,
+        "semantic_report": source_map_path.relative_to(root).as_posix(),
+        "open_assumptions": packet["open_assumptions"],
+    }
+    coverage_record = state["coverage"].get("feature") or state["coverage"].get(slice_item["id"])
+    coverage_state = (coverage_record or empty_coverage_scope())["state"]
+    normalized_coverage = {
+        "manifest_path": coverage_state.get("manifest_path"),
+        "manifest_sha256": coverage_state.get("manifest_sha256"),
+        "ac_mapped": coverage_state.get("ac_mapped", False),
+        "identities_registered": coverage_state.get("identities_registered", "pending"),
+        "automated": coverage_state.get("automated", "pending"),
+        "manual": coverage_state.get("manual", "pending"),
+    }
+    handoff_path, handoff = generate_schema2_handoff(root, state, pending, normalized_coverage)
+    state["handoffs"].append(
+        {
+            "handoff_id": handoff["handoff_id"],
+            "path": handoff_path,
+            "sha256": file_sha256(root / handoff_path),
+            "handoff_sha256": handoff["handoff_sha256"],
+            "schema": 2,
+            "recorded_at": utc_now(),
+        }
+    )
+    release_active_lease(state, result="complete", reason="DOCUMENTATION_COMPLETE")
+    record_worker(state, f"documentation_finisher_{lane}", args.worker_id)
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+def cmd_documentation_not_required(args: argparse.Namespace) -> int:
+    _, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    lane = "normative" if args.mode == "normative_pre_review" else "derived"
+    if (
+        args.plan_sha256 != state["development_plan_sha256"]
+        or args.policy_evidence != documentation_policy_reference(state, lane)
+    ):
+        raise PipelineError("documentation-not-required requires exact approved-plan policy evidence")
+    expected = {"normative": {"implementation_complete", "normative_documentation"}, "derived": {"derived_documentation"}}
+    if state["phase"] not in expected[lane]:
+        raise PipelineError("documentation-not-required is invalid in the current phase")
+    state["documentation"][lane].update(
+        {
+            "status": "not_required",
+            "paths": [],
+            "report_path": args.policy_evidence,
+            "report_sha256": None,
+        }
+    )
+    if lane == "normative":
+        state["documentation"][lane]["product_revision"] = state["product_revision"]
+        next_wave = state.get("convergence", {}).get("wave", 0) + 1
+        state["convergence"] = empty_convergence_state(
+            state["required_convergence_audits"],
+            state["revision"],
+            state["product_revision"],
+            state["support_revision"],
+            state["evidence_revision"],
+            next_wave,
+            list(state["ordered_slices"]),
+            "initial_implementation",
+        )
+        state["phase"] = "convergence"
+    else:
+        state["documentation"][lane]["support_revision"] = state["support_revision"]
+        state["documentation"][lane]["closure_review_id"] = "not_required"
+        qa = state["qa"]
+        if (
+            qa.get("status") != "pass"
+            or qa.get("product_revision") != state["product_revision"]
+            or qa.get("evidence_revision") != state["evidence_revision"]
+        ):
+            raise PipelineError("Derived not-required closure requires unchanged passed-QA identities")
+        state["feature_verification_state"] = {
+            "status": "pass",
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        }
+        controller_root = Path(state["tests_path"]) / "verification" / "controller"
+        controller_root.mkdir(parents=True, exist_ok=True)
+        change_path = controller_root / "derived-not-required-change.json"
+        diff_path = controller_root / "derived-not-required-diff.json"
+        write_json(change_path, {"schema": 2, "change_manifest": [], "policy_evidence": args.policy_evidence})
+        write_json(diff_path, {"schema": 2, "product_files": [], "support_paths": [], "evidence_paths": []})
+        scope_id = state["ordered_slices"][-1]
+        coverage_record = state["coverage"].get("feature") or state["coverage"][scope_id]
+        coverage_state = coverage_record["state"]
+        identities = {
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        }
+        pending = {
+            "phase": "derived_documentation",
+            "writer_role": "documentation_finisher",
+            "writer_id": "controller-not-required",
+            "lease_id": "no_write",
+            "slice_id": scope_id,
+            "base_revisions": identities,
+            "result_revisions": identities,
+            "change_manifest": change_path.relative_to(Path(state["project_root"])).as_posix(),
+            "diff_summary": diff_path.relative_to(Path(state["project_root"])).as_posix(),
+            "semantic_report": args.policy_evidence,
+            "open_assumptions": [],
+        }
+        coverage_for_handoff = {
+            "manifest_path": coverage_state.get("manifest_path"),
+            "manifest_sha256": coverage_state.get("manifest_sha256"),
+            "ac_mapped": coverage_state.get("ac_mapped", False),
+            "identities_registered": coverage_state.get("identities_registered", "pending"),
+            "automated": coverage_state.get("automated", "pending"),
+            "manual": coverage_state.get("manual", "pending"),
+        }
+        root = Path(state["project_root"])
+        handoff_path, handoff = generate_schema2_handoff(root, state, pending, coverage_for_handoff)
+        state["handoffs"].append(
+            {
+                "handoff_id": handoff["handoff_id"],
+                "path": handoff_path,
+                "sha256": file_sha256(root / handoff_path),
+                "handoff_sha256": handoff["handoff_sha256"],
+                "schema": 2,
+                "recorded_at": utc_now(),
+            }
+        )
+        state["phase"] = "ready"
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
@@ -3490,6 +6581,13 @@ def cmd_convergence_finalize(args: argparse.Namespace) -> int:
     convergence["decided_at"] = utc_now()
 
     if args.decision == "pass":
+        if state["implementation_state"].get("status") != "pass":
+            raise PipelineError("Convergence PASS requires independent implementation_state=pass")
+        if state["documentation"]["normative"].get("status") not in {
+            "required_complete",
+            "not_required",
+        }:
+            raise PipelineError("Convergence PASS requires normative documentation closure")
         if current_blocking or audit_failed:
             raise PipelineError(
                 "Convergence cannot pass while an audit failed or current blocking findings remain open"
@@ -3668,9 +6766,22 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
         raise PipelineError("Review decision requires both final Review reports")
     if len(review.get("runs", [])) != state["required_reviews"]:
         raise PipelineError("Review decision requires exactly two completed Review reports")
-    report = resolve_report(root, state, args.report, "Aggregated Review decision report")
-    budget = state["worker_budget"]
-    budget["full_review_waves"] += 1
+    if args.decision == "pass":
+        coverage_gaps = [
+            scope_id
+            for scope_id, record in state.get("coverage", {}).items()
+            if record.get("state", {}).get("readiness_class") == "EVIDENCE_CONTRACT_VIOLATION"
+            or record.get("state", {}).get("gaps")
+            or (
+                record.get("finalized_manifest")
+                and not record.get("state", {}).get("implementation_eligible")
+            )
+        ]
+        if coverage_gaps:
+            raise PipelineError(
+                "Final Review PASS is forbidden by EVIDENCE_CONTRACT_VIOLATION in: "
+                + ", ".join(sorted(coverage_gaps))
+            )
     reviewer_failed = any(run["status"] == "fail" for run in review["runs"])
     review_findings = [
         item
@@ -3680,6 +6791,33 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
         and item["revision"] == args.revision
     ]
     review_blocking = [item for item in review_findings if item.get("blocking")]
+
+    derived_rework_scope: str | None = None
+    if args.decision == "rework":
+        if not review_blocking:
+            raise PipelineError(
+                "Rework decision requires at least one registered blocking Review finding"
+            )
+        blocking_kinds = {item.get("finding_kind") for item in review_blocking}
+        if blocking_kinds == {"product"}:
+            derived_rework_scope = "product"
+        elif blocking_kinds.issubset({"evidence", "support"}):
+            derived_rework_scope = "recovery"
+        else:
+            raise PipelineError(
+                "Blocking Review findings do not form one normalized product or evidence/support batch"
+            )
+        requested_family = (
+            "product" if args.rework_scope == "product" else "recovery"
+        )
+        if requested_family != derived_rework_scope:
+            raise PipelineError(
+                "Review rework scope conflicts with the controller-derived blocking finding_kind route"
+            )
+
+    report = resolve_report(root, state, args.report, "Aggregated Review decision report")
+    budget = state["worker_budget"]
+    budget["full_review_waves"] += 1
 
     if args.decision == "pass":
         if review_blocking or reviewer_failed:
@@ -3699,17 +6837,9 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
         state["product_revalidation"] = None
         state["phase"] = "qa"
     else:
-        if not review_blocking:
-            raise PipelineError(
-                "Rework decision requires at least one registered blocking Review finding"
-            )
         review["status"] = "failed"
         state["qa"] = empty_qa_state()
-        if args.rework_scope in {"evidence", "support", "recovery"}:
-            if any(item.get("finding_kind") == "product" for item in review_blocking):
-                raise PipelineError(
-                    "Non-product recovery cannot contain a product finding"
-                )
+        if derived_rework_scope == "recovery":
             state["recovery"] = {
                 "status": "awaiting_remediation",
                 "base_revision": state["revision"],
@@ -3768,7 +6898,7 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
     review["decided_at"] = utc_now()
     if (
         args.decision == "rework"
-        and args.rework_scope == "product"
+        and derived_rework_scope == "product"
         and args.revalidation == "full"
         and budget["full_review_waves"] >= budget["max_full_review_waves"]
     ):
@@ -4132,173 +7262,226 @@ def cmd_accept_finding(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_start_evidence_recovery(args: argparse.Namespace) -> int:
-    """Convert a paused legacy Review rework into the non-product recovery lane."""
-    _, state_path, findings_path, state, findings = load_runtime(args.project_root)
-    require_sources_current(state)
-    require_current_revision(state, args.revision)
-    review = state.get("review", {})
-    if state["phase"] != "engineering" or review.get("status") != "failed":
-        raise PipelineError(
-            "start-evidence-recovery requires a finalized failed Review paused in engineering"
-        )
-    selected = set(args.finding_id or [])
-    open_review = [
-        item
-        for item in findings["items"]
-        if item["status"] == "open"
-        and item["source"] == "review"
-        and item.get("blocking") is True
-    ]
-    if not selected or selected != {item["id"] for item in open_review}:
-        raise PipelineError(
-            "Supply every and only open Review finding with --finding-id"
-        )
-    if any(item.get("finding_kind") not in {"evidence", "support"} for item in open_review):
-        raise PipelineError(
-            "Legacy recovery cannot infer finding_kind; selected findings must already be "
-            "normalized as evidence or support under schema 8"
-        )
-    state["product_revision"] = args.product_revision
-    state["support_revision"] = args.support_revision
-    state["evidence_revision"] = args.evidence_revision
-    clean = state.get("engineer_clean")
-    if clean:
-        clean["product_revision"] = args.product_revision
-        clean["support_revision"] = args.support_revision
-        clean["evidence_revision"] = args.evidence_revision
-    state["machine_checks"]["product_revision"] = args.product_revision
-    state["machine_checks"]["support_revision"] = args.support_revision
-    state["machine_checks"]["evidence_revision"] = args.evidence_revision
-    review["product_revision"] = args.product_revision
-    review["support_revision"] = args.support_revision
-    review["evidence_revision"] = args.evidence_revision
-    state["recovery"] = {
-        "status": "awaiting_remediation",
-        "base_revision": state["revision"],
-        "base_product_revision": args.product_revision,
-        "base_support_revision": args.support_revision,
-        "base_evidence_revision": args.evidence_revision,
-        "finding_ids": sorted(selected),
-        "base_review_runs": list(review.get("runs", [])),
-        "remediation_owner_id": None,
-        "remediation_runs": [],
-        "verification_runs": [],
-        "cycles": 0,
-        "reason": args.reason,
-    }
-    state["phase"] = "evidence_recovery"
-    save_runtime(state_path, findings_path, state, findings)
-    return cmd_status(args)
-
-
 def cmd_evidence_remediation_complete(args: argparse.Namespace) -> int:
-    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
-    require_sources_current(state)
-    require_worker_budget(state, args.worker_id)
+    root, state_path, findings_path, state, findings = load_runtime(
+        args.project_root, allow_active_writer_completion_drift=True
+    )
     recovery = state.get("recovery")
-    if state["phase"] != "evidence_recovery" or not recovery:
-        raise PipelineError("No support/evidence remediation is awaiting completion")
-    if args.product_revision != recovery["base_product_revision"]:
-        raise PipelineError(
-            "Product revision changed during evidence recovery; return to full engineering"
-        )
-    if recovery.get("remediation_owner_id") is None:
-        recovery["remediation_owner_id"] = args.worker_id
-    elif recovery["remediation_owner_id"] != args.worker_id:
-        raise PipelineError(
-            "Support/evidence recovery must resume the assigned remediator identity"
-        )
-    if args.production_change_scope != "none":
-        raise PipelineError("Support/evidence recovery must not modify runtime product code")
-    if args.machine_checks != "pass":
-        raise PipelineError("Support/evidence recovery requires passing targeted and aggregate checks")
+    lease = state.get("active_write_lease")
     if (
-        args.support_revision == recovery["base_support_revision"]
-        and args.evidence_revision == recovery["base_evidence_revision"]
+        state["phase"] != "evidence_recovery"
+        or not recovery
+        or not lease
+        or lease.get("lease_id") != args.lease_id
+        or lease.get("role") != "recovery_remediator"
+        or lease.get("worker_id") != args.worker_id
     ):
-        raise PipelineError(
-            "Non-product remediation must produce a new support or evidence revision"
-        )
+        raise PipelineError("recovery-remediation-complete requires the exact active recovery lease")
+    if args.machine_checks != "pass":
+        raise PipelineError("Recovery remediation remains incomplete until targeted checks pass")
+    require_worker_budget(state, args.worker_id)
     if any(
-        run["run_id"] == args.run_id
-        for run in recovery.get("remediation_runs", [])
+        run.get("run_id") == args.run_id for run in recovery.get("remediation_runs", [])
     ):
-        raise PipelineError(f"Evidence remediation run ID already recorded: {args.run_id}")
-
-    required_ids = set(recovery["finding_ids"])
-    selected_items = [
-        item for item in findings["items"] if item["id"] in required_ids
-    ]
-    if len(selected_items) != len(required_ids) or any(
-        item.get("status") != "open" or item.get("finding_kind") == "product"
-        for item in selected_items
-    ):
-        raise PipelineError("The frozen evidence-recovery batch is missing or no longer open")
-    resolved_ids = set(args.resolved_finding or [])
-    if resolved_ids != required_ids:
-        raise PipelineError(
-            "Evidence remediation must resolve the complete open evidence finding batch"
-        )
-    report = resolve_report(root, state, args.report, "Evidence remediation report")
-    coverage_manifest = resolve_coverage_manifest(
+        raise PipelineError(f"Recovery remediation run ID already recorded: {args.run_id}")
+    resolve_validated_capsule(
         root,
         state,
-        args.coverage_manifest,
-        args.product_revision,
-        args.support_revision,
-        args.evidence_revision,
+        args.capsule,
+        role="recovery_remediator",
+        worker_id=args.worker_id,
+        phase="evidence_recovery",
     )
-    for item in findings["items"]:
-        if item["id"] in resolved_ids:
-            item["status"] = "resolved"
-            item["resolved_revision"] = args.revision
-            item["resolved_product_revision"] = args.product_revision
-            item["resolved_support_revision"] = args.support_revision
-            item["resolved_evidence_revision"] = args.evidence_revision
-            item["resolved_at"] = utc_now()
-
-    state["revision"] = args.revision
-    state["product_revision"] = args.product_revision
-    state["support_revision"] = args.support_revision
-    state["evidence_revision"] = args.evidence_revision
-    state["coverage_manifest"] = coverage_manifest
+    semantic_path = resolve_project_file(root, args.semantic_report, "Recovery semantic report")
+    packet = read_json(semantic_path)
+    slice_item = state["slices"][state["ordered_slices"][-1]]
+    changes, inventory, _ = validate_semantic_write_packet(
+        root, state, lease, packet, slice_item=slice_item
+    )
+    if any(item["domain"] == "product" for item in changes):
+        raise PipelineError("Product drift exits evidence recovery and requires Engineer routing")
+    required_ids = set(recovery["finding_ids"])
+    resolved_ids = set(args.resolved_finding or [])
+    if resolved_ids != required_ids:
+        raise PipelineError("Recovery remediation must resolve the exact frozen non-product batch")
+    report = resolve_report(root, state, args.report, "Recovery remediation report")
+    base = {
+        "revision": state["revision"],
+        "product_revision": state["product_revision"],
+        "support_revision": state["support_revision"],
+        "evidence_revision": state["evidence_revision"],
+    }
+    state["revision_inventory"] = inventory
+    current = compute_inventory_revisions(root, state)
+    if current["product_revision"] != base["product_revision"]:
+        raise PipelineError("Product identity drifted during recovery")
+    coverage_path = resolve_report(
+        root, state, args.coverage_manifest, "Recovery finalized coverage aggregate"
+    )
+    coverage_manifest = read_json(Path(coverage_path))
+    coverage_validation = validate_coverage_manifest(
+        root,
+        state,
+        coverage_manifest,
+        scope_id="feature",
+        require_finalized=True,
+        expected_revision=current["revision"],
+        expected_product_revision=current["product_revision"],
+        expected_support_revision=current["support_revision"],
+        expected_evidence_revision=current["evidence_revision"],
+    )
+    prior_coverage_record = state.get("coverage", {}).get("feature", {}).get(
+        "finalized_manifest"
+    )
+    if not prior_coverage_record:
+        raise PipelineError("Recovery requires a prior finalized feature coverage aggregate")
+    prior_coverage_path = Path(prior_coverage_record["path"])
+    if (
+        not prior_coverage_path.is_file()
+        or file_sha256(prior_coverage_path) != prior_coverage_record["sha256"]
+    ):
+        raise PipelineError("Prior finalized feature coverage aggregate drifted")
+    validate_coverage_continuity(
+        state,
+        read_json(prior_coverage_path),
+        coverage_manifest,
+        authorized_new_ids=set(),
+    )
+    for key in base:
+        state[key] = current[key]
+    coverage_state = coverage_state_from_validation(
+        coverage_path, coverage_manifest, coverage_validation
+    )
+    coverage_state.update(
+        {
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        }
+    )
+    state["coverage"]["feature"] = {
+        "planned_manifest": state["coverage"]["feature"].get("planned_manifest"),
+        "finalized_manifest": {
+            "path": coverage_path,
+            "sha256": file_sha256(Path(coverage_path)),
+            "revision": state["revision"],
+            "report": report,
+            "steward_id": "recovery-remediator-validated",
+        },
+        "state": coverage_state,
+    }
+    state["coverage_manifest"] = coverage_path
+    if (
+        state.get("implementation_state", {}).get("status") == "pass"
+        and coverage_state.get("implementation_eligible") is True
+    ):
+        state["implementation_state"] = {
+            "status": "pass",
+            "revision": state["revision"],
+            "coverage_manifest": coverage_path,
+        }
     state["machine_checks"] = {
         "status": "pass",
-        "revision": args.revision,
-        "product_revision": args.product_revision,
-        "support_revision": args.support_revision,
-        "evidence_revision": args.evidence_revision,
+        "revision": state["revision"],
+        "product_revision": state["product_revision"],
+        "support_revision": state["support_revision"],
+        "evidence_revision": state["evidence_revision"],
         "report": report,
-        "coverage_manifest": coverage_manifest,
+        "coverage_manifest": coverage_path,
     }
-    recovery["status"] = "awaiting_verification"
-    recovery["current_revision"] = args.revision
-    recovery["current_support_revision"] = args.support_revision
-    recovery["current_evidence_revision"] = args.evidence_revision
-    recovery["remediation_runs"].append(
+    state["review"].update(
         {
-            "run_id": args.run_id,
-            "worker_id": args.worker_id,
-            "revision": args.revision,
-            "product_revision": args.product_revision,
-            "support_revision": args.support_revision,
-            "evidence_revision": args.evidence_revision,
-            "resolved_findings": sorted(resolved_ids),
-            "report": report,
-            "coverage_manifest": coverage_manifest,
+            "status": "recovery_verification",
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+            "recovery_run": None,
+        }
+    )
+    state["qa"] = empty_qa_state()
+    state["qa_capability"] = empty_qa_capability_state()
+    change_path, diff_path, revision_path, _ = write_controller_mechanics(
+        root,
+        state,
+        run_id=args.run_id,
+        lease=lease,
+        slice_item=slice_item,
+        changes=changes,
+        base_revisions=base,
+        result_revisions={key: current[key] for key in base},
+    )
+    coverage_scope = state["coverage"].get("feature") or state["coverage"].get(
+        slice_item["id"], empty_coverage_scope()
+    )
+    coverage_value = coverage_scope.get("state", {})
+    handoff_path, handoff = generate_schema2_handoff(
+        root,
+        state,
+        {
+            "phase": lease["phase"],
+            "writer_role": "recovery_remediator",
+            "writer_id": args.worker_id,
+            "lease_id": lease["lease_id"],
+            "slice_id": slice_item["id"],
+            "base_revisions": base,
+            "result_revisions": {key: current[key] for key in base},
+            "change_manifest": change_path,
+            "diff_summary": diff_path,
+            "semantic_report": semantic_path.relative_to(root).as_posix(),
+            "open_assumptions": packet["open_assumptions"],
+        },
+        {
+            "manifest_path": coverage_value.get("manifest_path"),
+            "manifest_sha256": coverage_value.get("manifest_sha256"),
+            "ac_mapped": coverage_value.get("ac_mapped", False),
+            "identities_registered": coverage_value.get(
+                "identities_registered", "pending"
+            ),
+            "automated": coverage_value.get("automated", "pending"),
+            "manual": coverage_value.get("manual", "pending"),
+        },
+    )
+    state["handoffs"].append(
+        {
+            "handoff_id": handoff["handoff_id"],
+            "path": handoff_path,
+            "sha256": file_sha256(root / handoff_path),
+            "handoff_sha256": handoff["handoff_sha256"],
+            "schema": 2,
             "recorded_at": utc_now(),
         }
     )
-    review = state["review"]
-    review["status"] = "recovery_verification"
-    review["revision"] = args.revision
-    review["product_revision"] = args.product_revision
-    review["support_revision"] = args.support_revision
-    review["evidence_revision"] = args.evidence_revision
-    review["recovery_run"] = None
-    state["qa"] = empty_qa_state()
+    for item in findings["items"]:
+        if item["id"] in resolved_ids:
+            if item.get("finding_kind") == "product" or item.get("status") != "open":
+                raise PipelineError("Recovery batch contains an invalid product/closed finding")
+            item["status"] = "resolved"
+            item["resolved_revision"] = state["revision"]
+            item["resolved_product_revision"] = state["product_revision"]
+            item["resolved_support_revision"] = state["support_revision"]
+            item["resolved_evidence_revision"] = state["evidence_revision"]
+            item["resolved_at"] = utc_now()
+    recovery["status"] = "awaiting_verification"
+    recovery["current_revision"] = state["revision"]
+    recovery["current_support_revision"] = state["support_revision"]
+    recovery["current_evidence_revision"] = state["evidence_revision"]
+    recovery.setdefault("remediation_runs", []).append(
+        {
+            "run_id": args.run_id,
+            "worker_id": args.worker_id,
+            "resolved_findings": sorted(resolved_ids),
+            "semantic_report": semantic_path.relative_to(root).as_posix(),
+            "change_manifest": change_path,
+            "diff_summary": diff_path,
+            "revision_manifest": revision_path,
+            "recorded_at": utc_now(),
+        }
+    )
+    release_active_lease(state, result="complete", reason="RECOVERY_REMEDIATION_COMPLETE")
     state["phase"] = "recovery_review"
+    state["feature_verification_state"]["status"] = "invalidated"
     record_worker(state, "nonproduct_remediation", args.worker_id)
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
@@ -4477,6 +7660,154 @@ def resolve_qa_gates(state: dict[str, Any], revision: str, resolution: str) -> N
             gate["resolution"] = resolution
 
 
+
+
+def finalized_manual_identity_catalog(
+    root: Path, state: dict[str, Any]
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    identities: dict[str, dict[str, Any]] = {}
+    mandatory: set[str] = set()
+    scopes = list(state["ordered_slices"])
+    if state.get("coverage", {}).get("feature", {}).get("finalized_manifest"):
+        scopes = ["feature"]
+    for scope_id in scopes:
+        record = state["coverage"].get(scope_id, {})
+        artifact = record.get("finalized_manifest")
+        if not artifact:
+            raise PipelineError(f"QA requires finalized schema-2 coverage for {scope_id}")
+        path = Path(artifact["path"])
+        if not path.is_file() or file_sha256(path) != artifact["sha256"]:
+            raise PipelineError(f"Finalized coverage artifact drifted for {scope_id}")
+        manifest = read_json(path)
+        actual = manifest.get("actual_identities")
+        if not isinstance(actual, list):
+            raise PipelineError("Finalized coverage actual identities are missing")
+        for item in actual:
+            identity_id = item.get("identity_id") if isinstance(item, dict) else None
+            if not identity_id or identity_id in identities:
+                raise PipelineError("Coverage identity IDs must be globally unique across scopes")
+            if item.get("kind") == "manual":
+                identities[identity_id] = item
+        mandatory.update(
+            identity_id
+            for identity_id in manifest.get("mandatory_actual_identity_ids", [])
+            if identity_id in identities
+        )
+    return identities, mandatory
+
+
+def validate_manual_execution_artifact(
+    root: Path,
+    state: dict[str, Any],
+    supplied: str,
+) -> tuple[str, list[dict[str, Any]], dict[str, dict[str, Any]], set[str]]:
+    path = resolve_project_file(root, supplied, "QA manual execution artifact")
+    value = read_json(path)
+    if set(value) != {
+        "schema",
+        "revision",
+        "product_revision",
+        "support_revision",
+        "evidence_revision",
+        "manual_execution",
+    } or value.get("schema") != 2:
+        raise PipelineError("Manual execution artifact must use the exact schema 2 envelope")
+    for field in ("revision", "product_revision", "support_revision", "evidence_revision"):
+        if value[field] != state[field]:
+            raise PipelineError(f"Manual execution artifact {field} is stale")
+    catalog, mandatory = finalized_manual_identity_catalog(root, state)
+    rows = value["manual_execution"]
+    if not isinstance(rows, list):
+        raise PipelineError("Manual execution rows must be a list")
+    by_id: dict[str, dict[str, Any]] = {}
+    exact = {
+        "identity_id",
+        "executed",
+        "passed",
+        "deferred",
+        "blocked_by_finding",
+        "qa_evidence",
+        "gate",
+        "minimum_resume_action",
+    }
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != exact:
+            raise PipelineError("Every QA manual row must use exact schema-2 execution fields")
+        identity_id = row["identity_id"]
+        if identity_id not in catalog or identity_id in by_id:
+            raise PipelineError("QA manual row names an unknown or duplicate exact identity")
+        if not isinstance(row["executed"], bool) or row["passed"] not in {True, False, None} or not isinstance(
+            row["deferred"], bool
+        ):
+            raise PipelineError("QA manual executed/passed/deferred values are invalid")
+        if row["passed"] is True and not row["executed"]:
+            raise PipelineError("Manual PASS requires executed=true")
+        if row["deferred"]:
+            if row["executed"] or row["passed"] is not None or row["gate"] not in QA_GATE_STATUSES or not row[
+                "minimum_resume_action"
+            ]:
+                raise PipelineError("Deferred manual identity requires a gate and resume action")
+        elif row["gate"] is not None:
+            raise PipelineError("Non-deferred manual identity cannot carry a gate")
+        if row["blocked_by_finding"]:
+            if row["executed"] or row["deferred"] or row["passed"] is not None:
+                raise PipelineError("blocked_by_finding is an unexecuted non-gate identity")
+        if row["executed"]:
+            evidence = row["qa_evidence"]
+            if not isinstance(evidence, dict) or set(evidence) != {"path", "sha256"}:
+                raise PipelineError(
+                    "Every executed manual identity requires immutable QA evidence path/SHA"
+                )
+            evidence_path = resolve_project_file(root, evidence["path"], "QA identity evidence")
+            try:
+                evidence_path.relative_to(Path(state["tests_path"]).resolve())
+            except ValueError as exc:
+                raise PipelineError("QA identity evidence must stay under feature test artifacts") from exc
+            if (
+                not re.fullmatch(r"[0-9a-f]{64}", str(evidence["sha256"]))
+                or file_sha256(evidence_path) != evidence["sha256"]
+            ):
+                raise PipelineError("QA identity evidence SHA does not match immutable bytes")
+        elif row["qa_evidence"] is not None:
+            raise PipelineError("Unexecuted manual identity cannot claim QA evidence")
+        by_id[identity_id] = row
+    if set(by_id) != set(catalog):
+        raise PipelineError("QA must return every registered manual identity exactly once")
+    return path.relative_to(root).as_posix(), rows, by_id, mandatory
+
+
+def require_current_review_chain_for_qa(state: dict[str, Any]) -> None:
+    review = state.get("review", {})
+    exact = all(
+        review.get(key) == state[key]
+        for key in ("revision", "product_revision", "support_revision", "evidence_revision")
+    )
+    if review.get("status") not in PASSED_REVIEW_STATUSES or not exact:
+        raise PipelineError("QA requires an exact-current immutable Review chain")
+    if review["status"] == "passed":
+        runs = review.get("runs", [])
+        if len(runs) != state["required_reviews"] or len(
+            {item.get("reviewer_id") for item in runs}
+        ) != len(runs):
+            raise PipelineError("QA requires the complete distinct final Review pair")
+    elif review["status"] == "passed_recovery":
+        recovery = state.get("recovery") or {}
+        if (
+            recovery.get("status") != "passed"
+            or len(recovery.get("base_review_runs", [])) != state["required_reviews"]
+            or not review.get("recovery_run")
+        ):
+            raise PipelineError("QA recovery Review chain is incomplete")
+    else:
+        closure = state.get("closure_review") or {}
+        if (
+            closure.get("status") != "passed"
+            or len(closure.get("base_review_runs", [])) != state["required_reviews"]
+            or not closure.get("run")
+        ):
+            raise PipelineError("QA targeted-closure Review chain is incomplete")
+
+
 def cmd_qa_complete(args: argparse.Namespace) -> int:
     root, state_path, findings_path, state, findings = load_runtime(args.project_root)
     require_sources_current(state)
@@ -4489,166 +7820,230 @@ def cmd_qa_complete(args: argparse.Namespace) -> int:
         args.evidence_revision,
     )
     if state["phase"] != "qa":
-        raise PipelineError("QA can complete only during the QA phase")
-    qa_capability = state.get("qa_capability", {})
-    capability_exact = qa_capability.get("revision") == args.revision
-    if args.status in QA_GATE_STATUSES:
-        failed_statuses = set(qa_capability.get("capabilities", {}).values())
-        if (
-            not capability_exact
-            or qa_capability.get("status") != "blocked"
-            or args.status not in failed_statuses
-            or not qa_capability.get("minimum_resume_actions")
-        ):
-            raise PipelineError(
-                "BLOCKED_USER/BLOCKED_ENVIRONMENT/ERROR_TEST requires a recorded failed "
-                "capability probe on the exact revision and a minimum resume action"
-            )
-    elif not capability_exact or qa_capability.get("status") != "ready":
-        raise PipelineError(
-            "QA must not spawn before the complete exact-revision capability probe passes"
-        )
-    blocked_capabilities = blocked_preflight_capabilities(state)
-    if blocked_capabilities:
-        raise PipelineError(
-            "QA must not spawn before preflight capabilities are ready: "
-            + ", ".join(sorted(blocked_capabilities))
-        )
-    non_qa_roles = {
+        raise PipelineError("qa-complete requires QA phase")
+    if any(run.get("run_id") == args.run_id for run in state["qa_runs"]):
+        raise PipelineError(f"QA run ID already recorded: {args.run_id}")
+    prior_non_qa_roles = {
         record["role"]
         for record in state["worker_budget"].get("records", [])
-        if record.get("worker_id") == args.worker_id and record.get("role") != "runtime_qa"
+        if record.get("worker_id") == args.worker_id
+        and record.get("role") != "runtime_qa"
     }
-    if non_qa_roles:
-        raise PipelineError("Runtime QA requires an identity independent of earlier pipeline roles")
-    review = state.get("review", {})
-    if review.get("status") not in PASSED_REVIEW_STATUSES or review.get("revision") != args.revision:
-        raise PipelineError("QA requires two passed final reviews on the current revision")
-    if any(run["run_id"] == args.run_id for run in state["qa_runs"]):
-        raise PipelineError(f"QA run ID already recorded: {args.run_id}")
+    if prior_non_qa_roles:
+        raise PipelineError("Runtime QA requires an identity fresh from every prior non-QA role")
+    require_current_review_chain_for_qa(state)
+    resolve_validated_capsule(
+        root, state, args.capsule, role="qa", worker_id=args.worker_id, phase="qa"
+    )
+    qa_capability = state["qa_capability"]
+    if qa_capability.get("revision") != state["revision"]:
+        raise PipelineError("QA capability probe is stale")
+    if args.status in QA_GATE_STATUSES:
+        if qa_capability.get("status") != "blocked" or args.status not in set(
+            qa_capability.get("capabilities", {}).values()
+        ):
+            raise PipelineError("QA gate requires the matching failed exact-revision capability probe")
+    elif qa_capability.get("status") != "ready":
+        raise PipelineError("QA execution requires a ready exact-revision capability probe")
+    manual_path, rows, by_id, mandatory = validate_manual_execution_artifact(
+        root, state, args.manual_execution
+    )
+    pending = sorted(args.pending_identity or [])
+    if len(pending) != len(set(pending)) or any(identity_id not in by_id for identity_id in pending):
+        raise PipelineError("pending-identity must name distinct registered manual identities")
+    deferred = sorted(identity_id for identity_id, row in by_id.items() if row["deferred"])
+    blocked_by_finding = sorted(
+        identity_id for identity_id, row in by_id.items() if row["blocked_by_finding"]
+    )
+    failed = sorted(
+        identity_id
+        for identity_id, row in by_id.items()
+        if row["executed"] and row["passed"] is False
+    )
+    mandatory_pass = all(
+        by_id[identity_id]["executed"] is True
+        and by_id[identity_id]["passed"] is True
+        and not by_id[identity_id]["deferred"]
+        and not by_id[identity_id]["blocked_by_finding"]
+        for identity_id in mandatory
+    )
+    if args.status == "pass":
+        if pending or deferred or blocked_by_finding or failed or not mandatory_pass:
+            raise PipelineError("QA PASS requires every mandatory manual identity executed/passed")
+    elif args.status == "fail_product":
+        if not failed:
+            raise PipelineError("FAIL_PRODUCT requires an executed failed manual identity")
+        qa_product = [
+            item
+            for item in findings["items"]
+            if item.get("status") == "open"
+            and item.get("source") == "qa"
+            and item.get("finding_kind") == "product"
+            and item.get("blocking") is True
+            and item.get("revision") == state["revision"]
+        ]
+        if not qa_product:
+            raise PipelineError("FAIL_PRODUCT requires a normalized blocking QA product finding")
+        if pending:
+            raise PipelineError("Product-invalidated identities use blocked_by_finding, not pending gates")
+    elif args.status in QA_GATE_STATUSES:
+        if not args.reason or pending != deferred or not pending:
+            raise PipelineError("QA gate pending identities must equal exact deferred identities")
+        if any(by_id[identity_id]["gate"] != args.status for identity_id in pending):
+            raise PipelineError("Deferred identity gates must match overall QA gate status")
+    elif args.status == "error_test" and not args.reason:
+        raise PipelineError("ERROR_TEST requires a reason")
     report = resolve_report(root, state, args.report, "QA report")
-    pending = args.pending_scenario or []
-    if args.status != "pass" and not args.reason:
-        raise PipelineError("Non-pass QA requires --reason")
-    if args.status in QA_GATE_STATUSES and not pending:
-        raise PipelineError(
-            "Blocked or errored QA requires --reason and at least one --pending-scenario"
-        )
-
-    qa_product_findings = [
-        item
-        for item in findings["items"]
-        if item.get("status") == "open"
-        and item.get("source") == "qa"
-        and item.get("finding_kind") == "product"
-        and item.get("blocking") is True
-        and item.get("revision") == args.revision
-    ]
-    if args.status == "fail_product" and not qa_product_findings:
-        raise PipelineError(
-            "FAIL_PRODUCT requires an open critical or major QA product finding "
-            "on this revision"
-        )
-    if args.status != "fail_product" and qa_product_findings:
-        raise PipelineError("Open blocking QA product findings require status fail_product")
-    if args.status == "pass" and pending:
-        raise PipelineError("Passing QA cannot contain pending scenarios")
-    effective_status = args.status
-    qa_run = {
+    run = {
         "run_id": args.run_id,
         "worker_id": args.worker_id,
-        "revision": args.revision,
+        "revision": state["revision"],
         "product_revision": state["product_revision"],
         "support_revision": state["support_revision"],
         "evidence_revision": state["evidence_revision"],
-        "status": effective_status,
-        "report": report,
-        "pending_scenarios": pending,
+        "status": args.status,
+        "manual_execution": manual_path,
+        "executed_identity_ids": sorted(
+            identity_id for identity_id, row in by_id.items() if row["executed"]
+        ),
+        "passed_identity_ids": sorted(
+            identity_id for identity_id, row in by_id.items() if row["passed"] is True
+        ),
+        "deferred_identity_ids": deferred,
+        "blocked_by_finding_identity_ids": blocked_by_finding,
+        "pending_identities": pending,
         "reason": args.reason,
+        "report": report,
         "capability_probe_id": qa_capability.get("probe_id"),
-        "minimum_resume_actions": qa_capability.get("minimum_resume_actions", {}),
         "recorded_at": utc_now(),
     }
-    state["qa_runs"].append(qa_run)
-    state["qa"] = {
-        "status": effective_status,
-        "revision": args.revision,
-        "product_revision": state["product_revision"],
-        "support_revision": state["support_revision"],
-        "evidence_revision": state["evidence_revision"],
-        "run_id": args.run_id,
-        "worker_id": args.worker_id,
+    state["qa_runs"].append(run)
+    state["qa"] = run
+    aggregate_path, _, aggregate_state = write_feature_coverage_aggregate(
+        root,
+        state,
+        mode="qa_updated",
+        manual_execution=rows,
+        suffix=f"qa-{args.run_id}",
+    )
+    aggregate_absolute = str(root / aggregate_path)
+    aggregate_state["manual_execution"] = manual_path
+    feature_scope = state["coverage"].setdefault("feature", empty_coverage_scope())
+    feature_scope["finalized_manifest"] = {
+        "path": aggregate_absolute,
+        "sha256": file_sha256(root / aggregate_path),
+        "revision": state["revision"],
         "report": report,
-        "pending_scenarios": pending,
-        "reason": args.reason,
-        "capability_probe_id": qa_capability.get("probe_id"),
-        "minimum_resume_actions": qa_capability.get("minimum_resume_actions", {}),
+        "steward_id": "controller-qa-aggregate",
     }
-
-    if effective_status == "pass":
-        resolve_qa_gates(state, args.revision, "QA completed on the same revision")
-        state["phase"] = "ready"
-    elif effective_status == "fail_product":
-        resolve_qa_gates(state, args.revision, "QA reproduced a product defect")
-        state["engineer_clean"] = None
-        state["review"] = empty_review_state(
-            state["required_reviews"],
-            args.revision,
-            state["product_revision"],
-            state["support_revision"],
-            state["evidence_revision"],
-        )
-        build_remediation_queue(
-            state, findings, [item["id"] for item in qa_product_findings]
-        )
+    feature_scope["state"] = aggregate_state
+    state["coverage_manifest"] = aggregate_absolute
+    if args.status == "pass":
+        resolve_qa_gates(state, state["revision"], "All mandatory manual identities passed")
+        state["feature_verification_state"] = {
+            "status": "pending",
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        }
+        state["phase"] = "derived_documentation"
+    elif args.status == "fail_product":
+        qa_product = [
+            item for item in findings["items"] if item.get("status") == "open" and item.get("source") == "qa" and item.get("blocking")
+        ]
+        state["feature_verification_state"]["status"] = "invalidated"
+        build_remediation_queue(state, findings, [item["id"] for item in qa_product])
         if state.get("phase") != "owner_handoff_hold":
             state["phase"] = "engineering"
     else:
-        matching_probe_gate = next(
-            (
-                gate
-                for gate in state.get("gates", [])
-                if gate.get("status") == "open"
-                and gate.get("origin") == "qa_capability_probe"
-                and gate.get("category") == effective_status
-                and gate.get("revision") == args.revision
-            ),
-            None,
-        )
-        gate_record = {
+        state["feature_verification_state"]["status"] = "pending"
+        state["gates"].append(
+            {
                 "id": f"qa:{args.run_id}",
                 "phase": "qa",
-                "category": effective_status,
-                "revision": args.revision,
+                "category": args.status,
+                "revision": state["revision"],
+                "pending_identities": pending,
                 "reason": args.reason,
-                "pending_scenarios": pending,
-                "report": report,
-                "capability_probe_id": qa_capability.get("probe_id"),
-                "minimum_resume_actions": qa_capability.get(
-                    "minimum_resume_actions", {}
-                ),
+                "minimum_resume_actions": {
+                    identity_id: by_id[identity_id]["minimum_resume_action"] for identity_id in pending
+                },
                 "status": "open",
                 "created_at": utc_now(),
             }
-        if matching_probe_gate:
-            matching_probe_gate["qa_run_id"] = args.run_id
-            matching_probe_gate["qa_report"] = report
-        else:
-            state["gates"].append(gate_record)
+        )
         state["phase"] = "qa"
-
     record_worker(state, "runtime_qa", args.worker_id)
-    if state["phase"] == "ready":
-        state["worker_budget"]["status"] = "running"
-        state["worker_budget"]["reason"] = None
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+def cmd_documentation_review_complete(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    require_current_identity(
+        state,
+        args.revision,
+        args.product_revision,
+        args.support_revision,
+        args.evidence_revision,
+    )
+    if state["phase"] != "documentation_review":
+        raise PipelineError("documentation-review-complete requires documentation_review")
+    resolve_validated_capsule(
+        root,
+        state,
+        args.capsule,
+        role="reviewer",
+        worker_id=args.reviewer_id,
+        phase="documentation_review",
+    )
+    qa = state["qa"]
+    if (
+        qa.get("status") != "pass"
+        or qa.get("product_revision") != state["product_revision"]
+        or qa.get("evidence_revision") != state["evidence_revision"]
+        or args.product_revision != qa.get("product_revision")
+        or args.evidence_revision != qa.get("evidence_revision")
+    ):
+        state["feature_verification_state"]["status"] = "invalidated"
+        save_runtime(state_path, findings_path, state, findings)
+        raise PipelineError("Documentation closure cannot preserve QA after product/evidence drift")
+    if args.reviewer_id in state["worker_budget"].get("worker_ids", []):
+        raise PipelineError("Documentation closure requires a fresh reviewer identity")
+    report = resolve_report(root, state, args.report, "Documentation closure report")
+    if args.status == "pass":
+        state["documentation"]["derived"]["closure_review_id"] = args.run_id
+        state["feature_verification_state"] = {
+            "status": "pass",
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+        }
+        state["phase"] = "ready"
+    else:
+        state["documentation"]["derived"]["status"] = "gap"
+        state["feature_verification_state"]["status"] = "invalidated"
+        state["phase"] = "derived_documentation"
+    state.setdefault("documentation_review_runs", []).append(
+        {
+            "run_id": args.run_id,
+            "reviewer_id": args.reviewer_id,
+            "status": args.status,
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+            "report": report,
+            "recorded_at": utc_now(),
+        }
+    )
+    record_worker(state, "documentation_closure_review", args.reviewer_id)
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
 
 def readiness_reasons(state: dict[str, Any], findings: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
-    if source_drift(state):
-        reasons.append("approved PRD/spec/development plan bytes changed")
     if state.get("development_mode") == "sequential_slices" and not all_slices_sealed(state):
         reasons.append("not every approved development-plan slice has a sealed exact-revision handoff")
     if state.get("remediation_queue") and any(
@@ -4662,12 +8057,112 @@ def readiness_reasons(state: dict[str, Any], findings: dict[str, Any]) -> list[s
     evidence_revision = state.get("evidence_revision")
     if not revision:
         reasons.append("no current revision")
+    if state.get("active_write_lease") is not None:
+        reasons.append("a write-capable lease is still active")
+    if any(item.get("status") not in {"released", "revoked"} for item in state.get("write_lease_history", [])):
+        reasons.append("write lease history contains an unclosed entry")
+    if state.get("implementation_state", {}).get("status") != "pass":
+        reasons.append("implementation_state has not independently passed")
+    feature_verification = state.get("feature_verification_state", {})
+    if feature_verification != {
+        "status": "pass",
+        "product_revision": product_revision,
+        "support_revision": support_revision,
+        "evidence_revision": evidence_revision,
+    }:
+        reasons.append("feature_verification_state has not passed on current identities")
+    if state.get("documentation", {}).get("normative", {}).get("status") not in {
+        "required_complete",
+        "not_required",
+    }:
+        reasons.append("normative documentation is incomplete")
+    if state.get("documentation", {}).get("derived", {}).get("status") not in {
+        "required_complete",
+        "not_required",
+    }:
+        reasons.append("derived documentation is incomplete")
+    if any(
+        record.get("state", {}).get("readiness_class") == "EVIDENCE_CONTRACT_VIOLATION"
+        or record.get("state", {}).get("gaps")
+        for record in state.get("coverage", {}).values()
+        if record.get("finalized_manifest")
+    ):
+        reasons.append("schema-2 coverage has an EVIDENCE_CONTRACT_VIOLATION")
+    feature_coverage = state.get("coverage", {}).get("feature", {})
+    feature_artifact = feature_coverage.get("finalized_manifest")
+    feature_state = feature_coverage.get("state", {})
+    expected_terminal_coverage_state: dict[str, Any] | None = None
+    if not feature_artifact:
+        reasons.append("terminal feature coverage aggregate is missing")
+    else:
+        feature_path = Path(feature_artifact.get("path", ""))
+        try:
+            feature_value = read_json(feature_path)
+            validation = validate_coverage_manifest(
+                Path(state["project_root"]),
+                state,
+                feature_value,
+                scope_id="feature",
+                require_finalized=True,
+            )
+        except PipelineError:
+            validation = None
+        expected_coverage_revisions = {
+            key: state[key]
+            for key in ("revision", "product_revision", "support_revision", "evidence_revision")
+        }
+        if (
+            not feature_path.is_file()
+            or file_sha256(feature_path) != feature_artifact.get("sha256")
+            or feature_artifact.get("revision") != revision
+            or not validation
+            or feature_value.get("revisions") != expected_coverage_revisions
+            or feature_state.get("revision") != revision
+            or feature_state.get("product_revision") != product_revision
+            or feature_state.get("support_revision") != support_revision
+            or feature_state.get("evidence_revision") != evidence_revision
+            or feature_state.get("feature_verification_eligible") is not True
+        ):
+            reasons.append("terminal feature coverage aggregate is stale or ineligible")
+        else:
+            validated_coverage_state = coverage_state_from_validation(
+                str(feature_path), feature_value, validation
+            )
+            expected_terminal_coverage_state = {
+                "manifest_path": validated_coverage_state["manifest_path"],
+                "manifest_sha256": validated_coverage_state["manifest_sha256"],
+                "ac_mapped": validated_coverage_state["ac_mapped"],
+                "identities_registered": validated_coverage_state["identities_registered"],
+                "automated": validated_coverage_state["automated"],
+                "manual": validated_coverage_state["manual"],
+            }
+    terminal = state.get("handoffs", [])[-1] if state.get("handoffs") else None
+    if not terminal:
+        reasons.append("controller-generated schema-2 terminal handoff is missing")
+    else:
+        terminal_path = Path(state["project_root"]) / terminal.get("path", "")
+        try:
+            terminal_value = read_json(terminal_path)
+        except PipelineError:
+            terminal_value = {}
+        if (
+            terminal.get("schema") != 2
+            or not terminal_path.is_file()
+            or file_sha256(terminal_path) != terminal.get("sha256")
+            or terminal_value.get("decision_ids") != state["decision_ledger"]["active_decision_ids"]
+            or terminal_value.get("documentation_state")
+            != {
+                "normative": state["documentation"]["normative"]["status"],
+                "derived": state["documentation"]["derived"]["status"],
+            }
+            or expected_terminal_coverage_state is None
+            or terminal_value.get("coverage_state") != expected_terminal_coverage_state
+            or "open_assumptions" not in terminal_value
+        ):
+            reasons.append("schema-2 terminal handoff is stale or incomplete")
     machine = state.get("machine_checks", {})
     if (
         machine.get("status") != "pass"
-        or machine.get("revision") != revision
-        or machine.get("product_revision") != product_revision
-        or machine.get("support_revision") != support_revision
         or machine.get("evidence_revision") != evidence_revision
     ):
         reasons.append("machine checks have not passed on the current revision")
@@ -4682,8 +8177,12 @@ def readiness_reasons(state: dict[str, Any], findings: dict[str, Any]) -> list[s
     if not clean or clean.get("product_revision") != product_revision:
         reasons.append("parallel read-only convergence has not passed on the current product revision")
     review = state.get("review", {})
-    if review.get("status") not in PASSED_REVIEW_STATUSES or review.get("revision") != revision:
-        reasons.append("two final reviews have not passed on the current revision")
+    if (
+        review.get("status") not in PASSED_REVIEW_STATUSES
+        or review.get("product_revision") != product_revision
+        or review.get("evidence_revision") != evidence_revision
+    ):
+        reasons.append("two final reviews have not passed on the current product/evidence identities")
     elif review.get("status") == "passed" and len(review.get("runs", [])) != state.get("required_reviews", 2):
         reasons.append("final review evidence is incomplete")
     elif review.get("status") == "passed" and len({run["reviewer_id"] for run in review["runs"]}) != len(review["runs"]):
@@ -4709,15 +8208,19 @@ def readiness_reasons(state: dict[str, Any], findings: dict[str, Any]) -> list[s
         reasons.append("preflight resource-budget proof has not passed")
     if blocked_preflight_capabilities(state):
         reasons.append("preflight runtime capabilities remain unavailable")
+    qa = state.get("qa", {})
     qa_capability = state.get("qa_capability", {})
     if (
         qa_capability.get("status") != "ready"
-        or qa_capability.get("revision") != revision
+        or qa_capability.get("probe_id") != qa.get("capability_probe_id")
     ):
         reasons.append("exact-revision QA capability probe has not passed")
-    qa = state.get("qa", {})
-    if qa.get("status") != "pass" or qa.get("revision") != revision:
-        reasons.append("feature-focused runtime QA has not passed on the current revision")
+    if (
+        qa.get("status") != "pass"
+        or qa.get("product_revision") != product_revision
+        or qa.get("evidence_revision") != evidence_revision
+    ):
+        reasons.append("feature-focused runtime QA has not passed on current product/evidence")
     if any(gate.get("status") == "open" for gate in state.get("gates", [])):
         reasons.append("an execution, environment, or user gate remains open")
     if state.get("phase") != "ready":
@@ -4748,6 +8251,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--plan", required=True)
     init.add_argument("--plan-sha256", required=True)
     init.add_argument("--base-revision", required=True)
+    init.add_argument("--decision-ledger")
     init.add_argument("--integration-owner")
     init.add_argument("--slice")
     init.add_argument("--required-reviews", type=int, default=2)
@@ -4788,6 +8292,67 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_project_root(status)
     status.set_defaults(handler=cmd_status)
 
+    user_authority = commands.add_parser("user-authority-accept")
+    add_common_project_root(user_authority)
+    user_authority.add_argument("--authority-id", required=True)
+    user_authority.add_argument("--approval-reference", required=True)
+    user_authority.add_argument("--statement", required=True)
+    user_authority.set_defaults(handler=cmd_user_authority_accept)
+
+    capsule_create = commands.add_parser("context-capsule-create")
+    add_common_project_root(capsule_create)
+    capsule_create.add_argument("--role", choices=tuple(sorted(CAPSULE_ROLES)), required=True)
+    capsule_create.add_argument("--phase", required=True)
+    capsule_create.add_argument("--worker-id", required=True)
+    capsule_create.add_argument("--plan-sha256", required=True)
+    capsule_create.add_argument("--revision", required=True)
+    capsule_create.add_argument("--authority", action="append", required=True)
+    capsule_create.add_argument("--evidence", action="append")
+    capsule_create.add_argument("--decision-id", action="append")
+    capsule_create.add_argument("--finding-id", action="append")
+    capsule_create.add_argument("--coverage-identity-id", action="append")
+    capsule_create.add_argument("--allowed-path", action="append")
+    capsule_create.add_argument("--allowed-symbol", action="append")
+    capsule_create.add_argument("--exclusion", action="append")
+    capsule_create.add_argument("--command", action="append")
+    capsule_create.add_argument("--output-path", action="append", required=True)
+    capsule_create.add_argument("--stop-condition", required=True)
+    for limit in CONTEXT_LIMIT_NAMES:
+        capsule_create.add_argument("--" + limit.replace("_", "-"), dest=limit, type=int, required=True)
+    capsule_create.add_argument("--output", required=True)
+    capsule_create.set_defaults(handler=cmd_context_capsule_create)
+
+    capsule_check = commands.add_parser("context-capsule-check")
+    add_common_project_root(capsule_check)
+    capsule_check.add_argument("--capsule", required=True)
+    capsule_check.set_defaults(handler=cmd_context_capsule_check)
+
+    acquire_lease = commands.add_parser("acquire-write-lease")
+    add_common_project_root(acquire_lease)
+    acquire_lease.add_argument("--role", choices=tuple(sorted(WRITE_ROLES)), required=True)
+    acquire_lease.add_argument("--phase", required=True)
+    acquire_lease.add_argument("--write-scope", required=True)
+    acquire_lease.add_argument("--worker-id", required=True)
+    acquire_lease.add_argument("--capsule", required=True)
+    acquire_lease.set_defaults(handler=cmd_acquire_write_lease)
+
+    release_lease = commands.add_parser("release-write-lease")
+    add_common_project_root(release_lease)
+    release_lease.add_argument("--lease-id", required=True)
+    release_lease.add_argument("--result", choices=("complete", "incomplete", "blocked", "revoked"), required=True)
+    release_lease.add_argument("--reason", required=True)
+    release_lease.set_defaults(handler=cmd_release_write_lease)
+
+    decision_complete = commands.add_parser("decision-record-complete")
+    add_common_project_root(decision_complete)
+    decision_complete.add_argument("--recorder-id", required=True)
+    decision_complete.add_argument("--lease-id", required=True)
+    decision_complete.add_argument("--capsule", required=True)
+    decision_complete.add_argument("--semantic-packet", required=True)
+    decision_complete.add_argument("--adr-path", action="append")
+    decision_complete.add_argument("--report", required=True)
+    decision_complete.set_defaults(handler=cmd_decision_record_complete)
+
     research = commands.add_parser("slice-research-complete")
     add_common_project_root(research)
     research.add_argument("--slice-id", required=True)
@@ -4803,6 +8368,15 @@ def build_parser() -> argparse.ArgumentParser:
     research_not_required.add_argument("--owner-id", required=True)
     research_not_required.add_argument("--reason", required=True)
     research_not_required.set_defaults(handler=cmd_slice_research_not_required)
+
+    coverage_plan = commands.add_parser("coverage-plan-complete")
+    add_common_project_root(coverage_plan)
+    coverage_plan.add_argument("--slice-id", required=True)
+    coverage_plan.add_argument("--steward-id", required=True)
+    coverage_plan.add_argument("--capsule", required=True)
+    coverage_plan.add_argument("--coverage-manifest", required=True)
+    coverage_plan.add_argument("--report", required=True)
+    coverage_plan.set_defaults(handler=cmd_coverage_plan_complete)
 
     scope_check = commands.add_parser("slice-scope-check")
     add_common_project_root(scope_check)
@@ -4828,36 +8402,48 @@ def build_parser() -> argparse.ArgumentParser:
 
     engineer = commands.add_parser("engineer-complete")
     add_common_project_root(engineer)
-    engineer.add_argument("--revision", required=True)
-    engineer.add_argument("--product-revision")
-    engineer.add_argument("--support-revision")
-    engineer.add_argument("--evidence-revision")
     engineer.add_argument("--run-id", required=True)
     engineer.add_argument("--owner-id", required=True)
-    engineer.add_argument("--slice-id")
-    engineer.add_argument("--base-revision")
-    engineer.add_argument("--handoff-manifest")
-    engineer.add_argument("--change-manifest")
-    engineer.add_argument("--diff-summary")
+    engineer.add_argument("--lease-id", required=True)
+    engineer.add_argument("--capsule", required=True)
+    engineer.add_argument("--slice-id", required=True)
+    engineer.add_argument("--engineering-status", choices=("pass",), required=True)
     engineer.add_argument("--machine-checks", choices=("pass", "fail"), required=True)
+    engineer.add_argument("--diff-inspection", choices=("pass", "fail"), required=True)
+    engineer.add_argument("--semantic-handoff", required=True)
     engineer.add_argument("--report", required=True)
-    engineer.add_argument("--coverage-manifest", required=True)
-    engineer.add_argument(
-        "--production-change-scope",
-        choices=("none", "local", "architectural"),
-        required=True,
-    )
-    engineer.add_argument("--production-files-changed", type=int)
-    engineer.add_argument("--production-lines-changed", type=int)
     engineer.add_argument("--scope-approval")
     engineer.add_argument("--resolved-finding", action="append")
-    engineer.add_argument(
-        "--audit-complete",
-        action="store_true",
-        required=True,
-        help="Assert that delegated bounded research, batch remediation, checks, and scope resweep finished",
-    )
     engineer.set_defaults(handler=cmd_engineer_complete)
+
+    coverage_finalize = commands.add_parser("coverage-finalize")
+    add_common_project_root(coverage_finalize)
+    coverage_finalize.add_argument("--scope-id", required=True)
+    coverage_finalize.add_argument("--steward-id", required=True)
+    coverage_finalize.add_argument("--capsule", required=True)
+    coverage_finalize.add_argument("--coverage-manifest", required=True)
+    coverage_finalize.add_argument("--expected-actual-equality", choices=("pass", "fail"), required=True)
+    coverage_finalize.add_argument("--mandatory-registration", choices=("pass", "fail"), required=True)
+    coverage_finalize.add_argument("--automated-execution", choices=("pass", "fail"), required=True)
+    coverage_finalize.add_argument("--report", required=True)
+    coverage_finalize.set_defaults(handler=cmd_coverage_finalize)
+
+    documentation_complete = commands.add_parser("documentation-complete")
+    add_common_project_root(documentation_complete)
+    documentation_complete.add_argument("--mode", choices=("normative_pre_review", "derived_post_qa"), required=True)
+    documentation_complete.add_argument("--worker-id", required=True)
+    documentation_complete.add_argument("--lease-id", required=True)
+    documentation_complete.add_argument("--capsule", required=True)
+    documentation_complete.add_argument("--source-map", required=True)
+    documentation_complete.add_argument("--report", required=True)
+    documentation_complete.set_defaults(handler=cmd_documentation_complete)
+
+    documentation_not_required = commands.add_parser("documentation-not-required")
+    add_common_project_root(documentation_not_required)
+    documentation_not_required.add_argument("--mode", choices=("normative_pre_review", "derived_post_qa"), required=True)
+    documentation_not_required.add_argument("--plan-sha256", required=True)
+    documentation_not_required.add_argument("--policy-evidence", required=True)
+    documentation_not_required.set_defaults(handler=cmd_documentation_not_required)
 
     transfer_owner = commands.add_parser("transfer-engineering-owner")
     add_common_project_root(transfer_owner)
@@ -4865,7 +8451,6 @@ def build_parser() -> argparse.ArgumentParser:
     transfer_owner.add_argument("--to-owner", required=True)
     transfer_owner.add_argument("--reason", required=True)
     transfer_owner.add_argument("--slice-id")
-    transfer_owner.add_argument("--handoff-manifest", required=True)
     transfer_owner.set_defaults(handler=cmd_transfer_engineering_owner)
 
     convergence_audit = commands.add_parser("convergence-audit-complete")
@@ -5011,36 +8596,20 @@ def build_parser() -> argparse.ArgumentParser:
     accept.add_argument("--approval-reference", required=True)
     accept.set_defaults(handler=cmd_accept_finding)
 
-    recovery_start = commands.add_parser("start-evidence-recovery")
-    add_common_project_root(recovery_start)
-    recovery_start.add_argument("--revision", required=True)
-    recovery_start.add_argument("--product-revision", required=True)
-    recovery_start.add_argument("--support-revision", required=True)
-    recovery_start.add_argument("--evidence-revision", required=True)
-    recovery_start.add_argument("--finding-id", action="append", required=True)
-    recovery_start.add_argument("--reason", required=True)
-    recovery_start.set_defaults(handler=cmd_start_evidence_recovery)
-
     remediation = commands.add_parser(
         "recovery-remediation-complete",
         aliases=["evidence-remediation-complete"],
     )
     add_common_project_root(remediation)
-    remediation.add_argument("--revision", required=True)
-    remediation.add_argument("--product-revision", required=True)
-    remediation.add_argument("--support-revision", required=True)
-    remediation.add_argument("--evidence-revision", required=True)
     remediation.add_argument("--run-id", required=True)
     remediation.add_argument("--worker-id", required=True)
+    remediation.add_argument("--lease-id", required=True)
+    remediation.add_argument("--capsule", required=True)
     remediation.add_argument("--machine-checks", choices=("pass", "fail"), required=True)
-    remediation.add_argument("--report", required=True)
+    remediation.add_argument("--semantic-report", required=True)
     remediation.add_argument("--coverage-manifest", required=True)
+    remediation.add_argument("--report", required=True)
     remediation.add_argument("--resolved-finding", action="append", required=True)
-    remediation.add_argument(
-        "--production-change-scope",
-        choices=("none", "local", "architectural"),
-        default="none",
-    )
     remediation.set_defaults(handler=cmd_evidence_remediation_complete)
 
     recovery_review = commands.add_parser("recovery-review-complete")
@@ -5084,11 +8653,26 @@ def build_parser() -> argparse.ArgumentParser:
     qa.add_argument("--evidence-revision")
     qa.add_argument("--run-id", required=True)
     qa.add_argument("--worker-id", required=True)
+    qa.add_argument("--capsule", required=True)
     qa.add_argument("--status", choices=tuple(sorted(QA_STATUSES)), required=True)
+    qa.add_argument("--manual-execution", required=True)
     qa.add_argument("--report", required=True)
     qa.add_argument("--reason")
-    qa.add_argument("--pending-scenario", dest="pending_scenario", action="append")
+    qa.add_argument("--pending-identity", action="append")
     qa.set_defaults(handler=cmd_qa_complete)
+
+    documentation_review = commands.add_parser("documentation-review-complete")
+    add_common_project_root(documentation_review)
+    documentation_review.add_argument("--revision", required=True)
+    documentation_review.add_argument("--product-revision", required=True)
+    documentation_review.add_argument("--support-revision", required=True)
+    documentation_review.add_argument("--evidence-revision", required=True)
+    documentation_review.add_argument("--run-id", required=True)
+    documentation_review.add_argument("--reviewer-id", required=True)
+    documentation_review.add_argument("--capsule", required=True)
+    documentation_review.add_argument("--status", choices=("pass", "fail"), required=True)
+    documentation_review.add_argument("--report", required=True)
+    documentation_review.set_defaults(handler=cmd_documentation_review_complete)
 
     ready = commands.add_parser("ready")
     add_common_project_root(ready)

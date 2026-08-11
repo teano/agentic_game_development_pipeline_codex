@@ -17,6 +17,9 @@ SKILL_NAMES = (
     "gamedev-research",
     "gamedev-review",
     "gamedev-qa",
+    "gamedev-decision-recorder",
+    "gamedev-coverage-steward",
+    "gamedev-documentation-finisher",
 )
 
 

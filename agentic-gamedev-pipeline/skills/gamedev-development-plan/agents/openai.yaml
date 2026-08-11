@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Development Plan"
   short_description: "Plan bounded sequential game feature work"
-  default_prompt: "Use $gamedev-development-plan to turn approved feature documents into an approval-gated development plan."
+  default_prompt: "Use $gamedev-development-plan to create an approval-gated plan with phase-scoped writers, exact coverage/documentation contracts, and bounded context capsules."
 policy:
   allow_implicit_invocation: false

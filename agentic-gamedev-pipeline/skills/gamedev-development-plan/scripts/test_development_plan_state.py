@@ -34,6 +34,7 @@ class DevelopmentPlanStateTests(unittest.TestCase):
         self.prd = self.feature_dir / "product-requirements.md"
         self.spec = self.feature_dir / "technical-specification.md"
         self.plan = self.feature_dir / "development-plan.md"
+        self.ledger = self.feature_dir / "decision-ledger.jsonl"
         self.prd.write_text(PRD, encoding="utf-8")
         self.write_spec_and_ready_state()
 
@@ -86,6 +87,7 @@ product_authority:
                 prd=self.prd.relative_to(self.root).as_posix(),
                 spec=self.spec.relative_to(self.root).as_posix(),
                 plan=self.plan.relative_to(self.root).as_posix(),
+                decision_ledger=self.ledger.relative_to(self.root).as_posix(),
                 analyst_id="planning-analyst-1",
             )
         )
@@ -123,7 +125,8 @@ Exact reviewed base revision and evidence.
 
 ### Handoff Contract
 
-Sealed result hash, checks, evidence, and open risks.
+Controller-generated schema-2 handoff with decision_ids, coverage_state,
+documentation_state, and open_assumptions.
 
 ### Owned Paths
 
@@ -153,6 +156,35 @@ Sealed result hash, checks, evidence, and open risks.
 ### Research Briefs
 
 - RESEARCH-{number:03d} | question=find exact feature entry point | paths=src/feature | exclusions=unrelated systems | evidence=owners and contracts | stop=entry point confirmed
+
+### Coverage Contract
+
+- acceptance_ids: PRD-AC-{number:03d}
+- automated_identity_namespace: AUTO-SLICE-{number:03d}-*
+- manual_identity_namespace: MANUAL-SLICE-{number:03d}-*
+- mandatory_identity_ids: AUTO-SLICE-{number:03d}-CORE, MANUAL-SLICE-{number:03d}-RUNTIME
+- automation_feasibility: deterministic logic automated; runtime topology manual
+- capability_prerequisites: editor, server plus two clients, operator
+- planned_manifest: tests/sample-feature/verification/SLICE-{number:03d}-planned.json
+- finalized_manifest: tests/sample-feature/verification/SLICE-{number:03d}-finalized.json
+- amendment_authorities: DEC-*, normalized finding, or approved rebaseline
+
+### Documentation Contract
+
+- normative_pre_review_paths: docs/contracts/feature.md
+- derived_post_qa_paths: docs/operators/feature.md
+- decision_ids: none
+- evidence_sources: controller handoff, Review, and QA IDs
+
+### Context Capsule Budget
+
+- max_authority_files: 8
+- max_evidence_files: 12
+- max_total_files: 20
+- max_payload_bytes: 160000
+- max_estimated_tokens: 40000
+- authority_paths: approved feature documents and exact edit files
+- evidence_paths: bounded research and verification artifacts
 
 ### Verification and Exit Criteria
 
@@ -195,6 +227,7 @@ specification_authority:
   path: docs/Features/template/{self.feature}/technical-specification.md
   revision: 4
   sha256: {spec_hash}
+decision_ledger_path: docs/Features/template/{self.feature}/decision-ledger.jsonl
 slice_count: {slice_count}
 ---
 
@@ -203,6 +236,7 @@ slice_count: {slice_count}
 ## Decision
 
 Writer sequencing: one-at-a-time
+Ownership meaning: phase-scoped write lease
 Use the selected bounded ownership mode.
 
 ## Planning Analysis
@@ -213,9 +247,35 @@ Complexity, seams, dependencies, conflicts, and verification were assessed.
 
 Only the approved feature and named shared symbol are in scope.
 
+## Decision Ledger
+
+- ledger_path: docs/Features/template/{self.feature}/decision-ledger.jsonl
+- active_decision_ids: none
+- new_decision_route: explicit authority -> Decision Recorder -> controller append validation
+
+## Coverage Strategy
+
+- manifest_path: tests/sample-feature/verification/coverage-schema-2.json
+- automated_identity_namespace: AUTO-FEATURE-*
+- manual_identity_namespace: MANUAL-FEATURE-*
+- mandatory_rule: explicit identities mapped to PRD-AC IDs
+- automation_feasibility: deterministic logic automated
+- capability_prerequisites: editor, topology, operator
+- gates: plan-before-engineering, finalize-after-code-freeze
+
+## Documentation Strategy
+
+- normative_pre_review: docs/contracts/feature.md
+- derived_post_qa: docs/operators/feature.md
+
 ## Context Budget
 
-Eight files, three tests, one research packet, and bounded evidence.
+- max_authority_files: 12
+- max_evidence_files: 20
+- max_total_files: 32
+- max_payload_bytes: 250000
+- max_estimated_tokens: 60000
+- estimation_recipe: ceil(payload bytes / 4)
 
 {milestones}{''.join(slices)}""",
             encoding="utf-8",
@@ -230,6 +290,7 @@ Eight files, three tests, one research packet, and bounded evidence.
                     prd=self.prd.relative_to(self.root).as_posix(),
                     spec=self.spec.relative_to(self.root).as_posix(),
                     plan=self.plan.relative_to(self.root).as_posix(),
+                    decision_ledger=self.ledger.relative_to(self.root).as_posix(),
                     analyst_id="planning-analyst-1",
                 )
             )
@@ -326,6 +387,133 @@ Eight files, three tests, one research packet, and bounded evidence.
             controller.command_reinitialize(
                 self.args(analyst_id="planning-analyst-1")
             )
+
+    def test_plan_requires_exact_resolved_decision_ledger_path(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                f"decision_ledger_path: docs/Features/template/{self.feature}/decision-ledger.jsonl",
+                "decision_ledger_path: docs/other/ledger.jsonl",
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "decision_ledger_path"):
+            controller.command_validate(self.args())
+
+    def test_global_context_budget_requires_all_five_positive_limits(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- max_payload_bytes: 250000", "- max_payload_bytes: 0"
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "limits must be positive"):
+            controller.command_validate(self.args())
+
+    def test_slice_requires_coverage_documentation_and_capsule_contracts(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = self.plan.read_text(encoding="utf-8")
+        start = text.index("### Coverage Contract")
+        end = text.index("### Documentation Contract")
+        self.plan.write_text(text[:start] + text[end:], encoding="utf-8")
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "Coverage Contract"):
+            controller.command_validate(self.args())
+
+    def test_global_context_budget_rejects_duplicate_exact_limit(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- max_authority_files: 12",
+                "- max_authority_files: 12\n- max_authority_files: 11",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "repeats numeric limit"):
+            controller.command_validate(self.args())
+
+    def test_global_context_budget_rejects_unsupported_numeric_limit(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- max_estimated_tokens: 60000",
+                "- max_estimated_tokens: 60000\n- max_transcript_bytes: 10",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "unsupported numeric limit"):
+            controller.command_validate(self.args())
+
+    def test_slice_context_budget_cannot_exceed_global_authority_limit(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = self.plan.read_text(encoding="utf-8")
+        marker = text.index("### Context Capsule Budget")
+        before, after = text[:marker], text[marker:]
+        after = after.replace("- max_authority_files: 8", "- max_authority_files: 13", 1)
+        self.plan.write_text(before + after, encoding="utf-8")
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "exceeds global limits"):
+            controller.command_validate(self.args())
+
+    def test_slice_context_budget_cannot_exceed_global_payload_limit(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = self.plan.read_text(encoding="utf-8")
+        marker = text.index("### Context Capsule Budget")
+        before, after = text[:marker], text[marker:]
+        after = after.replace("- max_payload_bytes: 160000", "- max_payload_bytes: 250001", 1)
+        self.plan.write_text(before + after, encoding="utf-8")
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "exceeds global limits"):
+            controller.command_validate(self.args())
+
+    def test_slice_context_budget_rejects_duplicate_limit(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = self.plan.read_text(encoding="utf-8")
+        marker = text.index("### Context Capsule Budget")
+        before, after = text[:marker], text[marker:]
+        after = after.replace(
+            "- max_evidence_files: 12",
+            "- max_evidence_files: 12\n- max_evidence_files: 11",
+            1,
+        )
+        self.plan.write_text(before + after, encoding="utf-8")
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "repeats numeric limit"):
+            controller.command_validate(self.args())
+
+    def test_slice_context_budget_rejects_unsupported_numeric_limit(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = self.plan.read_text(encoding="utf-8")
+        marker = text.index("### Context Capsule Budget")
+        before, after = text[:marker], text[marker:]
+        after = after.replace(
+            "- max_estimated_tokens: 40000",
+            "- max_estimated_tokens: 40000\n- max_chat_messages: 5",
+            1,
+        )
+        self.plan.write_text(before + after, encoding="utf-8")
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "unsupported numeric limit"):
+            controller.command_validate(self.args())
+
+    def test_context_total_files_cannot_be_smaller_than_component_limit(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- max_total_files: 32", "- max_total_files: 10", 1
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "cannot be smaller"):
+            controller.command_validate(self.args())
 
     def test_skill_metadata_is_explicit_only(self) -> None:
         skill_root = Path(__file__).resolve().parents[1]
