@@ -15,6 +15,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+_capability_contract_path = (
+    Path(__file__).resolve().parents[2]
+    / "gamedev-development-plan"
+    / "scripts"
+    / "capability_contract.py"
+)
+_capability_contract_spec = importlib.util.spec_from_file_location(
+    "gamedev_capability_contract", _capability_contract_path
+)
+if _capability_contract_spec is None or _capability_contract_spec.loader is None:
+    raise RuntimeError("Cannot load the canonical capability contract")
+_capability_contract = importlib.util.module_from_spec(_capability_contract_spec)
+_capability_contract_spec.loader.exec_module(_capability_contract)
+CAPABILITY_ID_PATTERN = _capability_contract.CAPABILITY_ID_PATTERN
+parse_capability_ids = _capability_contract.parse_capability_ids
+
 try:
     from deferred_findings import (
         BACKLOG_PATH as DEFERRED_BACKLOG_PATH,
@@ -36,6 +52,7 @@ except ImportError:  # pragma: no cover - package-style imports used by some tes
 STATE_DIR = ".agentic-pipeline"
 SCHEMA_VERSION = 9
 CONTRACT_VERSION = "2026-08-11-role-artifacts-coverage-docs-v2"
+PREFLIGHT_PROOF_VERSION = 1
 DEVELOPMENT_PLAN_STATE = Path(STATE_DIR) / "development-plan-state.json"
 FINDING_KINDS = {"product", "evidence", "support", "hardening"}
 BLOCKING_SCOPE_RELATIONS = {
@@ -123,6 +140,29 @@ LEASE_PHASES = {
     "documentation_finisher": {"normative_documentation", "derived_documentation"},
     "recovery_remediator": {"evidence_recovery"},
 }
+CAPSULE_PHASES = {
+    "decision_recorder": {"decision_recording"},
+    "researcher": {"slice_research"},
+    "coverage_steward": {
+        "slice_coverage_planning",
+        "slice_coverage_finalization",
+        "coverage_finalization",
+    },
+    "engineer": {"slice_engineering", "engineering"},
+    "documentation_finisher": {
+        "normative_documentation",
+        "derived_documentation",
+    },
+    "reviewer": {
+        "convergence",
+        "review",
+        "closure_review",
+        "recovery_review",
+        "documentation_review",
+    },
+    "qa": {"qa"},
+    "recovery_remediator": {"evidence_recovery"},
+}
 CONTEXT_LIMIT_NAMES = (
     "max_authority_files",
     "max_evidence_files",
@@ -130,6 +170,7 @@ CONTEXT_LIMIT_NAMES = (
     "max_payload_bytes",
     "max_estimated_tokens",
 )
+CONTEXT_METRIC_SCOPE = "capsule_plus_referenced_files"
 EXCLUDED_REVISION_PREFIXES = (
     f"{STATE_DIR}/",
     ".git/",
@@ -417,6 +458,10 @@ def runtime_plan_contracts(text: str, slices: list[dict[str, Any]]) -> dict[str,
     global_sections = markdown_sections(body, 2)
     global_budget_raw = contract_scalars(global_sections["Context Budget"], "Context Budget")
     global_budget = {key: int(global_budget_raw[key]) for key in CONTEXT_LIMIT_NAMES}
+    if global_budget_raw.get("metric_scope") != CONTEXT_METRIC_SCOPE:
+        raise PipelineError(
+            f"Context Budget metric_scope must be {CONTEXT_METRIC_SCOPE}"
+        )
     slice_sections = {
         slice_id: markdown_sections(content, 3)
         for slice_id, content in re.findall(
@@ -430,8 +475,14 @@ def runtime_plan_contracts(text: str, slices: list[dict[str, Any]]) -> dict[str,
         budget_raw = contract_scalars(
             sections["Context Capsule Budget"], f"{slice_id} Context Capsule Budget"
         )
+        if budget_raw.get("metric_scope") != CONTEXT_METRIC_SCOPE:
+            raise PipelineError(
+                f"{slice_id} Context Capsule Budget metric_scope must be "
+                f"{CONTEXT_METRIC_SCOPE}"
+            )
         per_slice[slice_id] = {
             "context_budget": {key: int(budget_raw[key]) for key in CONTEXT_LIMIT_NAMES},
+            "context_metric_scope": budget_raw["metric_scope"],
             "coverage": contract_scalars(
                 sections["Coverage Contract"], f"{slice_id} Coverage Contract"
             ),
@@ -441,6 +492,7 @@ def runtime_plan_contracts(text: str, slices: list[dict[str, Any]]) -> dict[str,
         }
     return {
         "context_budget": global_budget,
+        "context_metric_scope": global_budget_raw["metric_scope"],
         "coverage_strategy": contract_scalars(
             global_sections["Coverage Strategy"], "Coverage Strategy"
         ),
@@ -1191,6 +1243,27 @@ def normalize_runtime(state: dict[str, Any], findings: dict[str, Any]) -> None:
         )
     state.setdefault("product_revalidation", None)
     state.setdefault("preflight", empty_preflight_state())
+    preflight = state["preflight"]
+    preflight.setdefault("minimum_resume_actions", {})
+    preflight.setdefault("proof_version", None)
+    preflight.setdefault("required_capability_ids", [])
+    preflight.setdefault("required_capability_digest", None)
+    preflight.setdefault("resume_contract_complete", False)
+    preflight.setdefault("migration_resume_phase", None)
+    state.setdefault("preflight_migration_hold", None)
+    state.setdefault("preflight_migration_history", [])
+    phase = state.get("phase")
+    if phase not in {"preflight", "preflight_migration_hold"}:
+        proof_error = preflight_proof_error(state)
+        if proof_error:
+            state["preflight_migration_hold"] = {
+                "resume_phase": phase,
+                "reason": proof_error,
+                "required_capability_ids": sorted(
+                    required_preflight_capabilities(state)
+                ),
+            }
+            state["phase"] = "preflight_migration_hold"
     state.setdefault(
         "convergence",
         empty_convergence_state(
@@ -1239,6 +1312,10 @@ def normalize_runtime(state: dict[str, Any], findings: dict[str, Any]) -> None:
         item.setdefault("finding_kind", "product")
         item.setdefault("origin_slice", state.get("active_slice"))
         item.setdefault("remediation_route", item.get("origin_slice"))
+        item.setdefault("blocks_required_support_contract", False)
+        item.setdefault("required_support_contract_evidence", None)
+        item.setdefault("coverage_identity_ids", [])
+        item.setdefault("remediation_required", finding_requires_remediation(item))
     state.setdefault("finding_triage", None)
 
 
@@ -1326,6 +1403,21 @@ def open_blocking(findings: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def finding_requires_remediation(item: dict[str, Any]) -> bool:
+    return item.get("blocking") is True or (
+        item.get("finding_kind") == "support"
+        and item.get("blocks_required_support_contract") is True
+    )
+
+
+def open_remediation_required(findings: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in findings["items"]
+        if item["status"] == "open" and finding_requires_remediation(item)
+    ]
+
+
 def parse_explicit_bool(value: str, label: str) -> bool:
     if value not in {"true", "false"}:
         raise PipelineError(f"{label} must be true or false")
@@ -1351,6 +1443,18 @@ def finding_is_blocking(item: dict[str, Any]) -> bool:
             or item.get("violates_required_invariant") is True
         )
     )
+
+
+def required_support_contract_paths(state: dict[str, Any]) -> set[str]:
+    paths: set[str] = set()
+    for contract in (state.get("plan_contracts", {}).get("slices") or {}).values():
+        value = (contract.get("documentation") or {}).get(
+            "derived_post_qa_paths", ""
+        )
+        if value.startswith("not_required"):
+            continue
+        paths.update(scope_path(item, "required support contract") for item in comma_values(value))
+    return paths
 
 
 def validate_finding_dimensions(state: dict[str, Any], item: dict[str, Any]) -> None:
@@ -1401,6 +1505,22 @@ def validate_finding_dimensions(state: dict[str, Any], item: dict[str, Any]) -> 
         raise PipelineError(
             "Support and hardening findings cannot claim a blocked acceptance criterion or required invariant"
         )
+    support_contract_evidence = item.get("required_support_contract_evidence")
+    if item.get("blocks_required_support_contract") is True:
+        if item["finding_kind"] != "support":
+            raise PipelineError(
+                "Only a support finding may block an explicit required-support contract"
+            )
+        if support_contract_evidence not in required_support_contract_paths(state):
+            raise PipelineError(
+                "Required-support remediation needs an exact path from the approved "
+                "derived_post_qa_paths contract"
+            )
+    elif support_contract_evidence:
+        raise PipelineError(
+            "--required-support-contract-evidence requires "
+            "--blocks-required-support-contract=true"
+        )
     evidence_major_proof = (
         item.get("mandatory_core_acceptance_evidence_missing") is True
         and item.get("test_can_miss_product_defect") is True
@@ -1423,6 +1543,7 @@ def validate_finding_dimensions(state: dict[str, Any], item: dict[str, Any]) -> 
             "Missing evidence is not Critical by itself; record the evidenced product or invariant defect"
         )
     item["blocking"] = finding_is_blocking(item)
+    item["remediation_required"] = finding_requires_remediation(item)
     deferred_reference = item.get("deferred_reference")
     if deferred_reference:
         if item["blocking"] or item["production_reachability"] == "unknown":
@@ -1478,6 +1599,12 @@ def empty_preflight_state() -> dict[str, Any]:
         "status": "pending",
         "resource_budget_check": "pending",
         "capabilities": {},
+        "minimum_resume_actions": {},
+        "proof_version": None,
+        "required_capability_ids": [],
+        "required_capability_digest": None,
+        "resume_contract_complete": False,
+        "migration_resume_phase": None,
         "runs": [],
     }
 
@@ -3236,6 +3363,15 @@ def next_action(
     state: dict[str, Any], findings: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     phase = state.get("phase")
+    if phase == "preflight_migration_hold":
+        hold = state.get("preflight_migration_hold") or {}
+        return {
+            "action": "reinitialize_preflight",
+            "owner": "technical_director",
+            "user_input_required": False,
+            "resume_phase": hold.get("resume_phase"),
+            "reason": hold.get("reason", "current versioned preflight proof is absent"),
+        }
     if source_drift(state):
         if phase == "scope_expansion_hold":
             return {
@@ -3283,6 +3419,30 @@ def next_action(
             "reason": budget.get("reason"),
         }
     if phase == "preflight":
+        blocked = blocked_preflight_capabilities(state)
+        if blocked:
+            priority = qa_gate_priority(set(blocked.values()))
+            capability_id = sorted(
+                name for name, status in blocked.items() if status == priority
+            )[0]
+            contract = state.get("preflight", {}).get(
+                "minimum_resume_actions", {}
+            ).get(capability_id)
+            if not isinstance(contract, dict):
+                return {
+                    "action": "record_missing_preflight_resume_contract",
+                    "owner": "technical_director",
+                    "user_input_required": False,
+                    "capability_id": capability_id,
+                    "capability_summary": blocked_capability_summary(blocked),
+                }
+            return {
+                "action": contract["action"],
+                "owner": contract["owner"],
+                "user_input_required": contract["user_input_required"],
+                "capability_id": capability_id,
+                "capability_summary": blocked_capability_summary(blocked),
+            }
         action = (
             "reconcile_resource_budget"
             if state.get("preflight", {}).get("resource_budget_check") == "fail"
@@ -3452,15 +3612,12 @@ def next_action(
     if phase == "qa":
         blocked_capabilities = blocked_preflight_capabilities(state)
         if blocked_capabilities:
-            user_gate = any(
-                status == "blocked_user" for status in blocked_capabilities.values()
+            return blocked_capability_next_action(
+                blocked_capabilities,
+                state.get("preflight", {}).get("minimum_resume_actions", {}),
+                probe_id="preflight",
+                missing_action="record_missing_preflight_resume_contract",
             )
-            return {
-                "action": "prepare_qa_prerequisites",
-                "owner": "user" if user_gate else "technical_director",
-                "user_input_required": user_gate,
-                "capabilities": blocked_capabilities,
-            }
         qa_capability = state.get("qa_capability", {})
         if (
             qa_capability.get("status") != "ready"
@@ -3471,20 +3628,19 @@ def next_action(
                 for name, status in qa_capability.get("capabilities", {}).items()
                 if status in QA_CAPABILITY_BLOCKING_STATUSES
             }
-            user_gate = any(status == "blocked_user" for status in blocked.values())
+            if blocked:
+                return blocked_capability_next_action(
+                    blocked,
+                    qa_capability.get("minimum_resume_actions", {}),
+                    probe_id=qa_capability.get("probe_id"),
+                    missing_action="record_missing_qa_resume_contract",
+                )
             return {
-                "action": (
-                    "resolve_qa_capability_probe"
-                    if blocked
-                    else "run_exact_revision_qa_capability_probe"
-                ),
-                "owner": "user" if user_gate else "technical_director",
-                "user_input_required": user_gate,
+                "action": "run_exact_revision_qa_capability_probe",
+                "owner": "technical_director",
+                "user_input_required": False,
+                "capability_id": None,
                 "probe_id": qa_capability.get("probe_id"),
-                "capabilities": blocked,
-                "minimum_resume_actions": qa_capability.get(
-                    "minimum_resume_actions", {}
-                ),
             }
         gates = [
             gate for gate in state.get("gates", []) if gate.get("status") == "open"
@@ -3701,6 +3857,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         "qa_runs": [],
         "gates": [],
         "preflight": empty_preflight_state(),
+        "preflight_migration_hold": None,
+        "preflight_migration_history": [],
         "worker_budget": empty_worker_budget(
             args.max_workers, args.max_full_review_waves
         ),
@@ -3751,7 +3909,7 @@ def parse_capabilities(values: list[str] | None) -> dict[str, str]:
         name, status = value.split("=", 1)
         name = name.strip()
         status = status.strip()
-        if not re.fullmatch(r"[a-z0-9]+(?:[-_][a-z0-9]+)*", name):
+        if not re.fullmatch(CAPABILITY_ID_PATTERN, name):
             raise PipelineError(f"Invalid capability name: {name!r}")
         if status not in PREFLIGHT_CAPABILITY_STATUSES:
             raise PipelineError(f"Invalid capability status for {name}: {status!r}")
@@ -3759,6 +3917,105 @@ def parse_capabilities(values: list[str] | None) -> dict[str, str]:
             raise PipelineError(f"Duplicate capability: {name}")
         result[name] = status
     return result
+
+
+def required_preflight_capabilities(state: dict[str, Any]) -> set[str]:
+    """Return the closed capability contract approved by the plan plus platform minimums."""
+    required = set(QA_CAPABILITY_NAMES)
+    contracts = state.get("plan_contracts") or {}
+    coverage_values = [
+        (contracts.get("coverage_strategy") or {}).get("capability_prerequisites", "")
+    ]
+    coverage_values.extend(
+        (item.get("coverage") or {}).get("capability_prerequisites", "")
+        for item in (contracts.get("slices") or {}).values()
+    )
+    for value in coverage_values:
+        try:
+            required.update(
+                parse_capability_ids(value, label="approved capability_prerequisites")
+            )
+        except ValueError as exc:
+            raise PipelineError(str(exc)) from exc
+    return required
+
+
+def required_capability_proof_digest(required_ids: list[str]) -> str:
+    return canonical_json_sha256(
+        {
+            "proof_version": PREFLIGHT_PROOF_VERSION,
+            "required_capability_ids": required_ids,
+        }
+    )
+
+
+def resume_contract_is_valid(status: str, contract: Any) -> bool:
+    if not isinstance(contract, dict) or set(contract) != {
+        "owner",
+        "user_input_required",
+        "action",
+    }:
+        return False
+    if not isinstance(contract.get("action"), str) or not contract["action"].strip():
+        return False
+    if not isinstance(contract.get("user_input_required"), bool):
+        return False
+    if status == "blocked_user":
+        return contract["owner"] == "user" and contract["user_input_required"] is True
+    if status in {"blocked_environment", "error_test"}:
+        return (
+            contract["owner"] == "technical_director"
+            and contract["user_input_required"] is False
+        )
+    return False
+
+
+def preflight_proof_error(state: dict[str, Any]) -> str | None:
+    preflight = state.get("preflight")
+    if not isinstance(preflight, dict):
+        return "missing preflight state"
+    required_ids = sorted(required_preflight_capabilities(state))
+    if preflight.get("proof_version") != PREFLIGHT_PROOF_VERSION:
+        return "missing or unsupported proof_version"
+    if preflight.get("required_capability_ids") != required_ids:
+        return "required capability IDs do not match the current approved plan"
+    if preflight.get("required_capability_digest") != required_capability_proof_digest(
+        required_ids
+    ):
+        return "required capability digest is invalid"
+    capabilities = preflight.get("capabilities")
+    if not isinstance(capabilities, dict) or set(capabilities) != set(required_ids):
+        return "capability proof is incomplete or contains unexpected IDs"
+    if any(status not in PREFLIGHT_CAPABILITY_STATUSES for status in capabilities.values()):
+        return "capability proof contains an unsupported status"
+    blocked = {
+        name: status
+        for name, status in capabilities.items()
+        if status in QA_CAPABILITY_BLOCKING_STATUSES
+    }
+    resume_actions = preflight.get("minimum_resume_actions")
+    if not isinstance(resume_actions, dict) or set(resume_actions) != set(blocked):
+        return "minimum resume contracts do not exactly match blocked capabilities"
+    if any(
+        not resume_contract_is_valid(blocked[name], resume_actions[name])
+        for name in blocked
+    ):
+        return "minimum resume contract authority is invalid"
+    if preflight.get("resume_contract_complete") is not True:
+        return "resume contract completeness proof is absent"
+    resource_status = preflight.get("resource_budget_check")
+    expected_status = (
+        "complete"
+        if resource_status == "pass" and not blocked
+        else "capability_blocked"
+        if blocked
+        else "budget_failed"
+        if resource_status == "fail"
+        else None
+    )
+    if expected_status is None or preflight.get("status") != expected_status:
+        return "preflight aggregate status is inconsistent with its exact proof"
+    return None
 
 
 def cmd_preflight_complete(args: argparse.Namespace) -> int:
@@ -3772,42 +4029,154 @@ def cmd_preflight_complete(args: argparse.Namespace) -> int:
         raise PipelineError(f"Preflight run ID already recorded: {args.run_id}")
     report = resolve_report(root, state, args.report, "Preflight report")
     capabilities = parse_capabilities(args.capability)
+    required_capabilities = required_preflight_capabilities(state)
+    supplied_capabilities = set(capabilities)
+    missing = sorted(required_capabilities - supplied_capabilities)
+    unexpected = sorted(supplied_capabilities - required_capabilities)
+    if missing or unexpected:
+        details: list[str] = []
+        if missing:
+            details.append("missing=" + ",".join(missing))
+        if unexpected:
+            details.append("unexpected=" + ",".join(unexpected))
+        raise PipelineError(
+            "Preflight capability proof must exactly cover the approved capability set: "
+            + "; ".join(details)
+        )
+    blocked = sorted(
+        name
+        for name, status in capabilities.items()
+        if status in QA_CAPABILITY_BLOCKING_STATUSES
+    )
+    resume_actions = parse_resume_actions(args.minimum_resume_action, capabilities)
+    missing_actions = sorted(set(blocked) - set(resume_actions))
+    extra_actions = sorted(set(resume_actions) - set(blocked))
+    if missing_actions or extra_actions:
+        raise PipelineError(
+            "Preflight minimum resume actions must exactly match blocked capabilities: "
+            + "; ".join(
+                part
+                for part in (
+                    "missing=" + ",".join(missing_actions) if missing_actions else "",
+                    "unexpected=" + ",".join(extra_actions) if extra_actions else "",
+                )
+                if part
+            )
+        )
     preflight["resource_budget_check"] = args.resource_budget_check
-    preflight["capabilities"].update(capabilities)
+    preflight["capabilities"] = dict(sorted(capabilities.items()))
+    preflight["minimum_resume_actions"] = resume_actions
+    required_ids = sorted(required_capabilities)
+    preflight["proof_version"] = PREFLIGHT_PROOF_VERSION
+    preflight["required_capability_ids"] = required_ids
+    preflight["required_capability_digest"] = required_capability_proof_digest(
+        required_ids
+    )
+    preflight["resume_contract_complete"] = True
     preflight["status"] = (
-        "complete" if args.resource_budget_check == "pass" else "budget_failed"
+        "complete"
+        if args.resource_budget_check == "pass" and not blocked
+        else "capability_blocked"
+        if blocked
+        else "budget_failed"
     )
     preflight["runs"].append(
         {
             "run_id": args.run_id,
             "resource_budget_check": args.resource_budget_check,
             "capabilities": capabilities,
+            "proof_version": PREFLIGHT_PROOF_VERSION,
+            "required_capability_ids": required_ids,
+            "required_capability_digest": preflight["required_capability_digest"],
+            "resume_contract_complete": True,
             "report": report,
+            "report_sha256": file_sha256(Path(report)),
             "recorded_at": utc_now(),
         }
     )
     if entry_phase == "preflight":
-        state["phase"] = (
-            "preflight" if args.resource_budget_check == "fail" else "slice_research"
-        )
+        if preflight["status"] == "complete":
+            state["phase"] = preflight.get("migration_resume_phase") or "slice_research"
+            preflight["migration_resume_phase"] = None
+        else:
+            state["phase"] = "preflight"
     else:
         state["phase"] = "qa"
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
 
 
-def cmd_status(args: argparse.Namespace) -> int:
-    _, _, _, state, findings = load_runtime(args.project_root)
+def cmd_reinitialize_preflight(args: argparse.Namespace) -> int:
+    _, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    require_sources_current(state)
+    hold = state.get("preflight_migration_hold")
+    if state.get("phase") != "preflight_migration_hold" or not isinstance(hold, dict):
+        raise PipelineError("reinitialize-preflight requires an explicit preflight migration hold")
+    if state.get("active_write_lease") is not None:
+        raise PipelineError("Preflight migration cannot begin while a write lease is active")
+    old = state.get("preflight") or {}
+    state["preflight_migration_history"].append(
+        {
+            "resume_phase": hold.get("resume_phase"),
+            "reason": args.reason,
+            "detected_error": hold.get("reason"),
+            "prior_proof_version": old.get("proof_version"),
+            "prior_capability_count": len(old.get("capabilities") or {}),
+            "reinitialized_at": utc_now(),
+        }
+    )
+    fresh = empty_preflight_state()
+    fresh["migration_resume_phase"] = hold.get("resume_phase") or "slice_research"
+    state["preflight"] = fresh
+    state["preflight_migration_hold"] = None
+    state["phase"] = "preflight"
+    save_runtime(state_path, findings_path, state, findings)
+    return cmd_status(args)
+
+
+STATUS_SCHEMA_VERSION = 1
+STATUS_ID_LIMIT = 20
+STATUS_SECTIONS = (
+    "capsules",
+    "coverage",
+    "decisions",
+    "documentation",
+    "findings",
+    "gates",
+    "handoffs",
+    "leases",
+    "plan",
+    "preflight",
+    "qa",
+    "recovery",
+    "reviews",
+    "revisions",
+    "scope",
+    "workers",
+)
+
+
+def status_counts(
+    state: dict[str, Any], findings: dict[str, Any]
+) -> tuple[dict[str, int], dict[str, int]]:
     counts = {"critical": 0, "major": 0, "minor": 0}
     for item in findings["items"]:
         if item["status"] == "open":
             counts[item["severity"]] += 1
     counts["blocking"] = len(open_blocking(findings))
+    counts["remediation_required"] = len(open_remediation_required(findings))
     gate_counts = {status: 0 for status in sorted(QA_GATE_STATUSES)}
     for gate in state.get("gates", []):
         if gate.get("status") == "open":
             gate_counts[gate["category"]] += 1
-    result = {
+    return counts, gate_counts
+
+
+def full_status_payload(
+    state: dict[str, Any], findings: dict[str, Any]
+) -> dict[str, Any]:
+    counts, gate_counts = status_counts(state, findings)
+    return {
         "feature": state["feature"],
         "slice": state["slice_id"],
         "development_plan": {
@@ -3862,6 +4231,290 @@ def cmd_status(args: argparse.Namespace) -> int:
         "source_drift": source_drift(state),
         "next_action": next_action(state, findings),
     }
+
+
+def bounded_ids(values: list[str]) -> dict[str, Any]:
+    unique = sorted({value for value in values if value})
+    return {
+        "ids": unique[:STATUS_ID_LIMIT],
+        "total": len(unique),
+        "truncated": len(unique) > STATUS_ID_LIMIT,
+    }
+
+
+def blocked_capability_summary(blocked: dict[str, str]) -> dict[str, Any]:
+    summary = bounded_ids(list(blocked))
+    summary["by_status"] = {
+        status: sum(1 for value in blocked.values() if value == status)
+        for status in ("blocked_user", "blocked_environment", "error_test")
+        if status in set(blocked.values())
+    }
+    return summary
+
+
+def blocked_capability_next_action(
+    blocked: dict[str, str],
+    resume_actions: dict[str, Any],
+    *,
+    probe_id: str | None,
+    missing_action: str,
+) -> dict[str, Any]:
+    priority = qa_gate_priority(set(blocked.values()))
+    capability_id = (
+        sorted(name for name, status in blocked.items() if status == priority)[0]
+        if priority
+        else None
+    )
+    resume_contract = resume_actions.get(capability_id)
+    valid_contract = bool(
+        capability_id
+        and resume_contract_is_valid(blocked[capability_id], resume_contract)
+    )
+    return {
+        "action": resume_contract["action"] if valid_contract else missing_action,
+        "owner": resume_contract["owner"] if valid_contract else "technical_director",
+        "user_input_required": (
+            resume_contract["user_input_required"] if valid_contract else False
+        ),
+        "capability_id": capability_id,
+        "probe_id": probe_id,
+        "capability_summary": blocked_capability_summary(blocked),
+    }
+
+
+def coverage_revision_summary(state: dict[str, Any]) -> dict[str, Any]:
+    coverage = state.get("coverage", {})
+    scope_id = "feature" if coverage.get("feature") else state.get("active_slice")
+    scope = coverage.get(scope_id, {}) if scope_id else {}
+    record = scope.get("finalized_manifest") or scope.get("planned_manifest") or {}
+    coverage_state = scope.get("state", {})
+    return {
+        "scope_id": scope_id,
+        "revision": record.get("revision"),
+        "status": coverage_state.get("status", "pending"),
+        "manifest_path": record.get("path"),
+        "manifest_sha256": record.get("sha256"),
+    }
+
+
+def compact_write_lease(lease: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not lease:
+        return None
+    return {
+        key: lease.get(key)
+        for key in ("lease_id", "role", "phase", "write_scope", "worker_id", "status")
+        if key in lease
+    }
+
+
+def transition_changed_ids(args: argparse.Namespace) -> dict[str, Any]:
+    changed: dict[str, Any] = {}
+    for attribute in (
+        "id",
+        "run_id",
+        "worker_id",
+        "owner_id",
+        "reviewer_id",
+        "steward_id",
+        "recorder_id",
+        "lease_id",
+        "authority_id",
+        "probe_id",
+        "scope_id",
+        "slice_id",
+    ):
+        value = getattr(args, attribute, None)
+        if value:
+            changed[attribute] = value
+    resolved = getattr(args, "resolved_finding", None)
+    if resolved:
+        changed["resolved_finding_ids"] = sorted(set(resolved))
+    return changed
+
+
+def compact_status_payload(
+    state: dict[str, Any], findings: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
+    finding_counts, gate_counts = status_counts(state, findings)
+    open_findings = [
+        item for item in findings.get("items", []) if item.get("status") == "open"
+    ]
+    open_gates = [gate for gate in state.get("gates", []) if gate.get("status") == "open"]
+    active_batch = state.get("active_remediation_batch") or {}
+    triage = state.get("finding_triage") or {}
+    active_decisions = state.get("decision_ledger", {}).get("active_decision_ids", [])
+    pending_identities = [
+        str(value)
+        for value in state.get("qa", {}).get("pending_identities", [])
+    ]
+    return {
+        "status_schema": STATUS_SCHEMA_VERSION,
+        "mode": "compact",
+        "transition": getattr(args, "command", "status"),
+        "feature": state.get("feature"),
+        "phase": state.get("phase"),
+        "revision": state.get("revision"),
+        "product_revision": state.get("product_revision"),
+        "support_revision": state.get("support_revision"),
+        "evidence_revision": state.get("evidence_revision"),
+        "coverage_revision": coverage_revision_summary(state),
+        "active_slice": state.get("active_slice"),
+        "active_write_lease": compact_write_lease(state.get("active_write_lease")),
+        "active_remediation_batch": {
+            key: active_batch.get(key)
+            for key in ("batch_id", "route", "owner_id", "status")
+            if key in active_batch
+        } or None,
+        "execution_stage": state.get("execution_stage"),
+        "implementation_state": {
+            key: state.get("implementation_state", {}).get(key)
+            for key in ("status", "revision")
+        },
+        "feature_verification_state": {
+            key: state.get("feature_verification_state", {}).get(key)
+            for key in (
+                "status",
+                "product_revision",
+                "support_revision",
+                "evidence_revision",
+            )
+        },
+        "documentation": {
+            kind: (state.get("documentation", {}).get(kind) or {}).get("status")
+            for kind in ("normative", "derived")
+        },
+        "qa": {
+            key: state.get("qa", {}).get(key)
+            for key in ("status", "revision", "run_id", "worker_id")
+            if key in state.get("qa", {})
+        },
+        "iteration_control": {
+            key: state.get("iteration_control", {}).get(key)
+            for key in (
+                "status",
+                "consecutive_product_changes",
+                "max_consecutive_product_changes",
+                "reason",
+            )
+        },
+        "last_engineer_outcome": state.get("last_engineer_outcome"),
+        "changed_ids": transition_changed_ids(args),
+        "active_ids": {
+            "finding_triage_id": triage.get("finding_id"),
+            "remediation_finding_ids": bounded_ids(
+                [str(value) for value in active_batch.get("finding_ids", [])]
+            ),
+            "open_finding_ids": bounded_ids(
+                [str(item.get("id")) for item in open_findings if item.get("id")]
+            ),
+            "open_gate_ids": bounded_ids(
+                [str(gate.get("id")) for gate in open_gates if gate.get("id")]
+            ),
+            "decision_ids": bounded_ids([str(value) for value in active_decisions]),
+            "pending_qa_identity_ids": bounded_ids(pending_identities),
+        },
+        "open_findings": finding_counts,
+        "open_gates": gate_counts,
+        "source_drift": source_drift(state),
+        "next_action": next_action(state, findings),
+    }
+
+
+def status_section_payload(
+    section: str, state: dict[str, Any], findings: dict[str, Any]
+) -> dict[str, Any]:
+    finding_counts, gate_counts = status_counts(state, findings)
+    sections: dict[str, Any] = {
+        "capsules": state.get("context_capsules", []),
+        "coverage": state.get("coverage", {}),
+        "decisions": {
+            "decision_ledger": state.get("decision_ledger", {}),
+            "user_authorities": state.get("user_authorities", []),
+            "decision_recording": state.get("decision_recording"),
+        },
+        "documentation": {
+            "documentation": state.get("documentation", {}),
+            "plan_contracts": state.get("plan_contracts", {}),
+        },
+        "findings": {"counts": finding_counts, "items": findings.get("items", [])},
+        "gates": {"counts": gate_counts, "items": state.get("gates", [])},
+        "handoffs": {
+            "handoffs": state.get("handoffs", []),
+            "manifests": state.get("handoff_manifests", []),
+        },
+        "leases": {
+            "active": state.get("active_write_lease"),
+            "history": state.get("write_lease_history", []),
+            "snapshots": state.get("lease_snapshots", {}),
+        },
+        "plan": {
+            "development_plan": {
+                "path": state.get("development_plan_path"),
+                "sha256": state.get("development_plan_sha256"),
+                "mode": state.get("development_mode"),
+            },
+            "ordered_slices": state.get("ordered_slices", []),
+            "slices": state.get("slices", {}),
+        },
+        "preflight": state.get("preflight", {}),
+        "qa": {
+            "qa": state.get("qa", {}),
+            "capability": state.get("qa_capability", {}),
+            "gates": state.get("gates", []),
+        },
+        "recovery": {
+            "recovery": state.get("recovery"),
+            "remediation_queue": state.get("remediation_queue", []),
+            "active_remediation_batch": state.get("active_remediation_batch"),
+        },
+        "reviews": {
+            "convergence": state.get("convergence", {}),
+            "review": state.get("review", {}),
+            "product_revalidation": state.get("product_revalidation"),
+            "closure_review": state.get("closure_review"),
+            "component_review_credits": state.get("component_review_credits", []),
+        },
+        "revisions": {
+            "revision": state.get("revision"),
+            "product_revision": state.get("product_revision"),
+            "support_revision": state.get("support_revision"),
+            "evidence_revision": state.get("evidence_revision"),
+            "coverage_revision": coverage_revision_summary(state),
+            "implementation_state": state.get("implementation_state", {}),
+            "feature_verification_state": state.get("feature_verification_state", {}),
+        },
+        "scope": {
+            "active_slice": state.get("active_slice"),
+            "execution_stage": state.get("execution_stage"),
+            "scope_guard": state.get("scope_guard", {}),
+            "finding_triage": state.get("finding_triage"),
+        },
+        "workers": {
+            "worker_budget": state.get("worker_budget", {}),
+            "owner_by_slice": state.get("owner_by_slice", {}),
+            "integration_owner": state.get("integration_owner"),
+            "engineering_owner_id": state.get("engineering_owner_id"),
+        },
+    }
+    return {
+        "status_schema": STATUS_SCHEMA_VERSION,
+        "mode": "section",
+        "section": section,
+        "feature": state.get("feature"),
+        "phase": state.get("phase"),
+        "data": sections[section],
+        "next_action": next_action(state, findings),
+    }
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    _, _, _, state, findings = load_runtime(args.project_root)
+    if getattr(args, "full", False):
+        result = full_status_payload(state, findings)
+    elif getattr(args, "section", None):
+        result = status_section_payload(args.section, state, findings)
+    else:
+        result = compact_status_payload(state, findings, args)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -3942,6 +4595,423 @@ def approved_capsule_budget(state: dict[str, Any], phase: str) -> dict[str, int]
     if phase in slice_scoped and active_slice:
         return dict(state["plan_contracts"]["slices"][active_slice]["context_budget"])
     return dict(state["plan_contracts"]["context_budget"])
+
+
+def validate_capsule_budget_ceiling(
+    state: dict[str, Any], phase: str, budget: dict[str, int]
+) -> None:
+    approved = approved_capsule_budget(state, phase)
+    exceeded = [
+        name for name in CONTEXT_LIMIT_NAMES if budget[name] > approved[name]
+    ]
+    if exceeded:
+        raise PipelineError(
+            "Context capsule limits exceed approved development-plan ceilings: "
+            + ", ".join(exceeded)
+        )
+    if budget["max_total_files"] < max(
+        budget["max_authority_files"], budget["max_evidence_files"]
+    ):
+        raise PipelineError(
+            "Context capsule max_total_files must cover each authority/evidence file ceiling"
+        )
+
+
+def capsule_scope_ids(state: dict[str, Any], phase: str) -> set[str]:
+    if phase.startswith("slice_") and state.get("active_slice"):
+        scope_ids = [state["active_slice"]]
+    else:
+        scope_ids = list(state.get("ordered_slices", []))
+    result: set[str] = set()
+    for scope_id in scope_ids:
+        item = state.get("slices", {}).get(scope_id, {})
+        result.update(str(value) for value in item.get("requirement_ids", []))
+        result.update(
+            str(value)
+            for value in (item.get("scope_contract") or {}).get("acceptance_ids", [])
+        )
+    return result
+
+
+def capsule_manifest_contract(
+    root: Path, state: dict[str, Any], phase: str
+) -> tuple[str | None, set[str]]:
+    active_slice = state.get("active_slice")
+    record: dict[str, Any] | None = None
+    identity_field = "actual_identities"
+    if phase in {"slice_engineering", "engineering", "slice_coverage_finalization"}:
+        record = (
+            state.get("coverage", {}).get(active_slice, {}).get("planned_manifest")
+            if active_slice
+            else None
+        )
+        identity_field = "expected_identities"
+    elif phase in {
+        "convergence",
+        "review",
+        "closure_review",
+        "recovery_review",
+        "documentation_review",
+        "qa",
+        "evidence_recovery",
+        "derived_documentation",
+    }:
+        record = state.get("coverage", {}).get("feature", {}).get("finalized_manifest")
+    if not record:
+        return None, set()
+    supplied_path = record.get("path")
+    expected_sha = record.get("sha256")
+    if not supplied_path or not expected_sha:
+        raise PipelineError("Controller coverage evidence record is incomplete")
+    path = resolve_project_file(root, supplied_path, "Capsule coverage evidence")
+    if file_sha256(path) != expected_sha:
+        raise PipelineError("Controller coverage evidence record is stale")
+    manifest = read_json(path)
+    identities = manifest.get(identity_field)
+    if not isinstance(identities, list):
+        raise PipelineError(
+            f"Capsule coverage evidence lacks controller-required {identity_field}"
+        )
+    identity_ids = {
+        str(item.get("identity_id"))
+        for item in identities
+        if isinstance(item, dict) and item.get("identity_id")
+    }
+    if len(identity_ids) != len(identities):
+        raise PipelineError("Capsule coverage evidence contains malformed identity records")
+    return path.relative_to(root).as_posix(), identity_ids
+
+
+def capsule_expected_finding_ids(
+    root: Path, state: dict[str, Any], role: str, phase: str
+) -> set[str]:
+    expected: set[str] = set()
+    if role == "engineer":
+        batch = state.get("active_remediation_batch") or {}
+        if batch.get("route") == "engineer" and batch.get("status") == "active":
+            expected.update(str(value) for value in batch.get("finding_ids", []))
+    if role == "recovery_remediator" or phase == "recovery_review":
+        recovery = state.get("recovery") or {}
+        expected.update(str(value) for value in recovery.get("finding_ids", []))
+    return expected
+
+
+def capsule_exact_authority(root: Path, state: dict[str, Any]) -> dict[str, str]:
+    records: dict[str, str] = {}
+
+    def add(value: str, expected_sha256: str) -> None:
+        records[
+            controller_relative_path(root, value, "Capsule controller authority")
+        ] = expected_sha256
+
+    add(state["requirements_path"], state["requirements_sha256"])
+    add(state["spec_path"], state["spec_sha256"])
+    add(state["development_plan_path"], state["development_plan_sha256"])
+    if state["decision_ledger"]["active_decision_ids"]:
+        add(state["decision_ledger"]["path"], state["decision_ledger"]["sha256"])
+    return records
+
+
+def capsule_exact_evidence(
+    root: Path, state: dict[str, Any], role: str, phase: str
+) -> dict[str, str]:
+    records: dict[str, str] = {}
+
+    def add(value: str | None, expected_sha256: str | None, label: str) -> None:
+        if not value or not expected_sha256:
+            raise PipelineError(f"Exact {label} evidence is missing from controller state")
+        relative = controller_relative_path(root, value, f"Capsule {label} evidence")
+        path = resolve_project_file(root, relative, f"Capsule {label} evidence")
+        if file_sha256(path) != expected_sha256:
+            raise PipelineError(f"Exact {label} evidence drifted after controller recording")
+        records[relative] = expected_sha256
+
+    coverage_path, _ = capsule_manifest_contract(root, state, phase)
+    if coverage_path:
+        coverage_record = None
+        for scope in state.get("coverage", {}).values():
+            for name in ("planned_manifest", "finalized_manifest"):
+                candidate = scope.get(name) or {}
+                if candidate.get("path") and controller_relative_path(
+                    root, candidate["path"], "Capsule coverage lookup"
+                ) == coverage_path:
+                    coverage_record = candidate
+                    break
+            if coverage_record:
+                break
+        if not coverage_record:
+            raise PipelineError("Exact capsule coverage evidence is absent")
+        add(coverage_record["path"], coverage_record["sha256"], "coverage")
+
+    def add_handoff() -> None:
+        handoffs = state.get("handoffs") or []
+        if not handoffs:
+            raise PipelineError("Exact current controller handoff is missing")
+        handoff = handoffs[-1]
+        add(handoff.get("path"), handoff.get("sha256"), "handoff")
+
+    def add_review_runs(runs: list[dict[str, Any]], label: str) -> None:
+        for run in runs:
+            add(run.get("report"), run.get("report_sha256"), f"{label} report")
+            add(
+                run.get("credit_manifest"),
+                run.get("credit_manifest_sha256"),
+                f"{label} credit manifest",
+            )
+
+    if role == "reviewer":
+        add_handoff()
+        if phase == "review":
+            add_review_runs(
+                list((state.get("convergence") or {}).get("runs", [])),
+                "convergence",
+            )
+        elif phase == "closure_review":
+            add_review_runs(
+                list((state.get("closure_review") or {}).get("base_review_runs", [])),
+                "base Review",
+            )
+        elif phase == "recovery_review":
+            add_review_runs(
+                list((state.get("recovery") or {}).get("base_review_runs", [])),
+                "base Review",
+            )
+        elif phase == "documentation_review":
+            review = state.get("review") or {}
+            review_runs = list(review.get("runs", []))
+            if review.get("recovery_run"):
+                review_runs.append(review["recovery_run"])
+            add_review_runs(review_runs, "current Review")
+            qa = state.get("qa") or {}
+            add(qa.get("report"), qa.get("report_sha256"), "QA report")
+            add(
+                qa.get("manual_execution"),
+                qa.get("manual_execution_sha256"),
+                "QA manual execution",
+            )
+            capability = state.get("qa_capability") or {}
+            add(
+                capability.get("report"),
+                capability.get("report_sha256"),
+                "QA capability probe",
+            )
+            derived = (state.get("documentation") or {}).get("derived") or {}
+            add(derived.get("report_path"), derived.get("report_sha256"), "documentation report")
+            add(
+                derived.get("source_map_path"),
+                derived.get("source_map_sha256"),
+                "documentation source map",
+            )
+    elif role == "qa":
+        add_handoff()
+        review = state.get("review") or {}
+        review_runs = list(review.get("runs", []))
+        if review.get("recovery_run"):
+            review_runs.append(review["recovery_run"])
+        add_review_runs(review_runs, "current Review")
+        capability = state.get("qa_capability") or {}
+        add(
+            capability.get("report"),
+            capability.get("report_sha256"),
+            "QA capability probe",
+        )
+        prior_qa = state.get("qa") or {}
+        if prior_qa.get("report"):
+            add(prior_qa.get("report"), prior_qa.get("report_sha256"), "prior QA report")
+            add(
+                prior_qa.get("manual_execution"),
+                prior_qa.get("manual_execution_sha256"),
+                "prior QA manual execution",
+            )
+    elif role == "recovery_remediator":
+        add_review_runs(
+            list((state.get("recovery") or {}).get("base_review_runs", [])),
+            "recovery source Review",
+        )
+    elif role == "documentation_finisher" and phase == "derived_documentation":
+        qa = state.get("qa") or {}
+        add(qa.get("report"), qa.get("report_sha256"), "QA report")
+        add(
+            qa.get("manual_execution"),
+            qa.get("manual_execution_sha256"),
+            "QA manual execution",
+        )
+        capability = state.get("qa_capability") or {}
+        add(
+            capability.get("report"),
+            capability.get("report_sha256"),
+            "QA capability probe",
+        )
+
+    return records
+
+
+def validate_capsule_semantics(
+    root: Path, state: dict[str, Any], value: dict[str, Any]
+) -> None:
+    role = value["role"]
+    phase = value["phase"]
+    if phase not in CAPSULE_PHASES[role]:
+        raise PipelineError("Context capsule role/phase semantic assignment is invalid")
+    if role in WRITE_ROLES and not value["allowed_paths"]:
+        raise PipelineError("Write-capable context capsule requires semantic allowed_paths")
+    if role not in WRITE_ROLES and (
+        value["allowed_paths"] or value["allowed_symbols"] or value["exclusions"]
+    ):
+        raise PipelineError(
+            "Read-only context capsule cannot include write paths, symbols, or exclusions"
+        )
+
+    known_authority_ids = capsule_scope_ids(state, phase)
+    known_authority_ids.update(state["decision_ledger"]["active_decision_ids"])
+    known_authority_ids.update(
+        item["authority_id"] for item in state.get("user_authorities", [])
+    )
+    cited_authority_ids = {
+        str(authority_id)
+        for item in value["authority"]
+        for authority_id in item["ids"]
+    }
+    unknown_authority_ids = cited_authority_ids - known_authority_ids
+    if unknown_authority_ids:
+        raise PipelineError(
+            "Context capsule cites authority IDs outside controller state: "
+            + ", ".join(sorted(unknown_authority_ids))
+        )
+    if role == "decision_recorder":
+        user_ids = {item["authority_id"] for item in state.get("user_authorities", [])}
+        non_file_authority = [
+            item for item in value["authority"] if item["path"] == "not_applicable"
+        ]
+        if (
+            len(non_file_authority) != 1
+            or len(non_file_authority[0]["ids"]) != 1
+            or non_file_authority[0]["ids"][0] not in user_ids
+        ):
+            raise PipelineError(
+                "Decision Recorder capsule semantic authority requires exactly one prior user receipt"
+            )
+    else:
+        if any(item["path"] == "not_applicable" for item in value["authority"]):
+            raise PipelineError(
+                "Only Decision Recorder capsules may contain non-file user authority"
+            )
+        missing_authority = capsule_scope_ids(state, phase) - cited_authority_ids
+        if missing_authority:
+            raise PipelineError(
+                "Context capsule semantic authority omits required controller IDs: "
+                + ", ".join(sorted(missing_authority))
+            )
+    expected_authority = capsule_exact_authority(root, state)
+    file_authority = {
+        item["path"]: item for item in value["authority"] if item["path"] != "not_applicable"
+    }
+    if set(file_authority) != set(expected_authority):
+        missing = sorted(set(expected_authority) - set(file_authority))
+        extra = sorted(set(file_authority) - set(expected_authority))
+        raise PipelineError(
+            "Context capsule semantic authority paths must equal the exact role packet; "
+            + " ".join(
+                part
+                for part in (
+                    "missing=" + ",".join(missing) if missing else "",
+                    "unexpected=" + ",".join(extra) if extra else "",
+                )
+                if part
+            )
+        )
+    stale_authority = sorted(
+        path
+        for path, item in file_authority.items()
+        if item["sha256"] != expected_authority[path]
+    )
+    if stale_authority:
+        raise PipelineError(
+            "Context capsule authority SHA differs from controller state: "
+            + ", ".join(stale_authority)
+        )
+    requirements_relative = controller_relative_path(
+        root, state["requirements_path"], "Capsule PRD authority"
+    )
+    if set(file_authority[requirements_relative]["ids"]) != capsule_scope_ids(state, phase):
+        raise PipelineError("Context capsule PRD authority IDs must equal the phase scope")
+    for path, item in file_authority.items():
+        if path == requirements_relative:
+            continue
+        expected_ids = (
+            set(state["decision_ledger"]["active_decision_ids"])
+            if path
+            == controller_relative_path(
+                root, state["decision_ledger"]["path"], "Capsule decision authority"
+            )
+            else set()
+        )
+        if set(item["ids"]) != expected_ids:
+            raise PipelineError(
+                f"Context capsule authority IDs are unnecessary or incomplete for {path}"
+            )
+
+    expected_decisions = set(state["decision_ledger"]["active_decision_ids"])
+    if set(value["decision_ids"]) != expected_decisions:
+        raise PipelineError(
+            "Context capsule decision_ids must equal the active controller decision set"
+        )
+    expected_findings = capsule_expected_finding_ids(root, state, role, phase)
+    if set(value["finding_ids"]) != expected_findings:
+        raise PipelineError(
+            "Context capsule finding_ids must equal the assigned controller finding set"
+        )
+
+    required_evidence, expected_coverage = capsule_manifest_contract(root, state, phase)
+    evidence_required_phases = {
+        "slice_engineering",
+        "engineering",
+        "slice_coverage_finalization",
+        "convergence",
+        "review",
+        "closure_review",
+        "recovery_review",
+        "documentation_review",
+        "qa",
+        "evidence_recovery",
+        "derived_documentation",
+    }
+    if phase in evidence_required_phases and not required_evidence:
+        raise PipelineError(
+            "Context capsule semantic assignment lacks controller-produced phase evidence"
+        )
+    if set(value["coverage_identity_ids"]) != expected_coverage:
+        raise PipelineError(
+            "Context capsule coverage_identity_ids must equal the controller coverage set"
+        )
+    evidence_paths = {item["path"] for item in value["evidence"]}
+    exact_evidence = capsule_exact_evidence(root, state, role, phase)
+    if evidence_paths != set(exact_evidence):
+        missing = sorted(set(exact_evidence) - evidence_paths)
+        extra = sorted(evidence_paths - set(exact_evidence))
+        raise PipelineError(
+            "Context capsule evidence paths must equal the exact role/phase packet; "
+            + " ".join(
+                part
+                for part in (
+                    "missing=" + ",".join(missing) if missing else "",
+                    "unexpected=" + ",".join(extra) if extra else "",
+                )
+                if part
+            )
+        )
+    stale_evidence = sorted(
+        item["path"]
+        for item in value["evidence"]
+        if exact_evidence.get(item["path"]) != item["sha256"]
+    )
+    if stale_evidence:
+        raise PipelineError(
+            "Context capsule evidence SHA differs from controller state: "
+            + ", ".join(stale_evidence)
+        )
+    if role in {"decision_recorder", "documentation_finisher"} and value["commands"]:
+        raise PipelineError("Context capsule includes unnecessary commands for this role")
 
 
 def validate_capsule_value(
@@ -4032,15 +5102,13 @@ def validate_capsule_value(
         raise PipelineError(
             "Context capsule cites inactive decision IDs: " + ", ".join(unknown_decisions)
         )
+    validate_capsule_semantics(root, state, value)
     budget = value.get("budget")
     if not isinstance(budget, dict) or set(budget) != set(CONTEXT_LIMIT_NAMES):
         raise PipelineError("Context capsule budget must contain all five exact limits")
     if any(not isinstance(budget[name], int) or budget[name] < 1 for name in CONTEXT_LIMIT_NAMES):
         raise PipelineError("Every context capsule limit must be a positive integer")
-    if budget != approved_capsule_budget(state, value["phase"]):
-        raise PipelineError(
-            "Context capsule limits must exactly match the approved development-plan budget"
-        )
+    validate_capsule_budget_ceiling(state, value["phase"], budget)
     metrics = capsule_metrics(value, root)
     if value.get("metrics") != metrics:
         raise PipelineError("Context capsule metrics do not match controller calculation")
@@ -4053,7 +5121,7 @@ def validate_capsule_value(
     }
     exceeded = [name for name, actual in metrics.items() if actual > limits[name]]
     if exceeded:
-        raise PipelineError("Context capsule exceeds approved limits: " + ", ".join(exceeded))
+        raise PipelineError("Context capsule exceeds its declared limits: " + ", ".join(exceeded))
     if value.get("capsule_sha256") != capsule_digest(value):
         raise PipelineError("Context capsule digest is invalid")
 
@@ -4102,10 +5170,12 @@ def cmd_context_capsule_create(args: argparse.Namespace) -> int:
     if args.role not in CAPSULE_ROLES:
         raise PipelineError("Unsupported context capsule role")
     supplied_budget = {name: getattr(args, name) for name in CONTEXT_LIMIT_NAMES}
-    if supplied_budget != approved_capsule_budget(state, args.phase):
-        raise PipelineError(
-            "Context capsule CLI limits cannot invent or override the approved plan budget"
-        )
+    if any(
+        not isinstance(supplied_budget[name], int) or supplied_budget[name] < 1
+        for name in CONTEXT_LIMIT_NAMES
+    ):
+        raise PipelineError("Every context capsule CLI limit must be a positive integer")
+    validate_capsule_budget_ceiling(state, args.phase, supplied_budget)
     authority = [
         parse_capsule_reference(root, value, "Capsule authority")
         for value in (args.authority or [])
@@ -4383,19 +5453,52 @@ def cmd_slice_research_complete(args: argparse.Namespace) -> int:
     return cmd_status(args)
 
 
-def parse_resume_actions(values: list[str] | None) -> dict[str, str]:
-    result: dict[str, str] = {}
+def parse_resume_actions(
+    values: list[str] | None, capabilities: dict[str, str]
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
     for value in values or []:
         if "=" not in value:
             raise PipelineError(
-                "Minimum resume actions must use <capability>=<minimum action>"
+                "Minimum resume actions must use "
+                "<capability>=<owner>|<user_input_required>|<action>"
             )
-        name, action = value.split("=", 1)
+        name, contract = value.split("=", 1)
         name = name.strip()
-        action = action.strip()
-        if name not in QA_CAPABILITY_NAMES or not action:
+        try:
+            parsed_name = _capability_contract.require_capability_id(
+                name, label="minimum resume capability"
+            )
+        except ValueError as exc:
+            raise PipelineError(str(exc)) from exc
+        if parsed_name not in capabilities or parsed_name in result:
             raise PipelineError(f"Invalid minimum resume action: {value!r}")
-        result[name] = action
+        parts = [item.strip() for item in contract.split("|", 2)]
+        if len(parts) != 3 or parts[0] not in {"user", "technical_director"}:
+            raise PipelineError(
+                "Minimum resume action owner must be user or technical_director"
+            )
+        if parts[1] not in {"true", "false"} or not parts[2]:
+            raise PipelineError(
+                "Minimum resume action requires exact boolean and non-empty action"
+            )
+        user_input_required = parts[1] == "true"
+        status = capabilities[parsed_name]
+        expected_owner = "user" if status == "blocked_user" else "technical_director"
+        expected_user_input = status == "blocked_user"
+        if status not in QA_CAPABILITY_BLOCKING_STATUSES:
+            raise PipelineError(
+                f"Minimum resume action is valid only for a blocked capability: {parsed_name}"
+            )
+        if parts[0] != expected_owner or user_input_required != expected_user_input:
+            raise PipelineError(
+                f"Minimum resume action authority conflicts with {parsed_name}={status}"
+            )
+        result[parsed_name] = {
+            "owner": parts[0],
+            "user_input_required": user_input_required,
+            "action": parts[2],
+        }
     return result
 
 
@@ -4407,8 +5510,9 @@ def cmd_qa_capability_probe(args: argparse.Namespace) -> int:
         raise PipelineError("QA capability probe is valid only immediately before or during QA")
     report = resolve_report(root, state, args.report, "QA capability probe report")
     capabilities = parse_capabilities(args.capability)
-    missing = sorted(QA_CAPABILITY_NAMES - set(capabilities))
-    extra = sorted(set(capabilities) - QA_CAPABILITY_NAMES)
+    required_capabilities = required_preflight_capabilities(state)
+    missing = sorted(required_capabilities - set(capabilities))
+    extra = sorted(set(capabilities) - required_capabilities)
     if missing or extra:
         details = []
         if missing:
@@ -4420,17 +5524,25 @@ def cmd_qa_capability_probe(args: argparse.Namespace) -> int:
             + "; ".join(details)
             + ")"
         )
-    resume_actions = parse_resume_actions(args.minimum_resume_action)
+    resume_actions = parse_resume_actions(args.minimum_resume_action, capabilities)
     blocked = {
         name: status
         for name, status in capabilities.items()
         if status in QA_CAPABILITY_BLOCKING_STATUSES
     }
     missing_actions = sorted(set(blocked) - set(resume_actions))
-    if missing_actions:
+    extra_actions = sorted(set(resume_actions) - set(blocked))
+    if missing_actions or extra_actions:
         raise PipelineError(
-            "Every failed QA capability probe requires a minimum resume action: "
-            + ", ".join(missing_actions)
+            "QA minimum resume actions must exactly match blocked capabilities: "
+            + "; ".join(
+                part
+                for part in (
+                    "missing=" + ",".join(missing_actions) if missing_actions else "",
+                    "unexpected=" + ",".join(extra_actions) if extra_actions else "",
+                )
+                if part
+            )
         )
     capability_state = state["qa_capability"]
     if any(probe["probe_id"] == args.probe_id for probe in capability_state["probes"]):
@@ -4457,6 +5569,7 @@ def cmd_qa_capability_probe(args: argparse.Namespace) -> int:
         },
         "minimum_resume_actions": resume_actions,
         "report": report,
+        "report_sha256": file_sha256(root / report),
         "status": "blocked" if blocked else "ready",
         "recorded_at": utc_now(),
     }
@@ -4470,6 +5583,7 @@ def cmd_qa_capability_probe(args: argparse.Namespace) -> int:
             "capability_dimensions": probe["capability_dimensions"],
             "minimum_resume_actions": resume_actions,
             "report": report,
+            "report_sha256": probe["report_sha256"],
         }
     )
     for gate in state.get("gates", []):
@@ -6241,6 +7355,185 @@ def cmd_decision_record_complete(args: argparse.Namespace) -> int:
     return cmd_status(args)
 
 
+def controller_relative_path(root: Path, value: str, label: str) -> str:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        try:
+            return candidate.resolve().relative_to(root).as_posix()
+        except ValueError as exc:
+            raise PipelineError(f"{label} escapes the project root") from exc
+    return scope_path(value, label)
+
+
+def documentation_source_authorities(
+    root: Path, state: dict[str, Any], mode: str
+) -> dict[tuple[str, str], dict[str, str]]:
+    """Return controller-recorded immutable source bytes, never post-write bytes."""
+    authorities: dict[tuple[str, str], dict[str, str]] = {}
+
+    def add(
+        kind: str,
+        source_id: str | None,
+        path: str | None,
+        expected_sha256: str | None,
+    ) -> None:
+        if not source_id or not path or path == "not_applicable" or not expected_sha256:
+            return
+        if not re.fullmatch(r"[0-9a-f]{64}", str(expected_sha256)):
+            raise PipelineError(f"Controller {kind} source SHA is malformed")
+        normalized = controller_relative_path(root, path, f"{kind} source")
+        authorities.setdefault((kind, source_id), {})[normalized] = expected_sha256
+
+    requirement_ids = sorted(
+        {
+            requirement_id
+            for item in state.get("slices", {}).values()
+            for requirement_id in item.get("requirement_ids", [])
+        }
+    )
+    acceptance_ids = sorted(planned_acceptance_ids(state))
+    for source_id in requirement_ids + acceptance_ids:
+        add(
+            "requirement",
+            source_id,
+            state["requirements_path"],
+            state["requirements_sha256"],
+        )
+    add(
+        "specification",
+        "approved-specification",
+        state["spec_path"],
+        state["spec_sha256"],
+    )
+    for decision_id in state["decision_ledger"]["active_decision_ids"]:
+        add(
+            "decision",
+            decision_id,
+            state["decision_ledger"]["path"],
+            state["decision_ledger"]["sha256"],
+        )
+    if mode == "normative_pre_review":
+        lease = state.get("active_write_lease") or {}
+        snapshot = state.get("lease_snapshots", {}).get(lease.get("lease_id"), {})
+        checkout = snapshot.get("checkout") or {}
+        for path in state["revision_inventory"]["product"]:
+            add("public_contract", path, path, checkout.get(path))
+        return authorities
+
+    qa = state.get("qa") or {}
+    add("qa", qa.get("run_id"), qa.get("report"), qa.get("report_sha256"))
+    add(
+        "qa",
+        qa.get("run_id"),
+        qa.get("manual_execution"),
+        qa.get("manual_execution_sha256"),
+    )
+    capability = state.get("qa_capability") or {}
+    add(
+        "capability_probe",
+        capability.get("probe_id"),
+        capability.get("report"),
+        capability.get("report_sha256"),
+    )
+    for run in state.get("review_runs", []):
+        add("review", run.get("run_id"), run.get("report"), run.get("report_sha256"))
+        add(
+            "review",
+            run.get("run_id"),
+            run.get("credit_manifest"),
+            run.get("credit_manifest_sha256"),
+        )
+    for handoff in state.get("handoffs", []):
+        add(
+            "controller_handoff",
+            handoff.get("handoff_id"),
+            handoff.get("path"),
+            handoff.get("sha256"),
+        )
+    return authorities
+
+
+def validate_documentation_source_map(
+    root: Path,
+    state: dict[str, Any],
+    supplied: str,
+    *,
+    mode: str,
+    changed_paths: list[str],
+) -> tuple[str, list[str]]:
+    path = resolve_project_file(root, supplied, "Documentation statement source map")
+    value = read_json(path)
+    if set(value) != {"schema", "mode", "statements"} or value.get("schema") != 1:
+        raise PipelineError("Documentation source map must use the exact statement-map schema 1")
+    if value.get("mode") != mode or not isinstance(value.get("statements"), list):
+        raise PipelineError("Documentation source map mode/statements are invalid")
+    exact = {
+        "statement_id",
+        "path",
+        "source_kind",
+        "source_id",
+        "source_path",
+        "source_sha256",
+    }
+    allowed_kinds = (
+        {"decision", "requirement", "specification", "public_contract"}
+        if mode == "normative_pre_review"
+        else {"decision", "qa", "capability_probe", "review", "controller_handoff"}
+    )
+    authorities = documentation_source_authorities(root, state, mode)
+    seen_statements: set[str] = set()
+    mapped_paths: set[str] = set()
+    evidence_ids: set[str] = set()
+    for row in value["statements"]:
+        if not isinstance(row, dict) or set(row) != exact:
+            raise PipelineError("Every documentation statement mapping must use exact schema-1 fields")
+        if (
+            not isinstance(row["statement_id"], str)
+            or not row["statement_id"].strip()
+            or row["statement_id"] in seen_statements
+        ):
+            raise PipelineError("Documentation statement IDs must be non-empty and unique")
+        seen_statements.add(row["statement_id"])
+        if row["path"] not in changed_paths:
+            raise PipelineError("Documentation statement map cites a path outside the semantic packet")
+        if row["source_kind"] not in allowed_kinds:
+            raise PipelineError("Documentation statement map uses a source kind invalid for its lane")
+        source_key = (row["source_kind"], row["source_id"])
+        source_relative = controller_relative_path(
+            root, row["source_path"], "documentation statement source"
+        )
+        if source_relative in set(changed_paths):
+            raise PipelineError(
+                "Documentation statement source must be immutable pre-write authority, "
+                "not a changed path in the semantic packet"
+            )
+        expected_sha256 = authorities.get(source_key, {}).get(source_relative)
+        if not expected_sha256:
+            raise PipelineError(
+                "Documentation statement source is not controller-verified evidence for "
+                f"{row['source_kind']}:{row['source_id']}"
+            )
+        source_file = resolve_project_file(
+            root, source_relative, "Documentation statement source"
+        )
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", str(row["source_sha256"]))
+            or row["source_sha256"] != expected_sha256
+            or file_sha256(source_file) != row["source_sha256"]
+        ):
+            raise PipelineError(
+                "Documentation statement source SHA is stale or not the controller-recorded immutable baseline"
+            )
+        mapped_paths.add(row["path"])
+        evidence_ids.add(f"{row['source_kind']}:{row['source_id']}")
+    missing_paths = sorted(set(changed_paths) - mapped_paths)
+    if missing_paths:
+        raise PipelineError(
+            "Documentation source map omits changed paths: " + ", ".join(missing_paths)
+        )
+    return path.relative_to(root).as_posix(), sorted(evidence_ids)
+
+
 def cmd_documentation_complete(args: argparse.Namespace) -> int:
     root, state_path, findings_path, state, findings = load_runtime(
         args.project_root, allow_active_writer_completion_drift=True
@@ -6264,8 +7557,10 @@ def cmd_documentation_complete(args: argparse.Namespace) -> int:
         worker_id=args.worker_id,
         phase=phase,
     )
-    source_map_path = resolve_project_file(root, args.source_map, "Documentation semantic source map")
-    packet = read_json(source_map_path)
+    semantic_path = resolve_project_file(
+        root, args.semantic_packet, "Documentation semantic write packet"
+    )
+    packet = read_json(semantic_path)
     slice_item = state["slices"][state.get("active_slice") or state["ordered_slices"][-1]]
     changes, inventory, _ = validate_semantic_write_packet(
         root, state, lease, packet, slice_item=slice_item
@@ -6283,6 +7578,14 @@ def cmd_documentation_complete(args: argparse.Namespace) -> int:
             or qa.get("evidence_revision") != state["evidence_revision"]
         ):
             raise PipelineError("Derived documentation requires unchanged passed-QA product/evidence")
+    changed_paths = sorted(item["path"] for item in changes)
+    source_map_path, source_evidence_ids = validate_documentation_source_map(
+        root,
+        state,
+        args.source_map,
+        mode=args.mode,
+        changed_paths=changed_paths,
+    )
     report = resolve_report(root, state, args.report, "Documentation Finisher report")
     base = {
         "revision": state["revision"],
@@ -6321,7 +7624,6 @@ def cmd_documentation_complete(args: argparse.Namespace) -> int:
         base_revisions=base,
         result_revisions={key: current[key] for key in base},
     )
-    changed_paths = sorted(item["path"] for item in changes)
     decision_ids = sorted({decision for item in changes for decision in item["decision_ids"]})
     documentation = state["documentation"][lane]
     documentation.update(
@@ -6330,6 +7632,8 @@ def cmd_documentation_complete(args: argparse.Namespace) -> int:
             "paths": changed_paths,
             "report_path": report,
             "report_sha256": file_sha256(root / report),
+            "source_map_path": source_map_path,
+            "source_map_sha256": file_sha256(root / source_map_path),
         }
     )
     if lane == "normative":
@@ -6351,9 +7655,7 @@ def cmd_documentation_complete(args: argparse.Namespace) -> int:
         state["phase"] = "convergence"
     else:
         documentation["support_revision"] = state["support_revision"]
-        documentation["source_evidence_ids"] = sorted(
-            {source for item in changes for source in item["acceptance_ids"] + item["decision_ids"]}
-        )
+        documentation["source_evidence_ids"] = source_evidence_ids
         documentation["closure_review_id"] = "pending"
         state["phase"] = "documentation_review"
     pending = {
@@ -6366,7 +7668,7 @@ def cmd_documentation_complete(args: argparse.Namespace) -> int:
         "result_revisions": {key: current[key] for key in base},
         "change_manifest": change_path,
         "diff_summary": diff_path,
-        "semantic_report": source_map_path.relative_to(root).as_posix(),
+        "semantic_report": semantic_path.relative_to(root).as_posix(),
         "open_assumptions": packet["open_assumptions"],
     }
     coverage_record = state["coverage"].get("feature") or state["coverage"].get(slice_item["id"])
@@ -6524,6 +7826,14 @@ def cmd_convergence_audit_complete(args: argparse.Namespace) -> int:
         raise PipelineError("Every convergence audit requires a fresh worker identity")
     if any(run["lens"] == args.lens for run in convergence["runs"]):
         raise PipelineError(f"Convergence lens already covered: {args.lens}")
+    capsule_path, capsule = resolve_validated_capsule(
+        root,
+        state,
+        args.capsule,
+        role="reviewer",
+        worker_id=args.reviewer_id,
+        phase="convergence",
+    )
     report = resolve_report(root, state, args.report, "Convergence audit report")
     credit_manifest, credit_ids = resolve_review_credit_manifest(
         root,
@@ -6543,7 +7853,11 @@ def cmd_convergence_audit_complete(args: argparse.Namespace) -> int:
         "support_revision": state["support_revision"],
         "evidence_revision": state["evidence_revision"],
         "report": report,
+        "report_sha256": file_sha256(root / report),
+        "capsule": capsule_path,
+        "capsule_id": capsule["capsule_id"],
         "credit_manifest": credit_manifest,
+        "credit_manifest_sha256": file_sha256(Path(credit_manifest)),
         "component_credit_ids": credit_ids,
         "recorded_at": utc_now(),
     }
@@ -6722,6 +8036,14 @@ def cmd_review_complete(args: argparse.Namespace) -> int:
         raise PipelineError("Final Review requires a fresh identity independent of engineering and convergence")
     if args.reviewer_id in state["worker_budget"].get("worker_ids", []):
         raise PipelineError("Every full Review requires a fresh worker identity")
+    capsule_path, capsule = resolve_validated_capsule(
+        root,
+        state,
+        args.capsule,
+        role="reviewer",
+        worker_id=args.reviewer_id,
+        phase="review",
+    )
     report = resolve_report(root, state, args.report, "Review report")
     credit_manifest, credit_ids = resolve_review_credit_manifest(
         root,
@@ -6741,7 +8063,11 @@ def cmd_review_complete(args: argparse.Namespace) -> int:
         "evidence_revision": state["evidence_revision"],
         "status": args.status,
         "report": report,
+        "report_sha256": file_sha256(root / report),
+        "capsule": capsule_path,
+        "capsule_id": capsule["capsule_id"],
         "credit_manifest": credit_manifest,
+        "credit_manifest_sha256": file_sha256(Path(credit_manifest)),
         "component_credit_ids": credit_ids,
         "recorded_at": utc_now(),
     }
@@ -6790,15 +8116,17 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
         and item["source"] == "review"
         and item["revision"] == args.revision
     ]
-    review_blocking = [item for item in review_findings if item.get("blocking")]
+    review_actionable = [
+        item for item in review_findings if finding_requires_remediation(item)
+    ]
 
     derived_rework_scope: str | None = None
     if args.decision == "rework":
-        if not review_blocking:
+        if not review_actionable:
             raise PipelineError(
-                "Rework decision requires at least one registered blocking Review finding"
+                "Rework decision requires at least one registered remediation-required Review finding"
             )
-        blocking_kinds = {item.get("finding_kind") for item in review_blocking}
+        blocking_kinds = {item.get("finding_kind") for item in review_actionable}
         if blocking_kinds == {"product"}:
             derived_rework_scope = "product"
         elif blocking_kinds.issubset({"evidence", "support"}):
@@ -6820,9 +8148,9 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
     budget["full_review_waves"] += 1
 
     if args.decision == "pass":
-        if review_blocking or reviewer_failed:
+        if review_actionable or reviewer_failed:
             raise PipelineError(
-                "Cannot pass immutable final Review while a reviewer failed or blocking Review findings remain open"
+                "Cannot pass immutable final Review while a reviewer failed or remediation-required findings remain open"
             )
         try:
             require_pipeline_backlog_scope(
@@ -6846,7 +8174,7 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
                 "base_product_revision": state["product_revision"],
                 "base_support_revision": state["support_revision"],
                 "base_evidence_revision": state["evidence_revision"],
-                "finding_ids": [item["id"] for item in review_blocking],
+                "finding_ids": [item["id"] for item in review_actionable],
                 "base_review_runs": list(review["runs"]),
                 "remediation_owner_id": None,
                 "remediation_runs": [],
@@ -6866,7 +8194,7 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
             affected_slice_ids = sorted(
                 {
                     route_for_finding(state, item)
-                    for item in review_blocking
+                    for item in review_actionable
                     if route_for_finding(state, item) != "integration"
                 }
             ) or list(state["ordered_slices"])
@@ -6881,13 +8209,13 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
                 "base_support_revision": state["support_revision"],
                 "base_evidence_revision": state["evidence_revision"],
                 "base_review_runs": list(review["runs"]),
-                "finding_ids": [item["id"] for item in review_blocking],
+                "finding_ids": [item["id"] for item in review_actionable],
                 "reason": args.reason,
                 "slice_ids": affected_slice_ids,
                 "full_wave_trigger": args.full_wave_trigger,
             }
             build_remediation_queue(
-                state, findings, [item["id"] for item in review_blocking]
+                state, findings, [item["id"] for item in review_actionable]
             )
             if state.get("phase") != "owner_handoff_hold":
                 state["phase"] = "engineering"
@@ -6946,6 +8274,14 @@ def cmd_closure_review_complete(args: argparse.Namespace) -> int:
         raise PipelineError("Targeted closure requires a fresh worker identity")
     if any(run["run_id"] == args.run_id for run in state["review_runs"]):
         raise PipelineError(f"Review run ID already recorded: {args.run_id}")
+    capsule_path, capsule = resolve_validated_capsule(
+        root,
+        state,
+        args.capsule,
+        role="reviewer",
+        worker_id=args.reviewer_id,
+        phase="closure_review",
+    )
     report = resolve_report(root, state, args.report, "Targeted closure Review report")
     credit_manifest, credit_ids = resolve_review_credit_manifest(
         root,
@@ -6964,7 +8300,11 @@ def cmd_closure_review_complete(args: argparse.Namespace) -> int:
         "evidence_revision": state["evidence_revision"],
         "status": args.status,
         "report": report,
+        "report_sha256": file_sha256(root / report),
+        "capsule": capsule_path,
+        "capsule_id": capsule["capsule_id"],
         "credit_manifest": credit_manifest,
+        "credit_manifest_sha256": file_sha256(Path(credit_manifest)),
         "component_credit_ids": credit_ids,
         "frozen_finding_ids": list(closure.get("finding_ids", [])),
         "changed_impact_surface": closure.get("changed_impact_surface", {}),
@@ -6980,13 +8320,13 @@ def cmd_closure_review_complete(args: argparse.Namespace) -> int:
         and item["source"] == "review"
         and item["revision"] == args.revision
     ]
-    current_review_blocking = [
-        item for item in current_review_findings if item.get("blocking")
+    current_review_actionable = [
+        item for item in current_review_findings if finding_requires_remediation(item)
     ]
     if args.status == "pass":
-        if current_review_blocking or open_blocking(findings):
+        if current_review_actionable or open_remediation_required(findings):
             raise PipelineError(
-                "Targeted closure cannot pass while current or blocking findings remain open"
+                "Targeted closure cannot pass while remediation-required findings remain open"
             )
         closure["status"] = "passed"
         if closure.get("return_phase") == "review":
@@ -7033,14 +8373,14 @@ def cmd_closure_review_complete(args: argparse.Namespace) -> int:
         state["qa"] = empty_qa_state()
         state["qa_capability"] = empty_qa_capability_state()
     else:
-        if not current_review_blocking:
+        if not current_review_actionable:
             raise PipelineError(
-                "A failed targeted closure Review must register at least one current blocking finding"
+                "A failed targeted closure Review must register at least one current remediation-required finding"
             )
         closure["status"] = "failed"
         if any(
             item.get("finding_kind") == "product"
-            for item in current_review_blocking
+            for item in current_review_actionable
         ):
             state["product_revalidation"] = {
                 "mode": "targeted",
@@ -7053,7 +8393,7 @@ def cmd_closure_review_complete(args: argparse.Namespace) -> int:
                 "base_convergence_runs": list(
                     closure.get("base_convergence_runs", [])
                 ),
-                "finding_ids": [item["id"] for item in current_review_blocking],
+                "finding_ids": [item["id"] for item in current_review_actionable],
                 "slice_ids": list(
                     (state.get("product_revalidation") or {}).get(
                         "slice_ids", state["ordered_slices"]
@@ -7064,7 +8404,7 @@ def cmd_closure_review_complete(args: argparse.Namespace) -> int:
             build_remediation_queue(
                 state,
                 findings,
-                [item["id"] for item in current_review_blocking],
+                [item["id"] for item in current_review_actionable],
             )
             if state.get("phase") != "owner_handoff_hold":
                 state["phase"] = "engineering"
@@ -7075,7 +8415,7 @@ def cmd_closure_review_complete(args: argparse.Namespace) -> int:
                 "base_product_revision": state["product_revision"],
                 "base_support_revision": state["support_revision"],
                 "base_evidence_revision": state["evidence_revision"],
-                "finding_ids": [item["id"] for item in current_review_blocking],
+                "finding_ids": [item["id"] for item in current_review_actionable],
                 "base_review_runs": list(closure["base_review_runs"]),
                 "remediation_owner_id": None,
                 "remediation_runs": [],
@@ -7089,7 +8429,7 @@ def cmd_closure_review_complete(args: argparse.Namespace) -> int:
 
 
 def cmd_add_finding(args: argparse.Namespace) -> int:
-    _, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
     require_sources_current(state)
     require_current_revision(state, args.revision)
     if any(item["id"] == args.id for item in findings["items"]):
@@ -7106,6 +8446,17 @@ def cmd_add_finding(args: argparse.Namespace) -> int:
         )
     if args.source == "qa" and args.finding_kind != "product":
         raise PipelineError("QA may register only product findings")
+    coverage_identity_ids = sorted(set(args.coverage_identity_id or []))
+    if coverage_identity_ids and args.source != "qa":
+        raise PipelineError("Coverage identity binding is valid only for QA findings")
+    if coverage_identity_ids:
+        catalog, _ = finalized_manual_identity_catalog(root, state)
+        unknown_identities = sorted(set(coverage_identity_ids) - set(catalog))
+        if unknown_identities:
+            raise PipelineError(
+                "QA finding cites unknown finalized manual identities: "
+                + ", ".join(unknown_identities)
+            )
     if args.cross_slice_root_cause and args.origin_slice:
         raise PipelineError(
             "Use either --origin-slice or --cross-slice-root-cause, not both"
@@ -7137,6 +8488,11 @@ def cmd_add_finding(args: argparse.Namespace) -> int:
             args.violates_required_invariant, "violates_required_invariant"
         ),
         "required_invariant_evidence": args.required_invariant_evidence,
+        "blocks_required_support_contract": parse_explicit_bool(
+            args.blocks_required_support_contract,
+            "blocks_required_support_contract",
+        ),
+        "required_support_contract_evidence": args.required_support_contract_evidence,
         "mandatory_core_acceptance_evidence_missing": parse_explicit_bool(
             args.mandatory_core_acceptance_evidence_missing,
             "mandatory_core_acceptance_evidence_missing",
@@ -7145,6 +8501,7 @@ def cmd_add_finding(args: argparse.Namespace) -> int:
             args.test_can_miss_product_defect, "test_can_miss_product_defect"
         ),
         "deferred_reference": args.deferred_reference,
+        "coverage_identity_ids": coverage_identity_ids,
         "title": args.title,
         "evidence": args.evidence,
         "revision": args.revision,
@@ -7171,7 +8528,7 @@ def cmd_add_finding(args: argparse.Namespace) -> int:
             "started_at": utc_now(),
         }
         state["phase"] = "finding_triage"
-    elif item["blocking"] and not deferred_director_decision:
+    elif item["remediation_required"] and not deferred_director_decision:
         state["phase"] = "engineering"
     save_runtime(state_path, findings_path, state, findings)
     print(json.dumps({"added": args.id}, ensure_ascii=False))
@@ -7205,7 +8562,7 @@ def cmd_triage_finding(args: argparse.Namespace) -> int:
         target["source"] in {"convergence", "review", "qa"}
         and resume_phase in {"convergence", "review", "recovery_review", "closure_review", "qa"}
     )
-    if target["blocking"] and not deferred_director_decision:
+    if target["remediation_required"] and not deferred_director_decision:
         state["phase"] = "engineering"
     save_runtime(state_path, findings_path, state, findings)
     print(
@@ -7222,25 +8579,10 @@ def cmd_triage_finding(args: argparse.Namespace) -> int:
 
 
 def cmd_resolve_finding(args: argparse.Namespace) -> int:
-    _, state_path, findings_path, state, findings = load_runtime(args.project_root)
-    require_sources_current(state)
-    require_current_revision(state, args.revision)
-    target = next((item for item in findings["items"] if item["id"] == args.id), None)
-    if target is None:
-        raise PipelineError(f"Unknown finding ID: {args.id}")
-    if target["status"] != "open":
-        raise PipelineError(f"Finding is not open: {args.id}")
-    active_ids = set((state.get("active_remediation_batch") or {}).get("finding_ids", []))
-    if args.id in active_ids:
-        raise PipelineError(
-            "An active remediation finding can be resolved only atomically by its owner completion"
-        )
-    target["status"] = "resolved"
-    target["resolved_revision"] = args.revision
-    target["resolved_at"] = utc_now()
-    save_runtime(state_path, findings_path, state, findings)
-    print(json.dumps({"resolved": args.id}, ensure_ascii=False))
-    return 0
+    raise PipelineError(
+        "resolve-finding is disabled: findings may close only atomically through "
+        "engineer-complete or recovery-remediation-complete"
+    )
 
 
 def cmd_accept_finding(args: argparse.Namespace) -> int:
@@ -7253,9 +8595,41 @@ def cmd_accept_finding(args: argparse.Namespace) -> int:
         raise PipelineError(f"Finding is not open: {args.id}")
     if target["severity"] != "minor":
         raise PipelineError("Only minor findings can be accepted as residual risk")
+    if target.get("blocking") is not False or finding_requires_remediation(target):
+        raise PipelineError("A blocking or remediation-required finding cannot be accepted")
+    require_current_revision(state, args.revision)
+    if target.get("revision") != args.revision:
+        raise PipelineError(
+            "Residual-risk acceptance must bind the finding's exact current revision"
+        )
+    expected_statement = (
+        f"Accept residual risk for finding {args.id} at revision {args.revision}: "
+        f"{args.reason}"
+    )
+    receipt = next(
+        (
+            item
+            for item in state["user_authorities"]
+            if item.get("authority_id") == args.authority_id
+        ),
+        None,
+    )
+    if receipt is None or receipt.get("statement") != expected_statement:
+        raise PipelineError(
+            "accept-finding requires a prior immutable user-authority receipt bound to "
+            "the exact finding, revision, and reason"
+        )
+    if args.approval_reference and (
+        args.approval_reference != receipt.get("approval_reference")
+    ):
+        raise PipelineError("Approval reference does not match the immutable authority receipt")
     target["status"] = "accepted"
     target["accepted_reason"] = args.reason
-    target["approval_reference"] = args.approval_reference
+    target["accepted_revision"] = args.revision
+    target["authority_id"] = receipt["authority_id"]
+    target["approval_reference"] = receipt["approval_reference"]
+    target["authority_receipt_path"] = receipt["receipt_path"]
+    target["authority_receipt_sha256"] = receipt["receipt_sha256"]
     target["accepted_at"] = utc_now()
     save_runtime(state_path, findings_path, state, findings)
     print(json.dumps({"accepted": args.id}, ensure_ascii=False))
@@ -7512,7 +8886,22 @@ def cmd_recovery_review_complete(args: argparse.Namespace) -> int:
         raise PipelineError("Recovery verification requires a fresh worker identity")
     if any(run["run_id"] == args.run_id for run in state["review_runs"]):
         raise PipelineError(f"Review run ID already recorded: {args.run_id}")
+    capsule_path, capsule = resolve_validated_capsule(
+        root,
+        state,
+        args.capsule,
+        role="reviewer",
+        worker_id=args.reviewer_id,
+        phase="recovery_review",
+    )
     report = resolve_report(root, state, args.report, "Recovery Review report")
+    credit_manifest, credit_ids = resolve_review_credit_manifest(
+        root,
+        state,
+        args.credit_manifest,
+        reviewer_id=args.reviewer_id,
+        review_mode="recovery_verification",
+    )
     run = {
         "run_id": args.run_id,
         "reviewer_id": args.reviewer_id,
@@ -7523,6 +8912,12 @@ def cmd_recovery_review_complete(args: argparse.Namespace) -> int:
         "status": args.status,
         "mode": "evidence_recovery",
         "report": report,
+        "report_sha256": file_sha256(root / report),
+        "capsule": capsule_path,
+        "capsule_id": capsule["capsule_id"],
+        "credit_manifest": credit_manifest,
+        "credit_manifest_sha256": file_sha256(Path(credit_manifest)),
+        "component_credit_ids": credit_ids,
         "recorded_at": utc_now(),
     }
     recovery["verification_runs"].append(run)
@@ -7530,9 +8925,9 @@ def cmd_recovery_review_complete(args: argparse.Namespace) -> int:
     state["review"]["recovery_run"] = run
     record_worker(state, "recovery_review", args.reviewer_id)
     if args.status == "pass":
-        if open_blocking(findings):
+        if open_remediation_required(findings):
             raise PipelineError(
-                "Recovery Review cannot pass while blocking findings remain open"
+                "Recovery Review cannot pass while remediation-required findings remain open"
             )
         state["review"]["status"] = "passed_recovery"
         state["review"]["decision"] = "pass"
@@ -7564,7 +8959,7 @@ def cmd_recovery_review_complete(args: argparse.Namespace) -> int:
             for item in findings["items"]
             if item.get("status") == "open"
             and item.get("finding_kind") in {"support", "evidence"}
-            and item.get("blocking") is True
+            and finding_requires_remediation(item)
             and item.get("revision") == args.revision
         ]
         if not open_evidence:
@@ -7660,6 +9055,13 @@ def resolve_qa_gates(state: dict[str, Any], revision: str, resolution: str) -> N
             gate["resolution"] = resolution
 
 
+def qa_gate_priority(categories: set[str]) -> str | None:
+    for category in ("blocked_user", "blocked_environment", "error_test"):
+        if category in categories:
+            return category
+    return None
+
+
 
 
 def finalized_manual_identity_catalog(
@@ -7750,6 +9152,8 @@ def validate_manual_execution_artifact(
         elif row["gate"] is not None:
             raise PipelineError("Non-deferred manual identity cannot carry a gate")
         if row["blocked_by_finding"]:
+            if not isinstance(row["blocked_by_finding"], str):
+                raise PipelineError("blocked_by_finding must be a finding ID or null")
             if row["executed"] or row["deferred"] or row["passed"] is not None:
                 raise PipelineError("blocked_by_finding is an unexecuted non-gate identity")
         if row["executed"]:
@@ -7832,19 +9236,12 @@ def cmd_qa_complete(args: argparse.Namespace) -> int:
     if prior_non_qa_roles:
         raise PipelineError("Runtime QA requires an identity fresh from every prior non-QA role")
     require_current_review_chain_for_qa(state)
-    resolve_validated_capsule(
+    capsule_path, capsule = resolve_validated_capsule(
         root, state, args.capsule, role="qa", worker_id=args.worker_id, phase="qa"
     )
     qa_capability = state["qa_capability"]
     if qa_capability.get("revision") != state["revision"]:
         raise PipelineError("QA capability probe is stale")
-    if args.status in QA_GATE_STATUSES:
-        if qa_capability.get("status") != "blocked" or args.status not in set(
-            qa_capability.get("capabilities", {}).values()
-        ):
-            raise PipelineError("QA gate requires the matching failed exact-revision capability probe")
-    elif qa_capability.get("status") != "ready":
-        raise PipelineError("QA execution requires a ready exact-revision capability probe")
     manual_path, rows, by_id, mandatory = validate_manual_execution_artifact(
         root, state, args.manual_execution
     )
@@ -7867,32 +9264,117 @@ def cmd_qa_complete(args: argparse.Namespace) -> int:
         and not by_id[identity_id]["blocked_by_finding"]
         for identity_id in mandatory
     )
-    if args.status == "pass":
-        if pending or deferred or blocked_by_finding or failed or not mandatory_pass:
-            raise PipelineError("QA PASS requires every mandatory manual identity executed/passed")
-    elif args.status == "fail_product":
-        if not failed:
-            raise PipelineError("FAIL_PRODUCT requires an executed failed manual identity")
-        qa_product = [
+    if pending != deferred:
+        raise PipelineError("pending-identity must equal the exact deferred identity set")
+    current_qa_findings = [
+        item
+        for item in findings["items"]
+        if item.get("source") == "qa"
+        and item.get("finding_kind") == "product"
+        and item.get("revision") == state["revision"]
+        and item.get("status") in {"open", "accepted"}
+    ]
+    by_finding_id = {item["id"]: item for item in current_qa_findings}
+    linked_by_identity = {
+        identity_id: [
             item
-            for item in findings["items"]
-            if item.get("status") == "open"
-            and item.get("source") == "qa"
-            and item.get("finding_kind") == "product"
-            and item.get("blocking") is True
-            and item.get("revision") == state["revision"]
+            for item in current_qa_findings
+            if identity_id in item.get("coverage_identity_ids", [])
         ]
-        if not qa_product:
-            raise PipelineError("FAIL_PRODUCT requires a normalized blocking QA product finding")
-        if pending:
-            raise PipelineError("Product-invalidated identities use blocked_by_finding, not pending gates")
-    elif args.status in QA_GATE_STATUSES:
-        if not args.reason or pending != deferred or not pending:
-            raise PipelineError("QA gate pending identities must equal exact deferred identities")
-        if any(by_id[identity_id]["gate"] != args.status for identity_id in pending):
-            raise PipelineError("Deferred identity gates must match overall QA gate status")
-    elif args.status == "error_test" and not args.reason:
-        raise PipelineError("ERROR_TEST requires a reason")
+        for identity_id in by_id
+    }
+    product_failure = False
+    for identity_id in failed:
+        linked = linked_by_identity[identity_id]
+        if not linked:
+            raise PipelineError(
+                f"Failed QA identity {identity_id} requires an exact QA finding binding"
+            )
+        if identity_id in mandatory:
+            if not any(item.get("status") == "open" and item.get("blocking") for item in linked):
+                raise PipelineError(
+                    "A failed mandatory identity requires an open normalized blocking QA finding"
+                )
+            product_failure = True
+        else:
+            accepted_nonblocking = [
+                item
+                for item in linked
+                if item.get("status") == "accepted"
+                and item.get("severity") == "minor"
+                and item.get("blocking") is False
+            ]
+            if not accepted_nonblocking or any(
+                item.get("status") == "open" or item.get("blocking") is True
+                for item in linked
+            ):
+                raise PipelineError(
+                    "An optional failed identity may remain nonblocking only through an "
+                    "accepted minor exact-revision QA finding"
+                )
+    for identity_id in blocked_by_finding:
+        finding_id = by_id[identity_id]["blocked_by_finding"]
+        item = by_finding_id.get(finding_id)
+        if (
+            not item
+            or item.get("status") != "open"
+            or item.get("blocking") is not True
+            or identity_id not in item.get("coverage_identity_ids", [])
+        ):
+            raise PipelineError(
+                "blocked_by_finding must name an open blocking QA finding bound to the identity"
+            )
+        product_failure = True
+    unbound_blocking = [
+        item["id"]
+        for item in current_qa_findings
+        if item.get("status") == "open"
+        and item.get("blocking") is True
+        and not any(
+            identity_id in item.get("coverage_identity_ids", [])
+            and (identity_id in failed or identity_id in blocked_by_finding)
+            for identity_id in by_id
+        )
+    ]
+    if unbound_blocking:
+        raise PipelineError(
+            "Open blocking QA findings are not bound to a failed/blocked identity: "
+            + ", ".join(sorted(unbound_blocking))
+        )
+    gate_categories = {by_id[identity_id]["gate"] for identity_id in deferred}
+    derived_gate = qa_gate_priority(gate_categories)
+    if product_failure:
+        derived_status = "fail_product"
+    elif derived_gate:
+        derived_status = derived_gate
+    elif mandatory_pass:
+        derived_status = "pass"
+    else:
+        raise PipelineError(
+            "QA result is not closed: mandatory identities must pass, defer through an "
+            "external gate, or bind to a product finding"
+        )
+    if args.status != derived_status:
+        raise PipelineError(
+            f"Supplied QA status {args.status!r} conflicts with controller-derived "
+            f"status {derived_status!r}"
+        )
+    blocked_capability_categories = {
+        status
+        for status in qa_capability.get("capabilities", {}).values()
+        if status in QA_GATE_STATUSES
+    }
+    if gate_categories:
+        if qa_capability.get("status") != "blocked" or gate_categories != blocked_capability_categories:
+            raise PipelineError(
+                "Deferred QA gate categories must exactly match the failed capability probe"
+            )
+        if not args.reason:
+            raise PipelineError("QA external gates require a reason")
+    elif qa_capability.get("status") != "ready":
+        raise PipelineError("QA execution requires a ready exact-revision capability probe")
+    if derived_status == "fail_product" and not (failed or blocked_by_finding):
+        raise PipelineError("FAIL_PRODUCT requires a failed or finding-blocked manual identity")
     report = resolve_report(root, state, args.report, "QA report")
     run = {
         "run_id": args.run_id,
@@ -7914,6 +9396,10 @@ def cmd_qa_complete(args: argparse.Namespace) -> int:
         "pending_identities": pending,
         "reason": args.reason,
         "report": report,
+        "report_sha256": file_sha256(root / report),
+        "manual_execution_sha256": file_sha256(root / manual_path),
+        "capsule": capsule_path,
+        "capsule_id": capsule["capsule_id"],
         "capability_probe_id": qa_capability.get("probe_id"),
         "recorded_at": utc_now(),
     }
@@ -7938,6 +9424,28 @@ def cmd_qa_complete(args: argparse.Namespace) -> int:
     }
     feature_scope["state"] = aggregate_state
     state["coverage_manifest"] = aggregate_absolute
+    for category in sorted(gate_categories):
+        category_pending = sorted(
+            identity_id
+            for identity_id in deferred
+            if by_id[identity_id]["gate"] == category
+        )
+        state["gates"].append(
+            {
+                "id": f"qa:{args.run_id}:{category}",
+                "phase": "qa",
+                "category": category,
+                "revision": state["revision"],
+                "pending_identities": category_pending,
+                "reason": args.reason,
+                "minimum_resume_actions": {
+                    identity_id: by_id[identity_id]["minimum_resume_action"]
+                    for identity_id in category_pending
+                },
+                "status": "open",
+                "created_at": utc_now(),
+            }
+        )
     if args.status == "pass":
         resolve_qa_gates(state, state["revision"], "All mandatory manual identities passed")
         state["feature_verification_state"] = {
@@ -7957,21 +9465,6 @@ def cmd_qa_complete(args: argparse.Namespace) -> int:
             state["phase"] = "engineering"
     else:
         state["feature_verification_state"]["status"] = "pending"
-        state["gates"].append(
-            {
-                "id": f"qa:{args.run_id}",
-                "phase": "qa",
-                "category": args.status,
-                "revision": state["revision"],
-                "pending_identities": pending,
-                "reason": args.reason,
-                "minimum_resume_actions": {
-                    identity_id: by_id[identity_id]["minimum_resume_action"] for identity_id in pending
-                },
-                "status": "open",
-                "created_at": utc_now(),
-            }
-        )
         state["phase"] = "qa"
     record_worker(state, "runtime_qa", args.worker_id)
     save_runtime(state_path, findings_path, state, findings)
@@ -8166,8 +9659,8 @@ def readiness_reasons(state: dict[str, Any], findings: dict[str, Any]) -> list[s
         or machine.get("evidence_revision") != evidence_revision
     ):
         reasons.append("machine checks have not passed on the current revision")
-    if open_blocking(findings):
-        reasons.append("controller-classified blocking findings remain unresolved")
+    if open_remediation_required(findings):
+        reasons.append("controller-classified remediation-required findings remain unresolved")
     if any(
         item["status"] == "open" and item["severity"] == "minor"
         for item in findings["items"]
@@ -8204,6 +9697,9 @@ def readiness_reasons(state: dict[str, Any], findings: dict[str, Any]) -> list[s
         ):
             reasons.append("targeted product closure review chain is incomplete")
     preflight = state.get("preflight", {})
+    proof_error = preflight_proof_error(state)
+    if proof_error:
+        reasons.append("current versioned preflight proof is invalid: " + proof_error)
     if preflight.get("resource_budget_check") != "pass":
         reasons.append("preflight resource-budget proof has not passed")
     if blocked_preflight_capabilities(state):
@@ -8285,11 +9781,28 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--run-id", required=True)
     preflight.add_argument("--resource-budget-check", choices=("pass", "fail"), required=True)
     preflight.add_argument("--capability", action="append")
+    preflight.add_argument("--minimum-resume-action", action="append")
     preflight.add_argument("--report", required=True)
     preflight.set_defaults(handler=cmd_preflight_complete)
 
+    reinitialize_preflight = commands.add_parser("reinitialize-preflight")
+    add_common_project_root(reinitialize_preflight)
+    reinitialize_preflight.add_argument("--reason", required=True)
+    reinitialize_preflight.set_defaults(handler=cmd_reinitialize_preflight)
+
     status = commands.add_parser("status")
     add_common_project_root(status)
+    status_mode = status.add_mutually_exclusive_group()
+    status_mode.add_argument(
+        "--section",
+        choices=STATUS_SECTIONS,
+        help="Return one bounded diagnostic section plus the deterministic next action",
+    )
+    status_mode.add_argument(
+        "--full",
+        action="store_true",
+        help="Return the legacy accumulated status payload for diagnostics",
+    )
     status.set_defaults(handler=cmd_status)
 
     user_authority = commands.add_parser("user-authority-accept")
@@ -8434,6 +9947,7 @@ def build_parser() -> argparse.ArgumentParser:
     documentation_complete.add_argument("--worker-id", required=True)
     documentation_complete.add_argument("--lease-id", required=True)
     documentation_complete.add_argument("--capsule", required=True)
+    documentation_complete.add_argument("--semantic-packet", required=True)
     documentation_complete.add_argument("--source-map", required=True)
     documentation_complete.add_argument("--report", required=True)
     documentation_complete.set_defaults(handler=cmd_documentation_complete)
@@ -8461,6 +9975,7 @@ def build_parser() -> argparse.ArgumentParser:
     convergence_audit.add_argument("--evidence-revision")
     convergence_audit.add_argument("--run-id", required=True)
     convergence_audit.add_argument("--reviewer-id", required=True)
+    convergence_audit.add_argument("--capsule", required=True)
     convergence_audit.add_argument("--lens", choices=tuple(sorted(CONVERGENCE_LENSES)), required=True)
     convergence_audit.add_argument("--status", choices=("pass", "fail"), required=True)
     convergence_audit.add_argument("--report", required=True)
@@ -8488,6 +10003,7 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--evidence-revision")
     review.add_argument("--run-id", required=True)
     review.add_argument("--reviewer-id", required=True)
+    review.add_argument("--capsule", required=True)
     review.add_argument("--status", choices=("pass", "fail"), required=True)
     review.add_argument("--report", required=True)
     review.add_argument("--credit-manifest", required=True)
@@ -8520,6 +10036,7 @@ def build_parser() -> argparse.ArgumentParser:
     closure_review.add_argument("--evidence-revision")
     closure_review.add_argument("--run-id", required=True)
     closure_review.add_argument("--reviewer-id", required=True)
+    closure_review.add_argument("--capsule", required=True)
     closure_review.add_argument("--status", choices=("pass", "fail"), required=True)
     closure_review.add_argument("--report", required=True)
     closure_review.add_argument("--credit-manifest", required=True)
@@ -8556,6 +10073,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_finding.add_argument("--required-invariant-evidence")
     add_finding.add_argument(
+        "--blocks-required-support-contract",
+        choices=("true", "false"),
+        default="false",
+    )
+    add_finding.add_argument("--required-support-contract-evidence")
+    add_finding.add_argument(
         "--mandatory-core-acceptance-evidence-missing",
         choices=("true", "false"),
         required=True,
@@ -8564,6 +10087,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--test-can-miss-product-defect", choices=("true", "false"), required=True
     )
     add_finding.add_argument("--deferred-reference")
+    add_finding.add_argument("--coverage-identity-id", action="append", default=[])
     add_finding.add_argument("--title", required=True)
     add_finding.add_argument("--evidence", required=True)
     add_finding.add_argument("--revision", required=True)
@@ -8593,7 +10117,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_project_root(accept)
     accept.add_argument("--id", required=True)
     accept.add_argument("--reason", required=True)
-    accept.add_argument("--approval-reference", required=True)
+    accept.add_argument("--revision", required=True)
+    accept.add_argument("--authority-id", required=True)
+    accept.add_argument("--approval-reference")
     accept.set_defaults(handler=cmd_accept_finding)
 
     remediation = commands.add_parser(
@@ -8620,8 +10146,10 @@ def build_parser() -> argparse.ArgumentParser:
     recovery_review.add_argument("--evidence-revision", required=True)
     recovery_review.add_argument("--run-id", required=True)
     recovery_review.add_argument("--reviewer-id", required=True)
+    recovery_review.add_argument("--capsule", required=True)
     recovery_review.add_argument("--status", choices=("pass", "fail"), required=True)
     recovery_review.add_argument("--report", required=True)
+    recovery_review.add_argument("--credit-manifest", required=True)
     recovery_review.set_defaults(handler=cmd_recovery_review_complete)
 
     authorize = commands.add_parser("authorize-iteration")
@@ -8677,6 +10205,9 @@ def build_parser() -> argparse.ArgumentParser:
     ready = commands.add_parser("ready")
     add_common_project_root(ready)
     ready.set_defaults(handler=cmd_ready)
+    commands.metavar = "{" + ",".join(
+        sorted(name for name in commands.choices if name != "resolve-finding")
+    ) + "}"
     return parser
 
 

@@ -1,43 +1,35 @@
 ---
 name: gamedev-decision-recorder
-description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-decision-recorder` by name, explicitly asks for the Agentic GameDev Pipeline Decision Recorder or ADR Keeper mode, or an explicitly user-invoked `$gamedev-pipeline` delegates an accepted-decision recording pass. Append or synchronize only decisions already accepted by an identified authority; never choose, infer, complete, or broaden a product or technical decision.
+description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-decision-recorder` or an active, explicitly invoked `$gamedev-pipeline` Director delegates one accepted-decision pass. Record only receipt-backed accepted decisions without choosing or extending them. Do not activate from ambiguity, implementation discovery, or document gaps.
 ---
 
 # GameDev Decision Recorder
 
 ## Activation gate
 
-Proceed only when the current user explicitly requests `$gamedev-decision-recorder` by name, clearly asks for the Agentic GameDev Pipeline Decision Recorder or ADR Keeper mode, or this is a bounded recording assignment from an active `$gamedev-pipeline` that the user explicitly invoked. A discussion, ambiguity, implementation discovery, document gap, or apparent best practice is not authorization to activate this role or to create a decision.
+Proceed only on the explicit activation described above. A discussion, apparent best practice, ambiguity, implementation discovery, or missing document is not authorization to create a decision. Do not activate another GameDev stage.
 
-Read [decision-ledger-contract.md](references/decision-ledger-contract.md) before writing. Accept only a controller-validated context capsule and an exclusive write lease for the exact ledger/ADR paths. A user decision must cite an immutable receipt created by an earlier separate `user-authority-accept` checkpoint; the capsule or recorder packet cannot create that authority. Read the cited authority at its exact SHA; do not use chat history as authority.
+Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md) and [decision-ledger-contract.md](references/decision-ledger-contract.md). The contract is canonical for authority receipts, semantic packet schema, append-only behavior, ADR synchronization, and legal recording phases.
+
+Accept only a controller-validated capsule and exclusive lease for exact ledger/ADR paths. A user decision must cite a prior immutable `user-authority-accept` receipt whose statement, approval reference, digest, path, and SHA match exactly. Neither the capsule nor recorder packet may create authority. Use no chat history as authority.
+
+Decision recording is legal only during `preflight`, `slice_research`, or `slice_coverage_planning`. A later decision returns `DECISION_REPLAN_REQUIRED`; it does not invalidate downstream state in place.
 
 ## Record without deciding
 
-Use exactly one mode:
+Use one mode:
 
-- `ledger-append`: prepare the semantic payload for one or more already accepted decision IDs; the controller assigns ordering, timestamps, revision fields, hashes, and performs the append-only mutation.
-- `adr-sync`: synchronize explicitly assigned ADR sections from accepted ledger entries. Preserve meaning and cite every source `DEC-*`; do not add rationale, alternatives, consequences, or policy that the accepted records do not supply.
+- `ledger-append`: prepare schema-1 semantic payloads for already accepted decision IDs; the controller owns ordering, timestamps, hashes, and append mutation;
+- `adr-sync`: update only assigned ADR sections from active ledger entries and cite every source `DEC-*`.
 
-For each assigned decision:
+For each decision, verify stable ID, accepted status, exact authority, statement, affected IDs/scope, and any supersession target. Copy or faithfully compress supplied meaning. Use `not_supplied` for absent rationale/consequences; never fill a gap. Prior entries are immutable; corrections append a controller-authorized superseding entry. Inspect the final assigned diff for semantic fidelity and confinement.
 
-1. Verify a stable `DEC-*` ID, accepted status, exact authority reference, statement, affected scope/IDs, and any explicit supersession target.
-2. Copy or faithfully compress only supplied meaning. Use `not_supplied` for absent rationale or consequences; never fill a gap with a plausible answer.
-3. Reject mutation or deletion of a prior ledger entry. Correct history only by appending a controller-authorized superseding entry.
-4. Stop with `DECISION_INPUT_INCOMPLETE` when authority is missing, contradictory, stale, or not demonstrably accepted. Return the smallest missing-decision question; do not resolve it.
-5. Inspect the final assigned diff for semantic fidelity and path confinement.
+Stop with `DECISION_INPUT_INCOMPLETE` for missing, contradictory, stale, or unaccepted authority. Return only the smallest missing-decision question.
 
-The ledger and normative ADRs are `product_revision` inputs. Never write production code, tests, derived support documentation, coverage prose, Review/QA evidence, or controller state. Do not spawn subagents.
+The ledger and normative ADRs are product inputs. Never write production code/tests, derived support docs, coverage prose, Review/QA evidence, or controller state. Do not spawn subagents.
 
-## Return the bounded contract
+## Complete the stage
 
-Return:
+Return `RECORDING_COMPLETE: yes|no`, mode, recorder/lease/capsule IDs, assigned paths, authority references, decision IDs, payload/ADR changes, supersession links, `not_supplied` fields, fidelity inspection, and unresolved authority gaps. The controller alone authors revisions, counts, sequence/timestamps, ledger hashes, and sealed handoff fields.
 
-- `RECORDING_COMPLETE: yes|no` and mode;
-- recorder ID, lease ID, context capsule path/SHA, and exact assigned paths;
-- accepted authority references and recorded `decision_ids`;
-- semantic payload path or ADR sections changed;
-- supersession links and all `not_supplied` fields;
-- final semantic-fidelity/diff inspection result;
-- unresolved authority gaps.
-
-Do not report result revisions, change counts, timestamps, sequence numbers, ledger hashes, or sealed handoff fields as authored facts. The controller generates and validates those mechanical values. A successful pass means faithful recording only; it does not approve the underlying decision or declare implementation/readiness.
+On success return `NEXT_ACTION: $gamedev-pipeline` for Director validation/resume. On an authority or late-phase gate, return the exact `NEXT_ACTION: user-decision`, `$gamedev-requirements`, `$gamedev-specification`, or `$gamedev-development-plan` required to re-establish authority. Do not execute it; stop.

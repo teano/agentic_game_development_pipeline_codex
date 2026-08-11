@@ -12,7 +12,9 @@ The controller tracks two independent documentation dimensions:
     "paths": [],
     "decision_ids": [],
     "report_path": "path",
-    "report_sha256": "64 lowercase hex"
+    "report_sha256": "64 lowercase hex",
+    "source_map_path": "path",
+    "source_map_sha256": "64 lowercase hex"
   },
   "derived": {
     "status": "pending|required_complete|not_required|gap",
@@ -21,6 +23,8 @@ The controller tracks two independent documentation dimensions:
     "source_evidence_ids": [],
     "report_path": "path",
     "report_sha256": "64 lowercase hex",
+    "source_map_path": "path",
+    "source_map_sha256": "64 lowercase hex",
     "closure_review_id": "id or pending"
   }
 }
@@ -54,4 +58,28 @@ Otherwise fail closed to the ordinary invalidation route. The new composite revi
 
 ## Controller-owned mechanics
 
-The Finisher returns a semantic source map and diff inspection. The controller computes revisions, enumerates changed paths/symbols/lines, classifies domain drift, and generates the handoff `documentation_state`. A worker-authored revision hash, change count, or sealed manifest is advisory and cannot satisfy a gate.
+The Finisher returns two separate inputs:
+
+1. the shared schema-1 semantic write packet with complete domain inventory, exact changed-path annotations, and open assumptions;
+2. this exact schema-1 statement source map:
+
+```json
+{
+  "schema": 1,
+  "mode": "normative_pre_review|derived_post_qa",
+  "statements": [
+    {
+      "statement_id": "DOC-STMT-001",
+      "path": "one actually changed allowed output",
+      "source_kind": "lane-allowed kind",
+      "source_id": "controller-recognized ID",
+      "source_path": "exact controller-recognized source",
+      "source_sha256": "current 64 lowercase hex"
+    }
+  ]
+}
+```
+
+Every changed path needs at least one statement mapping. Statement IDs are non-empty and unique. Normative source kinds are `decision`, `requirement`, `specification`, and `public_contract`; derived source kinds are `decision`, `qa`, `capability_probe`, `review`, and `controller_handoff`. Source ID/path/SHA must match controller-known authority for the lane. A stale or unrecognized source fails closed without state mutation.
+
+The controller validates both packets, computes revisions, enumerates changed paths/symbols/lines, classifies domain drift, records the source-map path/SHA, and generates the handoff `documentation_state`. A worker-authored revision hash, change count, or sealed manifest is advisory and cannot satisfy a gate.

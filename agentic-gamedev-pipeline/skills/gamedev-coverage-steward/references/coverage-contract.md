@@ -65,7 +65,9 @@ This is registration equality, not execution success. Extra actual identities ar
 
 Each automated execution row names an actual automated identity and records `executed: true|false`, `passed: true|false|null`, exact command, result/evidence path, and evidence SHA. `passed=true` requires `executed=true`. A mandatory automated identity must be executed and pass for implementation completion.
 
-Each manual execution row names an actual manual identity and records `executed: true|false`, `passed: true|false|null`, `deferred: true|false`, QA evidence, and gate/resume data when deferred. `deferred=true` requires `executed=false`, one of `blocked_user|blocked_environment|error_test`, the failed capability probe when required, and a minimum resume action. A scenario blocked by a product finding uses `blocked_by_finding`, not deferred.
+QA returns every actual manual identity exactly once. Each row records `executed: true|false`, `passed: true|false|null`, `deferred: true|false`, `blocked_by_finding: finding-id|null`, immutable QA evidence path/SHA, and gate/resume data. `deferred=true` requires `executed=false`, one of `blocked_user|blocked_environment|error_test`, the matching failed capability probe category, and a minimum resume action. A scenario blocked by a product finding is unexecuted/non-deferred and cites an open blocking QA finding bound to that identity.
+
+Every failed identity binds to an exact-current QA product finding through `coverage_identity_ids`. Mandatory failure requires an open blocking finding. An optional failure may remain compatible with aggregate pass only through an accepted nonblocking Minor exact-revision QA finding. Mixed external gates retain every category and deferred identity while the controller derives one deterministic overall status.
 
 The summary contains these independent fields:
 
@@ -84,6 +86,6 @@ The summary contains these independent fields:
 }
 ```
 
-`implementation_eligible=true` requires all assigned acceptance IDs mapped, exact expected/actual and mandatory-set equality, no unresolved coverage gap, and every mandatory automated identity executed and passed. Mandatory manual identities may remain pending. `feature_verification_eligible=true` additionally requires every mandatory manual identity executed and passed, no `blocked_by_finding`, and no mandatory deferred scenario.
+`implementation_eligible=true` requires all assigned acceptance IDs mapped, exact expected/actual and mandatory-set equality, no unresolved coverage gap, and every mandatory automated identity executed and passed. Mandatory manual identities may remain pending. `feature_verification_eligible=true` additionally requires every mandatory manual identity executed and passed, no mandatory `blocked_by_finding`, and no mandatory deferred scenario. Accepted nonblocking optional failures remain explicit evidence and do not silently become passes.
 
 Coverage manifests, reports, and execution indexes are controller evidence artifacts and are excluded from product/support/evidence revision inputs. Tests and fixtures themselves remain `evidence_revision` inputs. QA appends immutable manual execution evidence; the controller produces the `qa_updated` aggregate without rewriting the Steward's finalized artifact.

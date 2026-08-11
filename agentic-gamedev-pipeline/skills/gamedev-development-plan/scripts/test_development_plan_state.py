@@ -164,7 +164,7 @@ documentation_state, and open_assumptions.
 - manual_identity_namespace: MANUAL-SLICE-{number:03d}-*
 - mandatory_identity_ids: AUTO-SLICE-{number:03d}-CORE, MANUAL-SLICE-{number:03d}-RUNTIME
 - automation_feasibility: deterministic logic automated; runtime topology manual
-- capability_prerequisites: editor, server plus two clients, operator
+- capability_prerequisites: studio-editor-sync, test-server-two-clients, window-control-path
 - planned_manifest: tests/sample-feature/verification/SLICE-{number:03d}-planned.json
 - finalized_manifest: tests/sample-feature/verification/SLICE-{number:03d}-finalized.json
 - amendment_authorities: DEC-*, normalized finding, or approved rebaseline
@@ -183,6 +183,7 @@ documentation_state, and open_assumptions.
 - max_total_files: 20
 - max_payload_bytes: 160000
 - max_estimated_tokens: 40000
+- metric_scope: capsule_plus_referenced_files
 - authority_paths: approved feature documents and exact edit files
 - evidence_paths: bounded research and verification artifacts
 
@@ -260,7 +261,7 @@ Only the approved feature and named shared symbol are in scope.
 - manual_identity_namespace: MANUAL-FEATURE-*
 - mandatory_rule: explicit identities mapped to PRD-AC IDs
 - automation_feasibility: deterministic logic automated
-- capability_prerequisites: editor, topology, operator
+- capability_prerequisites: studio-editor-sync, test-server-two-clients, window-control-path
 - gates: plan-before-engineering, finalize-after-code-freeze
 
 ## Documentation Strategy
@@ -275,6 +276,7 @@ Only the approved feature and named shared symbol are in scope.
 - max_total_files: 32
 - max_payload_bytes: 250000
 - max_estimated_tokens: 60000
+- metric_scope: capsule_plus_referenced_files
 - estimation_recipe: ceil(payload bytes / 4)
 
 {milestones}{''.join(slices)}""",
@@ -423,6 +425,32 @@ Only the approved feature and named shared symbol are in scope.
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "Coverage Contract"):
             controller.command_validate(self.args())
 
+    def test_slice_accepts_exact_research_not_required_sentinel(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- RESEARCH-001 | question=find exact feature entry point | paths=src/feature | exclusions=unrelated systems | evidence=owners and contracts | stop=entry point confirmed",
+                "- research_not_required | reason=approved specification and exact edit files fully identify the implementation surface",
+            ),
+            encoding="utf-8",
+        )
+        controller.command_validate(self.args())
+
+    def test_slice_rejects_brief_plus_research_not_required(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "### Coverage Contract",
+                "- research_not_required | reason=conflicting duplicate decision\n\n### Coverage Contract",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "briefs or research_not_required"):
+            controller.command_validate(self.args())
+
     def test_global_context_budget_rejects_duplicate_exact_limit(self) -> None:
         self.initialize()
         self.write_plan()
@@ -513,6 +541,61 @@ Only the approved feature and named shared symbol are in scope.
             encoding="utf-8",
         )
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "cannot be smaller"):
+            controller.command_validate(self.args())
+
+    def test_plan_rejects_prose_capability_prerequisites(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "studio-editor-sync, test-server-two-clients, window-control-path",
+                "studio-editor-sync, server plus two clients, window-control-path",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "capability ID"):
+            controller.command_validate(self.args())
+
+    def test_context_budget_requires_exact_metric_scope(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- metric_scope: capsule_plus_referenced_files\n", "", 1
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "metric_scope"):
+            controller.command_validate(self.args())
+
+    def test_context_budget_rejects_duplicate_metric_scope(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- metric_scope: capsule_plus_referenced_files\n",
+                "- metric_scope: capsule_plus_referenced_files\n"
+                "- metric_scope: capsule_plus_referenced_files\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "exactly one metric_scope"):
+            controller.command_validate(self.args())
+
+    def test_context_budget_rejects_wrong_metric_scope(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- metric_scope: capsule_plus_referenced_files",
+                "- metric_scope: capsule_only",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "metric_scope"):
             controller.command_validate(self.args())
 
     def test_skill_metadata_is_explicit_only(self) -> None:

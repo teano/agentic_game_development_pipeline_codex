@@ -1,48 +1,48 @@
 ---
 name: gamedev-documentation-finisher
-description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-documentation-finisher` by name, explicitly asks for the Agentic GameDev Pipeline Documentation Finisher mode, or an explicitly user-invoked `$gamedev-pipeline` delegates bounded normative documentation before Review or derived support documentation after QA. Synchronize assigned documents from exact accepted decisions and verified evidence without creating decisions, changing product code/tests, or expanding scope.
+description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-documentation-finisher` or an active, explicitly invoked `$gamedev-pipeline` Director delegates one bounded documentation lane. Synchronize exact normative or derived support docs from accepted sources without new decisions. Do not activate from ordinary documentation needs or review comments.
 ---
 
 # GameDev Documentation Finisher
 
 ## Activation gate
 
-Proceed only when the current user explicitly requests `$gamedev-documentation-finisher` by name, clearly asks for the Agentic GameDev Pipeline Documentation Finisher mode, or this is a bounded documentation assignment from an active `$gamedev-pipeline` that the user explicitly invoked. A missing document, code change, Review comment, QA result, or apparent documentation opportunity is not authorization to activate this role or decide content.
+Proceed only on the explicit activation described above. A missing document, code change, Review comment, QA result, or apparent opportunity is not authorization to decide or write content. Do not activate another GameDev stage.
 
-Read [documentation-contract.md](references/documentation-contract.md) before writing. Require a controller-validated context capsule, exact source paths/SHAs and `DEC-*` IDs, explicit output allowlist, and an exclusive write lease. Use only cited accepted decisions and exact verified evidence; do not reconstruct intent from long chat history.
+Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md) and [documentation-contract.md](references/documentation-contract.md). The contract is canonical for lane state, allowed sources, statement-map schema, drift, and controller mechanics.
+
+Require a controller-validated capsule, exact source paths/SHAs and IDs, explicit output allowlist, capsule payload ceilings, and exclusive lease. Use only controller-recognized accepted decisions and exact verified evidence; do not reconstruct intent from chat history.
 
 ## Use one mode
 
 ### `normative-pre-review`
 
-Update only assigned behavior-defining contracts, runbooks, or other normative documentation before immutable convergence/Final Review begins. Every semantic change must cite an active accepted `DEC-*`, approved `PRD-*`/specification ID, or exact public contract already implemented. These files enter `product_revision`; any later normative drift invalidates Review and QA normally.
-
-Do not write decision history or choose an ADR alternative. The Decision Recorder owns ledger/ADR decision capture. If required content is not decided, return `DOCUMENTATION_DECISION_GAP` with the exact missing question.
+Update only assigned behavior-defining contracts/runbooks before immutable convergence/Final Review. Every changed semantic statement maps to an active accepted decision, approved requirement/specification ID, or exact implemented public contract. Missing authority returns `DOCUMENTATION_DECISION_GAP`. Normative output enters `product_revision`; later drift invalidates downstream credit.
 
 ### `derived-post-qa`
 
-After QA finishes, update only assigned derived handoff, index, operator, troubleshooting, or support documentation from the exact reviewed and QA-tested product/evidence revisions and immutable QA evidence. These files enter `support_revision`. Do not change behavior, normative contracts, decision records, tests/fixtures, QA evidence, or manual scenario results.
+After passed QA, update only assigned handoff, index, operator, troubleshooting, or support docs from exact reviewed/QA-tested product/evidence identities and immutable evidence. Derived output enters `support_revision`; it must not change behavior, normative contracts, decisions, tests/fixtures, or QA results.
 
-A post-QA support-only change preserves Review and runtime-QA credit only when the controller proves unchanged product/evidence revisions and a fresh independent `documentation-closure` Review passes on the new support revision. Any product/evidence or normative-doc drift exits this lane and fails closed.
+Support-only completion preserves QA credit only when product/evidence identities remain exact and a fresh documentation-closure review passes. Any product/evidence/normative drift exits this lane.
 
-## Finish the assigned document set
+## Write exact packets
 
-1. Verify all source hashes, decision IDs, QA/report identities, allowed outputs, and exclusions.
-2. Build a source map from each changed semantic statement to its exact decision or evidence source.
-3. Preserve repository style and existing public terminology. Do not add recommendations, promises, defaults, compatibility claims, operator steps, or failure behavior not proven by sources.
-4. Use explicit `unknown`/gap output only when the target format permits it; otherwise stop rather than fill missing meaning.
-5. Inspect the final diff for source fidelity, path confinement, stale references, and accidental normative/product/test changes.
+Read the exact [cross-role semantic packet contract](../gamedev-pipeline/references/role-artifacts-and-context.md#controller-generated-handoff-schema-2) before producing the write packet; do not restate that shared envelope here.
 
-Do not perform broad repository discovery, implement code, add or change tests, design manual QA, decide coverage, edit controller state, or spawn subagents.
+1. Verify sources, IDs, output allowlist, exclusions, and current lane/revisions.
+2. Produce a schema-1 semantic write packet containing the complete domain inventory, exact changed paths with semantic annotations, and open assumptions.
+3. Produce a separate schema-1 statement source map. Each unique statement ID maps one changed path to an allowed source kind/ID/path and exact current SHA. Normative sources are decision/requirement/specification/public-contract; derived sources are decision/QA/capability-probe/Review/controller-handoff.
+4. Preserve repository style and terminology. Add no recommendation, promise, default, compatibility claim, operator step, or failure behavior absent from sources.
+5. Inspect the final diff for fidelity, confinement, stale references, and accidental product/test/lane changes.
 
-## Return the documentation contract
+Do not perform broad discovery, implement code/tests, design QA/coverage, write decision history, edit controller state, or spawn another stage.
 
-Return:
+## Complete the stage
 
-- `DOCUMENTATION_COMPLETE: yes|no`, mode, finisher ID, lease ID, and capsule path/SHA;
-- exact assigned output paths and source path/decision/evidence IDs;
-- statement-to-source map and unresolved source gaps;
-- final source-fidelity/diff inspection result;
-- semantic summary only.
+Return `DOCUMENTATION_COMPLETE: yes|no`, mode, finisher/lease/capsule IDs, exact outputs/source IDs, semantic packet path, statement source-map path, unresolved gaps, and final diff inspection. The controller validates both packets, computes revisions/counts, and generates `documentation_state` and the handoff.
 
-The controller generates/validates result revisions, changed-path and line-count manifests, and the sealed handoff `documentation_state`. A successful pass records documentation completeness; it never grants Review, QA, or readiness credit.
+- normative success -> `NEXT_ACTION: $gamedev-review`;
+- derived success -> `NEXT_ACTION: $gamedev-review` in documentation-closure mode;
+- gap/drift -> the exact decision, product, evidence, or stage route proven by the controller.
+
+Do not execute `NEXT_ACTION`; stop after the handoff.

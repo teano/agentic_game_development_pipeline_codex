@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Coverage Steward"
   short_description: "Plan and finalize exact feature coverage"
-  default_prompt: "Use $gamedev-coverage-steward to register the exact expected automated and manual coverage identities, then finalize semantic coverage and QA gaps after code freeze."
+  default_prompt: "Use $gamedev-coverage-steward for one exact planning or finalization assignment, persist the coverage artifact, return NEXT_ACTION, and stop."
 policy:
   allow_implicit_invocation: false

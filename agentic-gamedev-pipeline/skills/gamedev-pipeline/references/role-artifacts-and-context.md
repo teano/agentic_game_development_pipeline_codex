@@ -2,6 +2,13 @@
 
 This file is the normative cross-role schema contract. Role-specific semantic rules live in the corresponding skill references. The controller generates and validates all mechanical envelopes.
 
+## Contents
+
+- Exclusive write leases
+- Context capsule schema 1 and capsule-payload telemetry
+- Controller-generated handoff schema 2
+- Controller-generated change and revision evidence
+
 ## Exclusive write leases
 
 `single_owner` is a planning shape, not a lifetime worker identity. It means the implementation queue has one active implementation scope rather than multiple sequential slices. All modes use phase-scoped exclusive leases:
@@ -25,7 +32,7 @@ At most one write-capable lease may be active in a checkout, and at most one wri
 
 An Engineer is not the lifecycle owner. The controller may assign a different Engineer for a later approved slice or after a required structured transfer. Origin-route and integration-route rules still apply, but identity persistence never authorizes overlapping writers.
 
-## Context capsule schema 1
+## Context capsule schema 1 and capsule-payload telemetry
 
 Every delegated specialized role receives one controller-generated capsule, not inherited chat history:
 
@@ -33,7 +40,7 @@ Every delegated specialized role receives one controller-generated capsule, not 
 {
   "schema": 1,
   "capsule_id": "CAP-*",
-  "role": "engineer|researcher|decision_recorder|coverage_steward|documentation_finisher|reviewer|qa",
+  "role": "engineer|researcher|decision_recorder|coverage_steward|documentation_finisher|reviewer|qa|recovery_remediator",
   "phase": "exact phase",
   "worker_id": "worker ID",
   "plan_sha256": "exact approved plan SHA",
@@ -76,7 +83,15 @@ Every delegated specialized role receives one controller-generated capsule, not 
 }
 ```
 
-Every maximum is positive and comes from the approved plan or a recorded budget authorization. `total_files` is the deduplicated union of authority/evidence files. `payload_bytes` is the UTF-8 byte length of controller-canonical capsule JSON with `metrics` and `capsule_sha256` omitted plus the exact byte lengths of every referenced authority/evidence file. `estimated_tokens = ceil(payload_bytes / 4)`. The controller records this recipe and all observed sizes; allowed-but-unread path families do not enter metrics until a new capsule explicitly adds a file. The controller rejects a capsule when any metric exceeds its maximum, a referenced path/SHA/ID is stale or absent, output scopes overlap an active writer, a role receives unnecessary authority, or the capsule embeds chat transcripts/raw reasoning. The phase cannot spawn until `context-capsule-check` passes. Budget authorization is append-only and never resets prior metrics.
+Every declared maximum is positive and less than or equal to the corresponding approved plan ceiling; a stage may choose a smaller bounded capsule. `max_total_files` must be at least each authority/evidence file ceiling. `total_files` is the deduplicated union of authority/evidence files. `payload_bytes` is the UTF-8 byte length of controller-canonical capsule JSON with `metrics` and `capsule_sha256` omitted plus the exact byte lengths of every referenced authority/evidence file. The persisted field `estimated_tokens = ceil(payload_bytes / 4)` is specifically a capsule-payload estimate with metric scope `capsule_plus_referenced_files`.
+
+Capsules are exact minimal role/phase packets. Authority: current PRD/spec/plan; ledger iff decisions are active; Decision Recorder has its prior immutable receipt. Evidence: applicable coverage; Reviewer adds handoff and predecessor reports/credits; QA adds handoff, current Review reports/credits and probe (prior QA/manual only on resume); documentation review adds handoff, Review, QA/manual/probe and derived report/map. Others get only phase inputs. Paths, SHAs, and IDs are exact; missing/extra fails closed.
+
+IDs are exact for PRD/decisions, findings, and phase coverage. Writers have bounded paths; readers forbid writes/exclusions; only check roles allow commands.
+
+This metric excludes skill/reference instructions, metadata descriptions, system/AGENTS instructions, conversation history, and tool output. Never report it as total agent context. Maintain a separate CI static-instruction budget for metadata and each always/phase-conditional `SKILL.md` reference bundle; dynamic system/history/tool usage remains outside deterministic file-based measurement.
+
+The controller records the capsule recipe and observed sizes; allowed-but-unread path families do not enter metrics until a new capsule adds a file. It rejects a capsule when any metric exceeds its declared ceiling or that ceiling exceeds the plan, a referenced path/SHA/ID is stale/absent, output scopes overlap a writer, a role receives unnecessary authority, or the capsule embeds chat transcripts/raw reasoning. The phase cannot activate until `context-capsule-check` passes. Budget authorization is append-only and never resets prior metrics.
 
 User authority is the only non-file authority form and is encoded as `{"path":"not_applicable","sha256":"<controller receipt digest>","ids":["<authority-id>"]}`. Before capsule creation, a separate lease-free `user-authority-accept` checkpoint must already have appended the exact authority ID, explicit approval reference, statement, digest, receipt path/SHA, and timestamp to controller state. The controller records the assertion but does not authenticate the human. Capsule creation and a Decision Recorder packet may cite only that immutable prior receipt; neither operation can self-issue or alter user authority.
 

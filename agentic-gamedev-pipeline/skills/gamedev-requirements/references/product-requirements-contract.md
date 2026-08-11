@@ -64,3 +64,4 @@ Record what the product must achieve and what observable behavior proves it. Exc
 - Record the exact-byte SHA-256 at handoff time; do not embed a self-referential hash inside the PRD.
 - Reopen an approved PRD before any semantic edit by incrementing `revision`, setting `status: draft`, and clearing `approved_at`.
 - Treat every technical specification built from an older PRD hash as stale.
+- Emit `PRD_READY` only after explicit user approval and successful `--require-approved` validation on the same bytes. Return `NEXT_ACTION: $gamedev-specification` and stop; the Requirements stage never starts specification work.

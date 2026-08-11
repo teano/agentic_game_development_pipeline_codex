@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "responses": [
+    {
+      "case_id": "stale_capsule_rejected",
+      "activation": [],
+      "current_action": "reject_stale_capsule_and_refresh",
+      "completion_token": null,
+      "next_action": "refresh_context_capsule",
+      "forbidden_actions": ["edit_product_files", "acquire_write_lease_from_stale_capsule"],
+      "attempted_actions": ["edit_product_files"],
+      "references_read": ["skills/gamedev-pipeline/references/role-artifacts-and-context.md"],
+      "stop_result": "stop_before_write",
+      "authority_result": "stale_capsule_rejected"
+    }
+  ]
+}

@@ -58,7 +58,7 @@ Do not invent product behavior to fill a technical gap. Prefer the smallest desi
 
 ### Generator
 
-Write only the initial missing/stale draft. Read the approved PRD as product authority and run `$skill-specification-pipeline` in generation mode. Return the specification SHA, PRD coverage manifest, assumptions, and unresolved product questions. Stop after Director acceptance.
+Write only the initial missing/stale draft. Read the approved PRD as product authority. The bounded internal Generator may optionally use `$skill-specification-pipeline` in generation mode; if unavailable or invalid, fail fast and generate locally under the same packet. Both routes return the specification SHA, PRD coverage manifest, assumptions, and unresolved product questions. Neither route grants readiness. Stop after Director acceptance.
 
 ### Technical Spec Architect
 
@@ -96,4 +96,4 @@ Handoff gives the new Architect a compact source-backed packet: canonical paths/
 
 ## Readiness evidence
 
-The final Proofreader and Architect confirmation must reference the same current specification SHA. The PRD must still match the initialization path/revision/hash and the specification trace. `confirm-ready` is the only transition to `spec_ready`; prose declarations do not change readiness.
+The final Proofreader and Architect confirmation must reference the same current specification SHA. The PRD must still match the initialization path/revision/hash and the specification trace. `confirm-ready` is the only transition to `spec_ready`; prose declarations do not change readiness. Emit `SPEC_READY` plus `NEXT_ACTION: $gamedev-development-plan`, then stop. The Specification stage never starts planning.

@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Runtime QA"
   short_description: "Explicit-only GameDev runtime QA mode"
-  default_prompt: "Use $gamedev-qa to execute the finalized exact manual identity matrix on the immutably reviewed product/evidence revision and classify product failures separately from execution gates."
+  default_prompt: "Use $gamedev-qa to execute every exact manual identity, persist the controller-compatible aggregate, return NEXT_ACTION, and stop."
 policy:
   allow_implicit_invocation: false

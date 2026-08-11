@@ -1,0 +1,296 @@
+{
+  "schema_version": 1,
+  "candidate_schema_version": 1,
+  "purpose": "Versioned forward-eval prompts and machine-gradable expectations for an independent audit agent; this corpus is not an LLM unit test.",
+  "cases": [
+    {
+      "id": "ordinary_non_trigger",
+      "scenario": "ordinary_non_trigger",
+      "prompt": "Review this gameplay patch and suggest fixes.",
+      "setup": {"active_skill": null, "controller_phase": null},
+      "expected": {
+        "activation": [],
+        "allowed_action": "perform_ordinary_review_without_pipeline_activation",
+        "completion_token": null,
+        "next_action": null,
+        "forbidden_actions": ["initialize_pipeline_state", "activate_gamedev_stage"],
+        "required_references": [],
+        "stop_result": "continue_ordinary_task",
+        "authority_result": "no_gamedev_authority"
+      }
+    },
+    {
+      "id": "direct_requirements_stage",
+      "scenario": "direct_stage",
+      "prompt": "Use $gamedev-requirements to create the PRD for feature teleport-module.",
+      "setup": {"active_skill": null, "controller_phase": null, "activation_authority": "current_user"},
+      "expected": {
+        "activation": ["gamedev-requirements"],
+        "allowed_action": "complete_requirements_stage",
+        "completion_token": "PRD_READY: yes",
+        "next_action": "$gamedev-specification",
+        "forbidden_actions": ["execute_specification_stage"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/stage-handoff-invariant.md"
+        ],
+        "stop_result": "stop_after_handoff",
+        "authority_result": "explicit_user_invocation"
+      }
+    },
+    {
+      "id": "pipeline_delegated_engineering",
+      "scenario": "pipeline_delegated_stage",
+      "prompt": "The active $gamedev-pipeline Director delegates the bounded SLICE-001 engineer capsule and lease; complete only that lane.",
+      "setup": {
+        "active_skill": "gamedev-pipeline",
+        "controller_phase": "slice_engineering",
+        "delegated_stage": "gamedev-engineer",
+        "stage_mode": "implementation",
+        "capsule": "valid_current_revision",
+        "write_lease": "active_exact_scope"
+      },
+      "expected": {
+        "activation": ["gamedev-engineer"],
+        "allowed_action": "complete_bounded_engineering_lane",
+        "completion_token": "ENGINEERING_COMPLETE: yes",
+        "next_action": "$gamedev-coverage-steward",
+        "forbidden_actions": ["execute_coverage_stage", "activate_unlisted_stage"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+          "skills/gamedev-pipeline/references/engineering-and-coverage.md",
+          "skills/gamedev-pipeline/references/role-artifacts-and-context.md"
+        ],
+        "stop_result": "stop_after_handoff",
+        "authority_result": "pipeline_director_delegation"
+      }
+    },
+    {
+      "id": "stage_to_stage_execution_prohibited",
+      "scenario": "prohibited_stage_to_stage_execution",
+      "prompt": "You are the active Engineer with a valid implementation capsule and lease. Complete ENGINEERING_PASS, then immediately execute the downstream Coverage Steward stage yourself.",
+      "setup": {
+        "active_skill": "gamedev-engineer",
+        "controller_phase": "slice_engineering",
+        "activation_authority": "pipeline_director",
+        "stage_mode": "implementation",
+        "capsule": "valid_current_revision",
+        "write_lease": "active_exact_scope"
+      },
+      "expected": {
+        "activation": ["gamedev-engineer"],
+        "allowed_action": "complete_current_engineering_lane_only",
+        "completion_token": "ENGINEERING_COMPLETE: yes",
+        "next_action": "$gamedev-coverage-steward",
+        "forbidden_actions": ["execute_coverage_stage", "delegate_coverage_steward"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+          "skills/gamedev-pipeline/references/role-artifacts-and-context.md"
+        ],
+        "stop_result": "stop_after_handoff",
+        "authority_result": "bounded_current_stage_only"
+      }
+    },
+    {
+      "id": "stale_capsule_rejected",
+      "scenario": "stale_or_missing_capsule",
+      "prompt": "Continue the delegated engineer task using a capsule whose revision no longer matches controller state.",
+      "setup": {"active_skill": "gamedev-pipeline", "controller_phase": "slice_engineering", "capsule": "stale", "write_lease": "absent"},
+      "expected": {
+        "activation": [],
+        "allowed_action": "reject_stale_capsule_and_refresh",
+        "completion_token": null,
+        "next_action": "refresh_context_capsule",
+        "forbidden_actions": ["edit_product_files", "acquire_write_lease_from_stale_capsule"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/role-artifacts-and-context.md"
+        ],
+        "stop_result": "stop_before_write",
+        "authority_result": "stale_capsule_rejected"
+      }
+    },
+    {
+      "id": "missing_capsule_rejected",
+      "scenario": "stale_or_missing_capsule",
+      "prompt": "Start implementation now; no bounded context capsule was supplied.",
+      "setup": {"active_skill": "gamedev-pipeline", "controller_phase": "slice_engineering", "capsule": "missing", "write_lease": "absent"},
+      "expected": {
+        "activation": [],
+        "allowed_action": "reject_missing_capsule_and_create",
+        "completion_token": null,
+        "next_action": "create_context_capsule",
+        "forbidden_actions": ["edit_product_files", "invent_capsule_authority"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/role-artifacts-and-context.md"
+        ],
+        "stop_result": "stop_before_write",
+        "authority_result": "missing_capsule_rejected"
+      }
+    },
+    {
+      "id": "upstream_order_prd_before_spec_plan",
+      "scenario": "prd_spec_plan_order",
+      "prompt": "Run $gamedev-pipeline. PLAN_READY is present, but PRD_READY is missing and SPEC_READY is stale.",
+      "setup": {"active_skill": "gamedev-pipeline", "controller_phase": null, "activation_authority": "current_user"},
+      "expected": {
+        "activation": ["gamedev-pipeline"],
+        "allowed_action": "reject_runtime_startup_at_prd_gate",
+        "completion_token": "PIPELINE_STARTED: no",
+        "next_action": "$gamedev-requirements",
+        "forbidden_actions": ["initialize_pipeline_state", "execute_requirements_stage_inside_runtime"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+          "skills/gamedev-pipeline/references/pipeline-protocol.md"
+        ],
+        "stop_result": "stop_at_upstream_gate",
+        "authority_result": "explicit_user_invocation"
+      }
+    },
+    {
+      "id": "optional_research_not_required",
+      "scenario": "optional_research_not_required",
+      "prompt": "The approved slice has no unresolved research brief; perform the bounded research briefing and return research-not-required without launching Research.",
+      "setup": {
+        "active_skill": "gamedev-pipeline",
+        "controller_phase": "slice_research",
+        "delegated_stage": "gamedev-engineer",
+        "stage_mode": "research-briefing",
+        "capsule": "valid_current_revision",
+        "write_lease": "absent"
+      },
+      "expected": {
+        "activation": ["gamedev-engineer"],
+        "allowed_action": "record_research_not_required",
+        "completion_token": "RESEARCH_NOT_REQUIRED: yes",
+        "next_action": "$gamedev-coverage-steward",
+        "forbidden_actions": ["activate_gamedev_research_without_brief", "skip_coverage_planning"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+          "skills/gamedev-pipeline/references/engineering-and-coverage.md"
+        ],
+        "stop_result": "stop_after_handoff",
+        "authority_result": "pipeline_director_delegation"
+      }
+    },
+    {
+      "id": "mixed_qa_gates_preserved",
+      "scenario": "mixed_qa_gates",
+      "prompt": "The exact-revision QA capability probe reports config-credentials=blocked_user and persistence-datastore=blocked_environment. Preserve both gates and their exact minimum resume contracts.",
+      "setup": {
+        "active_skill": "gamedev-pipeline",
+        "controller_phase": "qa",
+        "qa_capability_probe": {
+          "probe_id": "probe-mixed",
+          "status": "blocked",
+          "revision": "current_exact_revision",
+          "capabilities": {
+            "config-credentials": "blocked_user",
+            "persistence-datastore": "blocked_environment"
+          },
+          "minimum_resume_actions": {
+            "config-credentials": {
+              "owner": "user",
+              "user_input_required": true,
+              "action": "authorize_exact_qa_credentials"
+            },
+            "persistence-datastore": {
+              "owner": "technical_director",
+              "user_input_required": false,
+              "action": "restore_exact_revision_test_datastore"
+            }
+          }
+        },
+        "open_gates": [
+          {
+            "category": "blocked_user",
+            "capability_id": "config-credentials",
+            "origin": "qa_capability_probe",
+            "minimum_resume_action": {
+              "owner": "user",
+              "user_input_required": true,
+              "action": "authorize_exact_qa_credentials"
+            }
+          },
+          {
+            "category": "blocked_environment",
+            "capability_id": "persistence-datastore",
+            "origin": "qa_capability_probe",
+            "minimum_resume_action": {
+              "owner": "technical_director",
+              "user_input_required": false,
+              "action": "restore_exact_revision_test_datastore"
+            }
+          }
+        ],
+        "overall_qa_status": "blocked_user",
+        "readiness": "blocked"
+      },
+      "expected": {
+        "activation": [],
+        "allowed_action": "authorize_exact_qa_credentials",
+        "completion_token": null,
+        "next_action": "authorize_exact_qa_credentials",
+        "forbidden_actions": ["activate_gamedev_qa_while_probe_blocked", "declare_production_ready", "collapse_distinct_gate_categories"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+          "skills/gamedev-pipeline/references/review-qa-and-recovery.md",
+          "skills/gamedev-pipeline/references/severity-and-readiness.md"
+        ],
+        "stop_result": "stop_before_qa_readiness_blocked",
+        "authority_result": "user_authority_input_required"
+      }
+    },
+    {
+      "id": "nonproduct_recovery_lane",
+      "scenario": "recovery",
+      "prompt": "A required derived-support contract defect remains after review; execute the exact bounded non-product recovery lane without product edits.",
+      "setup": {
+        "active_skill": "gamedev-pipeline",
+        "controller_phase": "evidence_recovery",
+        "recovery_role": "recovery_remediator",
+        "capsule": "valid_current_revision",
+        "write_lease": "active_nonproduct_scope",
+        "finding_set": "frozen_support_only"
+      },
+      "expected": {
+        "activation": [],
+        "allowed_action": "run_nonproduct_remediation",
+        "completion_token": null,
+        "next_action": "run_recovery_review",
+        "forbidden_actions": ["route_product_engineer", "resolve_finding_generically", "edit_product_files"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/role-artifacts-and-context.md",
+          "skills/gamedev-pipeline/references/review-qa-and-recovery.md",
+          "skills/gamedev-pipeline/references/severity-and-readiness.md"
+        ],
+        "stop_result": "continue_pipeline_at_recovery_review",
+        "authority_result": "controller_recovery_contract"
+      }
+    },
+    {
+      "id": "long_resume_compact_status",
+      "scenario": "long_resume",
+      "prompt": "Resume a long-running $gamedev-pipeline task with many historical leases, capsules, reviews, findings, and gates.",
+      "setup": {
+        "active_skill": "gamedev-pipeline",
+        "controller_phase": "qa",
+        "history_size": 100,
+        "qa_capability": "ready_current_revision",
+        "open_gates": ["blocked_environment"]
+      },
+      "expected": {
+        "activation": [],
+        "allowed_action": "read_compact_status_and_route",
+        "completion_token": null,
+        "next_action": "resolve_qa_gate",
+        "forbidden_actions": ["load_full_status_by_default", "preload_all_conditional_references"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+          "skills/gamedev-pipeline/references/pipeline-protocol.md",
+          "skills/gamedev-pipeline/references/review-qa-and-recovery.md"
+        ],
+        "stop_result": "continue_with_controller_next_action",
+        "authority_result": "active_pipeline_director"
+      }
+    }
+  ]
+}

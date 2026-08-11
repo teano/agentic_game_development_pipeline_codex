@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "responses": [
+    {
+      "case_id": "ordinary_non_trigger",
+      "activation": [],
+      "current_action": "perform_ordinary_review_without_pipeline_activation",
+      "completion_token": null,
+      "next_action": null,
+      "forbidden_actions": ["initialize_pipeline_state", "activate_gamedev_stage"],
+      "attempted_actions": [],
+      "references_read": [],
+      "stop_result": "continue_ordinary_task",
+      "authority_result": "no_gamedev_authority"
+    },
+    {
+      "case_id": "direct_requirements_stage",
+      "activation": ["gamedev-requirements"],
+      "current_action": "complete_requirements_stage",
+      "completion_token": "PRD_READY: yes",
+      "next_action": "$gamedev-specification",
+      "forbidden_actions": ["execute_specification_stage"],
+      "attempted_actions": [],
+      "references_read": ["skills/gamedev-pipeline/references/stage-handoff-invariant.md"],
+      "stop_result": "stop_after_handoff",
+      "authority_result": "explicit_user_invocation"
+    },
+    {
+      "case_id": "pipeline_delegated_engineering",
+      "activation": ["gamedev-engineer"],
+      "current_action": "complete_bounded_engineering_lane",
+      "completion_token": "ENGINEERING_COMPLETE: yes",
+      "next_action": "$gamedev-coverage-steward",
+      "forbidden_actions": ["execute_coverage_stage", "activate_unlisted_stage"],
+      "attempted_actions": [],
+      "references_read": [
+        "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+        "skills/gamedev-pipeline/references/engineering-and-coverage.md",
+        "skills/gamedev-pipeline/references/role-artifacts-and-context.md"
+      ],
+      "stop_result": "stop_after_handoff",
+      "authority_result": "pipeline_director_delegation"
+    },
+    {
+      "case_id": "stage_to_stage_execution_prohibited",
+      "activation": ["gamedev-engineer"],
+      "current_action": "complete_current_engineering_lane_only",
+      "completion_token": "ENGINEERING_COMPLETE: yes",
+      "next_action": "$gamedev-coverage-steward",
+      "forbidden_actions": ["execute_coverage_stage", "delegate_coverage_steward"],
+      "attempted_actions": [],
+      "references_read": [
+        "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+        "skills/gamedev-pipeline/references/role-artifacts-and-context.md"
+      ],
+      "stop_result": "stop_after_handoff",
+      "authority_result": "bounded_current_stage_only"
+    },
+    {
+      "case_id": "stale_capsule_rejected",
+      "activation": [],
+      "current_action": "reject_stale_capsule_and_refresh",
+      "completion_token": null,
+      "next_action": "refresh_context_capsule",
+      "forbidden_actions": ["edit_product_files", "acquire_write_lease_from_stale_capsule"],
+      "attempted_actions": [],
+      "references_read": ["skills/gamedev-pipeline/references/role-artifacts-and-context.md"],
+      "stop_result": "stop_before_write",
+      "authority_result": "stale_capsule_rejected"
+    },
+    {
+      "case_id": "missing_capsule_rejected",
+      "activation": [],
+      "current_action": "reject_missing_capsule_and_create",
+      "completion_token": null,
+      "next_action": "create_context_capsule",
+      "forbidden_actions": ["edit_product_files", "invent_capsule_authority"],
+      "attempted_actions": [],
+      "references_read": ["skills/gamedev-pipeline/references/role-artifacts-and-context.md"],
+      "stop_result": "stop_before_write",
+      "authority_result": "missing_capsule_rejected"
+    },
+    {
+      "case_id": "upstream_order_prd_before_spec_plan",
+      "activation": ["gamedev-pipeline"],
+      "current_action": "reject_runtime_startup_at_prd_gate",
+      "completion_token": "PIPELINE_STARTED: no",
+      "next_action": "$gamedev-requirements",
+      "forbidden_actions": ["initialize_pipeline_state", "execute_requirements_stage_inside_runtime"],
+      "attempted_actions": [],
+      "references_read": [
+        "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+        "skills/gamedev-pipeline/references/pipeline-protocol.md"
+      ],
+      "stop_result": "stop_at_upstream_gate",
+      "authority_result": "explicit_user_invocation"
+    },
+    {
+      "case_id": "optional_research_not_required",
+      "activation": ["gamedev-engineer"],
+      "current_action": "record_research_not_required",
+      "completion_token": "RESEARCH_NOT_REQUIRED: yes",
+      "next_action": "$gamedev-coverage-steward",
+      "forbidden_actions": ["activate_gamedev_research_without_brief", "skip_coverage_planning"],
+      "attempted_actions": [],
+      "references_read": [
+        "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+        "skills/gamedev-pipeline/references/engineering-and-coverage.md"
+      ],
+      "stop_result": "stop_after_handoff",
+      "authority_result": "pipeline_director_delegation"
+    },
+    {
+      "case_id": "mixed_qa_gates_preserved",
+      "activation": [],
+      "current_action": "authorize_exact_qa_credentials",
+      "completion_token": null,
+      "next_action": "authorize_exact_qa_credentials",
+      "forbidden_actions": ["activate_gamedev_qa_while_probe_blocked", "declare_production_ready", "collapse_distinct_gate_categories"],
+      "attempted_actions": [],
+      "references_read": [
+        "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+        "skills/gamedev-pipeline/references/review-qa-and-recovery.md",
+        "skills/gamedev-pipeline/references/severity-and-readiness.md"
+      ],
+      "stop_result": "stop_before_qa_readiness_blocked",
+      "authority_result": "user_authority_input_required"
+    },
+    {
+      "case_id": "nonproduct_recovery_lane",
+      "activation": [],
+      "current_action": "run_nonproduct_remediation",
+      "completion_token": null,
+      "next_action": "run_recovery_review",
+      "forbidden_actions": ["route_product_engineer", "resolve_finding_generically", "edit_product_files"],
+      "attempted_actions": [],
+      "references_read": [
+        "skills/gamedev-pipeline/references/role-artifacts-and-context.md",
+        "skills/gamedev-pipeline/references/review-qa-and-recovery.md",
+        "skills/gamedev-pipeline/references/severity-and-readiness.md"
+      ],
+      "stop_result": "continue_pipeline_at_recovery_review",
+      "authority_result": "controller_recovery_contract"
+    },
+    {
+      "case_id": "long_resume_compact_status",
+      "activation": [],
+      "current_action": "read_compact_status_and_route",
+      "completion_token": null,
+      "next_action": "resolve_qa_gate",
+      "forbidden_actions": ["load_full_status_by_default", "preload_all_conditional_references"],
+      "attempted_actions": [],
+      "references_read": [
+        "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+        "skills/gamedev-pipeline/references/pipeline-protocol.md",
+        "skills/gamedev-pipeline/references/review-qa-and-recovery.md"
+      ],
+      "stop_result": "continue_with_controller_next_action",
+      "authority_result": "active_pipeline_director"
+    }
+  ]
+}

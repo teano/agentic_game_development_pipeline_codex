@@ -45,7 +45,7 @@ Feature scope, non-goals, protected systems, and authorized shared boundaries.
 - manual_identity_namespace: MANUAL-FEATURE-*
 - mandatory_rule: explicit identity registration mapped to approved PRD-AC IDs
 - automation_feasibility: exact boundary
-- capability_prerequisites: exact runtime/manual capabilities
+- capability_prerequisites: studio-editor-sync, test-server-two-clients, window-control-path
 - gates: plan-before-engineering, finalize-after-code-freeze, qa-updated
 
 ## Documentation Strategy
@@ -61,6 +61,7 @@ Feature scope, non-goals, protected systems, and authorized shared boundaries.
 - max_total_files: 32
 - max_payload_bytes: 250000
 - max_estimated_tokens: 60000
+- metric_scope: capsule_plus_referenced_files
 - estimation_recipe: ceil((canonical capsule UTF-8 bytes + exact referenced authority/evidence bytes) / 4)
 
 ## Integration Milestones
@@ -118,7 +119,7 @@ Controller-generated schema-2 handoff with exact revisions/change evidence plus 
 
 ### Research Briefs
 
-- RESEARCH-001 | question=exact bounded question | paths=bounded/path | exclusions=unrelated areas | evidence=entry points and contracts | stop=question answered
+- research_not_required | reason=EXACT_SOURCE_BACKED_REASON
 
 ### Coverage Contract
 
@@ -127,7 +128,7 @@ Controller-generated schema-2 handoff with exact revisions/change evidence plus 
 - manual_identity_namespace: MANUAL-SLICE-001-*
 - mandatory_identity_ids: exact IDs or controller-validated derivation source
 - automation_feasibility: exact automated boundary
-- capability_prerequisites: exact runtime/DataStore/operator requirements
+- capability_prerequisites: test-server-two-clients, persistence-datastore, window-control-path
 - planned_manifest: tests/FEATURE_SLUG/verification/SLICE-001-coverage-planned.json
 - finalized_manifest: tests/FEATURE_SLUG/verification/SLICE-001-coverage-finalized.json
 - amendment_authorities: DEC-*, normalized finding IDs, or approved scope rebaseline only
@@ -146,6 +147,7 @@ Controller-generated schema-2 handoff with exact revisions/change evidence plus 
 - max_total_files: 20
 - max_payload_bytes: 160000
 - max_estimated_tokens: 40000
+- metric_scope: capsule_plus_referenced_files
 - authority_paths: exact bounded paths
 - evidence_paths: exact bounded paths
 

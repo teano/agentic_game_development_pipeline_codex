@@ -47,3 +47,5 @@ After validation, the controller atomically appends a JSONL ledger entry by addi
 An ADR synchronization assignment names exact ADR paths/sections and source `DEC-*` IDs. Every changed normative statement maps to at least one active decision ID. Preserve repository format. When the ledger lacks a needed rationale, alternative, consequence, lifecycle rule, or scope choice, write `not_supplied` only where the format permits; otherwise stop and request an accepted decision. ADR synchronization cannot introduce a new decision, reinterpret a superseded entry, or alter implementation artifacts.
 
 The controller generates the mechanical change/diff/revision manifest after the recorder's semantic diff inspection. Normative ADR drift invalidates downstream product evidence under ordinary product-revision rules.
+
+After controller-validated completion, emit `RECORDING_COMPLETE` and `NEXT_ACTION: $gamedev-pipeline` for Director validation/resume, then stop. A late-phase or authority gap emits the exact upstream/user action instead and never activates it.

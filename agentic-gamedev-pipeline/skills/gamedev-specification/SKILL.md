@@ -1,68 +1,55 @@
 ---
 name: gamedev-specification
-description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-specification` by name, explicitly asks for the Agentic GameDev Pipeline specification mode, or an explicitly user-invoked `$gamedev-pipeline` delegates specification work. Direct an approved game-feature PRD through optional specification generation, persistent technical architecture, fresh read-only proofreading, bounded correction cycles, and an implementation-ready SPEC_READY gate. Do not infer activation from a missing or stale specification, a generic request to design or review a feature, or the presence of feature documents.
+description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-specification` or an active, explicitly invoked `$gamedev-pipeline` Director delegates this stage. Converge an approved PRD through bounded architecture and independent proofreading to exact `SPEC_READY`. Do not activate for ordinary design, review, or implementation work.
 ---
 
 # GameDev Specification
 
 ## Activation gate
 
-Proceed only when the current user explicitly requests `$gamedev-specification`, clearly asks for the Agentic GameDev Pipeline specification mode, or an active `$gamedev-pipeline` explicitly delegates specification work after the user invoked that pipeline. Missing/stale documents, technical questions, or a request to plan or implement a feature is not authorization.
+Proceed only on the explicit activation described above. A missing/stale specification, technical question, or implementation request is not authorization. Do not activate another GameDev stage.
 
-Act as Specification Director. Own orchestration, deterministic state, hashes, budgets, handoffs, and user questions. Do not write or proofread the specification in the Director context.
+Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md) and [specification-contract.md](references/specification-contract.md). The contract is canonical for artifact paths, trace shapes, worker outputs, holds, and readiness evidence.
 
-Before acting, read [specification-contract.md](references/specification-contract.md). Use `scripts/specification_state.py` for every state transition; never edit its JSON state directly.
+Act as Specification Director. Own orchestration, deterministic state, hashes, budgets, handoffs, and user questions. Do not write or proofread the specification in the Director context. Use `scripts/specification_state.py` for every transition; never edit its JSON state directly.
 
 ## Establish authority
 
-1. Resolve `<project-root>` and lowercase `<feature>`.
-2. Resolve the repository-owned PRD and specification paths from explicit user context, repository instructions, feature manifests/indexes, and existing feature artifacts. A known PRD normally makes its repository-defined sibling specification unambiguous. Preserve path case and never create a copy, symlink, move, or parallel namespace merely to satisfy this plugin.
-3. If multiple plausible paths remain, ask one concise path question. If the project is empty and defines no convention, recommend `docs/features/<feature>/product-requirements.md` and sibling `technical-specification.md` as a proposed layout and wait for confirmation before creating either file.
-4. Require the resolved canonical approved PRD; validate that exact path with `$gamedev-requirements --require-approved` and record its exact-byte SHA-256.
-5. Initialize `.agentic-pipeline/specification-state.json` with `init --prd <resolved-prd> --spec <resolved-spec>`. Treat controller output as phase authority.
-6. If the specification is absent or stale, spawn one bounded Generator. Otherwise, skip generation. Never run competing generators.
-7. Assign one persistent Technical Spec Architect as the sole writer. Give workers resolved canonical paths, exact hashes, role contracts, and current blocking IDs rather than accumulated chat history.
+1. Resolve the project root, lowercase feature, canonical PRD, and canonical specification through the contract. Ask one path question only if ambiguity remains.
+2. Require `PRD_READY` on the exact canonical approved PRD. Independently run `../gamedev-requirements/scripts/validate_product_requirements.py <prd> --require-approved` and record its exact-byte SHA-256; do not activate the Requirements stage.
+3. Initialize `.agentic-pipeline/specification-state.json` with `init --prd <resolved-prd> --spec <resolved-spec>`. Treat controller output as phase authority.
+4. Assign one persistent Technical Spec Architect as the sole writer. Give every internal worker only canonical paths, exact hashes, role contract, current finding IDs, and a bounded task packet—not accumulated chat history.
 
 ## Generate only when required
 
-Ask the Generator to run `$skill-specification-pipeline` in generation mode against the approved PRD. It must preserve product meaning, trace every `PRD-REQ`, `PRD-NFR`, and `PRD-AC`, record the exact source path/revision/hash using the repository's established trace shape, and leave unsupported product choices unresolved. The controller accepts either flat `source_prd_*` fields or nested `product_authority.{path,revision,sha256}`. It returns one draft and a compact coverage manifest.
+If the specification is missing or stale, use exactly one bounded internal Generator; otherwise skip generation. Never run competing generators.
 
-Run `accept-spec` after generation. Reject stale traceability or a noncanonical path. End the Generator after acceptance; all later specification writes belong to the Architect.
+The Generator may optionally use `$skill-specification-pipeline` in generation mode as an internal drafting helper. Fail fast if that dependency is unavailable or returns an invalid/noncanonical draft, then fall back to local generation under the same Generator packet. Either route must preserve product meaning, trace every `PRD-REQ`, `PRD-NFR`, and `PRD-AC`, record the exact PRD path/revision/hash using the repository trace shape, leave unsupported product choices unresolved, and return one draft plus a compact coverage manifest. Neither route grants readiness.
+
+Run `accept-spec` after validating the draft. End the Generator after acceptance; all later writes belong to the Architect.
 
 ## Converge with one writer
 
-Have the Architect first inspect the draft against project rules, relevant existing patterns, platform guidance, and the approved PRD. The Architect may delegate bounded read-only repository research. It must not broaden product scope.
-
-The Director may provide component-relevant records from `docs/engineering/deferred-findings.json` as risk evidence. The Architect may design safe interfaces and verification around those risks, but backlog records are not requirements and cannot add feature scope, acceptance criteria, or remediation work.
+The Architect first inspects the draft against project rules, relevant existing patterns, platform guidance, the approved PRD, and component-relevant deferred risk evidence. It may use bounded internal read-only repository workers, but must not activate another GameDev stage or broaden product scope.
 
 For each wave:
 
-1. Run `start-cycle` before spawning exactly one fresh Proofreader.
-2. Give the Proofreader the immutable PRD/spec hashes and require a complete read-only pass. It must compare the entire specification with the PRD and report all findings in one batch.
-3. Run `record-proofread`. If the pass satisfies every readiness gate, ask the same Architect to confirm the exact unchanged specification and run `confirm-ready`.
-4. Otherwise, give one deduplicated technical batch to the same Architect. The Architect resolves it in one writing pass, then the Director runs `complete-cycle`.
-5. Repeat with a fresh Proofreader. Do not let a Proofreader edit files or let the Architect award its own clean credit.
+1. Run `start-cycle`, then assign exactly one fresh internal Proofreader.
+2. Give the Proofreader immutable PRD/spec hashes. Require a complete read-only comparison and one deduplicated finding batch.
+3. Run `record-proofread`. If every readiness gate passes, have the same Architect confirm the unchanged specification and run `confirm-ready`.
+4. Otherwise give one deduplicated technical batch to the same Architect, complete one writing pass, then run `complete-cycle`.
+5. Repeat with a fresh Proofreader. A Proofreader never edits; the Architect never awards its own clean credit.
 
-The Director owns all counters. One Architect may complete at most five Proofreader-to-response cycles. Never start a sixth cycle for that Architect. An attempted sixth cycle must enter `spec_convergence_hold`; do not bypass or reset state. Resolve the hold only by an explicit recorded handoff to a new Architect or by leaving it at a user gate. A handoff resets only the new Architect's per-owner counter; preserve total waves, prior owners, findings, hashes, and budget history.
+One Architect may complete at most five Proofreader-to-response cycles. An attempted sixth enters `spec_convergence_hold`. Resume only through a recorded handoff to a distinct Architect or a user gate; preserve total waves, prior owners, findings, hashes, and budget history.
 
-## Route decisions
+The Architect may resolve technical choices supported by project evidence. Escalate product semantics, observable outcomes, scope, ownership, system/public boundaries, or PRD contradictions to one consolidated user decision. Do not disguise them as assumptions.
 
-Let the Architect autonomously settle technical questions when supported by project rules, existing project patterns, or platform best practices, including API shape, type placement, lifecycle, concurrency, persistence mechanics, error handling, and verification design. Record the rationale and trace it to evidence.
+## Complete the stage
 
-Escalate through the Director when resolution would decide product semantics, change observable outcomes, expand scope, add a capability, move ownership, change a system boundary/public contract, or contradict the approved PRD. Ask the user one consolidated blocking decision at a time. Never disguise these as technical assumptions.
+Run `confirm-ready` only on the exact snapshot satisfying every readiness condition in the contract. Return:
 
-Minor editorial or locally implementable details may remain only when the Proofreader explicitly marks them engineer-resolvable without product interpretation or boundary changes.
+- `SPEC_READY: yes|no`, state path, PRD/spec paths and hashes, Architect cycle count, and total waves;
+- exact blocking finding/question IDs or the validated readiness evidence;
+- `NEXT_ACTION: $gamedev-development-plan` when `SPEC_READY: yes`, otherwise `NEXT_ACTION: user-decision` or `NEXT_ACTION: $gamedev-specification`.
 
-## Declare SPEC_READY
-
-Run `confirm-ready` and declare `SPEC_READY` only when all are true on one exact snapshot:
-
-- the current approved PRD bytes match the recorded path, revision, and SHA-256;
-- the specification records that exact PRD trace and its current exact-byte SHA-256;
-- the fresh Proofreader reports zero Critical and zero Major findings;
-- no product, scope, boundary, ownership, or public-contract question remains unresolved;
-- every remaining Minor is explicitly safe for an Engineer to resolve locally;
-- the persistent Architect confirms the same unchanged SHA reviewed by that Proofreader;
-- the specification status is `approved` and all required traceability/verification sections are complete.
-
-If any gate fails, keep the state out of `SPEC_READY`. Report the exact blocking IDs, current Architect cycle count, total wave count, state path, PRD/spec hashes, and next authorized action.
+Do not activate the Development Plan stage. Stop after persisting state and returning the handoff.

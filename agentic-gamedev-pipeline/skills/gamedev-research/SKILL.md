@@ -1,50 +1,34 @@
 ---
 name: gamedev-research
-description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-research` by name, explicitly asks for the Agentic GameDev Pipeline Researcher mode, or an explicitly user-invoked `$gamedev-pipeline` delegates one bounded research brief through its assigned Engineer. Perform read-only repository research within exact paths, symbols, revision, evidence limits, and stop conditions. Do not infer activation from ordinary project exploration, implementation, review, debugging, or planning.
+description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-research` or an active, explicitly invoked `$gamedev-pipeline` Director delegates one exact bounded brief. Produce read-only source-backed evidence within fixed revision/path/file limits. Do not activate for ordinary exploration, coding, debugging, planning, or review.
 ---
 
 # GameDev Researcher
 
 ## Activation gate
 
-Proceed only when the current user explicitly requests `$gamedev-research` by name, clearly asks for the Agentic GameDev Pipeline Researcher mode, or an assigned Engineer from an active `$gamedev-pipeline` that the user explicitly invoked delegates one bounded brief. Ordinary repository research, implementation, debugging, planning, or review is not authorization. Reject a request without a complete brief or with write authority.
+Proceed only on the explicit activation described above. An Engineer brief is input, not activation authority; only the user or active Pipeline Director may start this stage. Reject an incomplete brief or any write authority.
 
-Remain read-only. Do not edit project files, controller state, product documents, tests, or the brief. Do not spawn subagents. Work on the exact base revision recorded in the brief; report revision drift instead of continuing.
+Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md). Remain read-only except for the assigned result bundle. Do not edit project/controller/product/test files, change the brief, activate another stage, or spawn subagents. Report revision drift instead of continuing.
 
-## Accept one bounded brief
+## Execute one bounded brief
 
-Require all of:
+Require one concrete question, active `SLICE-*` and related `REQ/AC` IDs, exact base revision, seed and allowed paths/symbols, exclusions, requested evidence, positive `max_files`, deterministic stop condition, and one output path under the assigned research area.
 
-- one concrete question;
-- the active `SLICE-NNN` and related `REQ-*`/`AC-*` IDs;
-- exact base revision;
-- seed paths plus allowed paths and/or symbols;
-- explicit exclusions;
-- requested evidence;
-- positive `max_files`;
-- a deterministic stop condition;
-- one output path under `tests/<feature>/research/` or the controller-assigned runtime research path.
+1. Verify revision and boundary before opening project files.
+2. Start from supplied seeds and follow only links required to answer the question.
+3. Stop when evidence is sufficient, the stop condition fires, `max_files` is reached, or excluded scope is required.
+4. Prefer exact file/symbol citations and concise precedents. Do not return raw dumps, broad inventories, logs, or speculative architecture.
+5. For an out-of-brief issue, return only path/symbol, one-sentence candidate, and observed condition/effect. Do not investigate, classify, remediate, or mutate the backlog.
 
-Do not broaden the brief. Inspect no more than `max_files`; stay inside allowed paths and symbols. If an out-of-brief issue appears, return only its path/symbol, a one-sentence candidate description, and the observed condition/effect needed for a Director-owned deferred candidate. Do not investigate, validate, classify, remediate, or write the deferred backlog.
+## Complete the stage
 
-## Research workflow
+Persist inspected paths/symbols, owners/contracts/precedents, lifecycle/integration risks, minimal edit/reuse points, unresolved questions, pointer-only candidates, exact base revision, and canonical brief SHA-256.
 
-1. Verify the current revision and brief boundary before opening project files.
-2. Start from the supplied seeds and follow only links needed to answer the question.
-3. Stop when the requested evidence is sufficient, the stop condition fires, the file limit is reached, or the answer requires excluded scope.
-4. Prefer exact file/symbol citations and concise project precedents. Do not return raw source dumps, broad inventories, logs, or speculative architecture.
-5. Write only the assigned result bundle. Writing that artifact is the sole permitted mutation.
+Return `RESEARCH_COMPLETE: yes|no` with `COMPLETE`, `LIMIT_REACHED`, `STALE_REVISION`, or `INVALID_BRIEF`.
 
-## Return the result bundle
+- `COMPLETE` -> `NEXT_ACTION: $gamedev-coverage-steward`;
+- `LIMIT_REACHED` -> `NEXT_ACTION: $gamedev-engineer` for a revised brief or scope decision;
+- `STALE_REVISION` or `INVALID_BRIEF` -> `NEXT_ACTION: $gamedev-pipeline` Director correction, or the equivalent user action for standalone use.
 
-Record:
-
-- inspected paths and symbols;
-- owners, contracts, and applicable project precedents;
-- lifecycle and integration risks;
-- minimal edit and reuse points;
-- unresolved questions;
-- out-of-brief pointers without follow-up research;
-- exact base revision and canonical brief SHA-256.
-
-Return `COMPLETE` when the question is answered within the stop condition, `LIMIT_REACHED` when `max_files` or an exclusion prevents closure, `STALE_REVISION` on revision drift, or `INVALID_BRIEF` when a required field is absent. Never suggest that research evidence authorizes production edits.
+Research evidence never authorizes production edits. Do not execute `NEXT_ACTION`; stop after returning the result bundle.

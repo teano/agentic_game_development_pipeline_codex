@@ -1,61 +1,49 @@
 ---
 name: gamedev-qa
-description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-qa` by name, explicitly asks for the Agentic GameDev Pipeline QA mode, or an explicitly user-invoked `$gamedev-pipeline` delegates runtime QA. Execute the finalized exact manual identity matrix on an immutably reviewed game product/evidence revision, preserve independent evidence, and separate product failures from user/environment/test gates. Do not infer activation from ordinary testing or playtesting.
+description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-qa` or an active, explicitly invoked `$gamedev-pipeline` Director delegates exact runtime QA. Execute every registered manual identity on reviewed revisions and separate product findings from external/test gates. Do not activate for ordinary testing, playtesting, debugging, or inspection.
 ---
 
 # GameDev Runtime QA
 
 ## Activation gate
 
-Proceed only when the current user explicitly requests `$gamedev-qa` by name, clearly asks for the Agentic GameDev Pipeline QA mode, or this is a runtime-QA assignment delegated by an active `$gamedev-pipeline` that the user explicitly invoked. A request to test, playtest, verify, debug, or inspect a game, and even a completed Review chain, is not authorization.
+Proceed only on the explicit activation described above. A test/playtest request or completed Review chain is not authorization. Do not activate another GameDev stage.
 
-Remain immutable with respect to product code, tests, configuration, approved documents, decision records, coverage plan/finalization, support documents, and pipeline state. Write only QA evidence under `tests/<feature>/qa/<product-revision>/<run-id>/`. Do not share conclusions with Review workers.
+Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md). Remain immutable to product, tests, configuration, approved documents, decisions, coverage finalization, support docs, and controller state. Write only isolated QA evidence/report artifacts.
 
-## Validate the exact QA input
+Require a fresh QA identity and controller-validated capsule containing exact authority, active decisions, current reviewed product/support/evidence identities, passed immutable Review chain/credits, finalized schema-2 coverage, every manual identity/prerequisite, evidence outputs, exclusions, and capsule payload ceilings.
 
-Require a controller-validated bounded context capsule containing:
+Require a current exact-revision `qa-capability-probe` whose capability set exactly matches the approved plan plus platform minimums. Known external/test prerequisites remain probe gates; do not start doomed execution. Reuse passing automated evidence.
 
-- exact approved authority paths/SHAs and active `decision_ids`;
-- the exact reviewed product/evidence revisions and current support/composite revision;
-- passed immutable Review chain and component credits;
-- schema-2 finalized coverage manifest whose expected/actual and mandatory sets match exactly;
-- exact mandatory/manual identity matrix, prerequisites, evidence locations, exclusions, and context budget;
-- a current `qa-capability-probe` covering Studio/editor sync, single play, mandatory server+two-client topology, stable control or declared human operator, logs/screenshots, persistence/DataStore, publication/place topology, and configuration/credentials.
+## Execute the exact matrix
 
-Every capability is `available`, `not_required`, or `planned_manual` before spawn. A known unavailable prerequisite is a controller probe gate; do not launch doomed QA. Reuse passing automated evidence and do not rerun the full project suite.
+1. Attach to exact identities and record environment identity.
+2. Confirm the capability probe and run a harmless control-feasibility check.
+3. Return every registered manual identity exactly once, including optional identities. Invent no ID and silently change no matrix row.
+4. Use ordinary player-visible controls; setup affordances must not bypass accepted behavior.
+5. Capture immutable evidence path/SHA for every executed identity plus steps, expected/actual behavior, logs/timestamps, reproduction conditions, and available media.
+6. Continue through every independent safe/trustworthy identity after a defect.
 
-## Execute the registered manual identities
+Each schema-2 row independently records `executed`, `passed`, `deferred`, `blocked_by_finding`, immutable `qa_evidence`, gate, and minimum resume action. A deferred row is unexecuted and uses `blocked_user|blocked_environment|error_test`; a product-blocked row is unexecuted, non-deferred, and names an exact finding.
 
-1. Attach to the exact product/evidence revision and record environment identity.
-2. Confirm the capability probe remains current; run a short harmless control-feasibility check before a long scenario.
-3. Execute every independent mandatory manual identity and only the registered optional/adjacent smoke identities. Do not invent a new scenario ID or silently change the matrix.
-4. Use ordinary player-visible controls. A test affordance may shorten setup but must not bypass accepted behavior.
-5. Capture steps, expected/actual behavior, logs, timestamps, screenshots/recordings when available, exact reproduction conditions, and identity-linked evidence.
+Every failed identity requires an exact current-revision QA product finding bound through `coverage_identity_ids`. A failed mandatory identity requires an open controller-blocking finding. A failed optional identity may remain compatible with overall pass only through an accepted, nonblocking, Minor, exact-revision QA finding bound to that identity. `blocked_by_finding` must name an open blocking QA finding bound to the row.
 
-Continue after each defect through all independent safe/trustworthy identities. When a product finding invalidates another identity's prerequisite, record `blocked_by_finding: <id>`; it is not a user/environment/test gate.
+Send stable candidates to the Director with complete classification dimensions and evidence; never set `blocking`. No writer starts before `qa-complete` records the immutable aggregate.
 
-After a stable reproduction, send the Director a compact provisional product candidate with complete severity/scope/provenance/reachability/acceptance/invariant dimensions and exact evidence. Never set `blocking`. Unknown reachability requests bounded triage, not Engineer remediation. The assigned Engineer may prepare bounded read-only research while QA completes, but no writer starts until `qa-complete` records the immutable report.
+## Complete the stage
 
-## Record independent execution dimensions
+The controller derives overall status from the full matrix:
 
-For every registered manual identity return one of:
+- any bound mandatory/product failure -> `FAIL_PRODUCT`;
+- otherwise external gates use deterministic priority while preserving every gate category and pending identity;
+- otherwise `PASS` requires every mandatory identity executed/passed and no product-blocked mandatory row. Accepted nonblocking optional failures remain explicit in evidence.
 
-- `PASS`: executed and matched expected behavior;
-- `FAIL_PRODUCT`: executed and reproduced a product defect;
-- `BLOCKED_USER`: requires a user permission, credential, publication, or manual step;
-- `BLOCKED_ENVIRONMENT`: required client, tool, service, device, or runtime is unavailable;
-- `ERROR_TEST`: setup, harness, automation, or observation failed before behavior could be judged;
-- `BLOCKED_BY_FINDING`: a recorded product defect invalidated the prerequisite;
-- `NOT_APPLICABLE`: only when the finalized coverage manifest already carries accepted authority.
+The supplied status must equal the controller-derived status. `pending-identity` must exactly equal the deferred set, and deferred gate categories must exactly match the failed capability probe. `qa-complete` writes the immutable run plus current schema-2 `qa_updated` coverage aggregate.
 
-Record manual dimensions independently as `executed`, `passed`, and `deferred`. A gate uses `executed=false`, `passed=null`, `deferred=true`, exact pending identity IDs, completed reusable evidence, reason, capability-probe evidence, and minimum resume action. Unexecuted behavior is never a product failure.
+Return `QA_COMPLETE: yes|no`, worker/capsule/probe IDs, exact identities/revisions, complete execution matrix, normalized candidates, all gate categories/resume actions, report/evidence paths, and aggregate coverage path/state.
 
-Overall result is `PASS`, `FAIL_PRODUCT`, `BLOCKED_USER`, `BLOCKED_ENVIRONMENT`, or `ERROR_TEST`. `PASS` requires every mandatory manual identity executed and passed, no mandatory deferred identity, no `blocked_by_finding`, and no controller-blocking product candidate. A product failure remains `FAIL_PRODUCT`; causally blocked identities link to it. For mixed non-product gates choose the result owning the minimum resume action and list all pending identities.
+- `PASS` -> `NEXT_ACTION: $gamedev-documentation-finisher` for required derived docs, otherwise the Director's readiness terminal action;
+- `FAIL_PRODUCT` -> `NEXT_ACTION: $gamedev-engineer`;
+- external/test gate -> `NEXT_ACTION: $gamedev-qa` after the exact resume action.
 
-## Return the QA contract
-
-Return `QA_COMPLETE: yes|no`, worker/capsule/probe IDs, exact input revisions, the complete identity-linked execution matrix, normalized product candidates, exclusions, gate details, immutable report/evidence paths, and a schema-2 manual-execution artifact for controller aggregation. Do not rewrite the Coverage Steward manifest.
-
-`FAIL_PRODUCT` routes automatically to a phase-scoped Engineer lease. Other non-pass outcomes resume the same QA worker when possible. A pending manual/DataStore/operator identity makes feature verification pending, never makes the earlier Engineer `INCOMPLETE`.
-
-Do not fix product/tests/docs, waive risk, edit controller state, or declare readiness. After `PASS`, the controller may run derived support documentation; unchanged product/evidence preserves this QA credit only under the strict post-QA support closure contract.
+Do not fix code/tests/docs, waive risk, edit state, declare readiness, or execute `NEXT_ACTION`; stop.

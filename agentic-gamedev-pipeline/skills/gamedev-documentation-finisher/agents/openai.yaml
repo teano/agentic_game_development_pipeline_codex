@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Documentation Finisher"
   short_description: "Finish bounded normative and support docs"
-  default_prompt: "Use $gamedev-documentation-finisher to finish assigned normative documentation before Review or derived support documentation after QA without introducing new decisions."
+  default_prompt: "Use $gamedev-documentation-finisher for one exact documentation lane, return separate semantic/source-map packets plus NEXT_ACTION, and stop."
 policy:
   allow_implicit_invocation: false

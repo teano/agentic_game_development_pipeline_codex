@@ -20,6 +20,11 @@ def main() -> int:
         suite = loader.discover(str(scripts_dir), pattern="test_*.py")
         aggregate.addTests(suite)
         discovered += suite.countTestCases()
+    plugin_tests = root / "scripts" / "tests"
+    if plugin_tests.is_dir():
+        suite = loader.discover(str(plugin_tests), pattern="test_*.py")
+        aggregate.addTests(suite)
+        discovered += suite.countTestCases()
     if discovered == 0:
         print("error: no plugin tests were discovered", file=sys.stderr)
         return 2

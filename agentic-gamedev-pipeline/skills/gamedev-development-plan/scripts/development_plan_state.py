@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -12,6 +13,21 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    from capability_contract import parse_capability_ids
+except ImportError:  # pragma: no cover - importlib loading from the pipeline controller
+    _capability_path = Path(__file__).with_name("capability_contract.py")
+    _capability_spec = importlib.util.spec_from_file_location(
+        "gamedev_capability_contract", _capability_path
+    )
+    if _capability_spec is None or _capability_spec.loader is None:
+        raise
+    _capability_module = importlib.util.module_from_spec(
+        _capability_spec
+    )
+    _capability_spec.loader.exec_module(_capability_module)
+    parse_capability_ids = _capability_module.parse_capability_ids
 
 
 SCHEMA_VERSION = 1
@@ -64,6 +80,7 @@ CONTEXT_LIMITS = {
     "max_payload_bytes",
     "max_estimated_tokens",
 }
+CONTEXT_METRIC_SCOPE = "capsule_plus_referenced_files"
 
 
 class DevelopmentPlanError(RuntimeError):
@@ -397,6 +414,15 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
             found.get("max_authority_files", 0), found.get("max_evidence_files", 0)
         ):
             errors.append(f"{label} max_total_files cannot be smaller than a component file limit")
+        metric_scopes = re.findall(
+            r"(?m)^\s*-\s*metric_scope:\s*(\S(?:.*\S)?)\s*$", section
+        )
+        if len(metric_scopes) != 1:
+            errors.append(f"{label} requires exactly one metric_scope")
+        elif metric_scopes[0] != CONTEXT_METRIC_SCOPE:
+            errors.append(
+                f"{label} metric_scope must be {CONTEXT_METRIC_SCOPE}"
+            )
         return found
 
     global_context_budget = validate_context_budget(
@@ -414,6 +440,20 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
     ):
         if required_text not in coverage_strategy:
             errors.append(f"Coverage Strategy must contain {required_text}")
+    global_capability_values = re.findall(
+        r"(?m)^\s*-\s*capability_prerequisites:\s*(\S(?:.*\S)?)\s*$",
+        coverage_strategy,
+    )
+    if len(global_capability_values) != 1:
+        errors.append("Coverage Strategy requires exactly one capability_prerequisites field")
+    else:
+        try:
+            parse_capability_ids(
+                global_capability_values[0],
+                label="Coverage Strategy capability_prerequisites",
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
     documentation_strategy = global_sections.get("Documentation Strategy", "")
     for required_text in ("normative_pre_review", "derived_post_qa"):
         if required_text not in documentation_strategy:
@@ -532,9 +572,30 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
             if not match or int(match.group(1)) < 1:
                 errors.append(f"{slice_id} {budget} must be a positive integer")
 
-        research_rows = re.findall(r"(?m)^\s*-\s*(RESEARCH-\d{3})\s*\|\s*(.+)$", sections.get("Research Briefs", ""))
-        if not research_rows:
-            errors.append(f"{slice_id} requires at least one structured research brief")
+        research_section = sections.get("Research Briefs", "")
+        research_rows = re.findall(
+            r"(?m)^\s*-\s*(RESEARCH-\d{3})\s*\|\s*(.+)$",
+            research_section,
+        )
+        research_not_required = re.findall(
+            r"(?m)^\s*-\s*research_not_required\s*\|\s*reason=(\S.*?)\s*$",
+            research_section,
+        )
+        if research_rows and research_not_required:
+            errors.append(
+                f"{slice_id} Research Briefs must choose briefs or research_not_required, not both"
+            )
+        elif not research_rows and len(research_not_required) != 1:
+            errors.append(
+                f"{slice_id} requires structured research briefs or one exact "
+                "research_not_required | reason=<source-backed reason> sentinel"
+            )
+        elif research_not_required and research_not_required[0] in {
+            "EXACT_SOURCE_BACKED_REASON",
+            "placeholder",
+            "none",
+        }:
+            errors.append(f"{slice_id} research_not_required requires a concrete reason")
         for research_id, fields_text in research_rows:
             found = {
                 part.split("=", 1)[0].strip()
@@ -559,6 +620,22 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         ):
             if required_text not in coverage:
                 errors.append(f"{slice_id} Coverage Contract must contain {required_text}")
+        slice_capability_values = re.findall(
+            r"(?m)^\s*-\s*capability_prerequisites:\s*(\S(?:.*\S)?)\s*$",
+            coverage,
+        )
+        if len(slice_capability_values) != 1:
+            errors.append(
+                f"{slice_id} Coverage Contract requires exactly one capability_prerequisites field"
+            )
+        else:
+            try:
+                parse_capability_ids(
+                    slice_capability_values[0],
+                    label=f"{slice_id} Coverage Contract capability_prerequisites",
+                )
+            except ValueError as exc:
+                errors.append(str(exc))
         documentation = sections.get("Documentation Contract", "")
         for required_text in (
             "normative_pre_review_paths",

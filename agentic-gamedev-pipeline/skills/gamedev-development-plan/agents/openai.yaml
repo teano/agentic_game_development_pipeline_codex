@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Development Plan"
   short_description: "Plan bounded sequential game feature work"
-  default_prompt: "Use $gamedev-development-plan to create an approval-gated plan with phase-scoped writers, exact coverage/documentation contracts, and bounded context capsules."
+  default_prompt: "Use $gamedev-development-plan to turn PRD_READY and SPEC_READY into exact user-approved PLAN_READY plus NEXT_ACTION, then stop without starting runtime work."
 policy:
   allow_implicit_invocation: false
