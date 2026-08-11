@@ -7,6 +7,36 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-11
+
+### Добавлено
+
+- Общий stage-handoff инвариант: специализированный этап сохраняет результат, возвращает точный `NEXT_ACTION` и останавливается; следующий именованный этап может активировать только пользователь или явно запущенный Director.
+- Progressive-disclosure маршрутизация для engineering/coverage и review/QA/recovery контрактов, а также статические бюджеты описаний, initial bundle и условных reference-пакетов.
+- Компактный schema-versioned `status` по умолчанию с диагностическими `--section` и `--full`, плюс внешний semantic-forward-eval grader с положительными и отрицательными fixtures.
+- Версионированное доказательство полного environment preflight и явный `reinitialize-preflight` для безопасной миграции прежних schema-9 состояний.
+
+### Изменено
+
+- Requirements, Specification, Engineer и остальные специализированные этапы больше не запускают соседние GameDev-этапы напрямую; Director сохраняет порядок `PRD_READY` → `SPEC_READY` → `PLAN_READY` → runtime.
+- Справка контроллера и длинные фазовые правила разделены на каноническое компактное ядро и условно загружаемые контракты без дублирования статического command manual.
+- Capability prerequisites нормализованы единым lowercase-hyphen контрактом на planning, preflight и QA границах; `metric_scope` фиксируется как `capsule_plus_referenced_files`.
+- Reviewer, QA и recovery capsules теперь требуют точные текущие coverage, findings, evidence, credits и handoff-наборы; лишняя или устаревшая authority отклоняется.
+- QA выводит смешанные gates детерминированно, а support remediation отделён от product-blocking формулы.
+
+### Исправлено
+
+- Generic `resolve-finding` переведён в fail-closed режим, а принятие остаточного риска требует неизменяемого user-authority receipt с точной statement binding.
+- Documentation source maps проверяют неизменяемый pre-write SHA и запрещают самоавторизацию либо перекрёстную авторизацию изменяемых путей.
+- Старые или неполные preflight proofs больше не позволяют пройти в специализированный runtime: контроллер переводит их в `preflight_migration_hold` до явной повторной проверки.
+- Компактный status ограничивает длинные списки findings, gates и capability blockers, сохраняя полное состояние только в адресной диагностике.
+- Командные контракты синхронизированы с argparse, включая обязательный coverage manifest и документированные recovery/closure переходы.
+
+### Проверено
+
+- Полный набор из 177 тестов покрывает stage isolation, command parity, статические context budgets, compact output, migration hold, exact role capsules, immutable documentation authority и semantic-forward fixtures.
+- Все 11 skill-пакетов проходят локальную валидацию; `git diff --check` и проверка локальных Markdown-ссылок проходят без ошибок.
+
 ## [0.4.0] - 2026-08-11
 
 ### Добавлено
@@ -79,7 +109,8 @@
 - Полный набор из 97 тестов контроллеров, активации и межрежимных контрактов.
 - Валидация manifest плагина и всех восьми skill-пакетов.
 
-[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/teano/agentic_game_development_pipeline_codex/releases/tag/v0.3.0
