@@ -1,6 +1,6 @@
 # Role artifacts and bounded context
 
-This file is the normative cross-role schema contract. Role-specific semantic rules live in the corresponding skill references. The controller generates and validates all mechanical envelopes.
+This is the cross-role schema contract. Role semantics live in their skill references; the controller validates mechanical envelopes.
 
 ## Contents
 
@@ -15,20 +15,14 @@ This file is the normative cross-role schema contract. Role-specific semantic ru
 
 ```json
 {
-  "lease_id": "LEASE-*",
-  "phase": "decision_recording|slice_engineering|normative_documentation|derived_documentation|evidence_recovery",
-  "write_scope": "exact controller-owned scope ID",
-  "role": "decision_recorder|engineer|documentation_finisher|recovery_remediator",
-  "worker_id": "worker ID",
-  "base_revision": "exact composite revision",
-  "allowed_paths": [],
-  "allowed_symbols": [],
-  "exclusions": [],
-  "status": "active|released|revoked"
+  "lease_id": "LEASE-*", "phase": "exact write phase",
+  "write_scope": "scope ID", "role": "write role", "worker_id": "worker",
+  "base_revision": "composite", "allowed_paths": [],
+  "allowed_symbols": [], "exclusions": [], "status": "active|released|revoked"
 }
 ```
 
-At most one write-capable lease may be active in a checkout, and at most one writer may own a phase/write scope. Review, QA, Research, and Coverage Steward roles remain read-only to product/support/evidence inputs and may write only their isolated reports. Changing phase, role, owner, scope, or base revision requires releasing/revoking the prior lease and issuing a new one. Owner transfer preserves all hashes, findings, counters, decisions, coverage state, documentation state, and scope history.
+Only one write lease/writer may be active. Write roles are Decision Recorder, Engineer, Documentation Finisher, and Recovery Remediator in their exact phases; Review, QA, Research, and Coverage are input-read-only. Any phase/role/owner/scope/base change requires a new lease. Transfer preserves hashes, findings, counters, decisions, coverage/docs, and scope history.
 
 An Engineer is not the lifecycle owner. The controller may assign a different Engineer for a later approved slice or after a required structured transfer. Origin-route and integration-route rules still apply, but identity persistence never authorizes overlapping writers.
 
@@ -40,60 +34,32 @@ Every delegated specialized role receives one controller-generated capsule, not 
 {
   "schema": 1,
   "capsule_id": "CAP-*",
-  "role": "engineer|researcher|decision_recorder|coverage_steward|documentation_finisher|reviewer|qa|recovery_remediator",
-  "phase": "exact phase",
-  "worker_id": "worker ID",
-  "plan_sha256": "exact approved plan SHA",
-  "revisions": {
-    "revision": "composite",
-    "product_revision": "product",
-    "support_revision": "support",
-    "evidence_revision": "evidence"
-  },
-  "authority": [
-    {"path": "repository-relative path", "sha256": "64 lowercase hex", "ids": []}
-  ],
-  "decision_ids": [],
-  "finding_ids": [],
-  "coverage_identity_ids": [],
-  "evidence": [
-    {"path": "report/evidence path", "sha256": "64 lowercase hex", "ids": []}
-  ],
-  "allowed_paths": [],
-  "allowed_symbols": [],
-  "exclusions": [],
-  "commands": [],
-  "output_paths": [],
-  "stop_condition": "deterministic stop",
-  "budget": {
-    "max_authority_files": 0,
-    "max_evidence_files": 0,
-    "max_total_files": 0,
-    "max_payload_bytes": 0,
-    "max_estimated_tokens": 0
-  },
-  "metrics": {
-    "authority_files": 0,
-    "evidence_files": 0,
-    "total_files": 0,
-    "payload_bytes": 0,
-    "estimated_tokens": 0
-  },
+  "role": "exact role", "phase": "exact phase", "worker_id": "worker ID",
+  "plan_sha256": "approved plan SHA", "revisions": {},
+  "authority": [], "evidence": [],
+  "decision_ids": [], "finding_ids": [], "coverage_identity_ids": [],
+  "allowed_paths": [], "allowed_symbols": [], "exclusions": [],
+  "commands": [], "output_paths": [], "stop_condition": "deterministic stop",
+  "budget": {}, "metrics": {},
   "capsule_sha256": "controller digest"
 }
 ```
 
-Every declared maximum is positive and less than or equal to the corresponding approved plan ceiling; a stage may choose a smaller bounded capsule. `max_total_files` must be at least each authority/evidence file ceiling. `total_files` is the deduplicated union of authority/evidence files. `payload_bytes` is the UTF-8 byte length of controller-canonical capsule JSON with `metrics` and `capsule_sha256` omitted plus the exact byte lengths of every referenced authority/evidence file. The persisted field `estimated_tokens = ceil(payload_bytes / 4)` is specifically a capsule-payload estimate with metric scope `capsule_plus_referenced_files`.
+`revisions` contains exact composite/product/support/evidence identities. Each authority/evidence row is `{path,sha256,ids}`. `budget` contains positive `max_authority_files`, `max_evidence_files`, `max_total_files`, `max_payload_bytes`, and `max_estimated_tokens`; `metrics` contains the corresponding observed counts/bytes/tokens.
 
-Capsules are exact minimal role/phase packets. Authority: current PRD/spec/plan; ledger iff decisions are active; Decision Recorder has its prior immutable receipt. Evidence: applicable coverage; Reviewer adds handoff and predecessor reports/credits; QA adds handoff, current Review reports/credits and probe (prior QA/manual only on resume); documentation review adds handoff, Review, QA/manual/probe and derived report/map. Others get only phase inputs. Paths, SHAs, and IDs are exact; missing/extra fails closed.
+For a Director-delegated stage, `worker_id` identifies a real non-Director subagent task, not a persona label chosen by the Director. The Director identity and `worker_id` must differ. Start the worker with no inherited chat turns (`fork_turns: none` or the runtime-equivalent); the capsule and bounded task packet are its complete cross-stage input. Full-history forks are forbidden for production roles. If the runtime cannot create an isolated subagent, do not activate the stage.
+
+Every maximum is positive, within plan ceilings, and may be narrower. `max_total_files` covers each file ceiling. `total_files` deduplicates authority/evidence. `payload_bytes` is canonical capsule JSON without `metrics`/digest plus referenced file bytes; `estimated_tokens=ceil(payload_bytes/4)`. Its scope is `capsule_plus_referenced_files`.
+
+Capsules are exact minimal packets. Authority is current PRD/spec/plan, active ledger, and Recorder's prior receipt. Evidence is phase-specific: coverage; Reviewer predecessor handoff/reports/credits; QA handoff/current Review/probe (prior QA only on resume); documentation review also QA/manual and derived report/map. Missing/extra paths, SHAs, or IDs fail closed.
 
 IDs are exact for PRD/decisions, findings, and phase coverage. Writers have bounded paths; readers forbid writes/exclusions; only check roles allow commands.
 
-This metric excludes skill/reference instructions, metadata descriptions, system/AGENTS instructions, conversation history, and tool output. Never report it as total agent context. Maintain a separate CI static-instruction budget for metadata and each always/phase-conditional `SKILL.md` reference bundle; dynamic system/history/tool usage remains outside deterministic file-based measurement.
+The metric excludes skills/references, metadata, system/AGENTS instructions, history, and tools. Never report it as total agent context. Workers receive no Director history. CI verifies structural progressive disclosure and explicit always/conditional routing; dynamic context is not file-measurable.
 
-The controller records the capsule recipe and observed sizes; allowed-but-unread path families do not enter metrics until a new capsule adds a file. It rejects a capsule when any metric exceeds its declared ceiling or that ceiling exceeds the plan, a referenced path/SHA/ID is stale/absent, output scopes overlap a writer, a role receives unnecessary authority, or the capsule embeds chat transcripts/raw reasoning. The phase cannot activate until `context-capsule-check` passes. Budget authorization is append-only and never resets prior metrics.
+The controller records recipe/sizes and counts only included files. It rejects exceeded plan/capsule ceilings, stale/absent references, overlapping output scope, excess authority, or embedded transcripts/reasoning. Activation requires `context-capsule-check`; budget authorization is append-only.
 
-User authority is the only non-file authority form and is encoded as `{"path":"not_applicable","sha256":"<controller receipt digest>","ids":["<authority-id>"]}`. Before capsule creation, a separate lease-free `user-authority-accept` checkpoint must already have appended the exact authority ID, explicit approval reference, statement, digest, receipt path/SHA, and timestamp to controller state. The controller records the assertion but does not authenticate the human. Capsule creation and a Decision Recorder packet may cite only that immutable prior receipt; neither operation can self-issue or alter user authority.
+User authority is the sole non-file form: `{"path":"not_applicable","sha256":"receipt digest","ids":["authority-id"]}`. Before capsule creation, lease-free `user-authority-accept` appends ID, approval reference, statement, digest, receipt path/SHA, and time. It records but cannot authenticate the human. Capsules/Recorder cite that immutable receipt and cannot self-issue authority.
 
 `capsule_sha256` is SHA-256 of controller-canonical JSON with the `capsule_sha256` field omitted. The same omit-self rule defines `handoff_sha256` below; neither digest is self-referential.
 
@@ -117,49 +83,29 @@ Every write-capable completion command that changes checkout inputs uses this ex
 }
 ```
 
-The three domain arrays are the complete post-pass repository-relative revision inventory. Each `changes[]` row identifies one actually changed path, its domain, semantic reason, requirement/acceptance/decision IDs, scope or slice ID, symbols, change kind, and touchpoint where applicable. The controller rejects missing or extra changed paths, duplicate or cross-domain inventory entries, incomplete inventories, invalid plan mappings, or worker-supplied revision hashes and mechanical counts. `open_assumptions` uses the schema-2 handoff assumption shape below. A role-specific contract may narrow the allowed domains and require additional semantic fields, but may not omit this envelope.
+Domain arrays are the complete post-pass inventory. Each change names actual path/domain/reason, requirement/acceptance/decision IDs, scope, symbols, kind, and applicable touchpoint. Missing/extra paths, duplicate/cross-domain entries, incomplete inventory, invalid plan mapping, and worker hashes/counts fail. Role contracts may narrow but not omit this envelope.
 
 ```json
 {
   "schema": 2,
   "handoff_id": "HANDOFF-*",
-  "phase": "exact source phase",
-  "writer_role": "role",
-  "writer_id": "worker ID",
-  "lease_id": "LEASE-*|no_write",
-  "slice_id": "SLICE-NNN",
-  "base_revisions": {},
-  "result_revisions": {},
-  "change_manifest_path": "controller artifact",
-  "diff_summary_path": "controller artifact",
-  "semantic_report_path": "worker report",
+  "phase": "source phase", "writer_role": "role", "writer_id": "worker",
+  "lease_id": "LEASE-*|no_write", "slice_id": "SLICE-NNN",
+  "base_revisions": {}, "result_revisions": {},
+  "change_manifest_path": "path", "diff_summary_path": "path",
+  "semantic_report_path": "path",
   "decision_ids": ["DEC-001"],
-  "coverage_state": {
-    "manifest_path": "path",
-    "manifest_sha256": "sha",
-    "ac_mapped": false,
-    "identities_registered": "complete|mismatch|gaps|pending",
-    "automated": "pending|passed|failed|blocked",
-    "manual": "pending|passed|failed|deferred"
-  },
-  "documentation_state": {
-    "normative": "pending|required_complete|not_required|gap",
-    "derived": "pending|required_complete|not_required|gap"
-  },
-  "open_assumptions": [
-    {"assumption_id": "ASM-*", "statement": "text", "owner": "role/user", "validation_point": "phase", "impact_if_false": "text"}
-  ],
-  "generated_at": "controller timestamp",
-  "handoff_sha256": "controller digest"
+  "coverage_state": {}, "documentation_state": {}, "open_assumptions": [],
+  "generated_at": "timestamp", "handoff_sha256": "controller digest"
 }
 ```
 
-`decision_ids`, `coverage_state`, `documentation_state`, and `open_assumptions` are always present, even when empty/pending. Decision IDs must exist and be active in the exact ledger. Assumptions never substitute for an accepted decision, mandatory coverage identity, or gate. The controller rejects worker-authored base/result hashes, change counts, revision manifests, or sealed-handoff mechanics as phase evidence.
+The four trailing state fields are always present. Coverage records manifest path/SHA, AC mapping, registration, automated, and manual states. Documentation records normative/derived state. Assumptions are `{assumption_id,statement,owner,validation_point,impact_if_false}` and never replace decisions, coverage, or gates. Decision IDs must be active. Worker-authored revisions/counts/sealed mechanics are rejected.
 
 `lease_id: no_write` is the only non-lease sentinel. It is valid only for a controller-generated handoff from a command that performs no checkout write: `documentation-not-required` or an owner transfer with no active pass to revoke. Such a command must not acquire a ceremonial write lease. Every handoff generated by a writing pass requires the exact released `LEASE-*` identity.
 
 ## Controller-generated change and revision evidence
 
-The controller, not an Engineer, enumerates the actual diff and emits the canonical change manifest, diff summary, revision manifest, and handoff envelope. It validates every changed product path/symbol against the approved Scope Contract, touchpoint, requirements, acceptance IDs, exclusions, and budgets. Semantic mappings that cannot be derived deterministically require a bounded worker annotation, but the controller verifies it against the plan and actual diff before inclusion.
+The controller enumerates the diff and emits change, diff, revision, and handoff artifacts. It validates changed paths/symbols against scope, touchpoints, requirement/acceptance IDs, exclusions, and budgets. Non-derivable semantic mappings require bounded worker annotation verified against plan and diff.
 
 The existing product/support/evidence domain recipe remains exact and fail-closed. Reports, logs, screenshots, context capsules, coverage manifests, change/diff/revision/handoff manifests, controller state, and the deferred-findings backlog are excluded from all three revision inputs.

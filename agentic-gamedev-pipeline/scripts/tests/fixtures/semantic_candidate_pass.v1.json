@@ -42,6 +42,22 @@
       "authority_result": "pipeline_director_delegation"
     },
     {
+      "case_id": "director_must_delegate_specialized_stage",
+      "activation": ["gamedev-pipeline"],
+      "current_action": "spawn_separate_role_worker",
+      "completion_token": null,
+      "next_action": "wait_for_role_handoff",
+      "forbidden_actions": ["self_assume_stage", "author_role_artifact", "edit_role_scope", "run_role_checks"],
+      "attempted_actions": [],
+      "references_read": [
+        "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+        "skills/gamedev-pipeline/references/pipeline-protocol.md",
+        "skills/gamedev-pipeline/references/role-artifacts-and-context.md"
+      ],
+      "stop_result": "continue_as_orchestrator_only",
+      "authority_result": "separate_subagent_required"
+    },
+    {
       "case_id": "stage_to_stage_execution_prohibited",
       "activation": ["gamedev-engineer"],
       "current_action": "complete_current_engineering_lane_only",

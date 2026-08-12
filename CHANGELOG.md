@@ -7,6 +7,22 @@
 
 ## [Unreleased]
 
+### Изменено
+
+- Bundle переведён из Codex plugin в обычные пользовательские skills: plugin manifest/marketplace больше не используются, а весь каталог `skills/` подключается одной junction из `~/.codex/skills/agentic-gamedev-pipeline`.
+- Runtime Director теперь строго orchestration-only: каждый специализированный этап обязан выполняться отдельным non-Director субагентом без наследования длинной истории, а разные роли нельзя совмещать в одном агентном контексте.
+- Continuation после context compaction или замены Director восстанавливается из compact controller status, capsules, leases и sealed handoffs; потеря разговорного окна не считается пользовательским блокером.
+- После каждой controller mutation атомарно обновляется hash-bound `director-checkpoint.json`; обычный цикл запрещает повторный `--help`, `status --full`, неограниченный polling и более 32 Director-вызовов без stage boundary.
+
+### Исправлено
+
+- Engineer capsule теперь получает точный finding set активного slice/integration remediation batch; ошибочная проверка невозможного `route == "engineer"` заменена валидацией реальных controller routes и покрыта независимыми regression-тестами.
+- Integration remediation теперь получает finalized feature coverage, а targeted closure reviewer — точный frozen finding set.
+- Controller автоматически и fail-closed согласует единственный доказанный lifecycle-only drift даты в generated feature dashboard во время продолжения engineering remediation: требует exact batch/findings, неизменные support/evidence identities и уникальное обратное доказательство frozen product/composite revision; сохраняет append-only receipt, per-file records/guard, инвалидирует затронутые credits и stale unused Engineer capsules. Никакие Pause/Continue-скрипты не меняются.
+- Engineer lease теперь выдаётся только после current exact-base scope check; legacy lease восстанавливается отдельным audit receipt без rollback/EOL-реконструкции, а `prepare-engineer-continuation` идемпотентно подготавливает scope, capsule, lease и точный handoff.
+- Успешная targeted Final Review closure с возвратом в QA сохраняет exact convergence/review/remediation lineage в `engineer_clean`; исторический ready-state deadlock восстанавливается одноразовой fail-closed командой без повторного Review, QA или изменения checkout.
+- Создание off-phase capsule отклоняется до записи артефактов с сохранением только документированных cross-phase маршрутов Decision Recorder и Documentation Finisher.
+
 ## [0.5.0] - 2026-08-11
 
 ### Добавлено

@@ -540,6 +540,16 @@ class PipelineSchema9Tests(unittest.TestCase):
         capsule = self.capsule(
             "engineer", "slice_engineering", "engineer-1", allowed=allowed
         )
+        state = self.state()
+        self.cli(
+            "slice-scope-check",
+            "--slice-id",
+            "SLICE-001",
+            "--base-revision",
+            state["revision"],
+            "--owner-id",
+            "engineer-1",
+        )
         self.cli(
             "acquire-write-lease",
             "--role",
@@ -552,16 +562,6 @@ class PipelineSchema9Tests(unittest.TestCase):
             "engineer-1",
             "--capsule",
             capsule,
-        )
-        state = self.state()
-        self.cli(
-            "slice-scope-check",
-            "--slice-id",
-            "SLICE-001",
-            "--base-revision",
-            state["revision"],
-            "--owner-id",
-            "engineer-1",
         )
         changed_path = self.src
         if forbidden_path:
@@ -791,6 +791,226 @@ class PipelineSchema9Tests(unittest.TestCase):
             json.dumps(state), encoding="utf-8"
         )
 
+    def lifecycle_dashboard_text(
+        self,
+        updated_date: str,
+        *,
+        title: str = "Deterministic Feature Dashboard Validation",
+        status: str = "🟨 В работе",
+        link: str = "./deterministic-feature-dashboard-validation/",
+    ) -> str:
+        return (
+            "# Фичи шаблона\n\n"
+            "Этот dashboard генерируется из\n"
+            "`docs/Features/template/*/feature.json`. Манифесты —\n"
+            "единственный источник состояния; generated-блок не редактируется вручную.\n\n"
+            "<!-- feature-index:begin -->\n\n"
+            "Всего: 1 | Готово: 0 | В работе: 1 | В плане: 0 | С блокерами: 0\n\n"
+            "| ID | Фича | Состояние | Активность | Ветка | Базовый commit | Worklog | Блокеры | Обновлено |\n"
+            "|---|---|---|---|---|---|---|---|---|\n"
+            f"| TF-0008 | [{title}]({link}) | {status} | Активна | "
+            "`template-feature/tf-0008-deterministic-feature-dashboard-validation` | "
+            "`765fd71b` | [Открыть](./deterministic-feature-dashboard-validation/worklog.md) | "
+            f"— | {updated_date} |\n\n"
+            "<!-- feature-index:end -->\n"
+        )
+
+    def write_lifecycle_manifest(self, updated_at: str) -> Path:
+        path = (
+            self.root
+            / "docs"
+            / "Features"
+            / "template"
+            / "deterministic-feature-dashboard-validation"
+            / "feature.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 2,
+                    "id": "TF-0008",
+                    "slug": "deterministic-feature-dashboard-validation",
+                    "title": "Deterministic Feature Dashboard Validation",
+                    "status": "in_progress",
+                    "activity": "active",
+                    "branch": "template-feature/tf-0008-deterministic-feature-dashboard-validation",
+                    "baseCommit": "765fd71b755f2f0878a0c9c8761b887600590cdf",
+                    "startedAt": "2026-08-11T13:03:12.7309279+00:00",
+                    "completedAt": None,
+                    "updatedAt": updated_at,
+                    "blockers": [],
+                    "artifacts": [
+                        "product-requirements.md",
+                        "technical-specification.md",
+                        "development-plan.md",
+                    ],
+                    "verification": None,
+                    "recoveryLog": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def prepare_lifecycle_projection_recovery(self) -> dict:
+        self.initialize(research=False)
+        state = self.state()
+        state["feature"] = "deterministic-feature-dashboard-validation"
+        state["phase"] = "engineering"
+        state["engineering_owner_id"] = "engineer-1"
+        state["owner_by_slice"]["SLICE-001"] = "engineer-1"
+        state["active_slice"] = "SLICE-001"
+        state["slice_id"] = "SLICE-001"
+        state["pending_engineer_completion"] = None
+
+        dashboard = self.root / "docs" / "Features" / "template" / "README.md"
+        dashboard.parent.mkdir(parents=True, exist_ok=True)
+        dashboard.write_text(
+            self.lifecycle_dashboard_text("2026-08-11"), encoding="utf-8"
+        )
+        manifest = self.write_lifecycle_manifest("2026-08-11T23:59:00+00:00")
+        support = self.root / "pipeline-support.txt"
+        support.write_text("support-v1\n", encoding="utf-8")
+        dashboard_relative = self.rel(dashboard)
+        manifest_relative = self.rel(manifest)
+        support_relative = self.rel(support)
+        state["revision_inventory"]["product"] = sorted(
+            set(state["revision_inventory"]["product"])
+            | {dashboard_relative, self.rel(self.src)}
+        )
+        state["revision_inventory"]["support"] = [support_relative]
+        state["revision_inventory"]["evidence"] = [self.rel(self.test_source)]
+
+        coverage = self.root / "tests" / FEATURE / "verification" / "lifecycle-coverage.json"
+        coverage.write_text(
+            json.dumps({"expected_identities": []}) + "\n", encoding="utf-8"
+        )
+        state["coverage"]["SLICE-001"]["planned_manifest"] = {
+            "path": self.rel(coverage),
+            "sha256": self.sha(coverage),
+        }
+
+        finding_ids = [f"TF0008-CONV-{index:03d}" for index in range(1, 5)]
+        batch = {
+            "batch_id": "REMEDIATION-0008",
+            "route": "SLICE-001",
+            "finding_ids": finding_ids,
+            "status": "active",
+            "owner_id": "engineer-1",
+            "returns_for_owner": 0,
+        }
+        state["active_remediation_batch"] = batch
+        state["remediation_queue"] = [dict(batch)]
+        state["product_revalidation"] = {
+            "mode": "targeted",
+            "source": "convergence",
+            "base_revision": "frozen-convergence-revision",
+            "base_product_revision": "frozen-convergence-product",
+            "base_support_revision": "frozen-convergence-support",
+            "base_evidence_revision": "frozen-convergence-evidence",
+            "base_convergence_runs": [{"run_id": "convergence-history-1"}],
+            "base_review_runs": [],
+            "finding_ids": list(finding_ids),
+            "slice_ids": ["SLICE-001"],
+            "full_wave_trigger": None,
+        }
+        state["convergence"]["runs"] = [{"run_id": "convergence-history-1"}]
+        state["convergence"]["history_marker"] = "preserve-me"
+        state["lifecycle_projection_reconciliations"] = []
+
+        revisions = runtime_controller.compute_inventory_revisions(self.root, state)
+        for key in (
+            "revision",
+            "product_revision",
+            "support_revision",
+            "evidence_revision",
+        ):
+            state[key] = revisions[key]
+        state["revision_records"] = revisions["records"]
+        state["lifecycle_projection_guard"] = {
+            "schema": 1,
+            "feature_id": "TF-0008",
+            "feature_slug": "deterministic-feature-dashboard-validation",
+            "dashboard_path": dashboard_relative,
+            "manifest_path": manifest_relative,
+            "dashboard_sha256": self.sha(dashboard),
+            "manifest_sha256": self.sha(manifest),
+            "updated_date": "2026-08-11",
+        }
+        dashboard_hash = runtime_controller.exact_inventory_digest(
+            self.root, [dashboard_relative], "lifecycle dashboard credit"
+        )
+        state["component_review_credits"] = [
+            {
+                "id": "RC-TF0008-DASHBOARD-OLD",
+                "component": "feature-dashboard",
+                "product_hash": dashboard_hash,
+                "contract_hash": dashboard_hash,
+                "product_paths": [dashboard_relative],
+                "contract_paths": [dashboard_relative],
+                "lenses": ["persistence-lifecycle"],
+                "review_revision": state["revision"],
+                "reviewer_id": "reviewer-old",
+                "review_mode": "convergence",
+                "source_credit_id": None,
+                "valid": True,
+                "manifest": "tests/teleport-module/reviews/old-credit.json",
+                "recorded_at": "2026-08-11T23:59:00+00:00",
+            }
+        ]
+        findings = {
+            "schema_version": runtime_controller.SCHEMA_VERSION,
+            "items": [
+                {
+                    "id": finding_id,
+                    "status": "open",
+                    "severity": "major",
+                    "source": "convergence",
+                    "revision": state["revision"],
+                    "finding_kind": "product",
+                    "origin_slice": "SLICE-001",
+                    "remediation_route": "SLICE-001",
+                    "blocking": True,
+                    "remediation_required": True,
+                }
+                for finding_id in finding_ids
+            ],
+        }
+        self.write_state(state)
+        (self.root / ".agentic-pipeline" / "findings.json").write_text(
+            json.dumps(findings), encoding="utf-8"
+        )
+        return {
+            "state": json.loads(json.dumps(state)),
+            "findings": findings,
+            "dashboard": dashboard,
+            "manifest": manifest,
+            "support": support,
+            "finding_ids": finding_ids,
+        }
+
+    def apply_lifecycle_projection_drift(
+        self,
+        fixture: dict,
+        *,
+        dashboard_date: str = "2026-08-12",
+        manifest_updated_at: str = "2026-08-12T05:02:23.8245721+00:00",
+        title: str = "Deterministic Feature Dashboard Validation",
+        status: str = "🟨 В работе",
+        link: str = "./deterministic-feature-dashboard-validation/",
+    ) -> None:
+        fixture["dashboard"].write_text(
+            self.lifecycle_dashboard_text(
+                dashboard_date, title=title, status=status, link=link
+            ),
+            encoding="utf-8",
+        )
+        self.write_lifecycle_manifest(manifest_updated_at)
+
     def ready_for_qa(self) -> dict:
         self.implementation_complete()
         state = self.state()
@@ -806,6 +1026,252 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.prepare_qa_state()
         self.qa_probe()
         return self.state()
+
+    def prepare_targeted_qa_closure_ready_state(
+        self, *, remove_clean: bool = False, legacy_without_base_clean: bool = False,
+        prior_clean_source: str = "parallel_read_only_convergence",
+    ) -> dict:
+        """Build the exact Final-Review remediation -> closure -> QA -> ready chain."""
+        self.implementation_complete()
+        state = self.state()
+        self.cli(
+            "documentation-not-required", "--mode", "normative_pre_review",
+            "--plan-sha256", state["development_plan_sha256"],
+            "--policy-evidence", "POLICY-DOC-NONE",
+        )
+        state = self.state()
+        convergence_run_ids = ["base-convergence-current-1", "base-convergence-current-2"]
+        convergence_runs = []
+        for run_id in convergence_run_ids:
+            convergence_report = self.artifact("reviews", f"{run_id}-report")
+            convergence_credit = self.artifact("reviews", f"{run_id}-credit")
+            convergence_runs.append(
+                {
+                    "run_id": run_id,
+                    "reviewer_id": f"{run_id}-reviewer",
+                    "status": "pass",
+                    "revision": state["revision"],
+                    "product_revision": state["product_revision"],
+                    "support_revision": state["support_revision"],
+                    "evidence_revision": state["evidence_revision"],
+                    "report": convergence_report,
+                    "report_sha256": self.sha(self.root / convergence_report),
+                    "credit_manifest": convergence_credit,
+                    "credit_manifest_sha256": self.sha(self.root / convergence_credit),
+                }
+            )
+        prior_clean_run_ids = (
+            ["prior-targeted-convergence"]
+            if prior_clean_source == "targeted_convergence_closure"
+            else convergence_run_ids
+        )
+        prior_clean = {
+            "source": prior_clean_source,
+            "run_ids": prior_clean_run_ids,
+            "revision": state["revision"],
+            "product_revision": state["product_revision"],
+            "support_revision": state["support_revision"],
+            "evidence_revision": state["evidence_revision"],
+            "audit_complete": True,
+            "report": self.artifact("reviews", "base-convergence-current"),
+            "coverage_manifest": state["coverage_manifest"],
+            "recorded_at": "2026-08-11T23:00:00+00:00",
+        }
+        state["phase"] = "review"
+        state["engineer_clean"] = prior_clean
+        state["convergence"]["runs"] = convergence_runs
+        if prior_clean_source == "targeted_convergence_closure":
+            state["review_runs"].append(
+                {
+                    "run_id": prior_clean_run_ids[0],
+                    "reviewer_id": "prior-targeted-convergence-reviewer",
+                    "mode": "targeted_product_closure",
+                    "status": "pass",
+                    "revision": state["revision"],
+                    "product_revision": state["product_revision"],
+                    "support_revision": state["support_revision"],
+                    "evidence_revision": state["evidence_revision"],
+                }
+            )
+        state["review"] = runtime_controller.empty_review_state(
+            state["required_reviews"],
+            state["revision"],
+            state["product_revision"],
+            state["support_revision"],
+            state["evidence_revision"],
+        )
+        self.write_state(state)
+
+        finding_id = "F-FINAL-PRODUCT-001"
+        self.cli(
+            "add-finding", "--id", finding_id, "--source", "review",
+            "--finding-kind", "product", "--severity", "major",
+            "--scope-relation", "current_feature_path",
+            "--introduced-by-candidate", "true",
+            "--production-reachability", "normal",
+            "--blocks-acceptance-id", "PRD-AC-001",
+            "--violates-required-invariant", "false",
+            "--mandatory-core-acceptance-evidence-missing", "false",
+            "--test-can-miss-product-defect", "false",
+            "--title", "Final Review product defect",
+            "--evidence", "exact Final Review evidence", "--revision", state["revision"],
+        )
+        for index in (1, 2):
+            reviewer = f"base-final-reviewer-{index}"
+            capsule_path = self.capsule("reviewer", "review", reviewer)
+            report_relative = self.artifact("reviews", f"base-final-review-{index}")
+            credit_relative = self.review_credit_manifest(
+                f"base-final-review-credit-{index}",
+                reviewer,
+                "final_whole_feature_review",
+            )
+            credit_path = self.root / credit_relative
+            credit = json.loads(credit_path.read_text(encoding="utf-8"))
+            credit["composition_audit"] = True
+            credit["new_boundaries_audited"] = []
+            if index == 2:
+                source_credit = self.state()["component_review_credits"][-1]["id"]
+                credit["components"][0]["mode"] = "reused"
+                credit["components"][0]["source_credit_id"] = source_credit
+            credit_path.write_text(json.dumps(credit), encoding="utf-8")
+            self.cli(
+                "review-complete", "--revision", state["revision"],
+                "--product-revision", state["product_revision"],
+                "--support-revision", state["support_revision"],
+                "--evidence-revision", state["evidence_revision"],
+                "--run-id", f"base-final-review-{index}",
+                "--reviewer-id", reviewer, "--capsule", capsule_path,
+                "--status", "fail", "--report", report_relative,
+                "--credit-manifest", credit_relative,
+            )
+        state = self.state()
+        base_review_runs = list(state["review"]["runs"])
+        self.cli(
+            "review-finalize", "--revision", state["revision"],
+            "--decision", "rework", "--rework-scope", "product",
+            "--revalidation", "targeted",
+            "--reason", "repair exact Final Review product finding",
+            "--report", self.artifact("reviews", "base-final-review-decision"),
+        )
+        revalidation = json.loads(json.dumps(self.state()["product_revalidation"]))
+
+        state = self.state()
+        state["iteration_control"]["max_consecutive_product_changes"] = 10
+        self.write_state(state)
+        capsule = self.capsule(
+            "engineer", "engineering", "engineer-1", allowed=(self.rel(self.src),)
+        )
+        self.cli(
+            "slice-scope-check", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+        )
+        self.cli(
+            "acquire-write-lease", "--role", "engineer", "--phase", "engineering",
+            "--write-scope", "SLICE-001", "--worker-id", "engineer-1",
+            "--capsule", capsule,
+        )
+        self.src.write_text("VALUE = 2\n", encoding="utf-8")
+        semantic = self.semantic_packet_for_change(
+            self.src, domain="product", symbols=["VALUE"]
+        )
+        lease_id = self.state()["active_write_lease"]["lease_id"]
+        self.cli(
+            "engineer-complete", "--run-id", "engineer-remediation-final-review",
+            "--owner-id", "engineer-1", "--lease-id", lease_id,
+            "--capsule", capsule, "--slice-id", "SLICE-001",
+            "--engineering-status", "pass", "--machine-checks", "pass",
+            "--diff-inspection", "pass", "--semantic-handoff", semantic,
+            "--report", self.artifact("verification", "engineer-remediation-report"),
+            "--resolved-finding", finding_id,
+        )
+        state = self.state()
+        coverage_capsule = self.capsule(
+            "coverage_steward", "coverage_finalization", "steward-remediation-final"
+        )
+        prior_feature_coverage = Path(
+            state["coverage"]["feature"]["finalized_manifest"]["path"]
+        )
+        remediation_coverage = json.loads(
+            prior_feature_coverage.read_text(encoding="utf-8")
+        )
+        remediation_coverage["revisions"] = {
+            key: state[key]
+            for key in (
+                "revision", "product_revision", "support_revision", "evidence_revision"
+            )
+        }
+        remediation_coverage_path = self.artifact(
+            "verification", "coverage-remediation-final", remediation_coverage
+        )
+        self.cli(
+            "coverage-finalize", "--scope-id", "feature",
+            "--steward-id", "steward-remediation-final", "--capsule", coverage_capsule,
+            "--coverage-manifest", remediation_coverage_path,
+            "--expected-actual-equality", "pass", "--mandatory-registration", "pass",
+            "--automated-execution", "pass",
+            "--report", self.artifact("verification", "coverage-remediation-report"),
+        )
+        closure_before_review = json.loads(json.dumps(self.state()["closure_review"]))
+        closure_capsule = self.capsule(
+            "reviewer", "closure_review", "targeted-qa-closure-reviewer"
+        )
+        closure_credit = self.review_credit_manifest(
+            "targeted-qa-closure-credit",
+            "targeted-qa-closure-reviewer",
+            "targeted_closure",
+        )
+        state = self.state()
+        self.cli(
+            "closure-review-complete",
+            "--revision", state["revision"],
+            "--product-revision", state["product_revision"],
+            "--support-revision", state["support_revision"],
+            "--evidence-revision", state["evidence_revision"],
+            "--run-id", "targeted-qa-closure-pass",
+            "--reviewer-id", "targeted-qa-closure-reviewer",
+            "--capsule", closure_capsule,
+            "--status", "pass",
+            "--report", self.artifact("reviews", "targeted-qa-closure-report"),
+            "--credit-manifest", closure_credit,
+        )
+        self.qa_probe()
+        qa_capsule = self.capsule("qa", "qa", "qa-after-targeted-closure")
+        state = self.state()
+        self.cli(
+            "qa-complete",
+            "--revision", state["revision"],
+            "--product-revision", state["product_revision"],
+            "--support-revision", state["support_revision"],
+            "--evidence-revision", state["evidence_revision"],
+            "--run-id", "qa-after-targeted-closure",
+            "--worker-id", "qa-after-targeted-closure",
+            "--capsule", qa_capsule,
+            "--status", "pass",
+            "--manual-execution", self.qa_manual_artifact(),
+            "--report", self.artifact("qa", "qa-after-targeted-closure-report"),
+        )
+        state = self.state()
+        self.cli(
+            "documentation-not-required",
+            "--mode", "derived_post_qa",
+            "--plan-sha256", state["development_plan_sha256"],
+            "--policy-evidence", "POLICY-DOC-NONE",
+        )
+        if remove_clean or legacy_without_base_clean:
+            state = self.state()
+            state["engineer_clean"] = None
+            state["ready_targeted_closure_clean_recoveries"] = []
+            if legacy_without_base_clean:
+                state["closure_review"].pop("base_engineer_clean", None)
+            self.write_state(state)
+        return {
+            "state": self.state(),
+            "finding_id": finding_id,
+            "prior_clean": prior_clean,
+            "base_review_runs": base_review_runs,
+            "revalidation": revalidation,
+            "closure_before_review": closure_before_review,
+        }
 
     @staticmethod
     def user_authority_digest(
@@ -918,6 +1384,16 @@ class PipelineSchema9Tests(unittest.TestCase):
             symbols=symbols,
             exclusions=exclusions,
         )
+        state = self.state()
+        self.cli(
+            "slice-scope-check",
+            "--slice-id",
+            "SLICE-001",
+            "--base-revision",
+            state["revision"],
+            "--owner-id",
+            worker,
+        )
         self.cli(
             "acquire-write-lease",
             "--role",
@@ -931,17 +1407,72 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--capsule",
             capsule,
         )
-        state = self.state()
-        self.cli(
-            "slice-scope-check",
-            "--slice-id",
-            "SLICE-001",
-            "--base-revision",
-            state["revision"],
-            "--owner-id",
-            worker,
-        )
         return capsule
+
+    def install_legacy_engineer_lease(
+        self,
+        *,
+        base_bytes: bytes = b"VALUE = 0\r\n# lf\n# crlf\r\n",
+    ) -> tuple[str, str, dict]:
+        """Install a pre-fix active lease without retroactively creating scope authority."""
+        self.src.write_bytes(base_bytes)
+        self.initialize()
+        self.plan_coverage()
+        capsule_path = self.capsule(
+            "engineer", "slice_engineering", "engineer-1",
+            allowed=("src/feature.py",),
+        )
+        capsule = json.loads((self.root / capsule_path).read_text(encoding="utf-8"))
+        state = self.state()
+        lease_id = "LEASE-LEGACY-0003"
+        lease = {
+            "lease_id": lease_id,
+            "phase": "slice_engineering",
+            "write_scope": "SLICE-001",
+            "role": "engineer",
+            "worker_id": "engineer-1",
+            "base_revision": state["revision"],
+            "allowed_paths": ["src/feature.py"],
+            "allowed_symbols": [],
+            "exclusions": [],
+            "status": "active",
+            "rebaseline_carried": False,
+        }
+        snapshot = {
+            "capsule_path": capsule_path,
+            "capsule_sha256": capsule["capsule_sha256"],
+            "checkout": runtime_controller.checkout_snapshot(self.root, FEATURE),
+            "checkout_text": runtime_controller.checkout_text_snapshot(self.root, FEATURE),
+            "rebaseline_carried": False,
+            "created_at": "2026-08-12T07:00:00+00:00",
+        }
+        state["active_write_lease"] = lease
+        state["lease_snapshots"][lease_id] = snapshot
+        state["slices"]["SLICE-001"]["scope_pre_edit_check"] = None
+        state.setdefault("legacy_scope_recoveries", [])
+        self.write_state(state)
+        return lease_id, capsule_path, snapshot
+
+    def assert_legacy_recovery_tampering_rejected(self, fact: str) -> None:
+        lease_id, _, _ = self.install_legacy_engineer_lease()
+        state = self.state()
+        if fact == "snapshot":
+            state["lease_snapshots"][lease_id]["checkout"][self.rel(self.plan)] = "0" * 64
+        elif fact == "capsule":
+            state["lease_snapshots"][lease_id]["capsule_sha256"] = "0" * 64
+        elif fact == "base":
+            state["active_write_lease"]["base_revision"] = "0" * 64
+        else:
+            self.fail(f"unsupported tamper fact: {fact}")
+        self.write_state(state)
+        result = self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
+        )
+        self.assertTrue(result.stderr.strip())
+        state = self.state()
+        self.assertEqual([], state["legacy_scope_recoveries"])
+        self.assertIsNone(state["slices"]["SLICE-001"]["scope_pre_edit_check"])
 
     def semantic_packet_for_change(
         self,
@@ -1127,6 +1658,11 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.initialize()
         self.plan_coverage()
         capsule = self.capsule("engineer", "slice_engineering", "engineer-1", allowed=("src/feature.py",))
+        state = self.state()
+        self.cli(
+            "slice-scope-check", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+        )
         self.cli(
             "acquire-write-lease",
             "--role", "engineer", "--phase", "slice_engineering", "--write-scope", "SLICE-001",
@@ -1144,6 +1680,986 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--reason", "blocked after edit", expected=2,
         )
         self.assertEqual(lease, self.state()["active_write_lease"]["lease_id"])
+
+    def test_missing_scope_receipt_routes_to_scope_check_and_blocks_engineer_lease(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        capsule = self.capsule(
+            "engineer", "slice_engineering", "engineer-1",
+            allowed=("src/feature.py",),
+        )
+
+        status = self.full_status()
+        self.assertEqual("run_slice_scope_check", status["next_action"]["action"])
+        self.assertEqual("SLICE-001", status["next_action"]["active_slice"])
+        result = self.cli(
+            "acquire-write-lease", "--role", "engineer", "--phase", "slice_engineering",
+            "--write-scope", "SLICE-001", "--worker-id", "engineer-1",
+            "--capsule", capsule, expected=2,
+        )
+        self.assertIn("slice-scope-check", result.stderr)
+        self.assertIsNone(self.state()["active_write_lease"])
+
+    def test_stale_scope_receipt_routes_to_scope_check(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        state = self.state()
+        self.cli(
+            "slice-scope-check", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+        )
+        state = self.state()
+        state["slices"]["SLICE-001"]["scope_pre_edit_check"]["base_revision"] = "0" * 64
+        self.write_state(state)
+
+        status = self.full_status()
+        self.assertEqual("run_slice_scope_check", status["next_action"]["action"])
+        self.assertEqual(state["revision"], status["next_action"]["base_revision"])
+
+    def test_scope_route_does_not_bypass_full_review_budget_checkpoint(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        state = self.state()
+        state["phase"] = "engineering"
+        state["worker_budget"]["status"] = "checkpoint_required"
+        state["worker_budget"]["checkpoint_causes"] = ["full_review_waves"]
+        state["worker_budget"]["reason"] = "full review wave limit reached"
+        self.write_state(state)
+
+        route = self.full_status()["next_action"]
+        self.assertEqual("director_budget_checkpoint", route["action"])
+        self.assertEqual("technical_director", route["owner"])
+
+    def test_current_exact_scope_receipt_permits_engineer_lease(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        capsule = self.capsule(
+            "engineer", "slice_engineering", "engineer-1",
+            allowed=("src/feature.py",),
+        )
+        state = self.state()
+        self.cli(
+            "slice-scope-check", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+        )
+
+        lease = json.loads(self.cli(
+            "acquire-write-lease", "--role", "engineer", "--phase", "slice_engineering",
+            "--write-scope", "SLICE-001", "--worker-id", "engineer-1",
+            "--capsule", capsule,
+        ).stdout)
+        self.assertEqual("active", lease["status"])
+        self.assertEqual(state["revision"], lease["base_revision"])
+
+    def test_checkout_drift_after_scope_check_cannot_be_blessed_by_lease(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        capsule = self.capsule(
+            "engineer", "slice_engineering", "engineer-1",
+            allowed=("src/feature.py",),
+        )
+        state = self.state()
+        self.cli(
+            "slice-scope-check", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+        )
+        receipt = self.state()["slices"]["SLICE-001"]["scope_pre_edit_check"]
+        self.src.write_bytes(b"VALUE = 7\r\n")
+
+        result = self.cli(
+            "acquire-write-lease", "--role", "engineer", "--phase", "slice_engineering",
+            "--write-scope", "SLICE-001", "--worker-id", "engineer-1",
+            "--capsule", capsule, expected=2,
+        )
+        self.assertIn("checkout", result.stderr.lower())
+        self.assertIsNone(self.state()["active_write_lease"])
+        self.assertEqual(
+            receipt,
+            self.state()["slices"]["SLICE-001"]["scope_pre_edit_check"],
+        )
+
+    def test_scope_check_is_forbidden_after_engineer_lease(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        capsule = self.capsule(
+            "engineer", "slice_engineering", "engineer-1",
+            allowed=("src/feature.py",),
+        )
+        state = self.state()
+        self.cli(
+            "slice-scope-check", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+        )
+        self.cli(
+            "acquire-write-lease", "--role", "engineer", "--phase", "slice_engineering",
+            "--write-scope", "SLICE-001", "--worker-id", "engineer-1", "--capsule", capsule,
+        )
+        result = self.cli(
+            "slice-scope-check", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1", expected=2,
+        )
+        self.assertIn("precede", result.stderr.lower())
+
+    def test_new_lease_binds_scope_receipt_and_preserves_byte_exact_base(self) -> None:
+        mixed = b"VALUE = 0\r\n# lf\n# crlf\r\n"
+        self.src.write_bytes(mixed)
+        self.initialize()
+        self.plan_coverage()
+        capsule = self.capsule(
+            "engineer", "slice_engineering", "engineer-1",
+            allowed=("src/feature.py",),
+        )
+        state = self.state()
+        self.cli(
+            "slice-scope-check", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+        )
+        receipt = self.state()["slices"]["SLICE-001"]["scope_pre_edit_check"]
+        lease = json.loads(self.cli(
+            "acquire-write-lease", "--role", "engineer", "--phase", "slice_engineering",
+            "--write-scope", "SLICE-001", "--worker-id", "engineer-1", "--capsule", capsule,
+        ).stdout)
+        state = self.state()
+        snapshot = state["lease_snapshots"][lease["lease_id"]]
+
+        self.assertEqual(2, snapshot["snapshot_schema"])
+        self.assertEqual("sha256-raw-bytes-v1", snapshot["snapshot_format"])
+        self.assertEqual(
+            receipt["checkout_snapshot_sha256"],
+            lease["scope_authorization"]["checkout_snapshot_sha256"],
+        )
+        self.assertEqual(
+            receipt["checkout_snapshot_sha256"],
+            snapshot["scope_authorization"]["checkout_snapshot_sha256"],
+        )
+        self.assertEqual(self.sha(self.src), snapshot["checkout"]["src/feature.py"])
+        self.assertEqual(hashlib.sha256(mixed).hexdigest(), snapshot["checkout"]["src/feature.py"])
+        self.assertNotIn("byte_preimage_manifest", snapshot)
+
+    def test_engineer_completion_rejects_tampered_authorized_checkout_snapshot(self) -> None:
+        self.initialize()
+        capsule = self.begin_engineer_lease(allowed=("src/feature.py",))
+        state = self.state()
+        lease_id = state["active_write_lease"]["lease_id"]
+        state["lease_snapshots"][lease_id]["checkout"]["src/feature.py"] = "0" * 64
+        self.write_state(state)
+        self.src.write_text("VALUE = 1\n", encoding="utf-8")
+
+        result = self.cli(
+            "engineer-complete", "--run-id", "tampered-snapshot-run",
+            "--owner-id", "engineer-1", "--lease-id", lease_id,
+            "--capsule", capsule, "--slice-id", "SLICE-001",
+            "--engineering-status", "pass", "--machine-checks", "pass",
+            "--diff-inspection", "pass",
+            "--semantic-handoff", self.semantic_packet_for_change(self.src),
+            "--report", self.artifact("verification", "tampered-snapshot-report"),
+            expected=2,
+        )
+        self.assertIn("binding", result.stderr.lower())
+        self.assertEqual(lease_id, self.state()["active_write_lease"]["lease_id"])
+
+    def test_legacy_active_lease_routes_to_audited_recovery_without_rollback(self) -> None:
+        base = b"VALUE = 0\r\n# lf\n# crlf\r\n"
+        candidate = b"VALUE = 1\r\n# lf\n# crlf\r\n"
+        lease_id, _, legacy_snapshot = self.install_legacy_engineer_lease(
+            base_bytes=base
+        )
+        state = self.state()
+        lifecycle_history = [{
+            "receipt_id": "LPR-0001",
+            "kind": "lifecycle_generated_dashboard_date",
+            "path": "tests/teleport-module/verification/controller/lifecycle.json",
+            "sha256": "a" * 64,
+        }]
+        state["lifecycle_projection_reconciliations"] = lifecycle_history
+        self.write_state(state)
+        self.src.write_bytes(candidate)
+
+        status = self.full_status()
+        route = status["next_action"]
+        self.assertEqual("recover_legacy_engineer_scope_authorization", route["action"])
+        self.assertEqual(lease_id, route["lease_id"])
+        self.assertEqual("SLICE-001", route["active_slice"])
+        self.assertEqual("engineer-1", route["engineering_owner_id"])
+        self.assertEqual(hashlib.sha256(base).hexdigest(), legacy_snapshot["checkout"]["src/feature.py"])
+
+        recovered = json.loads(self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "engineer-1", "--slice-id", "SLICE-001",
+        ).stdout)
+        state = self.state()
+        normalized_snapshot = state["lease_snapshots"][lease_id]
+        self.assertEqual(1, normalized_snapshot["snapshot_schema"])
+        self.assertEqual("legacy_pre_scope_gate", normalized_snapshot["provenance"])
+        summary = state["legacy_scope_recoveries"][-1]
+        self.assertEqual(["src/feature.py"], summary["observed_changed_paths"])
+        receipt_path = self.root / summary["path"]
+        self.assertEqual(summary["sha256"], self.sha(receipt_path))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, receipt["schema"])
+        self.assertEqual("legacy_engineer_scope_authorization", receipt["kind"])
+        pre_edit = state["slices"]["SLICE-001"]["scope_pre_edit_check"]
+        self.assertEqual("LSR-0001", receipt["receipt_id"])
+        self.assertEqual(lease_id, receipt["lease_id"])
+        self.assertEqual(["src/feature.py"], receipt["observed_changed_paths"])
+        self.assertEqual(receipt["receipt_id"], pre_edit["recovery_receipt_id"])
+        self.assertEqual(receipt, recovered)
+        self.assertEqual(candidate, self.src.read_bytes())
+        self.assertEqual(lease_id, state["active_write_lease"]["lease_id"])
+        self.assertEqual(
+            receipt["checkout_snapshot_sha256"],
+            state["active_write_lease"]["scope_authorization"]["checkout_snapshot_sha256"],
+        )
+        after_recovery = self.full_status()
+        self.assertNotEqual(
+            "recover_legacy_engineer_scope_authorization",
+            after_recovery["next_action"]["action"],
+        )
+        self.assertEqual(1, len(self.state()["legacy_scope_recoveries"]))
+        self.assertEqual(
+            lifecycle_history,
+            self.state()["lifecycle_projection_reconciliations"],
+        )
+
+    def test_legacy_recovery_rejects_checkout_outside_original_allowlist(self) -> None:
+        lease_id, _, _ = self.install_legacy_engineer_lease()
+        outside = self.root / "src" / "outside.py"
+        outside.write_bytes(b"OUTSIDE = True\n")
+
+        result = self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
+        )
+        self.assertIn("authority", result.stderr.lower())
+        state = self.state()
+        self.assertEqual([], state["legacy_scope_recoveries"])
+        self.assertIsNone(state["slices"]["SLICE-001"]["scope_pre_edit_check"])
+
+    def test_legacy_recovery_rejects_snapshot_tampering(self) -> None:
+        self.assert_legacy_recovery_tampering_rejected("snapshot")
+
+    def test_legacy_recovery_rejects_capsule_tampering(self) -> None:
+        self.assert_legacy_recovery_tampering_rejected("capsule")
+
+    def test_legacy_recovery_rejects_base_revision_tampering(self) -> None:
+        self.assert_legacy_recovery_tampering_rejected("base")
+
+    def test_legacy_recovery_command_replay_fails_closed(self) -> None:
+        lease_id, _, _ = self.install_legacy_engineer_lease()
+        self.src.write_bytes(b"VALUE = 1\r\n# lf\n# crlf\r\n")
+        self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "engineer-1", "--slice-id", "SLICE-001",
+        )
+        before = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+        replay = self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "engineer-1", "--slice-id", "SLICE-001",
+            expected=2,
+        )
+        self.assertIn("replay", replay.stderr.lower())
+        self.assertEqual(
+            before,
+            (self.root / ".agentic-pipeline" / "state.json").read_bytes(),
+        )
+        mismatch = self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "different-owner", "--slice-id", "SLICE-001", expected=2,
+        )
+        self.assertIn("replay", mismatch.stderr.lower())
+
+    def test_legacy_recovery_rejects_tampered_audit_receipt(self) -> None:
+        lease_id, _, _ = self.install_legacy_engineer_lease()
+        self.src.write_bytes(b"VALUE = 1\r\n# lf\n# crlf\r\n")
+        self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "engineer-1", "--slice-id", "SLICE-001",
+        )
+        summary = self.state()["legacy_scope_recoveries"][-1]
+        receipt_path = self.root / summary["path"]
+        receipt_path.write_bytes(receipt_path.read_bytes() + b" ")
+        result = self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
+        )
+        self.assertIn("one-shot", result.stderr.lower())
+
+    def test_legacy_recovery_orphan_receipt_retry_is_deterministic(self) -> None:
+        lease_id, _, _ = self.install_legacy_engineer_lease()
+        self.src.write_bytes(b"VALUE = 1\r\n# lf\n# crlf\r\n")
+        original_save = runtime_controller.save_runtime
+
+        def fail_after_receipt(*_args, **_kwargs):
+            raise runtime_controller.PipelineError("simulated crash after receipt")
+
+        runtime_controller.save_runtime = fail_after_receipt
+        try:
+            args = type("Args", (), {
+                "project_root": str(self.root),
+                "lease_id": lease_id,
+                "owner_id": "engineer-1",
+                "slice_id": "SLICE-001",
+            })()
+            with self.assertRaisesRegex(
+                runtime_controller.PipelineError, "simulated crash after receipt"
+            ):
+                runtime_controller.cmd_recover_legacy_engineer_scope(args)
+        finally:
+            runtime_controller.save_runtime = original_save
+
+        receipt_path = (
+            self.root / "tests" / FEATURE / "verification" / "controller"
+            / "legacy-scope-recovery-0001.json"
+        )
+        orphan_bytes = receipt_path.read_bytes()
+        self.assertEqual([], self.state()["legacy_scope_recoveries"])
+        result = json.loads(self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "engineer-1", "--slice-id", "SLICE-001",
+        ).stdout)
+        self.assertEqual("LSR-0001", result["receipt_id"])
+        self.assertEqual(orphan_bytes, receipt_path.read_bytes())
+        self.assertEqual(1, len(self.state()["legacy_scope_recoveries"]))
+
+    def test_legacy_recovery_rejects_receipt_symlink_outside_root(self) -> None:
+        lease_id, _, _ = self.install_legacy_engineer_lease()
+        self.src.write_bytes(b"VALUE = 1\r\n# lf\n# crlf\r\n")
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_target = Path(outside.name) / "outside-receipt.json"
+        sentinel = b'{"outside":"unchanged"}\n'
+        outside_target.write_bytes(sentinel)
+        receipt_path = (
+            self.root / "tests" / FEATURE / "verification" / "controller"
+            / "legacy-scope-recovery-0001.json"
+        )
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            receipt_path.symlink_to(outside_target)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+
+        result = self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
+        )
+        self.assertIn("symlink", result.stderr.lower())
+        self.assertEqual(sentinel, outside_target.read_bytes())
+        self.assertEqual([], self.state()["legacy_scope_recoveries"])
+
+    def test_legacy_recovery_rejects_broken_receipt_symlink(self) -> None:
+        lease_id, _, _ = self.install_legacy_engineer_lease()
+        outside = tempfile.TemporaryDirectory()
+        outside_path = Path(outside.name)
+        outside.cleanup()
+        broken_target = outside_path / "missing-receipt.json"
+        receipt_path = (
+            self.root / "tests" / FEATURE / "verification" / "controller"
+            / "legacy-scope-recovery-0001.json"
+        )
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            receipt_path.symlink_to(broken_target)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+
+        result = self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
+        )
+        self.assertIn("symlink", result.stderr.lower())
+        self.assertFalse(broken_target.exists())
+
+    def test_legacy_recovery_rejects_controller_root_symlink_outside(self) -> None:
+        lease_id, _, _ = self.install_legacy_engineer_lease()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_root = Path(outside.name)
+        marker = outside_root / "marker.txt"
+        marker.write_bytes(b"unchanged\n")
+        controller_root = (
+            self.root / "tests" / FEATURE / "verification" / "controller"
+        )
+        controller_root.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            controller_root.symlink_to(outside_root, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"directory symlink creation unavailable: {exc}")
+
+        result = self.cli(
+            "recover-legacy-engineer-scope", "--lease-id", lease_id,
+            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
+        )
+        self.assertIn("escapes", result.stderr.lower())
+        self.assertEqual(b"unchanged\n", marker.read_bytes())
+        self.assertEqual([], self.state()["legacy_scope_recoveries"])
+
+    def test_prepare_engineer_continuation_creates_exact_bound_handoff(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        before = self.state()
+
+        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertEqual("slice_engineering", prepared["phase"])
+        self.assertEqual("engineer-1", prepared["owner_id"])
+        self.assertEqual("SLICE-001", prepared["slice_id"])
+        self.assertEqual(before["revision"], prepared["revision"])
+        state = self.state()
+        receipt = state["slices"]["SLICE-001"]["scope_pre_edit_check"]
+        lease = state["active_write_lease"]
+        capsule_path = self.root / prepared["capsule"]["path"]
+        capsule = json.loads(capsule_path.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["checkout_snapshot_sha256"], prepared["scope_receipt"]["checkout_snapshot_sha256"])
+        self.assertEqual(receipt["checkout_snapshot_sha256"], lease["scope_authorization"]["checkout_snapshot_sha256"])
+        self.assertEqual(lease["lease_id"], prepared["lease"]["id"])
+        self.assertEqual(capsule["capsule_id"], prepared["capsule"]["id"])
+        self.assertEqual(capsule["capsule_sha256"], prepared["capsule"]["capsule_sha256"])
+        self.assertEqual(self.sha(capsule_path), prepared["capsule"]["sha256"])
+        self.assertEqual(before["revision"], capsule["revisions"]["revision"])
+        self.assertEqual(before["product_revision"], capsule["revisions"]["product_revision"])
+        self.assertEqual(before["support_revision"], capsule["revisions"]["support_revision"])
+        self.assertEqual(before["evidence_revision"], capsule["revisions"]["evidence_revision"])
+        self.assertEqual([], capsule["finding_ids"])
+        self.assertEqual(
+            ["src/contracts.py", "src/feature.py"], sorted(capsule["allowed_paths"])
+        )
+        self.assertIn("src/commerce/**", capsule["exclusions"])
+        self.assertIn("commerce", capsule["exclusions"])
+        for output in capsule["output_paths"]:
+            self.assertFalse(Path(output).is_absolute())
+            self.assertTrue(output.startswith(f"tests/{FEATURE}/verification/controller/"))
+        self.assertEqual(
+            {
+                "action": "dispatch_engineer",
+                "role": "engineer",
+                "worker_id": "engineer-1",
+                "phase": "slice_engineering",
+                "slice_id": "SLICE-001",
+                "capsule_path": prepared["capsule"]["path"],
+                "lease_id": lease["lease_id"],
+                "stop_condition": capsule["stop_condition"],
+            },
+            prepared["handoff"],
+        )
+
+    def test_prepare_engineer_continuation_is_idempotent_without_duplicate_artifacts(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        first = json.loads(self.cli("prepare-engineer-continuation").stdout)
+        state_bytes = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+        findings_bytes = (self.root / ".agentic-pipeline" / "findings.json").read_bytes()
+        artifacts = {
+            self.rel(path): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file()
+        }
+
+        second = json.loads(self.cli("prepare-engineer-continuation").stdout)
+
+        self.assertEqual("already_prepared", second["status"])
+        for key in ("phase", "owner_id", "slice_id", "revision", "scope_receipt", "capsule", "lease", "handoff"):
+            self.assertEqual(first[key], second[key])
+        self.assertEqual(state_bytes, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+        self.assertEqual(findings_bytes, (self.root / ".agentic-pipeline" / "findings.json").read_bytes())
+        self.assertEqual(
+            artifacts,
+            {
+                self.rel(path): path.read_bytes()
+                for path in self.root.rglob("*")
+                if path.is_file()
+            },
+        )
+
+    def test_prepare_engineer_continuation_refreshes_stale_capsule_after_reconciliation(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        state = self.state()
+        state["tests_path"] = str(
+            self.root / "tests" / "deterministic-feature-dashboard-validation"
+        )
+        self.write_state(state)
+        stale_path = self.capsule(
+            "engineer", "engineering", "engineer-1", allowed=("src/feature.py",)
+        )
+        stale_value = json.loads((self.root / stale_path).read_text(encoding="utf-8"))
+        self.apply_lifecycle_projection_drift(fixture)
+
+        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
+
+        state = self.state()
+        stale_record = next(
+            item for item in state["context_capsules"] if item["capsule_id"] == stale_value["capsule_id"]
+        )
+        self.assertEqual("stale", stale_record["status"])
+        self.assertNotEqual(stale_path, prepared["capsule"]["path"])
+        fresh = json.loads((self.root / prepared["capsule"]["path"]).read_text(encoding="utf-8"))
+        self.assertEqual(state["revision"], fresh["revisions"]["revision"])
+        self.assertEqual(fixture["finding_ids"], fresh["finding_ids"])
+
+    def test_prepare_engineer_continuation_recovers_eligible_legacy_lease_without_rollback(self) -> None:
+        lease_id, capsule_path, _ = self.install_legacy_engineer_lease()
+        candidate = b"VALUE = 81\r\n# lf\n# crlf\r\n"
+        self.src.write_bytes(candidate)
+        before_history = list(self.state()["write_lease_history"])
+
+        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
+
+        state = self.state()
+        self.assertEqual("already_prepared", prepared["status"])
+        self.assertEqual(lease_id, prepared["lease"]["id"])
+        self.assertEqual(capsule_path, prepared["capsule"]["path"])
+        self.assertEqual(candidate, self.src.read_bytes())
+        self.assertEqual(lease_id, state["active_write_lease"]["lease_id"])
+        self.assertEqual(before_history, state["write_lease_history"])
+        self.assertEqual(1, len(state["legacy_scope_recoveries"]))
+        self.assertEqual("LSR-0001", prepared["scope_receipt"]["id"])
+        self.assertEqual(
+            ["src/feature.py"],
+            state["legacy_scope_recoveries"][0]["observed_changed_paths"],
+        )
+
+    def test_prepare_engineer_continuation_binds_remediation_findings_owner_slice_and_evidence(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        state = self.state()
+        state["tests_path"] = str(
+            self.root / "tests" / "deterministic-feature-dashboard-validation"
+        )
+        self.write_state(state)
+
+        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
+
+        state = self.state()
+        capsule = json.loads(
+            (self.root / prepared["capsule"]["path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(fixture["finding_ids"], capsule["finding_ids"])
+        self.assertEqual(state["engineering_owner_id"], capsule["worker_id"])
+        self.assertEqual("SLICE-001", prepared["slice_id"])
+        self.assertEqual(state["revision"], prepared["revision"])
+        expected_evidence = {
+            item["path"]: item["sha256"] for item in capsule["evidence"]
+        }
+        planned = state["coverage"]["SLICE-001"]["planned_manifest"]
+        self.assertEqual(planned["sha256"], expected_evidence[planned["path"]])
+        lease = state["active_write_lease"]
+        snapshot = state["lease_snapshots"][lease["lease_id"]]
+        self.assertEqual(capsule["capsule_sha256"], snapshot["capsule_sha256"])
+        self.assertEqual(capsule["allowed_paths"], lease["allowed_paths"])
+        self.assertEqual(capsule["exclusions"], lease["exclusions"])
+
+    def test_prepare_engineer_continuation_touchpoint_symbols_do_not_restrict_owned_path(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
+        capsule_path = prepared["capsule"]["path"]
+        capsule = json.loads((self.root / capsule_path).read_text(encoding="utf-8"))
+        # Touchpoint symbols are enforced by the slice scope contract. They must
+        # not become a lease-global restriction on the separately owned file.
+        self.assertEqual([], capsule["allowed_symbols"])
+        self.src.write_text("VALUE = 1\n", encoding="utf-8")
+        state = self.state()
+        semantic_output, report_output = capsule["output_paths"]
+        semantic_value = json.loads(
+            (self.root / self.semantic_packet_for_change(self.src)).read_text(
+                encoding="utf-8"
+            )
+        )
+        semantic_path = self.root / semantic_output
+        semantic_path.parent.mkdir(parents=True, exist_ok=True)
+        semantic_path.write_text(json.dumps(semantic_value), encoding="utf-8")
+        report_path = self.root / report_output
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps({"status": "pass"}), encoding="utf-8")
+
+        completed = json.loads(
+            self.cli(
+                "engineer-complete",
+                "--run-id",
+                "one-command-owned-path-run",
+                "--owner-id",
+                "engineer-1",
+                "--lease-id",
+                state["active_write_lease"]["lease_id"],
+                "--capsule",
+                capsule_path,
+                "--slice-id",
+                "SLICE-001",
+                "--engineering-status",
+                "pass",
+                "--machine-checks",
+                "pass",
+                "--diff-inspection",
+                "pass",
+                "--semantic-handoff",
+                semantic_output,
+                "--report",
+                report_output,
+            ).stdout
+        )
+        self.assertEqual("slice_coverage_finalization", completed["phase"])
+
+    def test_prepare_engineer_continuation_respects_higher_priority_checkpoint(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        state = self.state()
+        state["worker_budget"]["status"] = "checkpoint_required"
+        state["worker_budget"]["checkpoint_causes"] = ["full_review_waves"]
+        state["worker_budget"]["reason"] = "full review wave limit reached"
+        self.write_state(state)
+        before = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+
+        result = self.cli("prepare-engineer-continuation", expected=2)
+
+        self.assertIn("budget checkpoint", result.stderr.lower())
+        self.assertEqual(before, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+        self.assertIsNone(self.state()["active_write_lease"])
+
+    def test_prepare_engineer_continuation_allows_assigned_owner_past_worker_count_checkpoint(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        state = self.state()
+        state["phase"] = "engineering"
+        state["worker_budget"]["status"] = "checkpoint_required"
+        state["worker_budget"]["checkpoint_causes"] = ["workers"]
+        state["worker_budget"]["reason"] = "new worker budget reached"
+        self.write_state(state)
+        route = self.full_status()["next_action"]
+        self.assertEqual("run_slice_scope_check", route["action"])
+
+        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertEqual("engineer-1", prepared["owner_id"])
+
+    def test_prepare_engineer_continuation_stops_at_user_gate(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        state = self.state()
+        state["phase"] = "scope_expansion_hold"
+        state["scope_guard"]["hold"] = {
+            "reason": "product scope approval required",
+            "requested_paths": ["src/new-product-area.py"],
+        }
+        self.write_state(state)
+        before = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+
+        result = self.cli("prepare-engineer-continuation", expected=2)
+
+        self.assertIn("slice_engineering or engineering", result.stderr)
+        self.assertEqual(before, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+        self.assertIsNone(self.state()["active_write_lease"])
+
+    def test_prepare_engineer_continuation_rejects_tampered_prepared_capsule(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
+        capsule_path = self.root / prepared["capsule"]["path"]
+        capsule_path.write_bytes(capsule_path.read_bytes() + b" ")
+        frozen = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+
+        result = self.cli("prepare-engineer-continuation", expected=2)
+
+        self.assertIn("capsule", result.stderr.lower())
+        self.assertEqual(frozen, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+        self.assertEqual(prepared["lease"]["id"], self.state()["active_write_lease"]["lease_id"])
+
+    def test_prepare_engineer_continuation_rejects_tampered_prepared_scope_binding(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
+        state = self.state()
+        state["slices"]["SLICE-001"]["scope_pre_edit_check"][
+            "checkout_snapshot_sha256"
+        ] = "0" * 64
+        self.write_state(state)
+        frozen = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+
+        result = self.cli("prepare-engineer-continuation", expected=2)
+
+        self.assertIn("scope", result.stderr.lower())
+        self.assertEqual(frozen, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+        self.assertEqual(prepared["lease"]["id"], self.state()["active_write_lease"]["lease_id"])
+
+    def test_prepare_engineer_continuation_rejects_partial_direct_capsule_binding(self) -> None:
+        for missing in ("capsule_id", "capsule_path", "capsule_sha256"):
+            with self.subTest(missing=missing):
+                self.tearDown()
+                self.setUp()
+                self.initialize()
+                self.plan_coverage()
+                self.cli("prepare-engineer-continuation")
+                state = self.state()
+                state["active_write_lease"].pop(missing)
+                self.write_state(state)
+                frozen = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+
+                result = self.cli("prepare-engineer-continuation", expected=2)
+
+                self.assertIn("capsule", result.stderr.lower())
+                self.assertEqual(
+                    frozen,
+                    (self.root / ".agentic-pipeline" / "state.json").read_bytes(),
+                )
+
+    def test_engineer_complete_rejects_partial_auto_prepared_capsule_binding(self) -> None:
+        for missing in ("capsule_id", "capsule_path", "capsule_sha256"):
+            with self.subTest(missing=missing):
+                self.tearDown()
+                self.setUp()
+                self.initialize()
+                self.plan_coverage()
+                prepared = json.loads(
+                    self.cli("prepare-engineer-continuation").stdout
+                )
+                capsule_relative = prepared["capsule"]["path"]
+                capsule = json.loads(
+                    (self.root / capsule_relative).read_text(encoding="utf-8")
+                )
+                self.src.write_text("VALUE = 1\n", encoding="utf-8")
+                semantic_output, report_output = capsule["output_paths"]
+                semantic_value = json.loads(
+                    (
+                        self.root / self.semantic_packet_for_change(self.src)
+                    ).read_text(encoding="utf-8")
+                )
+                semantic_path = self.root / semantic_output
+                semantic_path.parent.mkdir(parents=True, exist_ok=True)
+                semantic_path.write_text(
+                    json.dumps(semantic_value), encoding="utf-8"
+                )
+                report_path = self.root / report_output
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(
+                    json.dumps({"status": "pass"}), encoding="utf-8"
+                )
+                state = self.state()
+                lease_id = state["active_write_lease"]["lease_id"]
+                state["active_write_lease"].pop(missing)
+                self.write_state(state)
+
+                result = self.cli(
+                    "engineer-complete",
+                    "--run-id",
+                    f"partial-direct-binding-{missing}",
+                    "--owner-id",
+                    "engineer-1",
+                    "--lease-id",
+                    lease_id,
+                    "--capsule",
+                    capsule_relative,
+                    "--slice-id",
+                    "SLICE-001",
+                    "--engineering-status",
+                    "pass",
+                    "--machine-checks",
+                    "pass",
+                    "--diff-inspection",
+                    "pass",
+                    "--semantic-handoff",
+                    semantic_output,
+                    "--report",
+                    report_output,
+                    expected=2,
+                )
+
+                self.assertIn("direct capsule binding is incomplete", result.stderr)
+                self.assertEqual(
+                    lease_id, self.state()["active_write_lease"]["lease_id"]
+                )
+
+    def test_prepare_engineer_continuation_repeated_drift_failure_is_bounded_and_nonmutating(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        self.prd.write_text(self.prd.read_text(encoding="utf-8") + "\nsource drift\n", encoding="utf-8")
+        before = {
+            self.rel(path): path.read_bytes()
+            for path in self.root.rglob("*")
+            if path.is_file()
+        }
+
+        first = self.cli("prepare-engineer-continuation", expected=2)
+        second = self.cli("prepare-engineer-continuation", expected=2)
+
+        self.assertEqual(first.stderr, second.stderr)
+        self.assertIn("drift", first.stderr.lower())
+        self.assertEqual(
+            before,
+            {
+                self.rel(path): path.read_bytes()
+                for path in self.root.rglob("*")
+                if path.is_file()
+            },
+        )
+
+    def test_prepare_engineer_continuation_reprepares_after_clean_incomplete_release(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        first = json.loads(self.cli("prepare-engineer-continuation").stdout)
+        self.cli(
+            "release-write-lease",
+            "--lease-id",
+            first["lease"]["id"],
+            "--result",
+            "incomplete",
+            "--reason",
+            "worker stopped before editing",
+        )
+        self.assertIsNone(self.state()["active_write_lease"])
+
+        second = json.loads(self.cli("prepare-engineer-continuation").stdout)
+
+        self.assertEqual("prepared", second["status"])
+        self.assertNotEqual(first["lease"]["id"], second["lease"]["id"])
+        self.assertNotEqual(first["capsule"]["id"], second["capsule"]["id"])
+        self.assertNotEqual(first["capsule"]["path"], second["capsule"]["path"])
+        self.assertTrue((self.root / first["capsule"]["path"]).is_file())
+        self.assertTrue((self.root / second["capsule"]["path"]).is_file())
+        second_capsule = json.loads(
+            (self.root / second["capsule"]["path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(self.state()["revision"], second_capsule["revisions"]["revision"])
+        self.assertEqual("dispatch_engineer", second["handoff"]["action"])
+        self.assertEqual(
+            second["lease"]["id"], self.state()["active_write_lease"]["lease_id"]
+        )
+
+    def test_prepare_engineer_continuation_rejects_controller_artifact_root_symlink(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_root = Path(outside.name)
+        controller_root = (
+            self.root / "tests" / FEATURE / "verification" / "controller"
+        )
+        controller_root.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            controller_root.symlink_to(outside_root, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"directory symlink creation unavailable: {exc}")
+        frozen = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+
+        result = self.cli("prepare-engineer-continuation", expected=2)
+
+        self.assertTrue(
+            "inside the project root" in result.stderr.lower()
+            or "escapes" in result.stderr.lower()
+        )
+        self.assertEqual(frozen, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+        self.assertEqual([], list(outside_root.iterdir()))
+
+    def test_prepare_engineer_continuation_adopts_exact_orphan_capsule_after_save_crash(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        before = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+        original_save = runtime_controller.save_runtime
+
+        def fail_after_capsule(*_args, **_kwargs):
+            raise runtime_controller.PipelineError("simulated continuation save crash")
+
+        runtime_controller.save_runtime = fail_after_capsule
+        try:
+            args = type("Args", (), {"project_root": str(self.root)})()
+            with self.assertRaisesRegex(
+                runtime_controller.PipelineError, "simulated continuation save crash"
+            ):
+                runtime_controller.cmd_prepare_engineer_continuation(args)
+        finally:
+            runtime_controller.save_runtime = original_save
+
+        self.assertEqual(before, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+        orphan_paths = list(
+            (self.root / "tests" / FEATURE / "verification" / "controller").glob(
+                "engineer-continuation-*.json"
+            )
+        )
+        self.assertEqual(1, len(orphan_paths))
+        orphan_bytes = orphan_paths[0].read_bytes()
+
+        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertEqual(orphan_paths[0], self.root / prepared["capsule"]["path"])
+        self.assertEqual(orphan_bytes, orphan_paths[0].read_bytes())
+        self.assertEqual(2, len(self.state()["context_capsules"]))
+
+    def test_prepare_engineer_continuation_rejects_tampered_orphan_capsule(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        original_save = runtime_controller.save_runtime
+
+        def fail_after_capsule(*_args, **_kwargs):
+            raise runtime_controller.PipelineError("simulated continuation save crash")
+
+        runtime_controller.save_runtime = fail_after_capsule
+        try:
+            args = type("Args", (), {"project_root": str(self.root)})()
+            with self.assertRaises(runtime_controller.PipelineError):
+                runtime_controller.cmd_prepare_engineer_continuation(args)
+        finally:
+            runtime_controller.save_runtime = original_save
+        orphan_path = next(
+            (self.root / "tests" / FEATURE / "verification" / "controller").glob(
+                "engineer-continuation-*.json"
+            )
+        )
+        orphan = json.loads(orphan_path.read_text(encoding="utf-8"))
+        orphan["stop_condition"] = "tampered orphan"
+        orphan_path.write_text(json.dumps(orphan), encoding="utf-8")
+        frozen = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+
+        result = self.cli("prepare-engineer-continuation", expected=2)
+
+        self.assertIn("capsule", result.stderr.lower())
+        self.assertEqual(frozen, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+        self.assertIsNone(self.state()["active_write_lease"])
+
+    def test_prepare_engineer_continuation_preserves_rebaseline_candidate_parity(self) -> None:
+        self.initialize()
+        self.engineer(forbidden_path=True)
+        held = self.state()
+        text = self.plan.read_text(encoding="utf-8")
+        text = text.replace(
+            "- editable_paths: src/feature.py",
+            "- editable_paths: src/feature.py, src/commerce/driveby.py",
+        )
+        text = text.replace("- excluded_components: commerce", "- excluded_components: payments")
+        text = text.replace("- excluded_paths: src/commerce/**", "- excluded_paths: src/payments/**")
+        text = text.replace(
+            "- scope_baseline_revision: base-0",
+            f"- scope_baseline_revision: {held['revision']}",
+        )
+        self.plan.write_text(text, encoding="utf-8")
+        planning_path = self.root / ".agentic-pipeline" / "development-plan-state.json"
+        planning = json.loads(planning_path.read_text(encoding="utf-8"))
+        planning["approval"]["approved_sha256"] = self.sha(self.plan)
+        planning_path.write_text(json.dumps(planning), encoding="utf-8")
+        self.cli(
+            "rebaseline-scope",
+            "--plan-sha256",
+            self.sha(self.plan),
+            "--user-scope-approval",
+            "USER-SCOPE-APPROVAL-CONTINUE",
+        )
+        before = self.state()["scope_guard"]["rebaseline_candidate"]
+        before_bytes = self.src.read_bytes()
+
+        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
+
+        state = self.state()
+        carried = state["scope_guard"]["rebaseline_candidate"]
+        self.assertEqual(before, carried)
+        self.assertEqual(before_bytes, self.src.read_bytes())
+        lease = state["active_write_lease"]
+        snapshot = state["lease_snapshots"][lease["lease_id"]]
+        self.assertTrue(lease["rebaseline_carried"])
+        self.assertTrue(snapshot["rebaseline_carried"])
+        self.assertEqual(carried["snapshot"]["checkout"], snapshot["checkout"])
+        self.assertEqual(carried["snapshot"]["checkout_text"], snapshot["checkout_text"])
+        self.assertNotIn(prepared["capsule"]["path"], snapshot["checkout"])
+        self.assertEqual(lease["lease_id"], prepared["lease"]["id"])
+        self.assertEqual("dispatch_engineer", prepared["next_action"]["action"])
 
     def test_engineering_pass_releases_lease_but_manual_qa_remains_pending(self) -> None:
         self.initialize()
@@ -1417,6 +2933,319 @@ class PipelineSchema9Tests(unittest.TestCase):
         result = self.cli("status", expected=2)
         self.assertIn("revision inventory drifted", result.stderr)
 
+    def test_status_reconciles_exact_lifecycle_dashboard_date_and_preserves_remediation(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        before = fixture["state"]
+        old_capsule = self.capsule(
+            "engineer",
+            "engineering",
+            "engineer-before-lifecycle-refresh",
+            allowed=(self.rel(fixture["dashboard"]),),
+        )
+        state = self.state()
+        self.cli(
+            "slice-scope-check", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+        )
+        before = self.state()
+        preserved = {
+            "phase": before["phase"],
+            "active_remediation_batch": before["active_remediation_batch"],
+            "remediation_queue": before["remediation_queue"],
+            "engineering_owner_id": before["engineering_owner_id"],
+            "owner_by_slice": before["owner_by_slice"],
+            "product_revalidation": before["product_revalidation"],
+            "convergence": before["convergence"],
+        }
+        self.apply_lifecycle_projection_drift(fixture)
+
+        status = json.loads(self.cli("status").stdout)
+        after = self.state()
+        self.assertEqual("engineering", status["phase"])
+        self.assertEqual("run_slice_scope_check", status["next_action"]["action"])
+        self.assertEqual("SLICE-001", status["next_action"]["active_slice"])
+        self.assertEqual(after["revision"], status["next_action"]["base_revision"])
+        self.assertFalse(status["next_action"]["user_input_required"])
+        for field, expected in preserved.items():
+            self.assertEqual(expected, after[field], field)
+        self.assertEqual(fixture["finding_ids"], status["active_ids"]["remediation_finding_ids"]["ids"])
+        self.assertNotEqual(before["revision"], after["revision"])
+        self.assertNotEqual(before["product_revision"], after["product_revision"])
+        self.assertEqual(before["support_revision"], after["support_revision"])
+        self.assertEqual(before["evidence_revision"], after["evidence_revision"])
+
+        reconciliations = after["lifecycle_projection_reconciliations"]
+        self.assertEqual(1, len(reconciliations))
+        receipt = reconciliations[0]
+        self.assertEqual("LPR-0001", receipt["receipt_id"])
+        self.assertEqual("lifecycle_generated_dashboard_date", receipt["kind"])
+        self.assertEqual("2026-08-11", receipt["before_date"])
+        self.assertEqual("2026-08-12", receipt["after_date"])
+        self.assertEqual(fixture["finding_ids"], receipt["finding_ids"])
+        self.assertTrue(receipt["invalidated_scope_pre_edit_check"])
+        receipt_path = self.root / receipt["path"]
+        self.assertTrue(receipt_path.is_file())
+        self.assertEqual(receipt["sha256"], self.sha(receipt_path))
+        receipt_value = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(before["revision"], receipt_value["before_revisions"]["revision"])
+        self.assertEqual(after["revision"], receipt_value["after_revisions"]["revision"])
+
+        old_record = next(
+            item
+            for item in after["context_capsules"]
+            if item["path"] == old_capsule
+        )
+        self.assertEqual("stale", old_record["status"])
+        self.assertIn("revision", self.cli("context-capsule-check", "--capsule", old_capsule, expected=2).stderr)
+        old_credit = after["component_review_credits"][0]
+        self.assertFalse(old_credit["valid"])
+        self.assertEqual(
+            "lifecycle_projection_product_hash_drift",
+            old_credit["invalidation_reason"],
+        )
+
+        fresh_capsule = self.capsule(
+            "engineer",
+            "engineering",
+            "engineer-after-lifecycle-refresh",
+            allowed=(self.rel(fixture["dashboard"]),),
+        )
+        capsule_value = json.loads((self.root / fresh_capsule).read_text(encoding="utf-8"))
+        self.assertEqual(fixture["finding_ids"], capsule_value["finding_ids"])
+        evidence = {item["path"]: item["sha256"] for item in capsule_value["evidence"]}
+        self.assertEqual(receipt["sha256"], evidence[receipt["path"]])
+
+        first_state = self.state()
+        self.cli("status")
+        second_state = self.state()
+        self.assertEqual(
+            first_state["lifecycle_projection_reconciliations"],
+            second_state["lifecycle_projection_reconciliations"],
+        )
+        self.assertEqual(first_state["revision"], second_state["revision"])
+
+    def assert_lifecycle_projection_drift_rejected(
+        self, fixture: dict, expected_message: str = "revision inventory drifted"
+    ) -> None:
+        frozen = self.state()
+        result = self.cli("status", expected=2)
+        self.assertIn(expected_message, result.stderr)
+        after = self.state()
+        self.assertEqual(frozen["revision"], after["revision"])
+        self.assertEqual(
+            frozen.get("lifecycle_projection_reconciliations", []),
+            after.get("lifecycle_projection_reconciliations", []),
+        )
+
+    def test_lifecycle_reconciliation_rejects_second_product_path_drift(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        self.apply_lifecycle_projection_drift(fixture)
+        self.src.write_text("VALUE = 404\n", encoding="utf-8")
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_dashboard_title_edit(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        self.apply_lifecycle_projection_drift(fixture, title="Manually Edited Title")
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_dashboard_status_edit(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        self.apply_lifecycle_projection_drift(fixture, status="🟩 Готова")
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_dashboard_link_edit(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        self.apply_lifecycle_projection_drift(fixture, link="./wrong-feature/")
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_manifest_date_mismatch(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        self.apply_lifecycle_projection_drift(
+            fixture, manifest_updated_at="2026-08-13T05:02:23+00:00"
+        )
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_support_drift(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        self.apply_lifecycle_projection_drift(fixture)
+        fixture["support"].write_text("support-v2\n", encoding="utf-8")
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_evidence_drift(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        self.apply_lifecycle_projection_drift(fixture)
+        self.test_source.write_text("def test_feature(): assert False\n", encoding="utf-8")
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_active_lease(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        state = self.state()
+        state["active_write_lease"] = {"status": "active", "lease_id": "LEASE-BUSY"}
+        self.write_state(state)
+        self.apply_lifecycle_projection_drift(fixture)
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_pending_engineer_completion(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        state = self.state()
+        state["pending_engineer_completion"] = {"run_id": "RUN-PENDING"}
+        self.write_state(state)
+        self.apply_lifecycle_projection_drift(fixture)
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_non_engineering_phase(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        state = self.state()
+        state["phase"] = "convergence"
+        self.write_state(state)
+        self.apply_lifecycle_projection_drift(fixture)
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_mismatched_remediation_queue(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        state = self.state()
+        state["remediation_queue"][0]["finding_ids"] = ["TF0008-CONV-001"]
+        self.write_state(state)
+        self.apply_lifecycle_projection_drift(fixture)
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_incomplete_open_finding_batch(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        findings_path = self.root / ".agentic-pipeline" / "findings.json"
+        findings = json.loads(findings_path.read_text(encoding="utf-8"))
+        findings["items"].append(
+            {
+                "id": "TF0008-CONV-005",
+                "status": "open",
+                "severity": "major",
+                "source": "convergence",
+                "revision": self.state()["revision"],
+                "finding_kind": "product",
+                "origin_slice": "SLICE-001",
+                "remediation_route": "SLICE-001",
+                "blocking": True,
+                "remediation_required": True,
+            }
+        )
+        findings_path.write_text(json.dumps(findings), encoding="utf-8")
+        self.apply_lifecycle_projection_drift(fixture)
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_rejects_multiple_active_feature_manifests(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        second = (
+            fixture["dashboard"].parent / "another-active-feature" / "feature.json"
+        )
+        second.parent.mkdir(parents=True, exist_ok=True)
+        second.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 2,
+                    "id": "TF-9999",
+                    "slug": "another-active-feature",
+                    "activity": "active",
+                    "startedAt": "2026-08-12T00:00:00+00:00",
+                    "updatedAt": "2026-08-12T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.apply_lifecycle_projection_drift(fixture)
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_lifecycle_reconciliation_recovers_exact_orphan_receipt_after_crash(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        self.apply_lifecycle_projection_drift(fixture)
+        original = self.state()
+        findings = json.loads(
+            (self.root / ".agentic-pipeline" / "findings.json").read_text(encoding="utf-8")
+        )
+        in_memory = json.loads(json.dumps(original))
+        computed = runtime_controller.compute_inventory_revisions(self.root, in_memory)
+        self.assertTrue(
+            runtime_controller.try_reconcile_lifecycle_projection_drift(
+                self.root, in_memory, findings, computed
+            )
+        )
+        self.assertEqual([], self.state()["lifecycle_projection_reconciliations"])
+        receipt_path = (
+            self.root
+            / "tests"
+            / FEATURE
+            / "verification"
+            / "controller"
+            / "lifecycle-projection-reconciliation-0001.json"
+        )
+        self.assertTrue(receipt_path.is_file())
+
+        self.cli("status")
+        recovered = self.state()
+        self.assertEqual(1, len(recovered["lifecycle_projection_reconciliations"]))
+        self.assertEqual("LPR-0001", recovered["lifecycle_projection_reconciliations"][0]["receipt_id"])
+        self.cli("status")
+        self.assertEqual(
+            1, len(self.state()["lifecycle_projection_reconciliations"])
+        )
+
+    def test_lifecycle_reconciliation_rejects_tampered_orphan_receipt_replay(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        self.apply_lifecycle_projection_drift(fixture)
+        original = self.state()
+        findings = json.loads(
+            (self.root / ".agentic-pipeline" / "findings.json").read_text(encoding="utf-8")
+        )
+        in_memory = json.loads(json.dumps(original))
+        computed = runtime_controller.compute_inventory_revisions(self.root, in_memory)
+        self.assertTrue(
+            runtime_controller.try_reconcile_lifecycle_projection_drift(
+                self.root, in_memory, findings, computed
+            )
+        )
+        receipt_path = (
+            self.root
+            / "tests"
+            / FEATURE
+            / "verification"
+            / "controller"
+            / "lifecycle-projection-reconciliation-0001.json"
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["finding_ids"] = ["REPLAYED-DIFFERENT-BATCH"]
+        receipt_path.write_text(
+            json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
+    def test_legacy_lifecycle_reconciliation_accepts_bounded_unique_candidate(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        state = self.state()
+        state["revision_records"] = None
+        state["lifecycle_projection_guard"] = None
+        self.write_state(state)
+        self.apply_lifecycle_projection_drift(fixture)
+        self.cli("status")
+        self.assertEqual(1, len(self.state()["lifecycle_projection_reconciliations"]))
+
+    def test_legacy_lifecycle_reconciliation_rejects_excessive_date_candidates(self) -> None:
+        fixture = self.prepare_lifecycle_projection_recovery()
+        state = self.state()
+        state["revision_records"] = None
+        state["lifecycle_projection_guard"] = None
+        self.write_state(state)
+        manifest = json.loads(fixture["manifest"].read_text(encoding="utf-8"))
+        manifest["startedAt"] = "1900-01-01T00:00:00+00:00"
+        manifest["updatedAt"] = "2026-08-12T05:02:23+00:00"
+        fixture["manifest"].write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        fixture["dashboard"].write_text(
+            self.lifecycle_dashboard_text("2026-08-12"), encoding="utf-8"
+        )
+        self.assert_lifecycle_projection_drift_rejected(fixture)
+
     def test_ready_rehashes_inventory_before_considering_phase(self) -> None:
         self.initialize(research=False)
         self.plan.write_text(self.plan.read_text(encoding="utf-8") + "\nplan drift\n", encoding="utf-8")
@@ -1498,14 +3327,14 @@ class PipelineSchema9Tests(unittest.TestCase):
             "engineer", "slice_engineering", "engineer-1",
             allowed=("src/feature.py", "src/commerce/driveby.py"),
         )
-        self.cli(
-            "acquire-write-lease", "--role", "engineer", "--phase", "slice_engineering",
-            "--write-scope", "SLICE-001", "--worker-id", "engineer-1", "--capsule", fresh_capsule,
-        )
         state = self.state()
         self.cli(
             "slice-scope-check", "--slice-id", "SLICE-001", "--base-revision", state["revision"],
             "--owner-id", "engineer-1",
+        )
+        self.cli(
+            "acquire-write-lease", "--role", "engineer", "--phase", "slice_engineering",
+            "--write-scope", "SLICE-001", "--worker-id", "engineer-1", "--capsule", fresh_capsule,
         )
         carried = self.state()["scope_guard"]["rebaseline_candidate"]
         completed = json.loads(self.cli(
@@ -2340,20 +4169,27 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.implementation_complete()
         packet, authority_id, authority_digest = self.decision_packet()
         self.accept_user_authority(packet)
-        capsule = self.capsule(
-            "decision_recorder", "decision_recording", "recorder-late",
-            allowed=(self.rel(self.ledger),), outputs=(self.rel(self.ledger),),
-            authorities=(f"not_applicable={authority_digest}:{authority_id}",),
-        )
         state_path = self.root / ".agentic-pipeline" / "state.json"
         before = state_path.read_bytes()
         result = self.cli(
-            "acquire-write-lease", "--role", "decision_recorder",
-            "--phase", "decision_recording", "--write-scope", "ledger",
-            "--worker-id", "recorder-late", "--capsule", capsule, expected=2,
+            "context-capsule-create", "--role", "decision_recorder",
+            "--phase", "decision_recording", "--worker-id", "recorder-late",
+            "--plan-sha256", self.state()["development_plan_sha256"],
+            "--revision", self.state()["revision"],
+            "--authority", f"not_applicable={authority_digest}:{authority_id}",
+            "--allowed-path", self.rel(self.ledger),
+            "--output-path", self.rel(self.ledger),
+            "--stop-condition", "Record only the accepted decision",
+            "--max-authority-files", "5", "--max-evidence-files", "5",
+            "--max-total-files", "10", "--max-payload-bytes", "500000",
+            "--max-estimated-tokens", "200000", "--output",
+            f"tests/{FEATURE}/verification/late-decision-capsule.json", expected=2,
         )
-        self.assertIn("before implementation begins", result.stderr)
+        self.assertIn("Context capsule activation is off-phase", result.stderr)
         self.assertEqual(before, state_path.read_bytes())
+        self.assertFalse(
+            (self.root / f"tests/{FEATURE}/verification/late-decision-capsule.json").exists()
+        )
         self.assertEqual("pass", self.state()["implementation_state"]["status"])
 
     def test_removed_legacy_recovery_command_cannot_persist_caller_hashes(self) -> None:
@@ -2735,6 +4571,515 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.write_state(state)
         result = self.cli("ready", expected=1)
         self.assertIn("schema-2 terminal handoff is stale or incomplete", result.stdout)
+
+    def test_final_review_targeted_qa_closure_preserves_clean_through_ready(self) -> None:
+        fixture = self.prepare_targeted_qa_closure_ready_state()
+        state = self.state()
+        clean = state["engineer_clean"]
+        closure = state["closure_review"]
+
+        self.assertEqual("ready", state["phase"])
+        self.assertEqual("targeted_final_review_closure_chain", clean["source"])
+        self.assertEqual([closure["run"]["run_id"]], clean["run_ids"])
+        for key in (
+            "revision", "product_revision", "support_revision", "evidence_revision"
+        ):
+            self.assertEqual(state[key], clean[key])
+        self.assertEqual(fixture["prior_clean"], clean["base_engineer_clean"])
+        self.assertEqual(
+            [run["run_id"] for run in fixture["base_review_runs"]],
+            clean["base_review_run_ids"],
+        )
+        self.assertEqual(closure["run"]["run_id"], clean["closure_run_id"])
+        self.assertTrue(clean["audit_complete"])
+        ready = json.loads(self.cli("ready").stdout)
+        self.assertTrue(ready["ready"])
+        self.assertEqual([], ready["reasons"])
+
+    def test_review_finalize_preserves_exact_clean_and_review_lineage_for_targeted_closure(self) -> None:
+        fixture = self.prepare_targeted_qa_closure_ready_state()
+        revalidation = fixture["revalidation"]
+        closure = fixture["closure_before_review"]
+
+        self.assertEqual("final_review", revalidation["source"])
+        self.assertEqual(fixture["prior_clean"], revalidation["base_engineer_clean"])
+        self.assertEqual(fixture["base_review_runs"], revalidation["base_review_runs"])
+        self.assertEqual(revalidation["base_engineer_clean"], closure["base_engineer_clean"])
+        self.assertEqual(revalidation["base_review_runs"], closure["base_review_runs"])
+        self.assertEqual("qa", closure["return_phase"])
+
+    def test_targeted_convergence_clean_lineage_is_accepted_and_source_tamper_rejected(self) -> None:
+        self.prepare_targeted_qa_closure_ready_state(
+            prior_clean_source="targeted_convergence_closure"
+        )
+        state = self.state()
+        self.assertEqual(
+            "targeted_convergence_closure",
+            state["engineer_clean"]["base_engineer_clean"]["source"],
+        )
+        closure = json.loads(json.dumps(state["closure_review"]))
+        closure["base_engineer_clean"]["source"] = "untrusted_synthetic_clean"
+        with self.assertRaisesRegex(
+            runtime_controller.PipelineError, "prior convergence proof"
+        ):
+            runtime_controller.targeted_closure_engineer_clean_proof(
+                self.root, state, closure, closure["run"]
+            )
+
+    def test_failed_or_stale_targeted_qa_closure_never_credits_clean(self) -> None:
+        fixture = self.prepare_targeted_qa_closure_ready_state()
+        state = self.state()
+        clean = dict(state["engineer_clean"])
+        closure = state["closure_review"]
+        closure["status"] = "failed"
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "exact-current|complete"):
+            runtime_controller.targeted_closure_engineer_clean_proof(
+                self.root, state, closure, closure["run"]
+            )
+        closure["status"] = "passed"
+        closure["run"]["revision"] = "0" * 64
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "exact-current|complete"):
+            runtime_controller.targeted_closure_engineer_clean_proof(
+                self.root, state, closure, closure["run"]
+            )
+        self.assertEqual(clean, self.state()["engineer_clean"])
+
+    def test_targeted_qa_closure_rejects_substituted_base_lineage(self) -> None:
+        fixture = self.prepare_targeted_qa_closure_ready_state()
+        state = self.state()
+        state["product_revalidation"] = fixture["revalidation"]
+        original = state["closure_review"]
+        mutations = {
+            "different_clean_same_revision": lambda closure: closure[
+                "base_engineer_clean"
+            ].update(run_ids=["different-clean-run"]),
+            "different_base_tuple": lambda closure: closure.update(
+                base_revision="0" * 64
+            ),
+            "inconsistent_review_status": lambda closure: closure[
+                "base_review_runs"
+            ][0].update(status="pass"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                closure = json.loads(json.dumps(original))
+                mutate(closure)
+                with self.assertRaises(runtime_controller.PipelineError):
+                    runtime_controller.targeted_closure_engineer_clean_proof(
+                        self.root, state, closure, closure["run"]
+                    )
+
+    def test_targeted_qa_closure_rejects_unrelated_current_engineer_run(self) -> None:
+        fixture = self.prepare_targeted_qa_closure_ready_state()
+        state = self.state()
+        state["product_revalidation"] = fixture["revalidation"]
+        closure = state["closure_review"]
+        frozen = list(closure["finding_ids"])
+        for engineer in state["engineer_runs"]:
+            if engineer.get("result_revisions") == {
+                key: state[key]
+                for key in (
+                    "revision", "product_revision", "support_revision", "evidence_revision"
+                )
+            }:
+                engineer["resolved_findings"] = []
+        unrelated = json.loads(json.dumps(state["engineer_runs"][-1]))
+        unrelated["run_id"] = "unrelated-exact-current-engineer"
+        unrelated["resolved_findings"] = ["F-UNRELATED"]
+        state["engineer_runs"].append(unrelated)
+
+        with self.assertRaisesRegex(
+            runtime_controller.PipelineError, "Engineer completion"
+        ):
+            runtime_controller.targeted_closure_engineer_clean_proof(
+                self.root, state, closure, closure["run"]
+            )
+        self.assertNotEqual(frozen, unrelated["resolved_findings"])
+
+    def test_ready_rejects_off_phase_review_and_convergence_capsules_without_mutation(self) -> None:
+        self.prepare_targeted_qa_closure_ready_state()
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        findings_path = self.root / ".agentic-pipeline" / "findings.json"
+        for role, phase in (("reviewer", "review"), ("reviewer", "convergence")):
+            with self.subTest(phase=phase):
+                output = f"tests/{FEATURE}/verification/off-phase-{phase}.json"
+                before_state = state_path.read_bytes()
+                before_findings = findings_path.read_bytes()
+                before_artifacts = {
+                    self.rel(path): path.read_bytes()
+                    for path in self.root.rglob("*") if path.is_file()
+                }
+                state = self.state()
+                result = self.cli(
+                    "context-capsule-create",
+                    "--role", role,
+                    "--phase", phase,
+                    "--worker-id", f"off-phase-{phase}",
+                    "--plan-sha256", state["development_plan_sha256"],
+                    "--revision", state["revision"],
+                    "--authority", f"{self.rel(self.prd)}={self.sha(self.prd)}:PRD-AC-001",
+                    "--output-path", f"tests/{FEATURE}/reviews/off-phase-{phase}.json",
+                    "--stop-condition", "stop",
+                    "--max-authority-files", "5",
+                    "--max-evidence-files", "12",
+                    "--max-total-files", "20",
+                    "--max-payload-bytes", "500000",
+                    "--max-estimated-tokens", "200000",
+                    "--output", output,
+                    expected=2,
+                )
+                self.assertIn("Context capsule activation is off-phase", result.stderr)
+                self.assertIn('"current_phase": "ready"', result.stderr)
+                self.assertIn('"next_action": "run_ready"', result.stderr)
+                self.assertEqual(before_state, state_path.read_bytes())
+                self.assertEqual(before_findings, findings_path.read_bytes())
+                self.assertEqual(
+                    before_artifacts,
+                    {
+                        self.rel(path): path.read_bytes()
+                        for path in self.root.rglob("*") if path.is_file()
+                    },
+                )
+                self.assertFalse((self.root / output).exists())
+
+    def test_documented_cross_phase_capsule_activations_remain_allowed(self) -> None:
+        state = self.initialize(research=False)
+        state["phase"] = "implementation_complete"
+        self.write_state(state)
+        normative = self.capsule(
+            "documentation_finisher", "normative_documentation", "docs-cross-phase",
+            allowed=(self.rel(self.src),),
+        )
+        self.assertTrue((self.root / normative).is_file())
+        state = self.state()
+        state["phase"] = "preflight"
+        self.write_state(state)
+        packet, _, _ = self.decision_packet()
+        self.accept_user_authority(packet)
+        decision = self.capsule(
+            "decision_recorder", "decision_recording", "decision-cross-phase",
+            allowed=(self.rel(self.ledger),), outputs=(self.rel(self.ledger),),
+            authorities=(
+                f"not_applicable={packet['items'][0]['authority']['sha256']}:{packet['items'][0]['authority']['section_or_id']}",
+            ),
+        )
+        self.assertTrue((self.root / decision).is_file())
+
+    def test_ready_targeted_closure_clean_recovery_is_exact_and_idempotent(self) -> None:
+        self.prepare_targeted_qa_closure_ready_state(legacy_without_base_clean=True)
+        before = self.state()
+        before_identities = {
+            key: before[key]
+            for key in (
+                "revision", "product_revision", "support_revision", "evidence_revision"
+            )
+        }
+        before_inventory = json.loads(json.dumps(before["revision_inventory"]))
+        before_records = json.loads(json.dumps(before["revision_records"]))
+
+        recovered = json.loads(
+            self.cli("recover-ready-targeted-closure-clean").stdout
+        )
+
+        self.assertEqual("recovered", recovered["status"])
+        self.assertEqual("ready", recovered["phase"])
+        self.assertEqual("run_ready", recovered["next_action"]["action"])
+        self.assertEqual("RTC-0001", recovered["receipt"]["id"])
+        state = self.state()
+        self.assertEqual(before_identities, {key: state[key] for key in before_identities})
+        self.assertEqual(before_inventory, state["revision_inventory"])
+        self.assertEqual(before_records, state["revision_records"])
+        self.assertEqual("targeted_final_review_closure_chain", state["engineer_clean"]["source"])
+        receipt_path = self.root / recovered["receipt"]["path"]
+        self.assertEqual(recovered["receipt"]["sha256"], self.sha(receipt_path))
+        first_state = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+        first_receipt = receipt_path.read_bytes()
+
+        again = json.loads(
+            self.cli("recover-ready-targeted-closure-clean").stdout
+        )
+        self.assertEqual("already_recovered", again["status"])
+        self.assertEqual(recovered["receipt"], again["receipt"])
+        self.assertEqual(first_state, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+        self.assertEqual(first_receipt, receipt_path.read_bytes())
+        self.assertTrue(json.loads(self.cli("ready").stdout)["ready"])
+
+    def test_ready_targeted_closure_clean_recovery_rejects_broken_chain(self) -> None:
+        mutations = {
+            "revision": lambda state, findings: state["closure_review"]["run"].update(
+                revision="0" * 64
+            ),
+            "closure_run": lambda state, findings: state["closure_review"].update(
+                run={**state["closure_review"]["run"], "run_id": "different-run"}
+            ),
+            "credit": lambda state, findings: state["closure_review"]["run"].update(
+                credit_manifest_sha256="0" * 64
+            ),
+            "base_review_pair": lambda state, findings: state["closure_review"].update(
+                base_review_runs=state["closure_review"]["base_review_runs"][:1]
+            ),
+            "qa": lambda state, findings: state["qa"].update(report_sha256="0" * 64),
+            "coverage": lambda state, findings: state["coverage"]["feature"][
+                "finalized_manifest"
+            ].update(sha256="0" * 64),
+            "handoff": lambda state, findings: state["handoffs"][-1].update(
+                sha256="0" * 64
+            ),
+            "lease": lambda state, findings: state.update(
+                active_write_lease={"lease_id": "LEASE-BUSY", "status": "active"}
+            ),
+            "pending": lambda state, findings: state.update(
+                pending_engineer_completion={"run_id": "PENDING"}
+            ),
+            "open_finding": lambda state, findings: findings["items"].append(
+                {
+                    "id": "F-OPEN", "status": "open", "severity": "major",
+                    "blocking": True, "remediation_required": True,
+                }
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.prepare_targeted_qa_closure_ready_state(
+                    legacy_without_base_clean=True
+                )
+                state = self.state()
+                findings_path = self.root / ".agentic-pipeline" / "findings.json"
+                findings = json.loads(findings_path.read_text(encoding="utf-8"))
+                mutate(state, findings)
+                self.write_state(state)
+                findings_path.write_text(json.dumps(findings), encoding="utf-8")
+                before_state = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+                before_findings = findings_path.read_bytes()
+
+                result = self.cli(
+                    "recover-ready-targeted-closure-clean", expected=2
+                )
+
+                self.assertTrue(result.stderr.strip())
+                self.assertEqual(before_state, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+                self.assertEqual(before_findings, findings_path.read_bytes())
+                self.assertIsNone(self.state()["engineer_clean"])
+
+    def test_ready_targeted_closure_clean_recovery_rejects_product_drift(self) -> None:
+        self.prepare_targeted_qa_closure_ready_state(legacy_without_base_clean=True)
+        self.src.write_text("VALUE = 999\n", encoding="utf-8")
+        before = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+        result = self.cli("recover-ready-targeted-closure-clean", expected=2)
+        self.assertIn("drift", result.stderr.lower())
+        self.assertEqual(before, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+
+    def test_ready_targeted_closure_clean_recovery_rejects_existing_unproven_clean(self) -> None:
+        self.prepare_targeted_qa_closure_ready_state()
+        before = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+        result = self.cli("recover-ready-targeted-closure-clean", expected=2)
+        self.assertIn("already", result.stderr.lower())
+        self.assertEqual(before, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+
+    def test_ready_targeted_closure_recovery_crash_adopts_exact_orphan(self) -> None:
+        self.prepare_targeted_qa_closure_ready_state(legacy_without_base_clean=True)
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        before = state_path.read_bytes()
+        original_save = runtime_controller.save_runtime
+
+        def fail_after_receipt(*_args, **_kwargs):
+            raise runtime_controller.PipelineError("simulated ready recovery save crash")
+
+        runtime_controller.save_runtime = fail_after_receipt
+        try:
+            args = type("Args", (), {"project_root": str(self.root)})()
+            with self.assertRaisesRegex(
+                runtime_controller.PipelineError, "simulated ready recovery save crash"
+            ):
+                runtime_controller.cmd_recover_ready_targeted_closure_clean(args)
+        finally:
+            runtime_controller.save_runtime = original_save
+        receipt_path = (
+            self.root / "tests" / FEATURE / "verification" / "controller"
+            / "ready-targeted-closure-clean-recovery-0001.json"
+        )
+        orphan = receipt_path.read_bytes()
+        self.assertEqual(before, state_path.read_bytes())
+
+        recovered = json.loads(
+            self.cli("recover-ready-targeted-closure-clean").stdout
+        )
+        self.assertEqual("recovered", recovered["status"])
+        self.assertEqual(orphan, receipt_path.read_bytes())
+
+    def test_ready_targeted_closure_recovery_adopts_exact_temporary_orphan(self) -> None:
+        self.prepare_targeted_qa_closure_ready_state(legacy_without_base_clean=True)
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        before = state_path.read_bytes()
+        original_save = runtime_controller.save_runtime
+
+        def fail_after_receipt(*_args, **_kwargs):
+            raise runtime_controller.PipelineError("simulated pre-replace crash")
+
+        runtime_controller.save_runtime = fail_after_receipt
+        try:
+            args = type("Args", (), {"project_root": str(self.root)})()
+            with self.assertRaisesRegex(runtime_controller.PipelineError, "pre-replace"):
+                runtime_controller.cmd_recover_ready_targeted_closure_clean(args)
+        finally:
+            runtime_controller.save_runtime = original_save
+        receipt_path = (
+            self.root / "tests" / FEATURE / "verification" / "controller"
+            / "ready-targeted-closure-clean-recovery-0001.json"
+        )
+        temporary = receipt_path.with_suffix(receipt_path.suffix + ".tmp")
+        exact = receipt_path.read_bytes()
+        receipt_path.rename(temporary)
+        self.assertEqual(before, state_path.read_bytes())
+
+        recovered = json.loads(self.cli("recover-ready-targeted-closure-clean").stdout)
+
+        self.assertEqual("recovered", recovered["status"])
+        self.assertFalse(temporary.exists())
+        self.assertEqual(exact, receipt_path.read_bytes())
+
+    def test_ready_targeted_closure_recovery_rejects_tampered_temporary_orphan(self) -> None:
+        self.prepare_targeted_qa_closure_ready_state(legacy_without_base_clean=True)
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        original_save = runtime_controller.save_runtime
+
+        def fail_after_receipt(*_args, **_kwargs):
+            raise runtime_controller.PipelineError("simulated pre-replace crash")
+
+        runtime_controller.save_runtime = fail_after_receipt
+        try:
+            args = type("Args", (), {"project_root": str(self.root)})()
+            with self.assertRaisesRegex(runtime_controller.PipelineError, "pre-replace"):
+                runtime_controller.cmd_recover_ready_targeted_closure_clean(args)
+        finally:
+            runtime_controller.save_runtime = original_save
+        receipt_path = (
+            self.root / "tests" / FEATURE / "verification" / "controller"
+            / "ready-targeted-closure-clean-recovery-0001.json"
+        )
+        temporary = receipt_path.with_suffix(receipt_path.suffix + ".tmp")
+        receipt_path.rename(temporary)
+        tampered = json.loads(temporary.read_text(encoding="utf-8"))
+        tampered["closure_run_id"] = "tampered-run"
+        temporary.write_text(json.dumps(tampered), encoding="utf-8")
+        before_state = state_path.read_bytes()
+        before_temporary = temporary.read_bytes()
+
+        result = self.cli("recover-ready-targeted-closure-clean", expected=2)
+
+        self.assertIn("temporary path contains unrelated bytes", result.stderr)
+        self.assertEqual(before_state, state_path.read_bytes())
+        self.assertEqual(before_temporary, temporary.read_bytes())
+        self.assertFalse(receipt_path.exists())
+
+    def test_ready_targeted_closure_recovery_rejects_malformed_history_without_mutation(self) -> None:
+        self.prepare_targeted_qa_closure_ready_state(legacy_without_base_clean=True)
+        state = self.state()
+        state["ready_targeted_closure_clean_recoveries"] = [{}, {}]
+        self.write_state(state)
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        findings_path = self.root / ".agentic-pipeline" / "findings.json"
+        before_state = state_path.read_bytes()
+        before_findings = findings_path.read_bytes()
+        before_artifacts = {
+            self.rel(path): path.read_bytes()
+            for path in self.root.rglob("*") if path.is_file()
+        }
+
+        result = self.cli("recover-ready-targeted-closure-clean", expected=2)
+
+        self.assertIn("history is malformed", result.stderr)
+        self.assertEqual(before_state, state_path.read_bytes())
+        self.assertEqual(before_findings, findings_path.read_bytes())
+        self.assertEqual(
+            before_artifacts,
+            {self.rel(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()},
+        )
+
+    def test_ready_targeted_closure_recovery_idempotency_revalidates_all_artifacts(self) -> None:
+        mutations = {
+            "qa_report": lambda state: Path(state["qa"]["report"]).write_text(
+                "tampered\n", encoding="utf-8"
+            ),
+            "closure_credit": lambda state: Path(
+                state["closure_review"]["run"]["credit_manifest"]
+            ).write_text("tampered\n", encoding="utf-8"),
+            "base_review_credit": lambda state: Path(
+                state["closure_review"]["base_review_runs"][0]["credit_manifest"]
+            ).write_text("tampered\n", encoding="utf-8"),
+            "handoff_artifact": lambda state: (self.root / state["engineer_clean"]["handoff_path"]).write_text(
+                "tampered\n", encoding="utf-8"
+            ),
+            "handoff_record": lambda state: state["handoffs"][-2].update(sha256="0" * 64),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.prepare_targeted_qa_closure_ready_state(
+                    legacy_without_base_clean=True
+                )
+                self.cli("recover-ready-targeted-closure-clean")
+                state = self.state()
+                mutate(state)
+                if name == "handoff_record":
+                    self.write_state(state)
+                before = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+
+                result = self.cli(
+                    "recover-ready-targeted-closure-clean", expected=2
+                )
+
+                self.assertTrue(result.stderr.strip())
+                self.assertEqual(
+                    before,
+                    (self.root / ".agentic-pipeline" / "state.json").read_bytes(),
+                )
+
+    def test_ready_targeted_closure_recovery_rejects_controller_root_symlink_in_project(self) -> None:
+        self.prepare_targeted_qa_closure_ready_state(legacy_without_base_clean=True)
+        controller_root = self.root / "tests" / FEATURE / "verification" / "controller"
+        relocated = controller_root.with_name("controller-relocated")
+        controller_root.rename(relocated)
+        try:
+            controller_root.symlink_to(relocated, target_is_directory=True)
+        except OSError as exc:
+            relocated.rename(controller_root)
+            self.skipTest(f"directory symlink creation unavailable: {exc}")
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        before = state_path.read_bytes()
+
+        result = self.cli("recover-ready-targeted-closure-clean", expected=2)
+
+        self.assertIn("symlink", result.stderr.lower())
+        self.assertEqual(before, state_path.read_bytes())
+        self.assertFalse(
+            (relocated / "ready-targeted-closure-clean-recovery-0001.json").exists()
+        )
+
+    def test_ready_targeted_closure_recovery_rejects_occupied_temporary_symlink(self) -> None:
+        self.prepare_targeted_qa_closure_ready_state(legacy_without_base_clean=True)
+        controller_root = self.root / "tests" / FEATURE / "verification" / "controller"
+        temporary = controller_root / "ready-targeted-closure-clean-recovery-0001.json.tmp"
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_target = Path(outside.name) / "outside.json"
+        sentinel = b'{"outside":"unchanged"}\n'
+        outside_target.write_bytes(sentinel)
+        try:
+            temporary.symlink_to(outside_target)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        before = state_path.read_bytes()
+
+        result = self.cli("recover-ready-targeted-closure-clean", expected=2)
+
+        self.assertIn("temporary path is already occupied", result.stderr)
+        self.assertEqual(before, state_path.read_bytes())
+        self.assertEqual(sentinel, outside_target.read_bytes())
 
     def test_preflight_requires_complete_exact_capability_contract(self) -> None:
         self.initialize(research=False)
@@ -3210,6 +5555,8 @@ class PipelineSchema9Tests(unittest.TestCase):
     def test_reviewer_capsule_rejects_semantically_empty_assignment(self) -> None:
         self.initialize(research=False)
         state = self.state()
+        state["phase"] = "review"
+        self.write_state(state)
         result = self.cli(
             "context-capsule-create", "--role", "reviewer", "--phase", "review",
             "--worker-id", "empty-reviewer", "--plan-sha256", state["development_plan_sha256"],
@@ -3269,6 +5616,119 @@ class PipelineSchema9Tests(unittest.TestCase):
         value["capsule_sha256"] = runtime_controller.capsule_digest(value)
         with self.assertRaisesRegex(runtime_controller.PipelineError, "finding_ids"):
             runtime_controller.validate_capsule_value(self.root, self.state(), value)
+
+    def test_engineer_capsule_receives_active_slice_remediation_findings(self) -> None:
+        state = self.initialize(research=False)
+        state["active_remediation_batch"] = {
+            "route": "SLICE-001",
+            "finding_ids": ["F-SLICE-REMEDIATION"],
+            "status": "active",
+        }
+        self.assertEqual(
+            {"F-SLICE-REMEDIATION"},
+            runtime_controller.capsule_expected_finding_ids(
+                self.root, state, "engineer", "engineering"
+            ),
+        )
+
+    def test_runtime_mutation_writes_hash_bound_director_checkpoint(self) -> None:
+        state = self.initialize(research=False)
+        checkpoint_path = self.root / runtime_controller.DIRECTOR_CHECKPOINT
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, checkpoint["schema"])
+        self.assertEqual(state["phase"], checkpoint["phase"])
+        self.assertEqual(runtime_controller.file_sha256(self.root / ".agentic-pipeline" / "state.json"), checkpoint["state_sha256"])
+        self.assertEqual(runtime_controller.file_sha256(self.root / ".agentic-pipeline" / "findings.json"), checkpoint["findings_sha256"])
+        self.assertEqual(state["revision"], checkpoint["revisions"]["revision"])
+        self.assertIn("next_action", checkpoint)
+
+    def test_engineer_capsule_receives_active_integration_remediation_findings(self) -> None:
+        state = self.initialize(research=False)
+        state["active_remediation_batch"] = {
+            "route": "integration",
+            "finding_ids": ["F-INTEGRATION-REMEDIATION"],
+            "status": "active",
+        }
+        self.assertEqual(
+            {"F-INTEGRATION-REMEDIATION"},
+            runtime_controller.capsule_expected_finding_ids(
+                self.root, state, "engineer", "engineering"
+            ),
+        )
+
+    def test_engineer_capsule_rejects_invalid_active_remediation_route(self) -> None:
+        state = self.initialize(research=False)
+        state["active_remediation_batch"] = {
+            "route": "engineer",
+            "finding_ids": ["F-INVALID-ROUTE"],
+            "status": "active",
+        }
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "invalid controller route"):
+            runtime_controller.capsule_expected_finding_ids(
+                self.root, state, "engineer", "engineering"
+            )
+
+    def test_slice_remediation_capsule_contains_exact_assigned_findings(self) -> None:
+        self.implementation_complete()
+        state = self.state()
+        state["phase"] = "engineering"
+        state["active_slice"] = "SLICE-001"
+        state["active_remediation_batch"] = {
+            "route": "SLICE-001",
+            "finding_ids": ["F-SLICE-CAPSULE"],
+            "status": "active",
+        }
+        self.write_state(state)
+        capsule_path = self.capsule(
+            "engineer",
+            "engineering",
+            "engineer-slice-remediation",
+            allowed=("src/feature.py",),
+        )
+        capsule = json.loads((self.root / capsule_path).read_text(encoding="utf-8"))
+        self.assertEqual(["F-SLICE-CAPSULE"], capsule["finding_ids"])
+
+    def test_integration_remediation_capsule_uses_feature_coverage_and_findings(self) -> None:
+        self.implementation_complete()
+        state = self.state()
+        state["phase"] = "engineering"
+        state["active_slice"] = None
+        state["active_remediation_batch"] = {
+            "route": "integration",
+            "finding_ids": ["F-INTEGRATION-CAPSULE"],
+            "status": "active",
+        }
+        self.write_state(state)
+        coverage_path, coverage_ids = runtime_controller.capsule_manifest_contract(
+            self.root, state, "engineering"
+        )
+        finalized = state["coverage"]["feature"]["finalized_manifest"]
+        self.assertEqual(self.rel(Path(finalized["path"])), coverage_path)
+        self.assertTrue(coverage_ids)
+        capsule_path = self.capsule(
+            "engineer",
+            "engineering",
+            "engineer-integration-remediation",
+            allowed=("src/feature.py",),
+        )
+        capsule = json.loads((self.root / capsule_path).read_text(encoding="utf-8"))
+        self.assertEqual(["F-INTEGRATION-CAPSULE"], capsule["finding_ids"])
+
+    def test_targeted_closure_capsule_contains_frozen_findings(self) -> None:
+        self.implementation_complete()
+        state = self.state()
+        state["phase"] = "closure_review"
+        state["closure_review"] = {
+            "finding_ids": ["F-CLOSURE-CAPSULE"],
+            "base_review_runs": [],
+            "base_convergence_runs": [],
+        }
+        self.write_state(state)
+        capsule_path = self.capsule(
+            "reviewer", "closure_review", "reviewer-targeted-closure"
+        )
+        capsule = json.loads((self.root / capsule_path).read_text(encoding="utf-8"))
+        self.assertEqual(["F-CLOSURE-CAPSULE"], capsule["finding_ids"])
 
     def test_legacy_schema9_complete_empty_preflight_enters_migration_hold(self) -> None:
         self.initialize(research=False)

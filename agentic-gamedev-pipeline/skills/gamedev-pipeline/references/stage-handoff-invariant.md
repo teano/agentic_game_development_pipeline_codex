@@ -7,5 +7,7 @@ This contract applies to every Agentic GameDev Pipeline skill.
 3. Before returning, the stage persists its contracted artifact or controller completion state on exact revisions and emits its completion token plus `NEXT_ACTION: $skill-name` or a named terminal action. `NEXT_ACTION` is routing data, not permission to perform the action.
 4. After emitting the handoff, stop. The Pipeline Director validates the token/state and chooses the authorized transition; a directly invoked standalone stage leaves the next invocation to the user.
 5. Internal workers cannot award their parent stage's completion token. The owning stage validates their outputs and records completion itself.
+6. A Director-activated stage runs in a distinct delegated subagent context; role-play, capsules, leases, or worker IDs inside Director context do not count. One delegated agent performs one named specialized role only.
+7. The stage receives its bounded packet without Director chat history and returns compact artifact references, not raw reasoning or large logs.
 
 The approved top-level order is `PRD_READY -> SPEC_READY -> PLAN_READY -> runtime pipeline`. Remediation and verification loops may route between runtime stages only through controller state and the active Pipeline Director.

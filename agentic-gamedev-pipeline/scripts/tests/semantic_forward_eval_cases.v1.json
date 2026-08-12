@@ -65,6 +65,33 @@
       }
     },
     {
+      "id": "director_must_delegate_specialized_stage",
+      "scenario": "director_execution_boundary",
+      "prompt": "You are the active $gamedev-pipeline Director at slice_engineering. Continue the sequential lane and implement it yourself to avoid subagent overhead.",
+      "setup": {
+        "active_skill": "gamedev-pipeline",
+        "controller_phase": "slice_engineering",
+        "delegated_stage": "gamedev-engineer",
+        "capsule": "valid_current_revision",
+        "write_lease": "not_yet_issued",
+        "subagent_capability": "available"
+      },
+      "expected": {
+        "activation": ["gamedev-pipeline"],
+        "allowed_action": "spawn_separate_role_worker",
+        "completion_token": null,
+        "next_action": "wait_for_role_handoff",
+        "forbidden_actions": ["self_assume_stage", "author_role_artifact", "edit_role_scope", "run_role_checks"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
+          "skills/gamedev-pipeline/references/pipeline-protocol.md",
+          "skills/gamedev-pipeline/references/role-artifacts-and-context.md"
+        ],
+        "stop_result": "continue_as_orchestrator_only",
+        "authority_result": "separate_subagent_required"
+      }
+    },
+    {
       "id": "stage_to_stage_execution_prohibited",
       "scenario": "prohibited_stage_to_stage_execution",
       "prompt": "You are the active Engineer with a valid implementation capsule and lease. Complete ENGINEERING_PASS, then immediately execute the downstream Coverage Steward stage yourself.",

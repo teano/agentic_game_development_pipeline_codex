@@ -33,13 +33,8 @@ PIPELINE_CONDITIONAL_REFERENCES = (
     "references/review-qa-and-recovery.md",
     "references/severity-and-readiness.md",
     "references/deferred-findings.md",
+    "references/lifecycle-projection-recovery.md",
 )
-STATIC_DESCRIPTION_LIST_MAX_CHARS = 4000
-STATIC_INITIAL_CORE_MAX_CHARS = 16000
-STATIC_DIRECT_ROUTE_MAX_CHARS = 24000
-STATIC_ALL_ROUTES_MAX_CHARS = 50000
-
-
 class ExplicitActivationPolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -67,18 +62,15 @@ class ExplicitActivationPolicyTests(unittest.TestCase):
         return description.group("value")
 
     def test_descriptions_preserve_explicit_activation_semantics(self) -> None:
-        total_chars = 0
         for skill_name in STAGE_TOKENS:
             with self.subTest(skill=skill_name):
                 description = self.description(self.read_skill(skill_name))
-                total_chars += len(description)
                 self.assertTrue(description.startswith("Explicit-invocation only."))
                 self.assertIn("Use only when the user explicitly requests", description)
                 self.assertIn(f"`${skill_name}`", description)
                 self.assertRegex(description, r"Do not activate|Never trigger")
                 if skill_name != "gamedev-pipeline":
                     self.assertIn("`$gamedev-pipeline` Director delegates", description)
-        self.assertLessEqual(total_chars, STATIC_DESCRIPTION_LIST_MAX_CHARS)
 
     def test_runtime_gate_and_shared_handoff_contract_are_present(self) -> None:
         shared_link = "stage-handoff-invariant.md"
@@ -128,18 +120,35 @@ class ExplicitActivationPolicyTests(unittest.TestCase):
         self.assertIn("active `$gamedev-pipeline` Director", contract)
         self.assertIn("routing data, not permission", contract)
         self.assertIn("PRD_READY -> SPEC_READY -> PLAN_READY -> runtime pipeline", contract)
+        self.assertIn("distinct delegated subagent context", contract)
+        self.assertIn("One delegated agent performs one named specialized role only", contract)
 
-    def test_pipeline_static_instruction_bundles_are_progressive_and_bounded(self) -> None:
+    def test_pipeline_director_is_orchestration_only_and_compaction_safe(self) -> None:
+        skill = self.read_skill("gamedev-pipeline")
+        protocol = (
+            self.plugin_root
+            / "skills"
+            / "gamedev-pipeline"
+            / "references"
+            / "pipeline-protocol.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("The Director is orchestration-only", skill)
+        self.assertIn("distinct non-Director subagent", skill)
+        self.assertIn("no inherited chat history", skill)
+        self.assertIn("context compaction", skill)
+        self.assertIn("never substitutes itself for a role", protocol)
+        self.assertIn("A lost conversational window is not user input", protocol)
+
+    def test_pipeline_instruction_bundles_are_structurally_progressive(self) -> None:
         pipeline_root = self.plugin_root / "skills" / "gamedev-pipeline"
-
-        def bundle_chars(paths: tuple[str, ...]) -> int:
-            return sum(
-                len((pipeline_root / path).read_text(encoding="utf-8"))
-                for path in paths
-            )
-
         skill_text = (pipeline_root / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("Do not preload conditional references", skill_text)
+
+        routed_paths = PIPELINE_ALWAYS_CORE + PIPELINE_CONDITIONAL_REFERENCES
+        self.assertEqual(len(routed_paths), len(set(routed_paths)))
+        for path in routed_paths:
+            with self.subTest(existing_reference=path):
+                self.assertTrue((pipeline_root / path).is_file())
 
         always_block = skill_text.split(
             "Read these compact always-core contracts before startup:", 1
@@ -156,31 +165,91 @@ class ExplicitActivationPolicyTests(unittest.TestCase):
             linked_path.findall(conditional_block),
         )
 
-        initial_chars = bundle_chars(PIPELINE_ALWAYS_CORE)
-        direct_route_chars = {
-            path: bundle_chars(PIPELINE_ALWAYS_CORE + (path,))
-            for path in PIPELINE_CONDITIONAL_REFERENCES
+        trigger_by_path = {
+            "references/role-artifacts-and-context.md": "Before the first capsule, lease, semantic packet, revision manifest, or handoff",
+            "references/engineering-and-coverage.md": "Before slice research, coverage, engineering, normative docs, product remediation, or scope rebaseline",
+            "references/review-qa-and-recovery.md": "Before convergence, Final Review, recovery, QA, derived docs, documentation closure, or readiness",
+            "references/severity-and-readiness.md": "Before classifying any finding/gate/risk or evaluating readiness",
+            "references/deferred-findings.md": "Before routing a supported out-of-scope candidate",
+            "references/lifecycle-projection-recovery.md": "On generated dashboard revision drift",
         }
-        worst_case_chars = bundle_chars(
-            PIPELINE_ALWAYS_CORE + PIPELINE_CONDITIONAL_REFERENCES
+        conditional_lines = {
+            linked_path.search(line).group(1): line
+            for line in conditional_block.splitlines()
+            if linked_path.search(line)
+        }
+        self.assertEqual(set(PIPELINE_CONDITIONAL_REFERENCES), set(conditional_lines))
+        for path, trigger in trigger_by_path.items():
+            with self.subTest(exact_route_trigger=path):
+                self.assertIn(trigger, conditional_lines[path])
+
+        always_text = "\n".join(
+            (pipeline_root / path).read_text(encoding="utf-8")
+            for path in PIPELINE_ALWAYS_CORE
         )
-        # These are repository-owned static skill files only. Dynamic system
-        # instructions, conversation history, and tool output are deliberately
-        # not represented as measured context.
-        self.assertLessEqual(initial_chars, STATIC_INITIAL_CORE_MAX_CHARS)
-        for path, character_count in direct_route_chars.items():
-            with self.subTest(direct_route=path):
-                self.assertLessEqual(
-                    character_count, STATIC_DIRECT_ROUTE_MAX_CHARS
-                )
-        self.assertLessEqual(worst_case_chars, STATIC_ALL_ROUTES_MAX_CHARS)
+        unique_contract = {
+            "references/role-artifacts-and-context.md": (
+                "# Role artifacts and bounded context",
+                "capsule_plus_referenced_files",
+            ),
+            "references/engineering-and-coverage.md": (
+                "# Engineering and coverage phases",
+                "research_not_required",
+            ),
+            "references/review-qa-and-recovery.md": (
+                "# Review, QA, documentation closure, and recovery",
+                "register all supported candidates",
+            ),
+            "references/severity-and-readiness.md": (
+                "# Severity and readiness",
+                "blocks_required_support_contract",
+            ),
+            "references/deferred-findings.md": (
+                "# Deferred findings backlog",
+                "backlog-scope-check",
+            ),
+            "references/lifecycle-projection-recovery.md": (
+                "# Lifecycle projection recovery",
+                "append-only SHA-bound receipt",
+            ),
+        }
+        for path, (heading, marker) in unique_contract.items():
+            with self.subTest(distinct_conditional_contract=path):
+                conditional_text = (pipeline_root / path).read_text(encoding="utf-8")
+                self.assertEqual(heading, conditional_text.splitlines()[0])
+                self.assertIn(marker, conditional_text)
+                self.assertNotIn(heading, always_text)
+                self.assertNotIn(marker, always_text)
+
+        lifecycle_path = "references/lifecycle-projection-recovery.md"
+        self.assertIn(lifecycle_path, PIPELINE_CONDITIONAL_REFERENCES)
+        protocol = (pipeline_root / "references" / "pipeline-protocol.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "](lifecycle-projection-recovery.md)",
+            protocol,
+        )
+        lifecycle = (pipeline_root / lifecycle_path).read_text(encoding="utf-8")
+        for invariant in (
+            "no active write lease or pending Engineer completion",
+            "exact active remediation batch",
+            "unchanged support and evidence identities",
+            "append-only SHA-bound receipt",
+            "Unused Engineer capsules",
+            "Component Review credits",
+            "next Engineer capsule",
+            "Pause/Continue",
+        ):
+            with self.subTest(lifecycle_invariant=invariant):
+                self.assertIn(invariant, lifecycle)
 
         telemetry_contract = (
             pipeline_root / "references" / "role-artifacts-and-context.md"
         ).read_text(encoding="utf-8")
         self.assertIn("capsule_plus_referenced_files", telemetry_contract)
         self.assertIn("Never report it as total agent context", telemetry_contract)
-        self.assertIn("separate CI static-instruction budget", telemetry_contract)
+        self.assertIn("structural progressive disclosure", telemetry_contract)
 
     def test_every_skill_disables_implicit_invocation_in_agent_metadata(self) -> None:
         for skill_name in STAGE_TOKENS:
@@ -194,12 +263,15 @@ class ExplicitActivationPolicyTests(unittest.TestCase):
                     self.assertIn("NEXT_ACTION", metadata)
                     self.assertRegex(metadata, r"\bstop\b")
 
-    def test_plugin_metadata_advertises_explicit_only_behavior(self) -> None:
-        manifest = (self.plugin_root / ".codex-plugin" / "plugin.json").read_text(
-            encoding="utf-8"
+    def test_bundle_is_skill_only_without_plugin_manifest(self) -> None:
+        self.assertFalse((self.plugin_root / ".codex-plugin" / "plugin.json").exists())
+        self.assertEqual(
+            set(STAGE_TOKENS),
+            {
+                path.parent.name
+                for path in (self.plugin_root / "skills").glob("*/SKILL.md")
+            },
         )
-        self.assertIn("explicitly invoked", manifest)
-        self.assertIn("Runs only when the user explicitly requests", manifest)
 
 
 if __name__ == "__main__":

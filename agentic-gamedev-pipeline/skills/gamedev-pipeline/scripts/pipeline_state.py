@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import copy
 import difflib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +53,7 @@ except ImportError:  # pragma: no cover - package-style imports used by some tes
 
 
 STATE_DIR = ".agentic-pipeline"
+DIRECTOR_CHECKPOINT = Path(STATE_DIR) / "director-checkpoint.json"
 SCHEMA_VERSION = 9
 CONTRACT_VERSION = "2026-08-11-role-artifacts-coverage-docs-v2"
 PREFLIGHT_PROOF_VERSION = 1
@@ -162,6 +166,18 @@ CAPSULE_PHASES = {
     },
     "qa": {"qa"},
     "recovery_remediator": {"evidence_recovery"},
+}
+CAPSULE_ACTIVATION_PHASES = {
+    "decision_recording": {
+        "decision_recording",
+        "preflight",
+        "slice_research",
+        "slice_coverage_planning",
+    },
+    "normative_documentation": {
+        "normative_documentation",
+        "implementation_complete",
+    },
 }
 CONTEXT_LIMIT_NAMES = (
     "max_authority_files",
@@ -964,6 +980,406 @@ def compute_inventory_revisions(root: Path, state: dict[str, Any]) -> dict[str, 
     }
 
 
+def aggregate_revision(
+    product_revision: str, support_revision: str, evidence_revision: str
+) -> str:
+    return hashlib.sha256(
+        (
+            f"product:{product_revision}\n"
+            f"support:{support_revision}\n"
+            f"evidence:{evidence_revision}\n"
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def parse_rfc3339_utc_day(value: Any, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise PipelineError(f"{label} must be an RFC3339 UTC timestamp")
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]00:00)",
+        value,
+    )
+    if not match:
+        raise PipelineError(f"{label} must be an RFC3339 UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(f"{match.group(1)}T{match.group(2)}+00:00")
+    except ValueError as exc:
+        raise PipelineError(f"{label} must be an RFC3339 UTC timestamp") from exc
+    return parsed
+
+
+def remediation_batch_is_exact(state: dict[str, Any], findings: dict[str, Any]) -> bool:
+    batch = state.get("active_remediation_batch")
+    if not isinstance(batch, dict) or batch.get("status") != "active":
+        return False
+    finding_ids = batch.get("finding_ids")
+    if (
+        not isinstance(finding_ids, list)
+        or not finding_ids
+        or len(finding_ids) != len(set(finding_ids))
+        or any(not isinstance(value, str) or not value for value in finding_ids)
+    ):
+        return False
+    required = open_remediation_required(findings)
+    if set(finding_ids) != {item.get("id") for item in required}:
+        return False
+    route = batch.get("route")
+    try:
+        if any(route_for_finding(state, item) != route for item in required):
+            return False
+    except PipelineError:
+        return False
+    if batch.get("owner_id") != state.get("engineering_owner_id"):
+        return False
+    active_queue = [
+        item
+        for item in state.get("remediation_queue", [])
+        if isinstance(item, dict) and item.get("status") == "active"
+    ]
+    return len(active_queue) == 1 and all(
+        active_queue[0].get(key) == batch.get(key)
+        for key in ("route", "finding_ids", "status", "owner_id", "returns_for_owner")
+    )
+
+
+def lifecycle_dashboard_candidate(
+    root: Path,
+    state: dict[str, Any],
+    dashboard_relative: str,
+) -> dict[str, Any] | None:
+    feature_slug = state.get("feature")
+    if not isinstance(feature_slug, str) or not feature_slug:
+        return None
+    dashboard = (root / dashboard_relative).resolve()
+    try:
+        dashboard.relative_to(root)
+    except ValueError:
+        return None
+    manifest = (dashboard.parent / feature_slug / "feature.json").resolve()
+    try:
+        manifest.relative_to(root)
+    except ValueError:
+        return None
+    if not dashboard.is_file() or not manifest.is_file():
+        return None
+    try:
+        manifest_value = read_json(manifest)
+        feature_id = manifest_value.get("id")
+        if (
+            not isinstance(feature_id, str)
+            or not feature_id
+            or manifest_value.get("activity") != "active"
+        ):
+            return None
+        updated = parse_rfc3339_utc_day(
+            manifest_value.get("updatedAt"), "Active feature manifest updatedAt"
+        )
+        started = parse_rfc3339_utc_day(
+            manifest_value.get("startedAt"), "Active feature manifest startedAt"
+        )
+        if started > updated:
+            return None
+        active_manifests: list[Path] = []
+        for sibling in dashboard.parent.glob("*/feature.json"):
+            sibling_value = read_json(sibling)
+            if sibling_value.get("activity") == "active":
+                active_manifests.append(sibling.resolve())
+        if active_manifests != [manifest.resolve()]:
+            return None
+        text = dashboard.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError, PipelineError):
+        return None
+    row_pattern = re.compile(
+        rf"(?m)^\|\s*{re.escape(feature_id)}\s*\|[^\r\n]*\|\s*(\d{{4}}-\d{{2}}-\d{{2}})\s*\|\s*$"
+    )
+    rows = list(row_pattern.finditer(text))
+    if len(rows) != 1 or f"./{feature_slug}/" not in rows[0].group(0):
+        return None
+    current_date = rows[0].group(1)
+    if current_date != updated.date().isoformat():
+        return None
+    return {
+        "feature_id": feature_id,
+        "feature_slug": feature_slug,
+        "dashboard_path": dashboard_relative,
+        "dashboard": dashboard,
+        "dashboard_text": text,
+        "date_span": rows[0].span(1),
+        "current_date": current_date,
+        "manifest_path": manifest.relative_to(root).as_posix(),
+        "manifest": manifest,
+        "started": started,
+        "updated": updated,
+    }
+
+
+def reverse_lifecycle_dashboard_candidates(
+    state: dict[str, Any],
+    computed: dict[str, Any],
+    candidate: dict[str, Any],
+) -> list[dict[str, Any]]:
+    dashboard_path = candidate["dashboard_path"]
+    current_records = computed["records"]["product"]
+    old_guard = state.get("lifecycle_projection_guard")
+    guarded_date = (
+        old_guard.get("updated_date")
+        if isinstance(old_guard, dict)
+        and old_guard.get("dashboard_path") == dashboard_path
+        and old_guard.get("feature_id") == candidate["feature_id"]
+        else None
+    )
+    dates: list[str] = []
+    if isinstance(guarded_date, str):
+        dates.append(guarded_date)
+    if (candidate["updated"].date() - candidate["started"].date()).days > 3660:
+        return []
+    day = candidate["started"]
+    while day.date() <= candidate["updated"].date():
+        value = day.date().isoformat()
+        if value not in dates:
+            dates.append(value)
+        day += timedelta(days=1)
+    before, after = candidate["date_span"]
+    matches: list[dict[str, Any]] = []
+    for old_date in dates:
+        if old_date == candidate["current_date"]:
+            continue
+        prior_text = (
+            candidate["dashboard_text"][:before]
+            + old_date
+            + candidate["dashboard_text"][after:]
+        )
+        prior_sha = hashlib.sha256(prior_text.encode("utf-8")).hexdigest()
+        prior_records = [dict(record) for record in current_records]
+        dashboard_records = [
+            record for record in prior_records if record["path"] == dashboard_path
+        ]
+        if len(dashboard_records) != 1:
+            return []
+        dashboard_records[0]["sha256"] = prior_sha
+        product_revision = revision_for_domain(
+            state["revision_base_revision"], prior_records
+        )
+        revision = aggregate_revision(
+            product_revision,
+            computed["support_revision"],
+            computed["evidence_revision"],
+        )
+        if (
+            product_revision == state.get("product_revision")
+            and revision == state.get("revision")
+        ):
+            matches.append(
+                {
+                    "before_date": old_date,
+                    "before_dashboard_sha256": prior_sha,
+                }
+            )
+    return matches
+
+
+def stale_unused_engineer_capsules(state: dict[str, Any], old_revision: str) -> list[str]:
+    used = {
+        item.get("capsule_id")
+        for item in state.get("write_lease_history", [])
+        if isinstance(item, dict)
+    }
+    active = state.get("active_write_lease")
+    if isinstance(active, dict):
+        used.add(active.get("capsule_id"))
+    stale: list[str] = []
+    for item in state.get("context_capsules", []):
+        if (
+            isinstance(item, dict)
+            and item.get("role") == "engineer"
+            and item.get("revision") == old_revision
+            and item.get("capsule_id") not in used
+            and item.get("status") != "stale"
+        ):
+            item["status"] = "stale"
+            item["stale_reason"] = "lifecycle_projection_reconciled"
+            stale.append(str(item.get("capsule_id")))
+    return stale
+
+
+def try_reconcile_lifecycle_projection_drift(
+    root: Path,
+    state: dict[str, Any],
+    findings: dict[str, Any],
+    computed: dict[str, Any],
+) -> bool:
+    if (
+        state.get("phase") != "engineering"
+        or state.get("active_write_lease") is not None
+        or state.get("pending_engineer_completion") is not None
+        or computed["support_revision"] != state.get("support_revision")
+        or computed["evidence_revision"] != state.get("evidence_revision")
+        or computed["product_revision"] == state.get("product_revision")
+        or computed["revision"] == state.get("revision")
+        or not remediation_batch_is_exact(state, findings)
+    ):
+        return False
+    stored_records = state.get("revision_records")
+    if isinstance(stored_records, dict):
+        if set(stored_records) != {"product", "support", "evidence"}:
+            return False
+        stored_product = stored_records.get("product")
+        if not isinstance(stored_product, list):
+            return False
+        old_by_path = {
+            item.get("path"): item.get("sha256")
+            for item in stored_product
+            if isinstance(item, dict)
+        }
+        current_by_path = {
+            item["path"]: item["sha256"] for item in computed["records"]["product"]
+        }
+        changed_paths = {
+            path
+            for path in set(old_by_path) | set(current_by_path)
+            if old_by_path.get(path) != current_by_path.get(path)
+        }
+        if len(changed_paths) != 1:
+            return False
+        dashboard_paths = list(changed_paths)
+    else:
+        dashboard_paths = [
+            value
+            for value in state["revision_inventory"]["product"]
+            if isinstance(value, str) and Path(value).name.lower() == "readme.md"
+        ]
+    proven: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for dashboard_path in dashboard_paths:
+        candidate = lifecycle_dashboard_candidate(root, state, dashboard_path)
+        if candidate is None:
+            continue
+        reverse = reverse_lifecycle_dashboard_candidates(state, computed, candidate)
+        if len(reverse) == 1:
+            proven.append((candidate, reverse[0]))
+    if len(proven) != 1:
+        return False
+    candidate, reverse = proven[0]
+    if isinstance(stored_records, dict):
+        expected_old_sha = next(
+            (
+                item.get("sha256")
+                for item in stored_records["product"]
+                if item.get("path") == candidate["dashboard_path"]
+            ),
+            None,
+        )
+        if expected_old_sha != reverse["before_dashboard_sha256"]:
+            return False
+
+    before_revisions = {
+        key: state[key]
+        for key in ("revision", "product_revision", "support_revision", "evidence_revision")
+    }
+    after_revisions = {
+        key: computed[key]
+        for key in ("revision", "product_revision", "support_revision", "evidence_revision")
+    }
+    history = state.setdefault("lifecycle_projection_reconciliations", [])
+    if not isinstance(history, list):
+        return False
+    receipt_id = f"LPR-{len(history) + 1:04d}"
+    controller_root = (
+        Path(state.get("tests_path", "")) / "verification" / "controller"
+    ).resolve()
+    try:
+        controller_root.relative_to(root)
+    except ValueError:
+        return False
+    receipt_path = controller_root / f"lifecycle-projection-reconciliation-{len(history) + 1:04d}.json"
+    orphan_receipt: dict[str, Any] | None = None
+    if receipt_path.exists():
+        try:
+            orphan_receipt = read_json(receipt_path)
+        except PipelineError:
+            return False
+    working = copy.deepcopy(state)
+    working_history = working["lifecycle_projection_reconciliations"]
+    stale_capsules = stale_unused_engineer_capsules(
+        working, before_revisions["revision"]
+    )
+    invalidated_credit_ids: list[str] = []
+    for credit in working.get("component_review_credits", []):
+        if (
+            isinstance(credit, dict)
+            and credit.get("valid") is True
+            and candidate["dashboard_path"]
+            in set(credit.get("product_paths") or [])
+            | set(credit.get("contract_paths") or [])
+        ):
+            credit["valid"] = False
+            credit["invalidated_at"] = utc_now()
+            credit["invalidation_reason"] = "lifecycle_projection_product_hash_drift"
+            invalidated_credit_ids.append(str(credit.get("id")))
+    invalidated_pre_edit = False
+    active_slice = active_slice_state(working)
+    if isinstance(active_slice, dict):
+        pre_edit = active_slice.get("scope_pre_edit_check")
+        if isinstance(pre_edit, dict) and before_revisions["revision"] in pre_edit.values():
+            active_slice["scope_pre_edit_check"] = None
+            invalidated_pre_edit = True
+    recorded_at = (
+        orphan_receipt.get("recorded_at")
+        if isinstance(orphan_receipt, dict)
+        else utc_now()
+    )
+    if not isinstance(recorded_at, str) or not recorded_at:
+        return False
+    receipt = {
+        "schema": 1,
+        "receipt_id": receipt_id,
+        "kind": "lifecycle_generated_dashboard_date",
+        "feature_id": candidate["feature_id"],
+        "feature_slug": candidate["feature_slug"],
+        "dashboard_path": candidate["dashboard_path"],
+        "manifest_path": candidate["manifest_path"],
+        "before_date": reverse["before_date"],
+        "after_date": candidate["current_date"],
+        "before_dashboard_sha256": reverse["before_dashboard_sha256"],
+        "after_dashboard_sha256": file_sha256(candidate["dashboard"]),
+        "manifest_sha256": file_sha256(candidate["manifest"]),
+        "before_revisions": before_revisions,
+        "after_revisions": after_revisions,
+        "remediation_route": working["active_remediation_batch"]["route"],
+        "finding_ids": sorted(working["active_remediation_batch"]["finding_ids"]),
+        "stale_capsule_ids": stale_capsules,
+        "invalidated_component_review_credit_ids": invalidated_credit_ids,
+        "invalidated_scope_pre_edit_check": invalidated_pre_edit,
+        "recorded_at": recorded_at,
+    }
+    if orphan_receipt is not None:
+        if orphan_receipt != receipt:
+            return False
+    else:
+        write_json(receipt_path, receipt)
+    receipt_relative = receipt_path.relative_to(root).as_posix()
+    receipt_sha = file_sha256(receipt_path)
+    summary = dict(receipt)
+    summary.pop("schema")
+    summary["path"] = receipt_relative
+    summary["sha256"] = receipt_sha
+    working_history.append(summary)
+    working.update(after_revisions)
+    working["revision_records"] = computed["records"]
+    working["lifecycle_projection_guard"] = {
+        "schema": 1,
+        "feature_id": candidate["feature_id"],
+        "feature_slug": candidate["feature_slug"],
+        "dashboard_path": candidate["dashboard_path"],
+        "manifest_path": candidate["manifest_path"],
+        "dashboard_sha256": receipt["after_dashboard_sha256"],
+        "manifest_sha256": receipt["manifest_sha256"],
+        "updated_date": candidate["current_date"],
+    }
+    state.clear()
+    state.update(working)
+    return True
+
+
 def checkout_snapshot(root: Path, feature: str) -> dict[str, str]:
     result: dict[str, str] = {}
     ignored_tests = f"tests/{feature}/"
@@ -1005,6 +1421,38 @@ def checkout_text_snapshot(root: Path, feature: str) -> dict[str, str]:
         except (OSError, UnicodeDecodeError):
             result[relative] = ""
     return result
+
+
+def checkout_snapshot_sha256(snapshot: dict[str, str]) -> str:
+    """Bind an authorization receipt to the exact byte hashes visible at a boundary."""
+    return canonical_json_sha256(snapshot)
+
+
+def snapshot_revisions(
+    state: dict[str, Any], snapshot: dict[str, str]
+) -> dict[str, str]:
+    """Rebuild the frozen revisions from an immutable lease checkout snapshot."""
+    domains: dict[str, list[dict[str, str]]] = {}
+    for domain in ("product", "support", "evidence"):
+        records: list[dict[str, str]] = []
+        for relative in state["revision_inventory"][domain]:
+            sha = snapshot.get(relative)
+            if not isinstance(sha, str) or not sha:
+                raise PipelineError(
+                    f"Lease snapshot lacks revision input {domain}:{relative}"
+                )
+            records.append({"path": relative, "sha256": sha})
+        domains[domain] = records
+    base = state["revision_base_revision"]
+    product = revision_for_domain(base, domains["product"])
+    support = revision_for_domain(base, domains["support"])
+    evidence = revision_for_domain(base, domains["evidence"])
+    return {
+        "revision": aggregate_revision(product, support, evidence),
+        "product_revision": product,
+        "support_revision": support,
+        "evidence_revision": evidence,
+    }
 
 
 def changed_line_count(before: str, after: str) -> int:
@@ -1201,6 +1649,21 @@ def normalize_runtime(state: dict[str, Any], findings: dict[str, Any]) -> None:
     state.setdefault("handoff_manifests", [])
     state.setdefault("remediation_queue", [])
     state.setdefault("active_remediation_batch", None)
+    state.setdefault("revision_records", None)
+    state.setdefault("lifecycle_projection_guard", None)
+    state.setdefault("lifecycle_projection_reconciliations", [])
+    state.setdefault("legacy_scope_recoveries", [])
+    active_lease = state.get("active_write_lease")
+    if (
+        isinstance(active_lease, dict)
+        and active_lease.get("role") == "engineer"
+        and not active_lease.get("scope_authorization")
+    ):
+        legacy_snapshot = state.get("lease_snapshots", {}).get(
+            active_lease.get("lease_id")
+        )
+        if isinstance(legacy_snapshot, dict) and "snapshot_schema" not in legacy_snapshot:
+            legacy_snapshot["_legacy_scope_snapshot_eligible"] = True
     state.setdefault("execution_stage", "feature_validation")
     scope_guard = state.setdefault(
         "scope_guard",
@@ -1242,6 +1705,7 @@ def normalize_runtime(state: dict[str, Any], findings: dict[str, Any]) -> None:
             },
         )
     state.setdefault("product_revalidation", None)
+    state.setdefault("ready_targeted_closure_clean_recoveries", [])
     state.setdefault("preflight", empty_preflight_state())
     preflight = state["preflight"]
     preflight.setdefault("minimum_resume_actions", {})
@@ -1319,7 +1783,9 @@ def normalize_runtime(state: dict[str, Any], findings: dict[str, Any]) -> None:
     state.setdefault("finding_triage", None)
 
 
-def require_revision_inventory_current(root: Path, state: dict[str, Any]) -> None:
+def require_revision_inventory_current(
+    root: Path, state: dict[str, Any], findings: dict[str, Any]
+) -> bool:
     computed = compute_inventory_revisions(root, state)
     stale = [
         key
@@ -1327,10 +1793,13 @@ def require_revision_inventory_current(root: Path, state: dict[str, Any]) -> Non
         if computed[key] != state.get(key)
     ]
     if stale:
+        if try_reconcile_lifecycle_projection_drift(root, state, findings, computed):
+            return True
         raise PipelineError(
             "Controller revision inventory drifted outside an active writer completion: "
             + ", ".join(stale)
         )
+    return False
 
 
 def load_runtime(
@@ -1380,7 +1849,9 @@ def load_runtime(
                 "Revision-drift bypass is valid only inside an exact active writer completion"
             )
     else:
-        require_revision_inventory_current(root, state)
+        reconciled = require_revision_inventory_current(root, state, findings)
+        if reconciled:
+            save_runtime(state_path, findings_path, state, findings)
     return root, state_path, findings_path, state, findings
 
 
@@ -1390,9 +1861,97 @@ def save_runtime(
     state: dict[str, Any],
     findings: dict[str, Any],
 ) -> None:
+    computed = compute_inventory_revisions(state_path.parent.parent, state)
+    if all(
+        computed[key] == state.get(key)
+        for key in ("revision", "product_revision", "support_revision", "evidence_revision")
+    ):
+        state["revision_records"] = computed["records"]
+        guards = [
+            candidate
+            for relative in state.get("revision_inventory", {}).get("product", [])
+            if isinstance(relative, str) and Path(relative).name.lower() == "readme.md"
+            for candidate in [lifecycle_dashboard_candidate(
+                state_path.parent.parent, state, relative
+            )]
+            if candidate is not None
+        ]
+        if len(guards) == 1:
+            candidate = guards[0]
+            state["lifecycle_projection_guard"] = {
+                "schema": 1,
+                "feature_id": candidate["feature_id"],
+                "feature_slug": candidate["feature_slug"],
+                "dashboard_path": candidate["dashboard_path"],
+                "manifest_path": candidate["manifest_path"],
+                "dashboard_sha256": file_sha256(candidate["dashboard"]),
+                "manifest_sha256": file_sha256(candidate["manifest"]),
+                "updated_date": candidate["current_date"],
+            }
     state["updated_at"] = utc_now()
     write_json(state_path, state)
     write_json(findings_path, findings)
+    latest_capsule = (state.get("context_capsules") or [None])[-1]
+    latest_handoff = (state.get("handoffs") or [None])[-1]
+
+    def artifact_reference(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(record, dict):
+            return None
+        return {
+            key: record.get(key)
+            for key in (
+                "capsule_id",
+                "handoff_id",
+                "path",
+                "sha256",
+                "capsule_sha256",
+                "handoff_sha256",
+                "role",
+                "phase",
+                "worker_id",
+            )
+            if record.get(key) is not None
+        }
+
+    route = next_action(state, findings)
+    checkpoint = {
+        "schema": 1,
+        "feature": state.get("feature"),
+        "phase": state.get("phase"),
+        "next_action": route,
+        "user_input_required": bool(route.get("user_input_required")),
+        "revisions": {
+            key: state.get(key)
+            for key in (
+                "revision",
+                "product_revision",
+                "support_revision",
+                "evidence_revision",
+            )
+        },
+        "active_slice": state.get("active_slice"),
+        "active_write_lease": compact_write_lease(state.get("active_write_lease")),
+        "active_remediation_batch": state.get("active_remediation_batch"),
+        "latest_capsule": artifact_reference(latest_capsule),
+        "latest_handoff": artifact_reference(latest_handoff),
+        "iteration_control": state.get("iteration_control"),
+        "worker_budget": {
+            key: state.get("worker_budget", {}).get(key)
+            for key in (
+                "status",
+                "workers_used",
+                "max_workers",
+                "full_review_waves",
+                "max_full_review_waves",
+                "checkpoint_causes",
+            )
+            if key in state.get("worker_budget", {})
+        },
+        "state_sha256": file_sha256(state_path),
+        "findings_sha256": file_sha256(findings_path),
+        "generated_at": utc_now(),
+    }
+    write_json(state_path.parent / DIRECTOR_CHECKPOINT.name, checkpoint)
 
 
 def open_blocking(findings: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2882,6 +3441,65 @@ def scope_slice_for_pass(state: dict[str, Any], requested_slice: str | None) -> 
     return state["slices"][slice_id]
 
 
+def exact_scope_precheck(
+    state: dict[str, Any], slice_item: dict[str, Any], owner_id: str
+) -> dict[str, Any] | None:
+    check = slice_item.get("scope_pre_edit_check")
+    if not isinstance(check, dict):
+        return None
+    if (
+        check.get("status") != "passed"
+        or check.get("slice_id") != slice_item.get("id")
+        or check.get("owner_id") != owner_id
+        or check.get("base_revision") != state.get("revision")
+        or check.get("development_plan_sha256")
+        != state.get("development_plan_sha256")
+        or check.get("scope_contract") != slice_item.get("scope_contract")
+        or not isinstance(check.get("checkout_snapshot_sha256"), str)
+    ):
+        return None
+    return check
+
+
+def engineer_scope_route(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a mandatory scope authorization route before Engineer execution."""
+    if state.get("phase") not in {"slice_engineering", "engineering"}:
+        return None
+    owner_id = state.get("engineering_owner_id")
+    if not owner_id:
+        return None
+    try:
+        slice_item = scope_slice_for_pass(state, None)
+    except PipelineError:
+        return None
+    check = exact_scope_precheck(state, slice_item, owner_id)
+    lease = state.get("active_write_lease")
+    if isinstance(lease, dict) and lease.get("role") == "engineer":
+        authorization = lease.get("scope_authorization")
+        if not isinstance(authorization, dict) or not authorization.get("receipt_sha256"):
+            return {
+                "action": "recover_legacy_engineer_scope_authorization",
+                "owner": "technical_director",
+                "user_input_required": False,
+                "lease_id": lease.get("lease_id"),
+                "engineering_owner_id": owner_id,
+                "active_slice": slice_item.get("id"),
+                "reason": "active_legacy_lease_missing_exact_base_scope_authorization",
+            }
+        return None
+    if check is None:
+        return {
+            "action": "run_slice_scope_check",
+            "owner": "technical_director",
+            "user_input_required": False,
+            "engineering_owner_id": owner_id,
+            "active_slice": slice_item.get("id"),
+            "base_revision": state.get("revision"),
+            "reason": "missing_or_stale_exact_base_scope_precheck",
+        }
+    return None
+
+
 def resolve_scope_artifact(
     root: Path, state: dict[str, Any], supplied: str, label: str
 ) -> tuple[str, dict[str, Any]]:
@@ -3418,6 +4036,9 @@ def next_action(
             "max_workers": budget.get("max_workers"),
             "reason": budget.get("reason"),
         }
+    scope_route = engineer_scope_route(state)
+    if scope_route is not None:
+        return scope_route
     if phase == "preflight":
         blocked = blocked_preflight_capabilities(state)
         if blocked:
@@ -3823,6 +4444,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         "active_write_lease": None,
         "write_lease_history": [],
         "lease_snapshots": {},
+        "legacy_scope_recoveries": [],
         "decision_ledger": ledger_state,
         "user_authorities": [],
         "coverage": {
@@ -3851,6 +4473,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         "review_runs": [],
         "component_review_credits": [],
         "product_revalidation": None,
+        "ready_targeted_closure_clean_recoveries": [],
         "closure_review": None,
         "qa": empty_qa_state(),
         "qa_capability": empty_qa_capability_state(),
@@ -3885,8 +4508,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         base_support_revision=state["support_revision"],
         base_evidence_revision=state["evidence_revision"],
     )
-    write_json(state_path, state)
-    write_json(findings_path, findings)
+    save_runtime(state_path, findings_path, state, findings)
     print(
         json.dumps(
             {
@@ -4219,6 +4841,9 @@ def full_status_payload(
         "convergence": state["convergence"],
         "review": state["review"],
         "product_revalidation": state["product_revalidation"],
+        "ready_targeted_closure_clean_recoveries": state.get(
+            "ready_targeted_closure_clean_recoveries", []
+        ),
         "closure_review": state["closure_review"],
         "component_review_credits": state["component_review_credits"],
         "qa": state["qa"],
@@ -4640,12 +5265,22 @@ def capsule_manifest_contract(
     record: dict[str, Any] | None = None
     identity_field = "actual_identities"
     if phase in {"slice_engineering", "engineering", "slice_coverage_finalization"}:
-        record = (
-            state.get("coverage", {}).get(active_slice, {}).get("planned_manifest")
-            if active_slice
-            else None
-        )
-        identity_field = "expected_identities"
+        active_batch = state.get("active_remediation_batch") or {}
+        if (
+            phase == "engineering"
+            and active_batch.get("status") == "active"
+            and active_batch.get("route") == "integration"
+        ):
+            record = state.get("coverage", {}).get("feature", {}).get(
+                "finalized_manifest"
+            )
+        else:
+            record = (
+                state.get("coverage", {}).get(active_slice, {}).get("planned_manifest")
+                if active_slice
+                else None
+            )
+            identity_field = "expected_identities"
     elif phase in {
         "convergence",
         "review",
@@ -4688,8 +5323,17 @@ def capsule_expected_finding_ids(
     expected: set[str] = set()
     if role == "engineer":
         batch = state.get("active_remediation_batch") or {}
-        if batch.get("route") == "engineer" and batch.get("status") == "active":
+        if batch.get("status") == "active":
+            route = batch.get("route")
+            valid_routes = set(state.get("ordered_slices", [])) | {"integration"}
+            if route not in valid_routes:
+                raise PipelineError(
+                    "Active Engineer remediation batch has an invalid controller route"
+                )
             expected.update(str(value) for value in batch.get("finding_ids", []))
+    if role == "reviewer" and phase == "closure_review":
+        closure = state.get("closure_review") or {}
+        expected.update(str(value) for value in closure.get("finding_ids", []))
     if role == "recovery_remediator" or phase == "recovery_review":
         recovery = state.get("recovery") or {}
         expected.update(str(value) for value in recovery.get("finding_ids", []))
@@ -4842,6 +5486,18 @@ def capsule_exact_evidence(
             capability.get("report_sha256"),
             "QA capability probe",
         )
+
+    if role == "engineer" and phase in {"slice_engineering", "engineering"}:
+        reconciliations = state.get("lifecycle_projection_reconciliations") or []
+        if reconciliations:
+            latest = reconciliations[-1]
+            after_revisions = latest.get("after_revisions") or {}
+            if after_revisions.get("revision") == state.get("revision"):
+                add(
+                    latest.get("path"),
+                    latest.get("sha256"),
+                    "lifecycle projection reconciliation",
+                )
 
     return records
 
@@ -5153,6 +5809,8 @@ def resolve_validated_capsule(
         ),
         None,
     )
+    if isinstance(recorded, dict) and recorded.get("status") == "stale":
+        raise PipelineError("Context capsule was made stale by controller reconciliation")
     if (
         not recorded
         or recorded.get("path") != relative
@@ -5169,6 +5827,23 @@ def cmd_context_capsule_create(args: argparse.Namespace) -> int:
     require_current_revision(state, args.revision)
     if args.role not in CAPSULE_ROLES:
         raise PipelineError("Unsupported context capsule role")
+    if args.phase not in CAPSULE_PHASES[args.role]:
+        raise PipelineError("Context capsule role/phase semantic assignment is invalid")
+    allowed_current_phases = CAPSULE_ACTIVATION_PHASES.get(
+        args.phase, {args.phase}
+    )
+    if state.get("phase") not in allowed_current_phases:
+        route = next_action(state, findings)
+        detail = {
+            "requested_role": args.role,
+            "requested_phase": args.phase,
+            "current_phase": state.get("phase"),
+            "next_action": route.get("action"),
+        }
+        raise PipelineError(
+            "Context capsule activation is off-phase: "
+            + json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        )
     supplied_budget = {name: getattr(args, name) for name in CONTEXT_LIMIT_NAMES}
     if any(
         not isinstance(supplied_budget[name], int) or supplied_budget[name] < 1
@@ -5320,6 +5995,31 @@ def cmd_acquire_write_lease(args: argparse.Namespace) -> int:
         raise PipelineError("Write lease requires an exact non-empty write scope")
     if not capsule["allowed_paths"]:
         raise PipelineError("Write-capable context capsule requires a non-empty allowed_paths scope")
+    scope_authorization: dict[str, Any] | None = None
+    current_checkout = checkout_snapshot(root, state["feature"])
+    if args.role == "engineer" and args.phase in {"slice_engineering", "engineering"}:
+        slice_item = scope_slice_for_pass(state, args.write_scope)
+        active_owner = state.get("engineering_owner_id") or slice_item.get("owner_id")
+        if active_owner and active_owner != args.worker_id:
+            raise PipelineError("Engineer lease owner does not match the assigned Engineer")
+        pre_edit = exact_scope_precheck(state, slice_item, args.worker_id)
+        if pre_edit is None:
+            raise PipelineError(
+                "Engineer write lease requires a current exact-base slice-scope-check"
+            )
+        current_checkout_sha = checkout_snapshot_sha256(current_checkout)
+        if pre_edit["checkout_snapshot_sha256"] != current_checkout_sha:
+            raise PipelineError(
+                "Checkout changed after slice-scope-check and before Engineer lease acquisition"
+            )
+        scope_authorization = {
+            "kind": "pre_edit_check",
+            "receipt_sha256": canonical_json_sha256(pre_edit),
+            "slice_id": slice_item["id"],
+            "owner_id": args.worker_id,
+            "base_revision": state["revision"],
+            "checkout_snapshot_sha256": current_checkout_sha,
+        }
     lease_id = f"LEASE-{len(state['write_lease_history']) + 1:04d}"
     carried = state.get("scope_guard", {}).get("rebaseline_candidate")
     if carried and (
@@ -5344,22 +6044,35 @@ def cmd_acquire_write_lease(args: argparse.Namespace) -> int:
         "exclusions": capsule["exclusions"],
         "status": "active",
         "rebaseline_carried": bool(carried),
+        "scope_authorization": scope_authorization,
     }
+    lease_checkout = (
+        carried["snapshot"]["checkout"] if carried else current_checkout
+    )
+    if scope_authorization is not None:
+        scope_authorization["diff_base_checkout_sha256"] = checkout_snapshot_sha256(
+            lease_checkout
+        )
+    checkout_text = (
+        carried["snapshot"]["checkout_text"]
+        if carried
+        else checkout_text_snapshot(root, state["feature"])
+    )
+    if not carried and checkout_snapshot(root, state["feature"]) != lease_checkout:
+        raise PipelineError(
+            "Checkout changed while capturing the Engineer lease snapshot"
+        )
     state["active_write_lease"] = lease
     state["lease_snapshots"][lease_id] = {
         "capsule_path": capsule_path,
         "capsule_sha256": capsule["capsule_sha256"],
-        "checkout": (
-            carried["snapshot"]["checkout"]
-            if carried
-            else checkout_snapshot(root, state["feature"])
-        ),
-        "checkout_text": (
-            carried["snapshot"]["checkout_text"]
-            if carried
-            else checkout_text_snapshot(root, state["feature"])
-        ),
+        "checkout": lease_checkout,
+        "authorization_checkout": current_checkout,
+        "checkout_text": checkout_text,
+        "snapshot_schema": 2,
+        "snapshot_format": "sha256-raw-bytes-v1",
         "rebaseline_carried": bool(carried),
+        "scope_authorization": scope_authorization,
         "created_at": utc_now(),
     }
     save_runtime(state_path, findings_path, state, findings)
@@ -5389,6 +6102,681 @@ def cmd_release_write_lease(args: argparse.Namespace) -> int:
         state["decision_recording"] = None
     save_runtime(state_path, findings_path, state, findings)
     print(json.dumps(released, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_recover_legacy_engineer_scope(args: argparse.Namespace) -> int:
+    root, state_path, findings_path, state, findings = load_runtime(
+        args.project_root, allow_active_writer_completion_drift=True
+    )
+    require_sources_current(state)
+    history = state.setdefault("legacy_scope_recoveries", [])
+    prior = next(
+        (
+            item
+            for item in history
+            if isinstance(item, dict) and item.get("lease_id") == args.lease_id
+        ),
+        None,
+    )
+    if prior is not None:
+        raise PipelineError("Legacy scope recovery is one-shot and cannot be replayed")
+    lease = state.get("active_write_lease")
+    if (
+        state.get("phase") not in {"slice_engineering", "engineering"}
+        or not isinstance(lease, dict)
+        or lease.get("lease_id") != args.lease_id
+        or lease.get("role") != "engineer"
+        or lease.get("worker_id") != args.owner_id
+        or lease.get("phase") != state.get("phase")
+    ):
+        raise PipelineError("Legacy scope recovery requires the exact active Engineer lease")
+    if lease.get("scope_authorization"):
+        raise PipelineError("Legacy scope recovery is one-shot and the lease is already authorized")
+    if lease.get("rebaseline_carried") is True:
+        raise PipelineError("Legacy scope recovery cannot infer authority across a rebaseline")
+    slice_item = scope_slice_for_pass(state, args.slice_id)
+    if slice_item.get("scope_pre_edit_check") is not None:
+        raise PipelineError("Legacy scope recovery requires a missing pre-edit check")
+    if lease.get("base_revision") != state.get("revision"):
+        raise PipelineError("Legacy lease base revision is not the current exact revision")
+    snapshot = state.get("lease_snapshots", {}).get(args.lease_id)
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("checkout"), dict):
+        raise PipelineError("Legacy scope recovery requires an immutable lease snapshot")
+    if snapshot.get("_legacy_scope_snapshot_eligible") is not True:
+        raise PipelineError("Active lease is not an eligible legacy scope-gate lease")
+    checkout = snapshot["checkout"]
+    frozen = snapshot_revisions(state, checkout)
+    for key in ("revision", "product_revision", "support_revision", "evidence_revision"):
+        if frozen[key] != state.get(key):
+            raise PipelineError(
+                "Legacy lease snapshot does not reproduce the frozen pipeline revisions"
+            )
+    capsule_path, capsule = resolve_validated_capsule(
+        root,
+        state,
+        snapshot.get("capsule_path", ""),
+        role="engineer",
+        worker_id=args.owner_id,
+        phase=state["phase"],
+    )
+    if (
+        capsule["capsule_sha256"] != snapshot.get("capsule_sha256")
+        or capsule["allowed_paths"] != lease.get("allowed_paths")
+        or capsule["allowed_symbols"] != lease.get("allowed_symbols")
+        or capsule["exclusions"] != lease.get("exclusions")
+    ):
+        raise PipelineError("Legacy lease capsule binding is missing or changed")
+    observed = changed_checkout_paths(
+        checkout, checkout_snapshot(root, state["feature"])
+    )
+    scope = slice_item.get("scope_contract") or {}
+    scope_paths = list(scope.get("editable_paths") or []) + [
+        item["path"]
+        for item in scope.get("shared_touchpoints") or []
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    ]
+    for relative in observed:
+        if not any(path_matches_scope(relative, rule) for rule in lease["allowed_paths"]):
+            raise PipelineError(
+                f"Legacy scope recovery observed path outside capsule authority: {relative}"
+            )
+        if any(
+            path_matches_scope(relative, rule)
+            for rule in list(lease.get("exclusions") or [])
+            + list(scope.get("excluded_paths") or [])
+            if "/" in rule
+        ):
+            raise PipelineError(
+                f"Legacy scope recovery observed excluded path: {relative}"
+            )
+        if not any(path_matches_scope(relative, rule) for rule in scope_paths):
+            raise PipelineError(
+                f"Legacy scope recovery observed path outside the approved slice: {relative}"
+            )
+    checkout_sha = checkout_snapshot_sha256(checkout)
+    recovery_id = f"LSR-{len(history) + 1:04d}"
+    pre_edit = {
+        "slice_id": slice_item["id"],
+        "owner_id": args.owner_id,
+        "base_revision": state["revision"],
+        "development_plan_sha256": state["development_plan_sha256"],
+        "scope_contract": slice_item["scope_contract"],
+        "checkout_snapshot_sha256": checkout_sha,
+        "status": "passed",
+        "recorded_at": snapshot.get("created_at"),
+        "recovered_at": utc_now(),
+        "recovery_receipt_id": recovery_id,
+    }
+    if not isinstance(pre_edit["recorded_at"], str) or not pre_edit["recorded_at"]:
+        raise PipelineError("Legacy lease snapshot lacks its controller-recorded creation time")
+    logical_controller_root = Path(state["tests_path"]) / "verification" / "controller"
+    controller_root = logical_controller_root.resolve()
+    try:
+        controller_relative = controller_root.relative_to(root)
+    except ValueError as exc:
+        raise PipelineError("Legacy scope recovery receipt root escapes project root") from exc
+    boundary = root
+    for part in controller_relative.parts:
+        boundary = boundary / part
+        if boundary.is_symlink():
+            raise PipelineError(
+                "Legacy scope recovery receipt path crosses a symlink boundary"
+            )
+    receipt_path = controller_root / f"legacy-scope-recovery-{len(history) + 1:04d}.json"
+    if receipt_path.is_symlink():
+        raise PipelineError("Legacy scope recovery receipt cannot be a symlink")
+    orphan_receipt = read_json(receipt_path) if receipt_path.exists() else None
+    recovery_recorded_at = (
+        orphan_receipt.get("recorded_at")
+        if isinstance(orphan_receipt, dict)
+        else utc_now()
+    )
+    if not isinstance(recovery_recorded_at, str) or not recovery_recorded_at:
+        raise PipelineError("Legacy scope recovery orphan receipt lacks recorded_at")
+    pre_edit["recovered_at"] = recovery_recorded_at
+    receipt = {
+        "schema": 1,
+        "receipt_id": recovery_id,
+        "kind": "legacy_engineer_scope_authorization",
+        "lease_id": args.lease_id,
+        "slice_id": slice_item["id"],
+        "owner_id": args.owner_id,
+        "base_revision": state["revision"],
+        "development_plan_sha256": state["development_plan_sha256"],
+        "capsule_path": capsule_path,
+        "capsule_sha256": capsule["capsule_sha256"],
+        "checkout_snapshot_sha256": checkout_sha,
+        "observed_changed_paths": observed,
+        "recorded_at": recovery_recorded_at,
+    }
+    if receipt_path.exists():
+        if orphan_receipt != receipt:
+            raise PipelineError("Legacy scope recovery receipt path is already occupied")
+    else:
+        write_json(receipt_path, receipt)
+    receipt_relative = receipt_path.relative_to(root).as_posix()
+    receipt_file_sha = file_sha256(receipt_path)
+    authorization = {
+        "kind": "legacy_recovery",
+        "receipt_sha256": canonical_json_sha256(pre_edit),
+        "recovery_receipt_id": recovery_id,
+        "recovery_receipt_sha256": receipt_file_sha,
+        "slice_id": slice_item["id"],
+        "owner_id": args.owner_id,
+        "base_revision": state["revision"],
+        "checkout_snapshot_sha256": checkout_sha,
+        "diff_base_checkout_sha256": checkout_sha,
+    }
+    slice_item["scope_pre_edit_check"] = pre_edit
+    slice_item["scope_history"].append({"event": "legacy_pre_edit_recovery", **pre_edit})
+    state["scope_guard"]["status"] = "edit_authorized"
+    state["scope_guard"]["history"].append(
+        {"event": "legacy_pre_edit_recovery", **pre_edit}
+    )
+    lease["scope_authorization"] = authorization
+    snapshot.pop("_legacy_scope_snapshot_eligible", None)
+    snapshot["snapshot_schema"] = 1
+    snapshot["snapshot_format"] = "sha256-raw-bytes-v1"
+    snapshot["provenance"] = "legacy_pre_scope_gate"
+    snapshot["scope_authorization"] = authorization
+    snapshot["authorization_checkout"] = copy.deepcopy(checkout)
+    history.append(
+        {
+            "receipt_id": recovery_id,
+            "lease_id": args.lease_id,
+            "slice_id": slice_item["id"],
+            "owner_id": args.owner_id,
+            "path": receipt_relative,
+            "sha256": receipt_file_sha,
+            "observed_changed_paths": observed,
+            "recorded_at": receipt["recorded_at"],
+        }
+    )
+    save_runtime(state_path, findings_path, state, findings)
+    print(json.dumps(receipt, ensure_ascii=False, indent=2))
+    return 0
+
+
+def engineer_continuation_artifact(
+    root: Path,
+    state: dict[str, Any],
+    slice_item: dict[str, Any],
+    owner_id: str,
+) -> tuple[Path, str, dict[str, Any]]:
+    """Derive the exact controller-owned Engineer capsule without role judgment."""
+    phase = state["phase"]
+    scope = slice_item.get("scope_contract") or {}
+    allowed_paths = sorted(
+        {
+            scope_path(value, "Engineer continuation allowed")
+            for value in list(scope.get("editable_paths") or [])
+            + [
+                item["path"]
+                for item in scope.get("shared_touchpoints") or []
+                if isinstance(item, dict) and isinstance(item.get("path"), str)
+            ]
+        }
+    )
+    exclusions = sorted(
+        {
+            str(value)
+            for value in list(scope.get("excluded_paths") or [])
+            + list(scope.get("excluded_components") or [])
+            if str(value).strip()
+        }
+    )
+    if not allowed_paths:
+        raise PipelineError("Engineer continuation scope has no controller-approved editable paths")
+
+    authority_ids = capsule_scope_ids(state, phase)
+    requirements_relative = controller_relative_path(
+        root, state["requirements_path"], "Engineer continuation PRD authority"
+    )
+    ledger_relative = controller_relative_path(
+        root, state["decision_ledger"]["path"], "Engineer continuation decision authority"
+    )
+    authority = []
+    for relative, digest in sorted(capsule_exact_authority(root, state).items()):
+        ids = (
+            sorted(authority_ids)
+            if relative == requirements_relative
+            else sorted(state["decision_ledger"]["active_decision_ids"])
+            if relative == ledger_relative
+            else []
+        )
+        authority.append({"path": relative, "sha256": digest, "ids": ids})
+    evidence = [
+        {"path": relative, "sha256": digest, "ids": []}
+        for relative, digest in sorted(
+            capsule_exact_evidence(root, state, "engineer", phase).items()
+        )
+    ]
+    _, coverage_ids = capsule_manifest_contract(root, state, phase)
+    safe_owner = re.sub(r"[^A-Za-z0-9_.-]+", "-", owner_id).strip("-.") or "engineer"
+    tests_relative = controller_relative_path(
+        root, state["tests_path"], "Engineer continuation tests root"
+    )
+    artifact_root = Path(tests_relative) / "verification" / "controller"
+    boundary = root
+    for part in artifact_root.parts:
+        boundary = boundary / part
+        if boundary.is_symlink():
+            raise PipelineError(
+                "Engineer continuation controller artifact path crosses a symlink boundary"
+            )
+    capsule_id = f"CAP-{len(state['context_capsules']) + 1:04d}"
+    capsule_relative = (
+        artifact_root
+        / f"engineer-continuation-{capsule_id.lower()}-{state['revision'][:12]}-{safe_owner}.json"
+    ).as_posix()
+    capsule_path, capsule_relative = resolve_project_output(
+        root, capsule_relative, "Engineer continuation capsule"
+    )
+    output_paths = [
+        (artifact_root / f"{capsule_id.lower()}-{safe_owner}-{phase}-semantic-handoff.json").as_posix(),
+        (artifact_root / f"{capsule_id.lower()}-{safe_owner}-{phase}-report.json").as_posix(),
+    ]
+    for relative in output_paths:
+        resolve_project_output(root, relative, "Engineer continuation delegated output")
+    budget = approved_capsule_budget(state, phase)
+    value: dict[str, Any] = {
+        "schema": 1,
+        "capsule_id": capsule_id,
+        "role": "engineer",
+        "phase": phase,
+        "worker_id": owner_id,
+        "plan_sha256": state["development_plan_sha256"],
+        "revisions": {
+            key: state[key]
+            for key in (
+                "revision",
+                "product_revision",
+                "support_revision",
+                "evidence_revision",
+            )
+        },
+        "authority": authority,
+        "decision_ids": sorted(state["decision_ledger"]["active_decision_ids"]),
+        "finding_ids": sorted(
+            capsule_expected_finding_ids(root, state, "engineer", phase)
+        ),
+        "coverage_identity_ids": sorted(coverage_ids),
+        "evidence": evidence,
+        "allowed_paths": allowed_paths,
+        "allowed_symbols": [],
+        "exclusions": exclusions,
+        "commands": [],
+        "output_paths": output_paths,
+        "stop_condition": (
+            "Return the bounded Engineer result through engineer-complete and stop; "
+            "do not perform another pipeline role"
+        ),
+        "budget": budget,
+        "metrics": {},
+        "capsule_sha256": "",
+    }
+    value["metrics"] = capsule_metrics(value, root)
+    value["capsule_sha256"] = capsule_digest(value)
+    validate_capsule_value(root, state, value)
+    return capsule_path, capsule_relative, value
+
+
+def validated_engineer_continuation_payload(
+    root: Path,
+    state: dict[str, Any],
+    slice_item: dict[str, Any],
+    owner_id: str,
+    *,
+    status: str,
+) -> dict[str, Any]:
+    """Validate every persisted binding before returning a subagent handoff."""
+    lease = state.get("active_write_lease")
+    if (
+        not isinstance(lease, dict)
+        or lease.get("status") != "active"
+        or lease.get("role") != "engineer"
+        or lease.get("phase") != state.get("phase")
+        or lease.get("worker_id") != owner_id
+        or lease.get("write_scope") != slice_item.get("id")
+    ):
+        raise PipelineError("Engineer continuation lacks the exact active Engineer lease")
+    snapshot = state.get("lease_snapshots", {}).get(lease["lease_id"])
+    if not isinstance(snapshot, dict):
+        raise PipelineError("Engineer continuation lease snapshot is missing")
+    capsule_path, capsule = resolve_validated_capsule(
+        root,
+        state,
+        snapshot.get("capsule_path", ""),
+        role="engineer",
+        worker_id=owner_id,
+        phase=state["phase"],
+    )
+    direct_capsule_binding = {
+        "capsule_id": capsule["capsule_id"],
+        "capsule_path": capsule_path,
+        "capsule_sha256": capsule["capsule_sha256"],
+    }
+    present_direct_fields = {key for key in direct_capsule_binding if key in lease}
+    direct_binding_present = len(present_direct_fields) == len(direct_capsule_binding)
+    proven_legacy_binding = (
+        not present_direct_fields
+        and snapshot.get("snapshot_schema") == 1
+        and snapshot.get("provenance") == "legacy_pre_scope_gate"
+        and (lease.get("scope_authorization") or {}).get("kind") == "legacy_recovery"
+    )
+    if (
+        capsule.get("capsule_sha256") != snapshot.get("capsule_sha256")
+        or (not direct_binding_present and not proven_legacy_binding)
+        or any(
+            lease.get(key) != expected
+            for key, expected in direct_capsule_binding.items()
+            if direct_binding_present
+        )
+        or capsule.get("allowed_paths") != lease.get("allowed_paths")
+        or capsule.get("allowed_symbols") != lease.get("allowed_symbols")
+        or capsule.get("exclusions") != lease.get("exclusions")
+    ):
+        raise PipelineError("Engineer continuation capsule/lease binding is missing or changed")
+    pre_edit = exact_scope_precheck(state, slice_item, owner_id)
+    authorization = lease.get("scope_authorization")
+    snapshot_authorization = snapshot.get("scope_authorization")
+    if (
+        pre_edit is None
+        or not isinstance(authorization, dict)
+        or authorization != snapshot_authorization
+        or authorization.get("receipt_sha256") != canonical_json_sha256(pre_edit)
+        or authorization.get("slice_id") != slice_item.get("id")
+        or authorization.get("owner_id") != owner_id
+        or authorization.get("base_revision") != state.get("revision")
+        or not isinstance(snapshot.get("checkout"), dict)
+        or authorization.get("diff_base_checkout_sha256")
+        != checkout_snapshot_sha256(snapshot["checkout"])
+        or not isinstance(snapshot.get("authorization_checkout"), dict)
+        or authorization.get("checkout_snapshot_sha256")
+        != checkout_snapshot_sha256(snapshot["authorization_checkout"])
+    ):
+        raise PipelineError("Engineer continuation scope receipt/lease binding is missing or changed")
+    receipt: dict[str, Any] = {
+        "kind": authorization.get("kind"),
+        "id": authorization.get("recovery_receipt_id"),
+        "path": None,
+        "sha256": authorization.get("receipt_sha256"),
+        "checkout_snapshot_sha256": authorization.get("checkout_snapshot_sha256"),
+    }
+    if authorization.get("kind") == "legacy_recovery":
+        recovery = next(
+            (
+                item
+                for item in state.get("legacy_scope_recoveries", [])
+                if item.get("receipt_id") == authorization.get("recovery_receipt_id")
+            ),
+            None,
+        )
+        if (
+            not isinstance(recovery, dict)
+            or recovery.get("lease_id") != lease["lease_id"]
+            or recovery.get("sha256") != authorization.get("recovery_receipt_sha256")
+        ):
+            raise PipelineError("Engineer continuation legacy recovery receipt is missing or changed")
+        receipt.update(
+            {"path": recovery.get("path"), "file_sha256": recovery.get("sha256")}
+        )
+    handoff = {
+        "action": "dispatch_engineer",
+        "role": "engineer",
+        "worker_id": owner_id,
+        "phase": state["phase"],
+        "slice_id": slice_item["id"],
+        "capsule_path": capsule_path,
+        "lease_id": lease["lease_id"],
+        "stop_condition": capsule["stop_condition"],
+    }
+    return {
+        "status": status,
+        "phase": state["phase"],
+        "owner_id": owner_id,
+        "slice_id": slice_item["id"],
+        "revision": state["revision"],
+        "scope_receipt": receipt,
+        "capsule": {
+            "id": capsule["capsule_id"],
+            "path": capsule_path,
+            "sha256": file_sha256(root / capsule_path),
+            "capsule_sha256": capsule["capsule_sha256"],
+        },
+        "lease": {
+            "id": lease["lease_id"],
+            "path": None,
+            "sha256": canonical_json_sha256(lease),
+            "status": lease["status"],
+        },
+        "next_action": handoff,
+        "handoff": handoff,
+    }
+
+
+def cmd_prepare_engineer_continuation(args: argparse.Namespace) -> int:
+    """Prepare the exact Engineer boundary as one controller-owned operation."""
+    root, state_path, findings_path = runtime_paths(args.project_root)
+    raw_state = read_json(state_path)
+    raw_lease = raw_state.get("active_write_lease")
+    allow_candidate = isinstance(raw_lease, dict) and raw_lease.get("role") == "engineer"
+    root, state_path, findings_path, state, findings = load_runtime(
+        args.project_root,
+        allow_active_writer_completion_drift=allow_candidate,
+    )
+    require_sources_current(state)
+    if state.get("phase") not in {"slice_engineering", "engineering"}:
+        raise PipelineError(
+            "prepare-engineer-continuation requires slice_engineering or engineering"
+        )
+    if state.get("pending_engineer_completion") is not None:
+        raise PipelineError("Engineer continuation is blocked by pending Engineer completion")
+    if state.get("iteration_control", {}).get("status") == "checkpoint_required":
+        raise PipelineError("Engineer continuation is blocked by the iteration checkpoint")
+    owner_id = state.get("engineering_owner_id")
+    if not isinstance(owner_id, str) or not owner_id:
+        raise PipelineError("Engineer continuation requires an assigned engineering owner")
+    slice_item = scope_slice_for_pass(state, None)
+    route = next_action(state, findings)
+    allowed_routes = {
+        "run_slice_scope_check",
+        "resume_engineering_owner",
+        "recover_legacy_engineer_scope_authorization",
+    }
+    if route.get("action") not in allowed_routes or route.get("user_input_required"):
+        label = (
+            "budget checkpoint"
+            if route.get("action") == "director_budget_checkpoint"
+            else str(route.get("action"))
+        )
+        raise PipelineError(
+            "Engineer continuation is blocked by higher-priority next_action: "
+            + label
+        )
+    lease = state.get("active_write_lease")
+    if isinstance(lease, dict):
+        authorization = lease.get("scope_authorization")
+        if not isinstance(authorization, dict) or not authorization.get("receipt_sha256"):
+            recovery_args = argparse.Namespace(
+                project_root=args.project_root,
+                lease_id=lease.get("lease_id"),
+                owner_id=owner_id,
+                slice_id=slice_item["id"],
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_recover_legacy_engineer_scope(recovery_args)
+            root, _, _, state, findings = load_runtime(
+                args.project_root, allow_active_writer_completion_drift=True
+            )
+            slice_item = scope_slice_for_pass(state, None)
+        payload = validated_engineer_continuation_payload(
+            root, state, slice_item, owner_id, status="already_prepared"
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    current_checkout = checkout_snapshot(root, state["feature"])
+    current_checkout_sha = checkout_snapshot_sha256(current_checkout)
+    carried = state.get("scope_guard", {}).get("rebaseline_candidate")
+    if carried and (
+        carried.get("slice_id") != slice_item["id"]
+        or state.get("phase") not in {"slice_engineering", "engineering"}
+        or not isinstance(carried.get("base_revisions"), dict)
+        or not isinstance(carried.get("snapshot"), dict)
+        or not isinstance(carried["snapshot"].get("checkout"), dict)
+        or not isinstance(carried["snapshot"].get("checkout_text"), dict)
+    ):
+        raise PipelineError(
+            "A rebaselined candidate requires the next fresh lease for its exact Engineer scope"
+        )
+    pre_edit = exact_scope_precheck(state, slice_item, owner_id)
+    if pre_edit is None or pre_edit.get("checkout_snapshot_sha256") != current_checkout_sha:
+        pre_edit = {
+            "slice_id": slice_item["id"],
+            "owner_id": owner_id,
+            "base_revision": state["revision"],
+            "development_plan_sha256": state["development_plan_sha256"],
+            "scope_contract": slice_item["scope_contract"],
+            "checkout_snapshot_sha256": current_checkout_sha,
+            "status": "passed",
+            "recorded_at": utc_now(),
+        }
+
+    capsule_path, capsule_relative, capsule = engineer_continuation_artifact(
+        root, state, slice_item, owner_id
+    )
+    recorded = next(
+        (
+            item
+            for item in state["context_capsules"]
+            if item.get("path") == capsule_relative
+        ),
+        None,
+    )
+    capsule_record: dict[str, Any]
+    if recorded is not None:
+        if not capsule_path.exists():
+            raise PipelineError("Recorded Engineer continuation capsule artifact is missing")
+        existing = read_json(capsule_path)
+        validate_capsule_value(root, state, existing)
+        if (
+            existing != capsule
+            or recorded.get("sha256") != file_sha256(capsule_path)
+            or recorded.get("capsule_sha256") != existing.get("capsule_sha256")
+        ):
+            raise PipelineError("Recorded Engineer continuation capsule is stale or changed")
+        capsule = existing
+        capsule_record = recorded
+    else:
+        if capsule_path.exists():
+            orphan = read_json(capsule_path)
+            if orphan != capsule:
+                raise PipelineError("Engineer continuation capsule path is already occupied")
+        capsule_record = {
+            "capsule_id": capsule["capsule_id"],
+            "path": capsule_relative,
+            "sha256": "",
+            "capsule_sha256": capsule["capsule_sha256"],
+            "role": "engineer",
+            "phase": state["phase"],
+            "worker_id": owner_id,
+            "revision": state["revision"],
+            "metrics": capsule["metrics"],
+            "created_at": utc_now(),
+        }
+        state["context_capsules"].append(capsule_record)
+
+    slice_item["scope_pre_edit_check"] = pre_edit
+    slice_item["scope_history"].append({"event": "pre_edit_check", **pre_edit})
+    state["scope_guard"]["status"] = "edit_authorized"
+    state["scope_guard"]["history"].append({"event": "pre_edit_check", **pre_edit})
+    lease_checkout = carried["snapshot"]["checkout"] if carried else current_checkout
+    scope_authorization = {
+        "kind": "pre_edit_check",
+        "receipt_sha256": canonical_json_sha256(pre_edit),
+        "slice_id": slice_item["id"],
+        "owner_id": owner_id,
+        "base_revision": state["revision"],
+        "checkout_snapshot_sha256": current_checkout_sha,
+        "diff_base_checkout_sha256": checkout_snapshot_sha256(lease_checkout),
+    }
+    lease_id = f"LEASE-{len(state['write_lease_history']) + 1:04d}"
+    lease = {
+        "lease_id": lease_id,
+        "phase": state["phase"],
+        "write_scope": slice_item["id"],
+        "role": "engineer",
+        "worker_id": owner_id,
+        "base_revision": (
+            carried["base_revisions"]["revision"] if carried else state["revision"]
+        ),
+        "allowed_paths": capsule["allowed_paths"],
+        "allowed_symbols": capsule["allowed_symbols"],
+        "exclusions": capsule["exclusions"],
+        "status": "active",
+        "rebaseline_carried": bool(carried),
+        "scope_authorization": scope_authorization,
+        "capsule_id": capsule["capsule_id"],
+        "capsule_path": capsule_relative,
+        "capsule_sha256": capsule["capsule_sha256"],
+    }
+    state["active_write_lease"] = lease
+    lease_snapshot = {
+        "capsule_path": capsule_relative,
+        "capsule_sha256": capsule["capsule_sha256"],
+        "checkout": lease_checkout,
+        "authorization_checkout": copy.deepcopy(current_checkout),
+        "checkout_text": {},
+        "snapshot_schema": 2,
+        "snapshot_format": "sha256-raw-bytes-v1",
+        "rebaseline_carried": bool(carried),
+        "scope_authorization": scope_authorization,
+        "created_at": utc_now(),
+    }
+    state["lease_snapshots"][lease_id] = lease_snapshot
+    capsule_path.parent.mkdir(parents=True, exist_ok=True)
+    if not capsule_path.exists():
+        write_json(capsule_path, capsule)
+    capsule_file_sha = file_sha256(capsule_path)
+    capsule_record["sha256"] = capsule_file_sha
+    # The artifact is outside the checkout snapshot. Re-capture the exact edit
+    # boundary after its write, including a hash/text/hash TOCTOU check.
+    final_checkout = checkout_snapshot(root, state["feature"])
+    boundary_changes = changed_checkout_paths(current_checkout, final_checkout)
+    if boundary_changes:
+        raise PipelineError(
+            "Checkout changed while preparing Engineer continuation: "
+            + ", ".join(boundary_changes)
+        )
+    if carried:
+        lease_snapshot["checkout_text"] = carried["snapshot"]["checkout_text"]
+    else:
+        final_text = checkout_text_snapshot(root, state["feature"])
+        if checkout_snapshot(root, state["feature"]) != final_checkout:
+            raise PipelineError("Checkout changed while capturing Engineer continuation text")
+        lease_snapshot["checkout_text"] = final_text
+    if checkout_snapshot(root, state["feature"]) != final_checkout:
+        raise PipelineError("Checkout changed before saving Engineer continuation")
+    computed = compute_inventory_revisions(root, state)
+    stale = [
+        key
+        for key in ("revision", "product_revision", "support_revision", "evidence_revision")
+        if computed[key] != state.get(key)
+    ]
+    if stale:
+        raise PipelineError(
+            "Controller revision inventory changed while preparing Engineer continuation: "
+            + ", ".join(stale)
+        )
+    if checkout_snapshot(root, state["feature"]) != final_checkout:
+        raise PipelineError("Checkout changed while validating Engineer continuation revisions")
+    save_runtime(state_path, findings_path, state, findings)
+    payload = validated_engineer_continuation_payload(
+        root, state, slice_item, owner_id, status="prepared"
+    )
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -6104,12 +7492,16 @@ def cmd_coverage_finalize(args: argparse.Namespace) -> int:
 
 
 def cmd_slice_scope_check(args: argparse.Namespace) -> int:
-    _, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
     require_sources_current(state)
     if state.get("phase") not in {"slice_engineering", "engineering"}:
         raise PipelineError("slice-scope-check is valid only immediately before an Engineer edit pass")
     if state.get("scope_guard", {}).get("status") == "scope_expansion_hold":
         raise PipelineError("scope_expansion_hold requires user-approved plan rebaseline")
+    if state.get("active_write_lease") is not None:
+        raise PipelineError(
+            "slice-scope-check must precede Engineer write lease acquisition"
+        )
     slice_item = scope_slice_for_pass(state, args.slice_id)
     if args.base_revision != state.get("revision"):
         raise PipelineError("slice-scope-check base revision must match current pipeline revision")
@@ -6122,6 +7514,9 @@ def cmd_slice_scope_check(args: argparse.Namespace) -> int:
         "base_revision": args.base_revision,
         "development_plan_sha256": state["development_plan_sha256"],
         "scope_contract": slice_item["scope_contract"],
+        "checkout_snapshot_sha256": checkout_snapshot_sha256(
+            checkout_snapshot(root, state["feature"])
+        ),
         "status": "passed",
         "recorded_at": utc_now(),
     }
@@ -6618,12 +8013,50 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
         or pre_edit.get("base_revision") != state["revision"]
     ):
         raise PipelineError("Engineer edits require a current exact-base slice-scope-check")
+    authorization = lease.get("scope_authorization") or {}
+    lease_snapshot = state["lease_snapshots"].get(lease["lease_id"], {})
+    snapshot_authorization = lease_snapshot.get("scope_authorization") or {}
+    authorization_checkout = lease_snapshot.get("authorization_checkout")
+    diff_base_checkout = lease_snapshot.get("checkout")
+    if (
+        authorization != snapshot_authorization
+        or authorization.get("receipt_sha256") != canonical_json_sha256(pre_edit)
+        or authorization.get("slice_id") != slice_item["id"]
+        or authorization.get("owner_id") != args.owner_id
+        or not isinstance(authorization_checkout, dict)
+        or authorization.get("checkout_snapshot_sha256")
+        != checkout_snapshot_sha256(authorization_checkout)
+        or not isinstance(diff_base_checkout, dict)
+        or authorization.get("diff_base_checkout_sha256")
+        != checkout_snapshot_sha256(diff_base_checkout)
+    ):
+        raise PipelineError("Engineer lease scope authorization binding is missing or changed")
     semantic_path = resolve_project_file(root, args.semantic_handoff, "Engineer semantic handoff")
     semantic = read_json(semantic_path)
     changes, inventory, _ = validate_semantic_write_packet(
         root, state, lease, semantic, slice_item=slice_item
     )
     report = resolve_report(root, state, args.report, "Engineer report")
+    direct_fields = {"capsule_id", "capsule_path", "capsule_sha256"}
+    present_direct_fields = direct_fields & set(lease)
+    if present_direct_fields and present_direct_fields != direct_fields:
+        raise PipelineError("Engineer lease direct capsule binding is incomplete")
+    if present_direct_fields == direct_fields:
+        if (
+            lease["capsule_id"] != capsule["capsule_id"]
+            or lease["capsule_sha256"] != capsule["capsule_sha256"]
+            or lease["capsule_path"]
+            != controller_relative_path(root, args.capsule, "Engineer lease capsule")
+        ):
+            raise PipelineError("Engineer lease direct capsule binding is missing or changed")
+        delegated_outputs = [
+            semantic_path.relative_to(root).as_posix(),
+            Path(report).relative_to(root).as_posix(),
+        ]
+        if capsule["output_paths"] != delegated_outputs:
+            raise PipelineError(
+                "Controller-prepared Engineer outputs must equal the semantic handoff/report pair"
+            )
     product_changes = [item for item in changes if item["domain"] == "product"]
     if any(item["domain"] == "support" for item in changes):
         raise PipelineError("Engineer cannot write derived support documentation")
@@ -6766,6 +8199,16 @@ def cmd_engineer_complete(args: argparse.Namespace) -> int:
                     "base_review_runs": list(revalidation.get("base_review_runs", [])),
                     "base_convergence_runs": list(
                         revalidation.get("base_convergence_runs", [])
+                    ),
+                    "base_engineer_clean": copy.deepcopy(
+                        revalidation.get("base_engineer_clean")
+                    ),
+                    "base_revision": revalidation.get("base_revision"),
+                    "base_product_revision": revalidation.get("base_product_revision"),
+                    "base_support_revision": revalidation.get("base_support_revision"),
+                    "base_evidence_revision": revalidation.get("base_evidence_revision"),
+                    "base_review_decision": copy.deepcopy(
+                        revalidation.get("base_review_decision")
                     ),
                     "finding_ids": list(revalidation.get("finding_ids", [])),
                     "changed_impact_surface": {
@@ -8208,7 +9651,14 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
                 "base_product_revision": state["product_revision"],
                 "base_support_revision": state["support_revision"],
                 "base_evidence_revision": state["evidence_revision"],
+                "base_engineer_clean": copy.deepcopy(state.get("engineer_clean")),
                 "base_review_runs": list(review["runs"]),
+                "base_review_decision": {
+                    "decision": "rework",
+                    "rework_scope": "product",
+                    "revalidation": args.revalidation,
+                    "decision_report": report,
+                },
                 "finding_ids": [item["id"] for item in review_actionable],
                 "reason": args.reason,
                 "slice_ids": affected_slice_ids,
@@ -8239,6 +9689,280 @@ def cmd_review_finalize(args: argparse.Namespace) -> int:
         )
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
+
+
+def targeted_closure_engineer_clean_proof(
+    root: Path,
+    state: dict[str, Any],
+    closure: dict[str, Any],
+    run: dict[str, Any],
+    *,
+    findings: dict[str, Any] | None = None,
+    legacy_inference: bool = False,
+    recorded_at: str | None = None,
+) -> dict[str, Any]:
+    """Bind current clean credit to prior convergence, full Review, and closure."""
+    if findings is None:
+        findings = read_json(root / STATE_DIR / "findings.json")
+    identities = (
+        "revision",
+        "product_revision",
+        "support_revision",
+        "evidence_revision",
+    )
+    if (
+        closure.get("mode") != "targeted_product_closure"
+        or closure.get("source") != "final_review"
+        or closure.get("return_phase") != "qa"
+        or closure.get("status") != "passed"
+        or closure.get("run") != run
+        or run.get("mode") != "targeted_product_closure"
+        or run.get("status") != "pass"
+        or any(closure.get(key) != state.get(key) for key in identities)
+        or any(run.get(key) != state.get(key) for key in identities)
+        or not isinstance(run.get("run_id"), str)
+        or not run.get("run_id")
+        or not isinstance(run.get("report"), str)
+        or not isinstance(run.get("report_sha256"), str)
+        or not isinstance(run.get("credit_manifest"), str)
+        or not isinstance(run.get("credit_manifest_sha256"), str)
+        or not run.get("component_credit_ids")
+    ):
+        raise PipelineError("Targeted closure clean proof is not exact-current or complete")
+    report_path = resolve_project_file(root, run["report"], "Targeted closure clean report")
+    credit_path = resolve_project_file(
+        root, run["credit_manifest"], "Targeted closure clean credit manifest"
+    )
+    if (
+        file_sha256(report_path) != run["report_sha256"]
+        or file_sha256(credit_path) != run["credit_manifest_sha256"]
+    ):
+        raise PipelineError("Targeted closure clean proof artifacts are stale")
+    base_clean = closure.get("base_engineer_clean")
+    base_runs = closure.get("base_review_runs")
+    base_identities = {
+        key: closure.get(f"base_{key}")
+        for key in identities
+    }
+    # Legacy in-memory callers may already carry the exact base tuple in the proof.
+    if all(value is None for value in base_identities.values()) and isinstance(base_clean, dict):
+        base_identities = {key: base_clean.get(key) for key in identities}
+    if not isinstance(base_clean, dict) or not isinstance(base_runs, list):
+        raise PipelineError("Targeted closure lacks exact prior convergence/full Review lineage")
+    allowed_clean_sources = (
+        {"legacy_controller_accepted_final_review_gate"}
+        if legacy_inference
+        else {"parallel_read_only_convergence", "targeted_convergence_closure"}
+    )
+    if (
+        base_clean.get("source") not in allowed_clean_sources
+        or base_clean.get("audit_complete") is not True
+        or any(base_clean.get(key) != base_identities[key] for key in identities)
+    ):
+        raise PipelineError("Targeted closure prior convergence proof is stale or incomplete")
+    if not legacy_inference:
+        clean_run_ids = base_clean.get("run_ids")
+        if not isinstance(clean_run_ids, list) or not clean_run_ids:
+            raise PipelineError("Targeted closure prior clean run lineage is missing")
+        if base_clean["source"] == "parallel_read_only_convergence":
+            convergence_runs = list((state.get("convergence") or {}).get("runs", []))
+            by_id = {item.get("run_id"): item for item in convergence_runs}
+            if any(
+                run_id not in by_id
+                or by_id[run_id].get("status") != "pass"
+                or any(by_id[run_id].get(key) != base_identities[key] for key in identities)
+                for run_id in clean_run_ids
+            ):
+                raise PipelineError("Targeted closure prior parallel convergence lineage is invalid")
+        else:
+            by_id = {item.get("run_id"): item for item in state.get("review_runs", [])}
+            if any(
+                run_id not in by_id
+                or by_id[run_id].get("mode") != "targeted_product_closure"
+                or by_id[run_id].get("status") != "pass"
+                or any(by_id[run_id].get(key) != base_identities[key] for key in identities)
+                for run_id in clean_run_ids
+            ):
+                raise PipelineError("Targeted closure prior targeted convergence lineage is invalid")
+        resolve_project_file(root, base_clean.get("report", ""), "Prior convergence decision report")
+        resolve_project_file(root, base_clean.get("coverage_manifest", ""), "Prior convergence coverage")
+    if (
+        len(base_runs) != state.get("required_reviews")
+        or len({item.get("reviewer_id") for item in base_runs}) != len(base_runs)
+        or any(item.get("status") not in {"pass", "fail"} for item in base_runs)
+        or any(any(item.get(key) != base_identities[key] for key in identities) for item in base_runs)
+    ):
+        raise PipelineError(
+            "Targeted closure lacks exact prior convergence/full Review lineage: "
+            + json.dumps({
+                "required": state.get("required_reviews"),
+                "count": len(base_runs),
+                "reviewers": [item.get("reviewer_id") for item in base_runs],
+                "statuses": [item.get("status") for item in base_runs],
+                "base_identities": base_identities,
+                "run_identities": [{key: item.get(key) for key in identities} for item in base_runs],
+            }, sort_keys=True)
+        )
+    if not legacy_inference:
+        revalidation = state.get("product_revalidation") or {}
+        decision = closure.get("base_review_decision")
+        if (
+            not isinstance(decision, dict)
+            or decision.get("decision") != "rework"
+            or decision.get("rework_scope") != "product"
+            or decision.get("revalidation") != "targeted"
+            or not decision.get("decision_report")
+            or revalidation.get("mode") != "targeted"
+            or revalidation.get("source") != "final_review"
+            or revalidation.get("base_engineer_clean") != base_clean
+            or revalidation.get("base_review_runs") != base_runs
+            or revalidation.get("base_review_decision") != decision
+            or any(
+                revalidation.get(f"base_{key}") != closure.get(f"base_{key}")
+                for key in identities
+            )
+            or sorted(revalidation.get("finding_ids") or [])
+            != sorted(closure.get("finding_ids") or [])
+        ):
+            raise PipelineError("Targeted closure lacks its controller-accepted Final Review rework gate")
+    recorded_runs = {item.get("run_id"): item for item in state.get("review_runs", [])}
+    capsule_records = {
+        item.get("capsule_id"): item for item in state.get("context_capsules", [])
+    }
+    credit_records = {
+        item.get("id"): item for item in state.get("component_review_credits", [])
+    }
+    for item in base_runs:
+        if recorded_runs.get(item.get("run_id")) != item:
+            raise PipelineError("Targeted closure base Review is not controller-recorded")
+        for field, sha_field, label in (
+            ("report", "report_sha256", "base Review report"),
+            ("credit_manifest", "credit_manifest_sha256", "base Review credit"),
+        ):
+            artifact = resolve_project_file(root, item.get(field, ""), label)
+            if file_sha256(artifact) != item.get(sha_field):
+                raise PipelineError(f"Targeted closure {label} drifted")
+        capsule_record = capsule_records.get(item.get("capsule_id"))
+        capsule_path = resolve_project_file(root, item.get("capsule", ""), "base Review capsule")
+        if (
+            not capsule_record
+            or capsule_record.get("path") != item.get("capsule")
+            or capsule_record.get("sha256") != file_sha256(capsule_path)
+        ):
+            raise PipelineError("Targeted closure base Review capsule is missing or changed")
+        credit_ids = item.get("component_credit_ids")
+        if (
+            not isinstance(credit_ids, list)
+            or not credit_ids
+            or any(credit_id not in credit_records for credit_id in credit_ids)
+        ):
+            raise PipelineError("Targeted closure base Review component credit lineage is missing")
+    frozen = sorted(set(closure.get("finding_ids") or []))
+    resolved = {
+        item.get("id"): item
+        for item in findings.get("items", [])
+        if item.get("id") in frozen and item.get("status") == "resolved"
+    }
+    if (
+        not frozen
+        or sorted(run.get("frozen_finding_ids") or []) != frozen
+        or sorted(resolved) != frozen
+        or any(item.get("resolved_product_revision") != state["product_revision"] for item in resolved.values())
+    ):
+        raise PipelineError("Targeted closure frozen findings are not exactly resolved on current product")
+    engineer = next(
+        (
+            item for item in reversed(state.get("engineer_runs", []))
+            if item.get("outcome") == "engineering_pass"
+            and item.get("result_revisions") == {key: state[key] for key in identities}
+            and sorted(item.get("resolved_findings") or []) == frozen
+        ),
+        None,
+    )
+    if not engineer:
+        raise PipelineError("Targeted closure lacks current controller-recorded Engineer completion")
+    for field, label in (
+        ("report", "Engineer report"),
+        ("semantic_handoff", "Engineer semantic handoff"),
+        ("change_manifest", "Engineer change manifest"),
+        ("diff_summary", "Engineer diff summary"),
+        ("revision_manifest", "Engineer revision manifest"),
+    ):
+        resolve_project_file(root, engineer.get(field, ""), label)
+    coverage_path = resolve_project_file(
+        root, state.get("coverage_manifest", ""), "Targeted closure clean coverage"
+    )
+    finalized = state.get("coverage", {}).get("feature", {}).get(
+        "finalized_manifest"
+    ) or {}
+    if (
+        finalized.get("path") != str(coverage_path)
+        or finalized.get("sha256") != file_sha256(coverage_path)
+        or finalized.get("revision") != state["revision"]
+    ):
+        raise PipelineError("Targeted closure clean proof lacks current finalized coverage")
+    handoff: dict[str, Any] | None = None
+    handoff_path: Path | None = None
+    handoff_value: dict[str, Any] | None = None
+    for candidate in reversed(state.get("handoffs") or []):
+        if not isinstance(candidate, dict) or candidate.get("schema") != 2:
+            continue
+        candidate_path = resolve_project_file(
+            root, candidate.get("path", ""), "Targeted closure Engineer handoff"
+        )
+        candidate_value = read_json(candidate_path)
+        if (
+            candidate_value.get("result_revisions") == {key: state[key] for key in identities}
+            and candidate_value.get("writer_id") == engineer.get("owner_id")
+            and candidate_value.get("semantic_report_path") == engineer.get("semantic_handoff")
+            and candidate_value.get("change_manifest_path") == engineer.get("change_manifest")
+            and candidate_value.get("diff_summary_path") == engineer.get("diff_summary")
+        ):
+            handoff = candidate
+            handoff_path = candidate_path
+            handoff_value = candidate_value
+            break
+    if handoff is None or handoff_path is None or handoff_value is None:
+        raise PipelineError("Targeted closure clean proof lacks current sealed handoff")
+    if (
+        file_sha256(handoff_path) != handoff.get("sha256")
+        or handoff_value.get("schema") != 2
+        or handoff_value.get("handoff_id") != handoff.get("handoff_id")
+        or handoff_value.get("result_revisions")
+        != {key: state[key] for key in identities}
+        or handoff_value.get("handoff_sha256") != handoff.get("handoff_sha256")
+        or handoff_value.get("handoff_sha256")
+        != canonical_json_sha256(
+            {key: value for key, value in handoff_value.items() if key != "handoff_sha256"}
+        )
+    ):
+        raise PipelineError("Targeted closure current handoff drifted")
+    return {
+        "source": "targeted_final_review_closure_chain",
+        "run_ids": [run["run_id"]],
+        "revision": state["revision"],
+        "product_revision": state["product_revision"],
+        "support_revision": state["support_revision"],
+        "evidence_revision": state["evidence_revision"],
+        "audit_complete": True,
+        "report": run["report"],
+        "report_sha256": run["report_sha256"],
+        "credit_manifest": run["credit_manifest"],
+        "credit_manifest_sha256": run["credit_manifest_sha256"],
+        "component_credit_ids": list(run["component_credit_ids"]),
+        "base_engineer_clean": copy.deepcopy(base_clean),
+        "base_review_runs": copy.deepcopy(base_runs),
+        "base_review_run_ids": [item["run_id"] for item in base_runs],
+        "targeted_closure_run": copy.deepcopy(run),
+        "closure_run_id": run["run_id"],
+        "engineer_run_id": engineer["run_id"],
+        "coverage_manifest": str(coverage_path),
+        "coverage_manifest_sha256": file_sha256(coverage_path),
+        "handoff_id": handoff.get("handoff_id"),
+        "handoff_path": handoff["path"],
+        "handoff_sha256": handoff["sha256"],
+        "recorded_at": recorded_at or utc_now(),
+    }
 
 
 def cmd_closure_review_complete(args: argparse.Namespace) -> int:
@@ -8329,6 +10053,7 @@ def cmd_closure_review_complete(args: argparse.Namespace) -> int:
                 "Targeted closure cannot pass while remediation-required findings remain open"
             )
         closure["status"] = "passed"
+        closure["run"] = run
         if closure.get("return_phase") == "review":
             state["engineer_clean"] = {
                 "source": "targeted_convergence_closure",
@@ -8352,6 +10077,9 @@ def cmd_closure_review_complete(args: argparse.Namespace) -> int:
             state["product_revalidation"] = None
             state["phase"] = "review"
         else:
+            state["engineer_clean"] = targeted_closure_engineer_clean_proof(
+                root, state, closure, run, findings=findings
+            )
             state["review"] = {
                 "status": "passed_targeted",
                 "revision": state["revision"],
@@ -8385,13 +10113,19 @@ def cmd_closure_review_complete(args: argparse.Namespace) -> int:
             state["product_revalidation"] = {
                 "mode": "targeted",
                 "source": closure.get("source"),
-                "base_revision": state["revision"],
-                "base_product_revision": state["product_revision"],
-                "base_support_revision": state["support_revision"],
-                "base_evidence_revision": state["evidence_revision"],
                 "base_review_runs": list(closure.get("base_review_runs", [])),
                 "base_convergence_runs": list(
                     closure.get("base_convergence_runs", [])
+                ),
+                "base_engineer_clean": copy.deepcopy(
+                    closure.get("base_engineer_clean")
+                ),
+                "base_revision": closure.get("base_revision"),
+                "base_product_revision": closure.get("base_product_revision"),
+                "base_support_revision": closure.get("base_support_revision"),
+                "base_evidence_revision": closure.get("base_evidence_revision"),
+                "base_review_decision": copy.deepcopy(
+                    closure.get("base_review_decision")
                 ),
                 "finding_ids": [item["id"] for item in current_review_actionable],
                 "slice_ids": list(
@@ -8859,6 +10593,228 @@ def cmd_evidence_remediation_complete(args: argparse.Namespace) -> int:
     record_worker(state, "nonproduct_remediation", args.worker_id)
     save_runtime(state_path, findings_path, state, findings)
     return cmd_status(args)
+
+
+def cmd_recover_ready_targeted_closure_clean(args: argparse.Namespace) -> int:
+    """Repair only the legacy ready-state omission of the targeted closure clean link."""
+    raw_root, _, _ = runtime_paths(args.project_root)
+    raw_state = read_json(raw_root / STATE_DIR / "state.json")
+    raw_computed = compute_inventory_revisions(raw_root, raw_state)
+    identity_fields = ("revision", "product_revision", "support_revision", "evidence_revision")
+    if any(raw_computed[key] != raw_state.get(key) for key in identity_fields):
+        raise PipelineError("Ready targeted-closure recovery rejects checkout revision drift")
+    root, state_path, findings_path, state, findings = load_runtime(args.project_root)
+    history = state.setdefault("ready_targeted_closure_clean_recoveries", [])
+    if state.get("phase") != "ready":
+        raise PipelineError("Ready targeted-closure clean recovery requires phase=ready")
+    if len(history) > 1 or (history and not isinstance(history[0], dict)):
+        raise PipelineError("Ready targeted-closure recovery history is malformed")
+    clean = state.get("engineer_clean")
+    if (
+        not history
+        and isinstance(clean, dict)
+        and clean.get("product_revision") == state.get("product_revision")
+    ):
+        raise PipelineError("Ready state already has current engineer_clean; recovery is not eligible")
+    if (
+        state.get("active_write_lease") is not None
+        or state.get("pending_engineer_completion") is not None
+        or state.get("product_revalidation") is not None
+        or any(item.get("status") != "completed" for item in state.get("remediation_queue", []))
+        or any(item.get("status") == "open" for item in findings.get("items", []))
+        or any(gate.get("status") == "open" for gate in state.get("gates", []))
+    ):
+        raise PipelineError("Ready targeted-closure recovery is blocked by pending work or an open hold")
+    closure = copy.deepcopy(state.get("closure_review") or {})
+    review = state.get("review") or {}
+    qa = state.get("qa") or {}
+    identities = identity_fields
+    if (
+        closure.get("status") != "passed"
+        or closure.get("mode") != "targeted_product_closure"
+        or closure.get("source") != "final_review"
+        or closure.get("return_phase") != "qa"
+        or review.get("status") != "passed_targeted"
+        or review.get("recovery_run") != closure.get("run")
+        or qa.get("status") != "pass"
+        or any(closure.get(key) != state.get(key) for key in identities)
+        or any(review.get(key) != state.get(key) for key in identities)
+        or any(qa.get(key) != state.get(key) for key in identities)
+    ):
+        raise PipelineError("Ready state lacks an exact accepted targeted closure and QA chain")
+    for field, sha_field, label in (
+        ("report", "report_sha256", "QA report"),
+        ("manual_execution", "manual_execution_sha256", "QA manual execution"),
+    ):
+        artifact = resolve_project_file(root, qa.get(field, ""), label)
+        if file_sha256(artifact) != qa.get(sha_field):
+            raise PipelineError(f"{label} is missing or changed")
+    base_runs = closure.get("base_review_runs")
+    if not isinstance(base_runs, list) or not base_runs:
+        raise PipelineError("Legacy closure lacks controller-accepted base Review records")
+    base_tuple = {key: base_runs[0].get(key) for key in identities}
+    if any(any(item.get(key) != base_tuple[key] for key in identities) for item in base_runs):
+        raise PipelineError("Legacy base Review identities are inconsistent")
+    closure.update({f"base_{key}": value for key, value in base_tuple.items()})
+    closure["base_engineer_clean"] = {
+        "source": "legacy_controller_accepted_final_review_gate",
+        "run_ids": [],
+        **base_tuple,
+        "audit_complete": True,
+        "recorded_at": base_runs[0].get("recorded_at"),
+        "legacy_inference": {
+            "schema": 1,
+            "provenance": "controller_accepted_full_review_records",
+            "base_review_run_ids": [item.get("run_id") for item in base_runs],
+        },
+    }
+    prior_record = history[-1] if history else None
+    prior_receipt: dict[str, Any] | None = None
+    if prior_record:
+        prior_path = root / str(prior_record.get("path", ""))
+        if prior_path.is_symlink():
+            raise PipelineError("Ready recovery receipt cannot be a symlink")
+        prior_path = resolve_project_file(root, str(prior_record.get("path", "")), "Ready recovery receipt")
+        prior_receipt = read_json(prior_path)
+    recovered_at = (
+        prior_receipt.get("recorded_at")
+        if isinstance(prior_receipt, dict)
+        else utc_now()
+    )
+    if not isinstance(recovered_at, str) or not recovered_at:
+        raise PipelineError("Ready recovery receipt lacks recorded_at")
+    proof = targeted_closure_engineer_clean_proof(
+        root,
+        state,
+        closure,
+        closure["run"],
+        findings=findings,
+        legacy_inference=True,
+        recorded_at=recovered_at,
+    )
+    proof["legacy_recovery"] = True
+    readiness_state = copy.deepcopy(state)
+    readiness_state["engineer_clean"] = proof
+    reasons = readiness_reasons(readiness_state, findings)
+    if reasons:
+        raise PipelineError(
+            "Ready targeted-closure recovery prerequisites are incomplete: "
+            + "; ".join(reasons)
+        )
+    before = compute_inventory_revisions(root, state)
+    sequence = len(history) if history else 1
+    receipt_id = f"RTC-{sequence:04d}"
+    logical_controller_root = Path(state["tests_path"]) / "verification" / "controller"
+    try:
+        logical_relative = logical_controller_root.relative_to(root)
+    except ValueError as exc:
+        raise PipelineError("Ready recovery receipt root escapes project root") from exc
+    boundary = root
+    for part in logical_relative.parts:
+        boundary = boundary / part
+        if boundary.is_symlink():
+            raise PipelineError("Ready recovery receipt path crosses a symlink boundary")
+    controller_root = logical_controller_root.resolve()
+    try:
+        controller_relative = controller_root.relative_to(root)
+    except ValueError as exc:
+        raise PipelineError("Ready recovery receipt root escapes project root") from exc
+    receipt_path = controller_root / f"ready-targeted-closure-clean-recovery-{sequence:04d}.json"
+    if receipt_path.is_symlink():
+        raise PipelineError("Ready recovery receipt cannot be a symlink")
+    receipt_temporary = receipt_path.with_suffix(receipt_path.suffix + ".tmp")
+    if receipt_temporary.is_symlink():
+        raise PipelineError(
+            "Ready recovery receipt temporary path is already occupied by a symlink"
+        )
+    orphan = read_json(receipt_path) if receipt_path.exists() else None
+    temporary_orphan = read_json(receipt_temporary) if receipt_temporary.exists() else None
+    if orphan is not None and temporary_orphan is not None:
+        raise PipelineError("Ready recovery receipt and temporary path are both occupied")
+    orphan_source = orphan if orphan is not None else temporary_orphan
+    if orphan_source is not None:
+        recovered_at = orphan_source.get("recorded_at")
+        if not isinstance(recovered_at, str) or not recovered_at:
+            raise PipelineError("Ready recovery orphan receipt lacks recorded_at")
+        proof["recorded_at"] = recovered_at
+    receipt = {
+        "schema": 1,
+        "receipt_id": receipt_id,
+        "kind": "ready_targeted_closure_clean_recovery",
+        "identities": {key: state[key] for key in identities},
+        "base_identities": base_tuple,
+        "base_review_run_ids": [item["run_id"] for item in base_runs],
+        "closure_run_id": closure["run"]["run_id"],
+        "closure_report_sha256": closure["run"]["report_sha256"],
+        "closure_credit_manifest_sha256": closure["run"]["credit_manifest_sha256"],
+        "qa_run_id": qa["run_id"],
+        "qa_report_sha256": qa["report_sha256"],
+        "qa_manual_execution_sha256": qa["manual_execution_sha256"],
+        "coverage_manifest": proof["coverage_manifest"],
+        "coverage_manifest_sha256": proof["coverage_manifest_sha256"],
+        "handoff_id": proof["handoff_id"],
+        "handoff_sha256": proof["handoff_sha256"],
+        "engineer_clean_sha256": canonical_json_sha256(proof),
+        "recorded_at": recovered_at,
+    }
+    created = False
+    if orphan is not None:
+        if orphan != receipt:
+            raise PipelineError("Ready recovery receipt path is occupied by unrelated bytes")
+    elif temporary_orphan is not None:
+        if temporary_orphan != receipt:
+            raise PipelineError("Ready recovery receipt temporary path contains unrelated bytes")
+        os.replace(receipt_temporary, receipt_path)
+        created = True
+    else:
+        write_json(receipt_path, receipt)
+        created = True
+    if receipt_path.is_symlink() or read_json(receipt_path) != receipt:
+        raise PipelineError("Ready recovery receipt write was not preserved exactly")
+    after = compute_inventory_revisions(root, state)
+    if any(before[key] != after[key] for key in identities):
+        if created:
+            receipt_path.unlink(missing_ok=True)
+        raise PipelineError("Ready recovery receipt changed revision inventory identities")
+    relative = receipt_path.relative_to(root).as_posix()
+    receipt_sha = file_sha256(receipt_path)
+    record = {
+        "receipt_id": receipt_id,
+        "kind": receipt["kind"],
+        "path": relative,
+        "sha256": receipt_sha,
+        "engineer_clean_sha256": receipt["engineer_clean_sha256"],
+        "recorded_at": recovered_at,
+    }
+    if history:
+        if (
+            len(history) != 1
+            or prior_record != record
+            or prior_receipt != receipt
+            or not isinstance(clean, dict)
+            or clean != proof
+            or canonical_json_sha256(clean) != record["engineer_clean_sha256"]
+        ):
+            raise PipelineError("Recorded ready targeted-closure recovery is missing or changed")
+        print(json.dumps({
+            "status": "already_recovered",
+            "receipt": {"id": receipt_id, "path": relative, "sha256": receipt_sha},
+            "engineer_clean": clean,
+            "phase": state["phase"],
+            "next_action": next_action(state, findings),
+        }, ensure_ascii=False, indent=2))
+        return 0
+    state["engineer_clean"] = proof
+    history.append(record)
+    save_runtime(state_path, findings_path, state, findings)
+    print(json.dumps({
+        "status": "recovered",
+        "receipt": {"id": receipt_id, "path": relative, "sha256": receipt_sha},
+        "engineer_clean": proof,
+        "phase": state["phase"],
+        "next_action": next_action(state, findings),
+    }, ensure_ascii=False, indent=2))
+    return 0
 
 
 def cmd_recovery_review_complete(args: argparse.Namespace) -> int:
@@ -9856,6 +11812,17 @@ def build_parser() -> argparse.ArgumentParser:
     release_lease.add_argument("--reason", required=True)
     release_lease.set_defaults(handler=cmd_release_write_lease)
 
+    legacy_scope = commands.add_parser("recover-legacy-engineer-scope")
+    add_common_project_root(legacy_scope)
+    legacy_scope.add_argument("--lease-id", required=True)
+    legacy_scope.add_argument("--owner-id", required=True)
+    legacy_scope.add_argument("--slice-id", required=True)
+    legacy_scope.set_defaults(handler=cmd_recover_legacy_engineer_scope)
+
+    prepare_engineer = commands.add_parser("prepare-engineer-continuation")
+    add_common_project_root(prepare_engineer)
+    prepare_engineer.set_defaults(handler=cmd_prepare_engineer_continuation)
+
     decision_complete = commands.add_parser("decision-record-complete")
     add_common_project_root(decision_complete)
     decision_complete.add_argument("--recorder-id", required=True)
@@ -10041,6 +12008,14 @@ def build_parser() -> argparse.ArgumentParser:
     closure_review.add_argument("--report", required=True)
     closure_review.add_argument("--credit-manifest", required=True)
     closure_review.set_defaults(handler=cmd_closure_review_complete)
+
+    recover_ready_closure = commands.add_parser(
+        "recover-ready-targeted-closure-clean"
+    )
+    add_common_project_root(recover_ready_closure)
+    recover_ready_closure.set_defaults(
+        handler=cmd_recover_ready_targeted_closure_clean
+    )
 
     add_finding = commands.add_parser("add-finding")
     add_common_project_root(add_finding)

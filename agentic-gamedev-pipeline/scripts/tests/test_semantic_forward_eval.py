@@ -35,6 +35,7 @@ REQUIRED_SCENARIOS = {
     "ordinary_non_trigger",
     "direct_stage",
     "pipeline_delegated_stage",
+    "director_execution_boundary",
     "prohibited_stage_to_stage_execution",
     "stale_or_missing_capsule",
     "prd_spec_plan_order",
@@ -104,6 +105,14 @@ class SemanticForwardEvalCorpusTests(unittest.TestCase):
         self.assertEqual(
             ["gamedev-engineer"],
             by_id["pipeline_delegated_engineering"]["expected"]["activation"],
+        )
+        self.assertEqual(
+            "spawn_separate_role_worker",
+            by_id["director_must_delegate_specialized_stage"]["expected"]["allowed_action"],
+        )
+        self.assertIn(
+            "self_assume_stage",
+            by_id["director_must_delegate_specialized_stage"]["expected"]["forbidden_actions"],
         )
         self.assertEqual(
             "$gamedev-requirements",
@@ -257,8 +266,8 @@ class SemanticForwardEvalGraderTests(unittest.TestCase):
     def test_passing_fixture_grades_every_case_and_dimension(self) -> None:
         report = self.grade_fixture("semantic_candidate_pass.v1.json")
         self.assertTrue(report["summary"]["pass"])
-        self.assertEqual(11, report["summary"]["graded_cases"])
-        self.assertEqual(11, report["summary"]["passed_cases"])
+        self.assertEqual(12, report["summary"]["graded_cases"])
+        self.assertEqual(12, report["summary"]["passed_cases"])
         for result in report["results"]:
             self.assertTrue(result["pass"])
             self.assertTrue(all(item["pass"] for item in result["dimensions"].values()))

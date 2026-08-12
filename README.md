@@ -1,6 +1,10 @@
-# Agentic Game Development Pipeline
+# Agentic Game Development Skills
 
-Локальный пакет Codex для разработки игровой фичи до production-ready candidate через ранний resource/runtime preflight, phase-scoped writing leases, bounded context capsules, независимые роли решений/coverage/docs, параллельную read-only проверку и feature-focused runtime QA.
+Пользовательский bundle Codex skills для разработки игровой фичи до production-ready candidate через ранний resource/runtime preflight, phase-scoped writing leases, bounded context capsules, независимые роли решений/coverage/docs, параллельную read-only проверку и feature-focused runtime QA.
+
+Codex обнаруживает bundle через одну пользовательскую junction: `~/.codex/skills/agentic-gamedev-pipeline` указывает на каталог `agentic-gamedev-pipeline/skills` этого репозитория. Plugin manifest и marketplace-регистрация не используются.
+
+Полный локальный regression suite запускается командой `python agentic-gamedev-pipeline/scripts/test_skills.py`.
 
 ## Активация только по запросу
 
@@ -10,7 +14,7 @@
 
 ## Принцип
 
-До запуска Engineer технический директор проверяет числовые бюджеты спецификации/контекста и заранее фиксирует доступность Studio/Rojo, опубликованных конфигов, DataStore, place topology и ручного управления. `single_owner` означает один implementation write-scope, а не одного Engineer на весь lifecycle: каждый Decision Recorder, Engineer, Documentation Finisher или recovery worker получает отдельную фазовую lease, причём одновременно разрешён только один writer. Все специализированные workers получают exact paths/SHA/IDs/evidence в bounded context capsule, а не историю чата. После code freeze Coverage Steward доказывает exact expected/actual identity equality и automated evidence; Review и QA остаются независимыми и immutable.
+До запуска Engineer технический директор проверяет числовые бюджеты спецификации/контекста и заранее фиксирует доступность Studio/Rojo, опубликованных конфигов, DataStore, place topology и ручного управления. Director занимается только оркестрацией: каждая специализированная роль выполняется отдельным non-Director субагентом, разные роли не совмещаются в одном агентном контексте, а недоступность делегирования останавливает этап до начала работы. `single_owner` означает один implementation write-scope, а не одного Engineer на весь lifecycle: каждый Decision Recorder, Engineer, Documentation Finisher или recovery worker получает отдельную фазовую lease, причём одновременно разрешён только один writer. Все специализированные workers получают exact paths/SHA/IDs/evidence в bounded context capsule без истории Director-чата и возвращают компактный handoff со ссылками на неизменяемые артефакты. После code freeze Coverage Steward доказывает exact expected/actual identity equality и automated evidence; Review и QA остаются независимыми и immutable.
 
 ## Skills
 
@@ -106,7 +110,6 @@ Namespace и регистр путей принадлежат проекту. К
 
 ```text
 agentic-gamedev-pipeline/
-  .codex-plugin/plugin.json
   skills/
     gamedev-requirements/
     gamedev-specification/

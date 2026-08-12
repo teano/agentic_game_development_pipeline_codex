@@ -32,24 +32,24 @@ When `production_reachability=unknown`, store `blocking=false`, enter bounded `f
 
 Kinds:
 
-- `product`: production behavior, contract, configuration, integration, or runtime source is wrong;
-- `evidence`: the current required test/fixture/assertion can let a real product defect pass undetected;
-- `support`: derived handoff, index, operator guidance, or non-normative metadata is stale while runtime behavior and public contracts remain unchanged;
-- `hardening`: defensive improvement beyond approved behavior, including theoretical robustness or an unsupported configuration.
+- `product`: wrong production behavior, contract, configuration, integration, or source;
+- `evidence`: required proof can miss a real defect;
+- `support`: stale derived handoff/index/guidance while product contracts remain correct;
+- `hardening`: defense beyond approved behavior or supported configuration.
 
 Severity:
 
-- `critical`: security compromise, data loss, unrecoverable corruption, unsafe external action, crash/hard blocker in a core flow, or release-breaking requirement failure;
-- `major`: incorrect core behavior, material requirement violation, likely regression, missing important supported failure handling, serious performance breach, or qualifying evidence failure;
-- `minor`: bounded defect or maintainability risk that does not invalidate a core flow and has a safe workaround.
+- `critical`: compromise/data loss/corruption, unsafe action, core-flow blocker, or release-breaking failure;
+- `major`: wrong core behavior, material violation/regression, missing supported failure handling, serious performance breach, or qualifying evidence failure;
+- `minor`: bounded defect/risk with safe workaround and no invalid core flow.
 
-Critical safety, corruption, or data-loss claims must identify a blocked approved acceptance criterion or the exact required invariant; an invariant claim requires supporting evidence. Missing evidence is never Critical by itself.
+Critical claims identify blocked acceptance or an evidenced required invariant; missing evidence alone is never Critical.
 
-An `evidence` finding may be Major only when all are proven: another required proof for a core acceptance criterion is absent; the exact current test can miss a real product defect; and `blocks_acceptance_ids` names that approved criterion. Otherwise classify it Minor or `support`. Duplicate preferred evidence, stale provenance, cosmetic diagnostics, and evidence-format preferences do not block automatically.
+`evidence` is Major only if another core proof is absent, the current test can miss a real defect, and `blocks_acceptance_ids` names that criterion; otherwise it is Minor/support. Duplicate evidence, stale provenance, cosmetic diagnostics, and format preferences do not block automatically.
 
-The following never block automatically: preexisting adjacent or out-of-scope defects, defensive hardening, theoretical paths, unsupported configurations, cosmetic issues, stale provenance, or duplicate evidence. Support/hardening findings cannot claim blocked acceptance IDs or a required product invariant; only support may claim an exact required-support contract path. A Minor classification likewise cannot claim a blocked approved acceptance criterion or required invariant; the controller rejects that incompatible combination, so Minor product findings never start a remediation wave by themselves.
+Preexisting/out-of-scope defects, hardening, theoretical/unsupported paths, cosmetics, stale provenance, and duplicate evidence never auto-block. Support/hardening cannot block acceptance or product invariants; only support may block an exact support contract. Minor cannot block acceptance/invariants and never starts remediation alone.
 
-Do not create a finding for unavailable tools, permissions, credentials, publication, manual actions, unrelated noise, or an unexecuted scenario. Record those as gates. Fix only the controller-frozen `remediation_required` batch through its product or non-product route. Preserve every supported nonblocking out-of-scope issue through Director `backlog-upsert`; convergence cannot pass until all canonical links resolve. Return introduced/worsened, changed-contract/feature-reachable, acceptance/invariant-blocking, or safety-impact issues to current scope, using `scope_expansion_hold` when the approved plan must materially change.
+Unavailable tools/permissions/credentials/publication/manual actions and unexecuted scenarios are gates, not findings. Fix only the frozen `remediation_required` batch. Keep introduced/worsened, contract/feature-reachable, acceptance/invariant-blocking, and safety-impact issues in current scope. Preserve supported nonblocking external issues through `backlog-upsert`; material plan change uses `scope_expansion_hold`.
 
 ## Gate classification
 
@@ -65,28 +65,21 @@ Before QA spawn, the controller requires a complete capability probe on the exac
 
 Require all of the following:
 
-- current approved PRD, traced technical specification, and approved development plan;
-- current append-only decision ledger (possibly zero-entry) with every referenced `DEC-*` active and exact, plus every policy-required ADR or plan-proven ADR `not_required`;
-- passed exact-set resource/capability preflight covering every approved prerequisite plus platform minimum and no unexpected capability;
-- passed schema-1 capsule-payload budget gates with preserved file/byte/token metrics for every specialized worker; these metrics do not claim full system context;
-- no active/overlapping write lease and a complete append-only lease history;
-- every repository-required normative product document completed before Review and current derived support document completed after QA, or exact plan/policy evidence that each class is not required;
-- no source drift;
-- `implementation_state=pass` independently of `feature_verification_state`;
-- a current schema-2 coverage manifest with every approved acceptance ID mapped, exact expected/actual identity set equality, separate exact mandatory-set registration equality, no coverage gap, and every mandatory automated identity executed/passed;
-- one passed parallel read-only convergence wave on the current product revision;
-- no slice has exceeded two append-only full convergence waves; local remediation is closed by one fresh targeted reviewer unless an allowed material full-wave trigger is recorded;
-- valid component Review credits keyed by component product hash, contract hash, lenses, and review revision, with unchanged components reused and Final Review composition/new-boundary coverage recorded;
-- two distinct passed full Reviews on current identities with exact reviewer capsules/credit manifests, their preserved reports plus one passed targeted local-product closure reviewer, or their preserved same-product reports plus one passed support/evidence recovery reviewer with exact capsule, credit manifest, and finalized recovery coverage continuity;
-- a passed exact-product/evidence QA capability probe and feature-focused runtime QA `pass` with every mandatory manual identity executed/passed and none deferred/blocked;
-- when derived support changed after QA, unchanged exact QA product/evidence identities plus one fresh passed `documentation-closure` Review on the current support revision;
-- a controller-generated schema-2 terminal handoff containing exact `decision_ids`, `coverage_state`, `documentation_state`, and `open_assumptions`;
-- no open controller-classified `remediation_required` finding;
-- no unaccepted Minor finding; acceptance requires a prior immutable user-authority receipt bound to exact finding ID, current revision, and reason;
-- no open gate hiding a mandatory scenario;
-- no unavailable required preflight capability;
-- worker and full-Review budgets either remain within their configured limits or have an explicit director authorization;
-- `feature_verification_state=pass` on the current product/support/evidence identities and preserved exact QA/support-closure credits;
+- exact-current approved PRD/spec/plan, no source drift, and append-only ledger with active referenced decisions and required ADRs (or plan-proven `not_required`);
+- exact-set preflight for plan plus platform capabilities, with none unexpected/unavailable, and no open gate hiding mandatory execution;
+- passed capsule budgets with preserved file/byte/token metrics; worker/review budgets remain within limits or have explicit Director authorization;
+- no active/overlapping lease and complete append-only lease history;
+- required normative docs before Review and derived support after QA, or exact policy `not_required` evidence;
+- independent `implementation_state=pass`;
+- current schema-2 coverage: all acceptance IDs mapped, expected=actual identities, mandatory registration exact, no gap, mandatory automation passed;
+- a passed parallel convergence wave on current product; at most two append-only full waves per slice, with local remediation closed by fresh targeted Review unless a recorded material trigger requires a full wave;
+- valid component credits keyed by product/contract hashes, lenses, and review revision; reuse unchanged components and record Final Review composition/new-boundary coverage;
+- two distinct full Reviews on current identities with exact capsules/credit manifests, then either targeted product closure or support/evidence recovery Review preserving same-product reports and finalized coverage continuity;
+- exact-product/evidence capability probe and runtime QA pass; every mandatory manual identity executed/passed, none deferred/blocked;
+- if post-QA derived support changed, unchanged QA product/evidence plus fresh documentation-closure Review on current support;
+- terminal schema-2 handoff with exact decisions, coverage, docs, and assumptions;
+- no open `remediation_required` finding; every Minor is closed or accepted by prior immutable receipt bound to finding, revision, and reason;
+- `feature_verification_state=pass` on current product/support/evidence with exact QA/support-closure credits;
 - controller phase `ready` and successful `ready` command.
 
 This verdict is a production-ready candidate, not authorization to publish, deploy, migrate, spend, submit, or accept risk.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run every Python test bundled with the plugin and reject an empty suite."""
+"""Run every Python test bundled with the skills and reject an empty suite."""
 
 from __future__ import annotations
 
@@ -20,13 +20,13 @@ def main() -> int:
         suite = loader.discover(str(scripts_dir), pattern="test_*.py")
         aggregate.addTests(suite)
         discovered += suite.countTestCases()
-    plugin_tests = root / "scripts" / "tests"
-    if plugin_tests.is_dir():
-        suite = loader.discover(str(plugin_tests), pattern="test_*.py")
+    bundle_tests = root / "scripts" / "tests"
+    if bundle_tests.is_dir():
+        suite = loader.discover(str(bundle_tests), pattern="test_*.py")
         aggregate.addTests(suite)
         discovered += suite.countTestCases()
     if discovered == 0:
-        print("error: no plugin tests were discovered", file=sys.stderr)
+        print("error: no skill tests were discovered", file=sys.stderr)
         return 2
     result = unittest.TextTestRunner(verbosity=2).run(aggregate)
     return 0 if result.wasSuccessful() else 1
