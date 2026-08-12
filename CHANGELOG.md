@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-12
+
 ### Изменено
 
 - Bundle переведён из Codex plugin в обычные пользовательские skills: plugin manifest/marketplace больше не используются, а весь каталог `skills/` подключается одной junction из `~/.codex/skills/agentic-gamedev-pipeline`.
@@ -22,6 +24,11 @@
 - Engineer lease теперь выдаётся только после current exact-base scope check; legacy lease восстанавливается отдельным audit receipt без rollback/EOL-реконструкции, а `prepare-engineer-continuation` идемпотентно подготавливает scope, capsule, lease и точный handoff.
 - Успешная targeted Final Review closure с возвратом в QA сохраняет exact convergence/review/remediation lineage в `engineer_clean`; исторический ready-state deadlock восстанавливается одноразовой fail-closed командой без повторного Review, QA или изменения checkout.
 - Создание off-phase capsule отклоняется до записи артефактов с сохранением только документированных cross-phase маршрутов Decision Recorder и Documentation Finisher.
+
+### Проверено
+
+- Полный regression suite из 260 тестов проходит; 6 symlink-сценариев ожидаемо пропускаются без соответствующих Windows-привилегий.
+- Skill validation, whitespace-проверка staged diff и независимый аудит controller recovery/state-machine изменений проходят без блокирующих замечаний.
 
 ## [0.5.0] - 2026-08-11
 
@@ -125,7 +132,8 @@
 - Полный набор из 97 тестов контроллеров, активации и межрежимных контрактов.
 - Валидация manifest плагина и всех восьми skill-пакетов.
 
-[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.3.0...v0.3.1
