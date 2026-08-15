@@ -7,6 +7,46 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-15
+
+### Добавлено
+
+- Общие строгие контракты acceptance criteria и development plan теперь одинаково используются Requirements, Specification, Planning и runtime-контроллерами; literal producer output принимается downstream без локальных dialects.
+- Добавлен explicit-only Recovery Remediator для controller-assigned support/evidence recovery, а Research, Review, QA и semantic write packets получили компактные role-owned output schemas.
+- Requirements Collector задаёт до пяти связанных вопросов за раунд, предлагает только grounded варианты с trade-offs и сохраняет частичные ответы, не превращая предложения в подтверждённые требования.
+- Test runner получил fast/runtime partitions, детерминированный discovery и пригодные для CI summaries без немых многоминутных запусков.
+
+### Изменено
+
+- Runtime state обновлён до schema 10: `state.json` является единственным атомарным authority, `findings.json` — восстанавливаемой projection; snapshots хранят только bounded digests/line hashes без raw checkout text и секретов.
+- Director startup context сокращён примерно вдвое до 12 271 байта: он загружает authority/phase/hold/lease/checkpoint summary, а worker schemas и фазовые детали раскрываются только по требованию.
+- Happy path использует одного Engineer и один logical Verifier ID; convergence, Final Review и QA запускаются в свежих `fork_turns:none` sessions с точными phase capsules и без sibling conclusions.
+- Preflight и QA capabilities выводятся из approved plan и фактически исполняемых manual identities вместо глобального engine-specific набора; Research briefs и waiver reason теперь буквально связаны с approved plan.
+- Scope discipline привязан к Product Outcome и назначенным PRD-REQ/AC: side issues требуют deferred backlog с owner, impact, rationale и точной occurrence binding, а rebaseline — immutable user-authority receipt для exact hold и plan SHA.
+- Coverage, QA, decision, documentation source-map и handoff contracts сделаны closed и controller-bound; opaque reports остаются audit-only и не используются как authority.
+
+### Исправлено
+
+- Устранены ложные material-scope holds и PLAN revision churn для заранее утверждённых lifecycle/ownership/public-contract изменений; повторное утверждение требуется только для нового material scope.
+- Generated/cache/vendor noise настраивается project policy и одинаково исключается из snapshots и semantic diff, не скрывая tracked source.
+- Decision ledger, lifecycle receipts и canonical findings сохраняются crash-safe; `status` не мутирует legacy/current state, а одинаковый lost-response retry возвращает прежний результат без дублирования.
+- Исправлены dead ends и replay-конфликты в decision recording, coverage re-finalization после remediation, Engineer continuation, context-exhausted owner handoff, documentation closure и QA recovery.
+- Approved PRD acceptance inventory, slice coverage и shared-AC aggregation используют exact literal IDs; диапазоны, дубликаты, hidden Markdown authority и несовместимые producer/consumer schemas отклоняются до runtime.
+- Final Review/QA больше не получают human-readable conclusions предыдущего reviewer; documentation closure требует structured credit/report, exact hashes и отклоняет последующий tamper.
+
+### Миграция
+
+- Active schema-9 state мигрируется автоматически при следующей authorized mutation; read-only `status` остаётся byte-for-byte nonmutating. Изменённый или недоказуемый legacy candidate сохраняет файлы, отзывает stale lease и требует fresh owner handoff.
+- `slice-research-not-required` должен повторять exact approved plan reason, а Research completion — exact набор из 1–3 plan brief IDs.
+- Legacy deferred entries остаются читаемыми, но не могут авторизовать scope, пока не дополнены owner, impact, rationale и exact finding occurrence.
+- Integrations должны использовать новые role-owned Research/Review/QA/semantic schemas и не считать generic report body машинным authority.
+
+### Проверено
+
+- Exact discovery: 403 теста; 399 проходят, 4 Windows symlink-сценария ожидаемо пропущены без link-creation privilege, failures отсутствуют.
+- Все 235 runtime-state тестов покрыты десятью непересекающимися partitions без пропусков или дубликатов; fast suite — 168/168.
+- Все 20 Python-файлов компилируются; `git diff --check`, secret/raw-snapshot/runtime-artifact scans проходят без замечаний.
+
 ## [0.6.0] - 2026-08-12
 
 ### Изменено
@@ -132,7 +172,8 @@
 - Полный набор из 97 тестов контроллеров, активации и межрежимных контрактов.
 - Валидация manifest плагина и всех восьми skill-пакетов.
 
-[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.3.1...v0.4.0
