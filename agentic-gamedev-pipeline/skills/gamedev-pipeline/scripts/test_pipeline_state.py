@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Schema-9 controller tests with exact role artifacts and verification boundaries."""
+"""Schema-10 controller tests with exact role artifacts and verification boundaries."""
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -44,8 +50,23 @@ class PipelineSchema9Tests(unittest.TestCase):
             "document_type: product-requirements\n"
             "status: approved\n"
             "revision: 1\n"
+            "language: English\n"
+            "approved_at: 2026-08-11T00:00:00+00:00\n"
             "---\n"
-            "# PRD\n\nPRD-REQ-001\nPRD-AC-001\n",
+            "# Product Requirements\n\n"
+            "## Product Outcome\n\nPlayable teleport outcome.\n\n"
+            "## Target Audience\n\nFeature players.\n\n"
+            "## Core Gameplay Loop\n\nStart, teleport, and observe the result.\n\n"
+            "## Release Target\n\nOne production-ready vertical slice.\n\n"
+            "## Scope\n\n### In Scope\n\nThe approved teleport feature.\n\n"
+            "### Out of Scope\n\nUnrelated systems.\n\n"
+            "## Functional Requirements\n\n- PRD-REQ-001: The feature teleports.\n\n"
+            "## Quality Requirements\n\n- PRD-NFR-001: Verification is deterministic.\n\n"
+            "## Acceptance Criteria\n\n"
+            "- PRD-AC-001: approved criterion\n"
+            "\n## Assumptions\n\nThe project baseline is available.\n\n"
+            "## Open Questions\n\nNone.\n\n"
+            "## Risks\n\nShared integration drift.\n",
             encoding="utf-8",
         )
         self.spec.write_text(
@@ -114,6 +135,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             "- automated_identity_namespace: AUTO-*\n"
             "- manual_identity_namespace: MANUAL-*\n"
             "- mandatory_rule: PRD-AC-001 and both declared identities\n"
+            "- automation_feasibility: deterministic logic automated; runtime topology manual\n"
             "- capability_prerequisites: test-server-two-clients\n"
             "- gates: plan-before-engineering, finalize-after-code-freeze, qa-updated\n\n"
             "## Documentation Strategy\n\n"
@@ -150,7 +172,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             "- max_product_files: 4\n"
             "- max_product_lines_changed: 200\n"
             "- verification_scope: project_tests/test_feature.py and runtime identity\n"
-            "- scope_baseline_revision: base-0\n\n"
+            "\n"
             "### Research Briefs\n\n"
             "- RESEARCH-001 | question=confirm exact edit surface | paths=src/feature.py | exclusions=src/commerce/** | evidence=approved spec | stop=scope is exact\n\n"
             "### Coverage Contract\n\n"
@@ -183,12 +205,30 @@ class PipelineSchema9Tests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def refresh_spec_plan_and_state_for_current_prd(self) -> None:
+        self.spec.write_text(
+            "---\n"
+            "document_type: technical-specification\n"
+            "status: approved\n"
+            "revision: 1\n"
+            "product_authority:\n"
+            f"  path: {self.rel(self.prd)}\n"
+            "  revision: 1\n"
+            f"  sha256: {self.sha(self.prd)}\n"
+            "---\n"
+            "# Specification\n\nPRD-REQ-001\nPRD-AC-001\n",
+            encoding="utf-8",
+        )
+        self.write_plan()
+        self.write_planning_state()
+
     def write_planning_state(self) -> None:
         state_root = self.root / ".agentic-pipeline"
         state_root.mkdir(parents=True, exist_ok=True)
         (state_root / "specification-state.json").write_text(
             json.dumps(
                 {
+                    "schema_version": 2,
                     "feature": FEATURE,
                     "status": "spec_ready",
                     "prd": {"path": self.rel(self.prd)},
@@ -243,16 +283,514 @@ class PipelineSchema9Tests(unittest.TestCase):
             (self.root / ".agentic-pipeline" / "state.json").read_text(encoding="utf-8")
         )
 
+    def inject_canonical_finding(self, finding: dict) -> tuple[Path, dict]:
+        _, state_path, findings_path, state, findings = runtime_controller.load_runtime(
+            str(self.root)
+        )
+        findings["items"].append(finding)
+        runtime_controller.save_runtime(state_path, findings_path, state, findings)
+        return findings_path, findings
+
     def full_status(self) -> dict:
         return json.loads(self.cli("status", "--full").stdout)
 
     def artifact(self, area: str, name: str, value: dict | None = None) -> str:
         path = self.root / "tests" / FEATURE / area / f"{name}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
+        if value is None and name.endswith("engineer-report"):
+            value = {"name": name, **self.dirty_candidate_report()}
         path.write_text(json.dumps(value or {"name": name}), encoding="utf-8")
         return self.rel(path)
 
-    def initialize(self, *, research: bool = True) -> dict:
+    def dirty_candidate_report(self) -> dict:
+        state = self.state()
+        lease = state["active_write_lease"]
+        candidate = runtime_controller.checkout_snapshot(self.root, FEATURE, state)
+        digest = runtime_controller.checkout_snapshot_sha256(candidate)
+        return {
+            "dirty_candidate_gate": {
+                "schema": 1,
+                "lease_id": lease["lease_id"],
+                "base_revision": lease["base_revision"],
+                "candidate_before_sha256": digest,
+                "candidate_after_sha256": digest,
+                "outcome": "pass",
+                "tool": "project-test-runner",
+            }
+        }
+
+    def research_bundle(self, name: str = "research-valid", **brief_updates) -> str:
+        relative = f"tests/{FEATURE}/research/{name}.json"
+        brief = {
+            "brief_id": "RESEARCH-001",
+            "question": "confirm exact edit surface",
+            "slice_id": "SLICE-001",
+            "base_revision": self.state()["revision"],
+            "requirement_ids": ["PRD-REQ-001", "PRD-AC-001"],
+            "seed_paths": ["src/feature.py"],
+            "allowed_paths": ["src"],
+            "allowed_symbols": ["VALUE"],
+            "exclusions": ["src/commerce/**"],
+            "requested_evidence": ["approved spec"],
+            "max_files": 1,
+            "stop_condition": "scope is exact",
+            "output_path": relative,
+        }
+        brief.update(brief_updates)
+        result = {
+            "brief_id": brief["brief_id"],
+            "researcher_id": "researcher-1",
+            "base_revision": brief["base_revision"],
+            "brief_sha256": runtime_controller.canonical_json_sha256(brief),
+            "status": "complete",
+            "inspected_paths": ["src/feature.py"],
+            "inspected_symbols": ["VALUE"],
+            "owners_contracts_precedents": ["Feature module owns VALUE."],
+            "lifecycle_integration_risks": [],
+            "minimal_edit_reuse_points": ["Reuse VALUE."],
+            "unresolved_questions": [],
+            "out_of_brief_pointers": [],
+        }
+        return self.artifact("research", name, {"schema_version": 1, "brief": brief, "result": result})
+
+    def initialize(self, *, research: bool = True, base_revision: str = "base-0") -> dict:
+        if research:
+            required = "- RESEARCH-001 | question=confirm exact edit surface | paths=src/feature.py | exclusions=src/commerce/** | evidence=approved spec | stop=scope is exact"
+            sentinel = "- research_not_required | reason=Exact authority and edit files answer the bounded question"
+            text = self.plan.read_text(encoding="utf-8")
+            if required in text:
+                self.plan.write_text(text.replace(required, sentinel), encoding="utf-8")
+                self.write_planning_state()
+        self.cli(
+            "init",
+            "--feature",
+            FEATURE,
+            "--requirements",
+            self.rel(self.prd),
+            "--spec",
+            self.rel(self.spec),
+            "--plan",
+            self.rel(self.plan),
+            "--plan-sha256",
+            self.sha(self.plan),
+            "--base-revision",
+            base_revision,
+            "--decision-ledger",
+            self.rel(self.ledger),
+            "--integration-owner",
+            "engineer-1",
+        )
+        self.complete_preflight("preflight-1")
+        if research:
+            state = self.state()
+            self.cli(
+                "slice-research-not-required",
+                "--slice-id",
+                "SLICE-001",
+                "--base-revision",
+                state["revision"],
+                "--reason",
+                "Exact authority and edit files answer the bounded question",
+            )
+        return self.state()
+
+    def test_research_bundle_direct_validator_binds_ids_and_path_types(self) -> None:
+        state = self.initialize(research=False)
+        valid = self.research_bundle()
+        record = runtime_controller.resolve_research_bundle(
+            self.root, state, valid, slice_id="SLICE-001", base_revision=state["revision"]
+        )
+        self.assertEqual("RESEARCH-001", record["brief_id"])
+
+        invalid = self.research_bundle(
+            "research-invalid-id", requirement_ids=["REQ-001", "AC-001"]
+        )
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "PRD-REQ/PRD-AC subset"):
+            runtime_controller.resolve_research_bundle(
+                self.root, state, invalid, slice_id="SLICE-001", base_revision=state["revision"]
+            )
+
+        invalid_path = self.research_bundle(
+            "research-invalid-path", seed_paths=["src"]
+        )
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "seed_path.*file"):
+            runtime_controller.resolve_research_bundle(
+                self.root, state, invalid_path, slice_id="SLICE-001", base_revision=state["revision"]
+            )
+
+    def test_research_bundle_cli_accepts_exact_active_slice_contract(self) -> None:
+        state = self.initialize(research=False)
+        research_contract = state["plan_contracts"]["slices"]["SLICE-001"]["research"]
+        self.assertEqual("required", research_contract["mode"])
+        self.assertEqual(
+            ["RESEARCH-001"],
+            [item["brief_id"] for item in research_contract["briefs"]],
+        )
+        blocked = self.cli(
+            "slice-research-not-required", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"],
+            "--reason", "Exact authority and edit files answer the bounded question",
+            expected=2,
+        )
+        self.assertIn("requires exact Research Brief", blocked.stderr)
+        bundle = self.research_bundle("research-cli")
+        result = self.cli(
+            "slice-research-complete", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+            "--bundle", bundle,
+        )
+        self.assertIn('"phase": "slice_coverage_planning"', result.stdout)
+
+    def test_research_bundle_rejects_unapproved_plan_selector(self) -> None:
+        state = self.initialize(research=False)
+        bundle = self.research_bundle("research-unapproved", brief_id="RESEARCH-002")
+        result = self.cli(
+            "slice-research-complete", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+            "--bundle", bundle, expected=2,
+        )
+        self.assertIn("not approved by the exact development plan", result.stderr)
+
+    def test_research_not_required_reason_is_copied_from_plan(self) -> None:
+        state = self.initialize()
+        research_contract = state["plan_contracts"]["slices"]["SLICE-001"]["research"]
+        self.assertEqual(
+            {
+                "mode": "not_required",
+                "reason": "Exact authority and edit files answer the bounded question",
+            },
+            research_contract,
+        )
+        self.assertEqual(
+            research_contract["reason"],
+            state["slices"]["SLICE-001"]["research"]["reason"],
+        )
+
+    def test_engineer_capsule_binds_accepted_research_bundle_and_selector(self) -> None:
+        state = self.initialize(research=False)
+        bundle = self.research_bundle("research-capsule")
+        self.cli(
+            "slice-research-complete", "--slice-id", "SLICE-001",
+            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+            "--bundle", bundle,
+        )
+        self.plan_coverage()
+        state = self.state()
+        capsule_path = self.capsule(
+            "engineer", "slice_engineering", "engineer-research",
+            allowed=(self.rel(self.src),),
+        )
+        capsule = json.loads((self.root / capsule_path).read_text(encoding="utf-8"))
+        research_ref = next(
+            item for item in capsule["evidence"] if item["path"] == bundle
+        )
+        self.assertEqual(self.sha(self.root / bundle), research_ref["sha256"])
+        self.assertEqual(["RESEARCH-001"], research_ref["ids"])
+
+        research_ref["ids"] = []
+        capsule["metrics"] = runtime_controller.capsule_metrics(capsule, self.root)
+        capsule["capsule_sha256"] = runtime_controller.capsule_digest(capsule)
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "evidence selectors"):
+            runtime_controller.validate_capsule_value(self.root, state, capsule)
+
+    def complete_preflight(self, run_id: str) -> dict:
+        preflight_args = [
+            "preflight-complete",
+            "--run-id",
+            run_id,
+            "--resource-budget-check",
+            "pass",
+            "--report",
+            self.artifact("verification", run_id),
+        ]
+        for name in sorted(
+            runtime_controller.required_preflight_capabilities(self.state())
+        ):
+            preflight_args.extend(("--capability", f"{name}=available"))
+        self.cli(*preflight_args)
+        return self.state()
+
+    def downgrade_active_snapshot_to_schema9(
+        self, lease_id: str, checkout_text: dict | None = None
+    ) -> None:
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        findings_path = self.root / ".agentic-pipeline" / "findings.json"
+        state = self.state()
+        snapshot = state["lease_snapshots"][lease_id]
+        snapshot["checkout_text"] = checkout_text or {
+            relative: (self.root / relative).read_text(encoding="utf-8")
+            for relative in snapshot["checkout"]
+            if (self.root / relative).is_file()
+        }
+        snapshot.pop("line_proofs", None)
+        snapshot["snapshot_schema"] = 2
+        snapshot["snapshot_format"] = "sha256-raw-bytes-v1"
+        state["schema_version"] = 9
+        state["contract_version"] = runtime_controller.LEGACY_CONTRACT_VERSION
+        findings = json.loads(findings_path.read_text(encoding="utf-8"))
+        findings["schema_version"] = 9
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        findings_path.write_text(json.dumps(findings), encoding="utf-8")
+
+    def prepare_authority_recovery(self) -> tuple[dict, str]:
+        state = self.state()
+        return state, runtime_controller.authority_rebaseline_token(
+            state,
+            "confirmed pre-engineering authority defect",
+            "technical-director-1",
+        )
+
+    def freshly_approve_plan_revision(self) -> str:
+        plan_text = self.plan.read_text(encoding="utf-8")
+        self.plan.write_text(
+            plan_text.replace("revision: 1\n", "revision: 2\n", 1).replace(
+                "approved_at: 2026-08-11T00:00:00+00:00",
+                "approved_at: 2099-08-13T00:00:00+00:00",
+            )
+            + "\n<!-- approved authority recovery correction -->\n",
+            encoding="utf-8",
+        )
+        planning_path = self.root / ".agentic-pipeline" / "development-plan-state.json"
+        planning = json.loads(planning_path.read_text(encoding="utf-8"))
+        planning["approval"] = {
+            "approved_by": "user",
+            "approved_at": "2099-08-13T00:00:00+00:00",
+            "approval_note": "fresh exact SHA authority recovery approval",
+            "approved_sha256": self.sha(self.plan),
+        }
+        planning_path.write_text(json.dumps(planning), encoding="utf-8")
+        return self.sha(self.plan)
+
+    def test_authority_recovery_plan_metadata_change_preserves_semantic_evidence(self) -> None:
+        before = self.initialize()
+        before = self.state()
+        recovery_state, token = self.prepare_authority_recovery()
+        self.assertEqual("slice_coverage_planning", recovery_state["phase"])
+        self.assertEqual("not_required", recovery_state["slices"]["SLICE-001"]["research"]["status"])
+        new_plan_sha = self.freshly_approve_plan_revision()
+        self.cli(
+            "rebaseline-authority",
+            "--recovery-token",
+            token,
+            "--reason",
+            "confirmed pre-engineering authority defect",
+            "--authorized-by",
+            "technical-director-1",
+            "--requirements",
+            self.rel(self.prd),
+            "--spec",
+            self.rel(self.spec),
+            "--plan",
+            self.rel(self.plan),
+            "--plan-sha256",
+            new_plan_sha,
+            "--plan-approval-reference",
+            "user exact SHA approval in planning controller",
+        )
+        after = self.state()
+        self.assertEqual("slice_coverage_planning", after["phase"])
+        self.assertEqual(new_plan_sha, after["development_plan_sha256"])
+        self.assertEqual("not_required", after["slices"]["SLICE-001"]["research"]["status"])
+        self.assertEqual("complete", after["preflight"]["status"])
+        self.assertEqual(before["coverage"]["SLICE-001"], after["coverage"]["SLICE-001"])
+        self.assertNotEqual(before["revision"], after["revision"])
+        self.assertEqual("authority_rebaseline", after["authority_recovery_history"][-1]["event"])
+        self.assertTrue(after["authority_recovery_history"][-1]["semantic_equivalent"])
+        active = after["slices"]["SLICE-001"]
+        self.assertEqual(after["revision"], active["base_revision"])
+        self.assertEqual(after["product_revision"], active["base_product_revision"])
+        self.assertEqual(after["support_revision"], active["base_support_revision"])
+        self.assertEqual(after["evidence_revision"], active["base_evidence_revision"])
+
+    def test_atomic_authority_recovery_rejects_wrong_token_without_mutation(self) -> None:
+        self.initialize()
+        _, token = self.prepare_authority_recovery()
+        new_plan_sha = self.freshly_approve_plan_revision()
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        before_failed_recovery = state_path.read_bytes()
+        blocked = self.cli(
+            "rebaseline-authority",
+            "--recovery-token",
+            "ARH-WRONG",
+            "--reason",
+            "confirmed pre-engineering authority defect",
+            "--authorized-by",
+            "technical-director-1",
+            "--requirements",
+            self.rel(self.prd),
+            "--spec",
+            self.rel(self.spec),
+            "--plan",
+            self.rel(self.plan),
+            "--plan-sha256",
+            new_plan_sha,
+            "--plan-approval-reference",
+            "fresh approval",
+            expected=2,
+        )
+        self.assertIn("does not match", blocked.stderr)
+        self.assertEqual(before_failed_recovery, state_path.read_bytes())
+
+    def test_authority_recovery_scope_contract_change_invalidates_only_research(self) -> None:
+        self.initialize()
+        before = self.state()
+        _, token = self.prepare_authority_recovery()
+        self.freshly_approve_plan_revision()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- max_product_files: 4", "- max_product_files: 5"
+            ),
+            encoding="utf-8",
+        )
+        planning_path = self.root / ".agentic-pipeline" / "development-plan-state.json"
+        planning = json.loads(planning_path.read_text(encoding="utf-8"))
+        planning["approval"]["approved_sha256"] = self.sha(self.plan)
+        planning_path.write_text(json.dumps(planning), encoding="utf-8")
+        self.cli(
+            "rebaseline-authority",
+            "--recovery-token", token,
+            "--reason", "confirmed pre-engineering authority defect",
+            "--authorized-by", "technical-director-1",
+            "--requirements", self.rel(self.prd),
+            "--spec", self.rel(self.spec),
+            "--plan", self.rel(self.plan),
+            "--plan-sha256", self.sha(self.plan),
+            "--plan-approval-reference", "user approved exact scope budget",
+        )
+        after = self.state()
+        self.assertEqual("slice_research", after["phase"])
+        self.assertEqual("complete", after["preflight"]["status"])
+        self.assertEqual("pending", after["slices"]["SLICE-001"]["research"]["status"])
+        self.assertEqual(before["coverage"]["SLICE-001"], after["coverage"]["SLICE-001"])
+
+    def test_atomic_authority_recovery_rejects_engineering_phase(self) -> None:
+        self.initialize()
+        state = self.state()
+        token = runtime_controller.authority_rebaseline_token(state, "too late", "director")
+        state["phase"] = "slice_engineering"
+        (self.root / ".agentic-pipeline" / "state.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        blocked = self.cli(
+            "rebaseline-authority",
+            "--recovery-token",
+            token,
+            "--reason",
+            "too late",
+            "--authorized-by",
+            "director",
+            "--requirements",
+            self.rel(self.prd),
+            "--spec",
+            self.rel(self.spec),
+            "--plan",
+            self.rel(self.plan),
+            "--plan-sha256",
+            self.sha(self.plan),
+            expected=2,
+        )
+        self.assertIn("legal only", blocked.stderr)
+
+    def test_authority_recovery_same_capability_set_preserves_preflight(self) -> None:
+        self.initialize()
+        _, token = self.prepare_authority_recovery()
+        old_prd_sha = self.sha(self.prd)
+        old_spec_sha = self.sha(self.spec)
+        self.prd.write_text(
+            self.prd.read_text(encoding="utf-8")
+            .replace("revision: 1", "revision: 2", 1)
+            .replace(
+                "approved_at: 2026-08-11T00:00:00+00:00",
+                "approved_at: 2099-08-13T00:00:00+00:00",
+                1,
+            )
+            + "\n<!-- approved removal of obsolete device-only authority -->\n",
+            encoding="utf-8",
+        )
+        self.spec.write_text(
+            self.spec.read_text(encoding="utf-8")
+            .replace("revision: 1", "revision: 2")
+            .replace(old_prd_sha, self.sha(self.prd))
+            + "\n<!-- exact simulation-based authority reconvergence -->\n",
+            encoding="utf-8",
+        )
+        ready_path = self.root / ".agentic-pipeline" / "specification-state.json"
+        ready = json.loads(ready_path.read_text(encoding="utf-8"))
+        ready["ready"] = {
+            "prd_sha256": self.sha(self.prd),
+            "spec_sha256": self.sha(self.spec),
+            "confirmed_at": "2099-08-13T00:00:00+00:00",
+        }
+        ready_path.write_text(json.dumps(ready), encoding="utf-8")
+        plan_text = self.plan.read_text(encoding="utf-8")
+        self.plan.write_text(
+            plan_text.replace("revision: 1", "revision: 2")
+            .replace(old_prd_sha, self.sha(self.prd))
+            .replace(old_spec_sha, self.sha(self.spec))
+            .replace(
+                "approved_at: 2026-08-11T00:00:00+00:00",
+                "approved_at: 2099-08-13T00:00:00+00:00",
+            ),
+            encoding="utf-8",
+        )
+        planning_path = self.root / ".agentic-pipeline" / "development-plan-state.json"
+        planning = json.loads(planning_path.read_text(encoding="utf-8"))
+        planning["prd"].update(revision="2", sha256=self.sha(self.prd))
+        planning["specification"].update(revision="2", sha256=self.sha(self.spec))
+        planning["approval"] = {
+            "approved_by": "user",
+            "approved_at": "2099-08-13T00:00:00+00:00",
+            "approval_note": "fresh exact SHA chain approval",
+            "approved_sha256": self.sha(self.plan),
+        }
+        planning_path.write_text(json.dumps(planning), encoding="utf-8")
+        self.cli(
+            "rebaseline-authority",
+            "--recovery-token",
+            token,
+            "--reason",
+            "confirmed pre-engineering authority defect",
+            "--authorized-by",
+            "technical-director-1",
+            "--requirements",
+            self.rel(self.prd),
+            "--spec",
+            self.rel(self.spec),
+            "--plan",
+            self.rel(self.plan),
+            "--plan-sha256",
+            self.sha(self.plan),
+            "--prd-approval-reference",
+            "user approved PRD revision 2",
+            "--spec-approval-reference",
+            "SPEC_READY exact revision 2",
+            "--plan-approval-reference",
+            "user approved exact plan SHA",
+        )
+        state = self.state()
+        self.assertEqual("2", state["requirements_revision"])
+        self.assertEqual("slice_research", state["phase"])
+        self.assertEqual("complete", state["preflight"]["status"])
+        event = state["authority_recovery_history"][-1]
+        self.assertNotEqual(
+            event["old_authority"]["requirements_sha256"],
+            event["new_authority"]["requirements_sha256"],
+        )
+        active = state["slices"]["SLICE-001"]
+        self.assertEqual(state["revision"], active["base_revision"])
+        self.assertEqual(state["product_revision"], active["base_product_revision"])
+        current = self.state()
+        self.cli(
+            "slice-research-not-required",
+            "--slice-id",
+            "SLICE-001",
+            "--base-revision",
+            current["revision"],
+            "--reason",
+            "Exact authority and edit files answer the bounded question",
+        )
+
+    def test_atomic_authority_recovery_from_incomplete_preflight(self) -> None:
         self.cli(
             "init",
             "--feature",
@@ -270,34 +808,60 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--decision-ledger",
             self.rel(self.ledger),
         )
-        preflight_args = [
-            "preflight-complete",
-            "--run-id",
-            "preflight-1",
-            "--resource-budget-check",
-            "pass",
-            "--report",
-            self.artifact("verification", "preflight"),
-        ]
-        for name in sorted(
-            runtime_controller.required_preflight_capabilities(self.state())
-        ):
-            preflight_args.extend(("--capability", f"{name}=available"))
-        self.cli(*preflight_args)
-        if research:
-            state = self.state()
-            self.cli(
-                "slice-research-not-required",
-                "--slice-id",
-                "SLICE-001",
-                "--base-revision",
-                state["revision"],
-                "--owner-id",
-                "engineer-1",
-                "--reason",
-                "Exact authority and edit files answer the bounded question",
-            )
-        return self.state()
+        _, token = self.prepare_authority_recovery()
+        status = json.loads(self.cli("status").stdout)
+        self.assertEqual("preflight", status["phase"])
+        new_plan_sha = self.freshly_approve_plan_revision()
+        self.cli(
+            "rebaseline-authority",
+            "--recovery-token",
+            token,
+            "--reason",
+            "confirmed pre-engineering authority defect",
+            "--authorized-by",
+            "technical-director-1",
+            "--requirements",
+            self.rel(self.prd),
+            "--spec",
+            self.rel(self.spec),
+            "--plan",
+            self.rel(self.plan),
+            "--plan-sha256",
+            new_plan_sha,
+            "--plan-approval-reference",
+            "fresh exact approval from incomplete preflight",
+        )
+        self.assertEqual("preflight", self.state()["phase"])
+
+    def test_atomic_authority_recovery_rejects_active_writer(self) -> None:
+        self.initialize()
+        state = self.state()
+        token = runtime_controller.authority_rebaseline_token(
+            state, "unsafe writer", "director"
+        )
+        state["active_write_lease"] = {"status": "active", "lease_id": "LEASE-UNSAFE"}
+        (self.root / ".agentic-pipeline" / "state.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        blocked = self.cli(
+            "rebaseline-authority",
+            "--recovery-token",
+            token,
+            "--reason",
+            "unsafe writer",
+            "--authorized-by",
+            "director",
+            "--requirements",
+            self.rel(self.prd),
+            "--spec",
+            self.rel(self.spec),
+            "--plan",
+            self.rel(self.plan),
+            "--plan-sha256",
+            self.sha(self.plan),
+            expected=2,
+        )
+        self.assertIn("write lease is active", blocked.stderr)
 
     def capsule(
         self,
@@ -350,7 +914,9 @@ class PipelineSchema9Tests(unittest.TestCase):
         ledger_relative = self.rel(self.ledger)
         for authority_path, authority_sha in sorted(exact_authority.items()):
             ids = (
-                scope_ids
+                []
+                if role == "decision_recorder"
+                else scope_ids
                 if authority_path == requirements_relative
                 else state["decision_ledger"]["active_decision_ids"]
                 if authority_path == ledger_relative
@@ -373,12 +939,17 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         for identity_id in sorted(coverage_ids):
             args.extend(("--coverage-identity-id", identity_id))
+        exact_evidence_ids = runtime_controller.capsule_exact_evidence_ids(
+            self.root, state, role, phase
+        )
         for evidence_path, evidence_sha in sorted(
             runtime_controller.capsule_exact_evidence(
                 self.root, state, role, phase
             ).items()
         ):
-            args.extend(("--evidence", f"{evidence_path}={evidence_sha}"))
+            ids = exact_evidence_ids[evidence_path]
+            suffix = ":" + ",".join(ids) if ids else ""
+            args.extend(("--evidence", f"{evidence_path}={evidence_sha}{suffix}"))
         for item in authorities:
             args.extend(("--authority", item))
         for item in outputs or (f"tests/{FEATURE}/verification/{worker}-output.json",):
@@ -519,15 +1090,10 @@ class PipelineSchema9Tests(unittest.TestCase):
         return self.artifact("verification", name, value)
 
     def plan_coverage(self) -> None:
-        capsule = self.capsule("coverage_steward", "slice_coverage_planning", "steward-plan")
         self.cli(
             "coverage-plan-complete",
             "--slice-id",
             "SLICE-001",
-            "--steward-id",
-            "steward-plan",
-            "--capsule",
-            capsule,
             "--coverage-manifest",
             self.coverage_manifest("coverage-planned", "planned"),
             "--report",
@@ -592,8 +1158,8 @@ class PipelineSchema9Tests(unittest.TestCase):
                     "path": self.rel(changed_path),
                     "domain": "product",
                     "symbols": ["VALUE"],
-                    "reason": "Implement PRD-AC-001",
-                    "change_kind": "behavior",
+                    "reason": "assigned_goal_effect: PRD-REQ-001, PRD-AC-001 | implement the assigned feature behavior",
+                    "change_kind": "modify",
                     "component": "feature",
                     "lifecycle_change": False,
                     "ownership_change": False,
@@ -620,8 +1186,6 @@ class PipelineSchema9Tests(unittest.TestCase):
             capsule,
             "--slice-id",
             "SLICE-001",
-            "--engineering-status",
-            "pass",
             "--machine-checks",
             "pass",
             "--diff-inspection",
@@ -635,17 +1199,10 @@ class PipelineSchema9Tests(unittest.TestCase):
         return self.full_status()
 
     def finalize_coverage(self, *, mismatch: bool = False, expected: int = 0) -> dict:
-        capsule = self.capsule(
-            "coverage_steward", "slice_coverage_finalization", "steward-final"
-        )
         result = self.cli(
             "coverage-finalize",
             "--scope-id",
             "SLICE-001",
-            "--steward-id",
-            "steward-final",
-            "--capsule",
-            capsule,
             "--coverage-manifest",
             self.coverage_manifest("coverage-final", "finalized", mismatch=mismatch),
             "--expected-actual-equality",
@@ -697,7 +1254,9 @@ class PipelineSchema9Tests(unittest.TestCase):
         }
         return self.artifact("qa", "manual-execution", value)
 
-    def optional_manual_identity(self, identity_id: str) -> dict:
+    def optional_manual_identity(
+        self, identity_id: str, *, capability_prerequisites: tuple[str, ...] = ()
+    ) -> dict:
         return {
             "identity_id": identity_id,
             "kind": "manual",
@@ -714,7 +1273,7 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "evidence_kind": "log",
             },
             "planned_assertion_or_observation": "optional observation is recorded",
-            "capability_prerequisites": [],
+            "capability_prerequisites": list(capability_prerequisites),
         }
 
     def qa_manual_rows_artifact(self, rows: list[dict], name: str) -> str:
@@ -752,7 +1311,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         state = self.state()
         state["phase"] = "qa"
         runs = []
-        for index in (1, 2):
+        for index in (1,):
             report_relative = self.artifact("reviews", f"prepared-review-{index}")
             credit_relative = self.artifact("reviews", f"prepared-credit-{index}")
             report = self.root / report_relative
@@ -779,7 +1338,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             "product_revision": state["product_revision"],
             "support_revision": state["support_revision"],
             "evidence_revision": state["evidence_revision"],
-            "required": 2,
+            "required": 1,
             "runs": runs,
             "recovery_run": None,
         }
@@ -980,10 +1539,9 @@ class PipelineSchema9Tests(unittest.TestCase):
                 for finding_id in finding_ids
             ],
         }
-        self.write_state(state)
-        (self.root / ".agentic-pipeline" / "findings.json").write_text(
-            json.dumps(findings), encoding="utf-8"
-        )
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        findings_path = self.root / ".agentic-pipeline" / "findings.json"
+        runtime_controller.save_runtime(state_path, findings_path, state, findings)
         return {
             "state": json.loads(json.dumps(state)),
             "findings": findings,
@@ -1114,9 +1672,11 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--mandatory-core-acceptance-evidence-missing", "false",
             "--test-can-miss-product-defect", "false",
             "--title", "Final Review product defect",
-            "--evidence", "exact Final Review evidence", "--revision", state["revision"],
+            "--evidence",
+            "assigned_acceptance_evidence: PRD-AC-001 | exact Final Review component evidence",
+            "--revision", state["revision"],
         )
-        for index in (1, 2):
+        for index in (1,):
             reviewer = f"base-final-reviewer-{index}"
             capsule_path = self.capsule("reviewer", "review", reviewer)
             report_relative = self.artifact("reviews", f"base-final-review-{index}")
@@ -1129,10 +1689,6 @@ class PipelineSchema9Tests(unittest.TestCase):
             credit = json.loads(credit_path.read_text(encoding="utf-8"))
             credit["composition_audit"] = True
             credit["new_boundaries_audited"] = []
-            if index == 2:
-                source_credit = self.state()["component_review_credits"][-1]["id"]
-                credit["components"][0]["mode"] = "reused"
-                credit["components"][0]["source_credit_id"] = source_credit
             credit_path.write_text(json.dumps(credit), encoding="utf-8")
             self.cli(
                 "review-complete", "--revision", state["revision"],
@@ -1179,15 +1735,14 @@ class PipelineSchema9Tests(unittest.TestCase):
             "engineer-complete", "--run-id", "engineer-remediation-final-review",
             "--owner-id", "engineer-1", "--lease-id", lease_id,
             "--capsule", capsule, "--slice-id", "SLICE-001",
-            "--engineering-status", "pass", "--machine-checks", "pass",
+            "--machine-checks", "pass",
             "--diff-inspection", "pass", "--semantic-handoff", semantic,
-            "--report", self.artifact("verification", "engineer-remediation-report"),
+            "--report", self.artifact(
+                "verification", "engineer-remediation-engineer-report"
+            ),
             "--resolved-finding", finding_id,
         )
         state = self.state()
-        coverage_capsule = self.capsule(
-            "coverage_steward", "coverage_finalization", "steward-remediation-final"
-        )
         prior_feature_coverage = Path(
             state["coverage"]["feature"]["finalized_manifest"]["path"]
         )
@@ -1205,7 +1760,6 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         self.cli(
             "coverage-finalize", "--scope-id", "feature",
-            "--steward-id", "steward-remediation-final", "--capsule", coverage_capsule,
             "--coverage-manifest", remediation_coverage_path,
             "--expected-actual-equality", "pass", "--mandatory-registration", "pass",
             "--automated-execution", "pass",
@@ -1213,11 +1767,11 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         closure_before_review = json.loads(json.dumps(self.state()["closure_review"]))
         closure_capsule = self.capsule(
-            "reviewer", "closure_review", "targeted-qa-closure-reviewer"
+            "reviewer", "closure_review", "base-final-reviewer-1"
         )
         closure_credit = self.review_credit_manifest(
             "targeted-qa-closure-credit",
-            "targeted-qa-closure-reviewer",
+            "base-final-reviewer-1",
             "targeted_closure",
         )
         state = self.state()
@@ -1228,14 +1782,14 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--support-revision", state["support_revision"],
             "--evidence-revision", state["evidence_revision"],
             "--run-id", "targeted-qa-closure-pass",
-            "--reviewer-id", "targeted-qa-closure-reviewer",
+            "--reviewer-id", "base-final-reviewer-1",
             "--capsule", closure_capsule,
             "--status", "pass",
             "--report", self.artifact("reviews", "targeted-qa-closure-report"),
             "--credit-manifest", closure_credit,
         )
         self.qa_probe()
-        qa_capsule = self.capsule("qa", "qa", "qa-after-targeted-closure")
+        qa_capsule = self.capsule("reviewer", "qa", "base-final-reviewer-1")
         state = self.state()
         self.cli(
             "qa-complete",
@@ -1244,7 +1798,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--support-revision", state["support_revision"],
             "--evidence-revision", state["evidence_revision"],
             "--run-id", "qa-after-targeted-closure",
-            "--worker-id", "qa-after-targeted-closure",
+            "--worker-id", "base-final-reviewer-1",
             "--capsule", qa_capsule,
             "--status", "pass",
             "--manual-execution", self.qa_manual_artifact(),
@@ -1334,6 +1888,22 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         return json.loads(result.stdout)
 
+    def accept_scope_authority(self, authority_id: str) -> dict:
+        state = self.state()
+        statement = runtime_controller.scope_rebaseline_authority_statement(
+            state["scope_guard"]["hold"], self.sha(self.plan)
+        )
+        result = self.cli(
+            "user-authority-accept",
+            "--authority-id",
+            authority_id,
+            "--approval-reference",
+            f"USER-APPROVAL-{authority_id}",
+            "--statement",
+            statement,
+        )
+        return json.loads(result.stdout)
+
     def review_credit_manifest(
         self, name: str, reviewer_id: str, review_mode: str
     ) -> str:
@@ -1364,6 +1934,43 @@ class PipelineSchema9Tests(unittest.TestCase):
                         "source_credit_id": None,
                     }
                 ],
+            },
+        )
+
+    def documentation_closure_report(
+        self,
+        name: str,
+        *,
+        run_id: str,
+        reviewer_id: str,
+        status: str = "pass",
+        source_gaps: list[str] | None = None,
+    ) -> str:
+        state = self.state()
+        derived = state["documentation"]["derived"]
+        source_map = json.loads(
+            (self.root / derived["source_map_path"]).read_text(encoding="utf-8")
+        )
+        return self.artifact(
+            "reviews",
+            name,
+            {
+                "schema": 1,
+                "review_mode": "documentation_closure",
+                "run_id": run_id,
+                "reviewer_id": reviewer_id,
+                "revision": state["revision"],
+                "product_revision": state["product_revision"],
+                "support_revision": state["support_revision"],
+                "evidence_revision": state["evidence_revision"],
+                "status": status,
+                "changed_support_paths": sorted(derived["paths"]),
+                "statement_source_map_path": derived["source_map_path"],
+                "statement_source_map_sha256": derived["source_map_sha256"],
+                "inspected_statement_ids": sorted(
+                    {row["statement_id"] for row in source_map["statements"]}
+                ),
+                "source_gaps": source_gaps or [],
             },
         )
 
@@ -1408,72 +2015,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             capsule,
         )
         return capsule
-
-    def install_legacy_engineer_lease(
-        self,
-        *,
-        base_bytes: bytes = b"VALUE = 0\r\n# lf\n# crlf\r\n",
-    ) -> tuple[str, str, dict]:
-        """Install a pre-fix active lease without retroactively creating scope authority."""
-        self.src.write_bytes(base_bytes)
-        self.initialize()
-        self.plan_coverage()
-        capsule_path = self.capsule(
-            "engineer", "slice_engineering", "engineer-1",
-            allowed=("src/feature.py",),
-        )
-        capsule = json.loads((self.root / capsule_path).read_text(encoding="utf-8"))
-        state = self.state()
-        lease_id = "LEASE-LEGACY-0003"
-        lease = {
-            "lease_id": lease_id,
-            "phase": "slice_engineering",
-            "write_scope": "SLICE-001",
-            "role": "engineer",
-            "worker_id": "engineer-1",
-            "base_revision": state["revision"],
-            "allowed_paths": ["src/feature.py"],
-            "allowed_symbols": [],
-            "exclusions": [],
-            "status": "active",
-            "rebaseline_carried": False,
-        }
-        snapshot = {
-            "capsule_path": capsule_path,
-            "capsule_sha256": capsule["capsule_sha256"],
-            "checkout": runtime_controller.checkout_snapshot(self.root, FEATURE),
-            "checkout_text": runtime_controller.checkout_text_snapshot(self.root, FEATURE),
-            "rebaseline_carried": False,
-            "created_at": "2026-08-12T07:00:00+00:00",
-        }
-        state["active_write_lease"] = lease
-        state["lease_snapshots"][lease_id] = snapshot
-        state["slices"]["SLICE-001"]["scope_pre_edit_check"] = None
-        state.setdefault("legacy_scope_recoveries", [])
-        self.write_state(state)
-        return lease_id, capsule_path, snapshot
-
-    def assert_legacy_recovery_tampering_rejected(self, fact: str) -> None:
-        lease_id, _, _ = self.install_legacy_engineer_lease()
-        state = self.state()
-        if fact == "snapshot":
-            state["lease_snapshots"][lease_id]["checkout"][self.rel(self.plan)] = "0" * 64
-        elif fact == "capsule":
-            state["lease_snapshots"][lease_id]["capsule_sha256"] = "0" * 64
-        elif fact == "base":
-            state["active_write_lease"]["base_revision"] = "0" * 64
-        else:
-            self.fail(f"unsupported tamper fact: {fact}")
-        self.write_state(state)
-        result = self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
-        )
-        self.assertTrue(result.stderr.strip())
-        state = self.state()
-        self.assertEqual([], state["legacy_scope_recoveries"])
-        self.assertIsNone(state["slices"]["SLICE-001"]["scope_pre_edit_check"])
-
+    # Pre-schema-10 lease recovery helpers were removed; migration is tested at the schema-9 boundary.
     def semantic_packet_for_change(
         self,
         path: Path,
@@ -1504,8 +2046,8 @@ class PipelineSchema9Tests(unittest.TestCase):
                         "path": relative,
                         "domain": domain,
                         "symbols": symbols if symbols is not None else ["VALUE"],
-                        "reason": "Bounded PRD-AC-001 implementation",
-                        "change_kind": "behavior",
+                        "reason": "assigned_goal_effect: PRD-REQ-001, PRD-AC-001 | bounded assigned implementation",
+                        "change_kind": "modify",
                         "component": "feature",
                         "lifecycle_change": False,
                         "ownership_change": False,
@@ -1538,8 +2080,6 @@ class PipelineSchema9Tests(unittest.TestCase):
             capsule,
             "--slice-id",
             "SLICE-001",
-            "--engineering-status",
-            "pass",
             "--machine-checks",
             "pass",
             "--diff-inspection",
@@ -1554,14 +2094,12 @@ class PipelineSchema9Tests(unittest.TestCase):
     def qa_probe(self, *, blocked: bool = False) -> None:
         state = self.state()
         statuses = {
-            "studio-editor-sync": "available",
-            "single-play": "available",
-            "test-server-two-clients": "available",
-            "window-control-path": "planned_manual",
-            "logging-screenshots": "available",
-            "persistence-datastore": "available",
-            "publication-place-topology": "available",
-            "config-credentials": "blocked_user" if blocked else "available",
+            name: (
+                "blocked_user"
+                if blocked and name == "test-server-two-clients"
+                else "available"
+            )
+            for name in runtime_controller.required_qa_capabilities(self.root, state)
         }
         args = [
             "qa-capability-probe",
@@ -1577,13 +2115,14 @@ class PipelineSchema9Tests(unittest.TestCase):
         if blocked:
             args.extend((
                 "--minimum-resume-action",
-                "config-credentials=user|true|authorize exact QA credential",
+                "test-server-two-clients=user|true|authorize exact QA operator",
             ))
         self.cli(*args)
 
-    def test_init_creates_exact_schema9_and_zero_entry_ledger(self) -> None:
+    def test_init_creates_exact_schema10_and_zero_entry_ledger(self) -> None:
         state = self.initialize(research=False)
-        self.assertEqual(9, state["schema_version"])
+        self.assertEqual(10, state["schema_version"])
+        self.assertGreaterEqual(state["generation"], 2)
         self.assertEqual(0, state["decision_ledger"]["entry_count"])
         self.assertTrue(self.ledger.is_file())
         for field in (
@@ -1598,6 +2137,80 @@ class PipelineSchema9Tests(unittest.TestCase):
         ):
             self.assertIn(field, state)
 
+    def test_semantic_packet_rejects_allowed_path_without_exact_assigned_goal_effect(self) -> None:
+        self.initialize()
+        state = self.state()
+        inventory = json.loads(json.dumps(state["revision_inventory"]))
+        inventory["product"] = sorted(set(inventory["product"] + [self.rel(self.src)]))
+        packet = {
+            "schema": 1,
+            "inventory_complete": True,
+            "domain_inventory": inventory,
+            "changes": [{
+                "path": self.rel(self.src), "domain": "product", "symbols": ["VALUE"],
+                "reason": "cleanup on an allowed path", "change_kind": "modify",
+                "component": "feature", "lifecycle_change": False,
+                "ownership_change": False, "public_contract_change": False,
+                "requirement_ids": ["PRD-REQ-001"], "acceptance_ids": ["PRD-AC-001"],
+                "decision_ids": [], "touchpoint_id": None,
+            }],
+            "open_assumptions": [],
+        }
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "assigned-ID effect"):
+            runtime_controller.validate_semantic_write_packet(
+                self.root,
+                state,
+                {"role": "engineer", "phase": "slice_engineering", "lease_id": "LEASE-TEST"},
+                packet,
+                slice_item=state["slices"]["SLICE-001"],
+            )
+
+    def test_review_side_issue_cannot_become_current_remediation_without_goal_binding(self) -> None:
+        self.initialize()
+        item = {
+            "source": "review", "finding_kind": "product", "severity": "major",
+            "scope_relation": "current_feature_path", "introduced_by_candidate": False,
+            "production_reachability": "normal", "blocks_acceptance_ids": [],
+            "violates_required_invariant": False, "required_invariant_evidence": None,
+            "blocks_required_support_contract": False,
+            "required_support_contract_evidence": None,
+            "mandatory_core_acceptance_evidence_missing": False,
+            "test_can_miss_product_defect": False, "deferred_reference": None,
+            "coverage_identity_ids": [], "evidence": "reviewer preference",
+        }
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "deferred backlog"):
+            runtime_controller.validate_finding_dimensions(self.state(), item)
+
+    def test_review_incomplete_is_input_gap_and_never_mutates_runtime(self) -> None:
+        self.initialize()
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        findings_path = self.root / ".agentic-pipeline" / "findings.json"
+        before_state = state_path.read_bytes()
+        before_findings = findings_path.read_bytes()
+        rejected = self.cli(
+            "review-complete", "--revision", self.state()["revision"],
+            "--run-id", "review-incomplete", "--reviewer-id", "reviewer-1",
+            "--capsule", "missing-capsule.json", "--status", "incomplete",
+            "--report", "missing-report.json", "--credit-manifest", "missing-credit.json",
+            expected=2,
+        )
+        self.assertIn("invalid choice", rejected.stderr)
+        self.assertEqual(before_state, state_path.read_bytes())
+        self.assertEqual(before_findings, findings_path.read_bytes())
+
+    def test_init_keeps_technical_base_controller_owned_without_plan_reapproval(self) -> None:
+        approved_plan_sha = self.sha(self.plan)
+        state = self.initialize(
+            research=False, base_revision="technical-base-digest-v2"
+        )
+        self.assertEqual("technical-base-digest-v2", state["revision_base_revision"])
+        self.assertEqual(approved_plan_sha, state["development_plan_sha256"])
+        self.assertEqual(approved_plan_sha, self.sha(self.plan))
+        self.assertNotIn(
+            "scope_baseline_revision",
+            state["slices"]["SLICE-001"]["scope_contract"],
+        )
+
     def test_schema8_is_rejected_without_guessing_migration_facts(self) -> None:
         self.initialize(research=False)
         for name in ("state.json", "findings.json"):
@@ -1606,26 +2219,24 @@ class PipelineSchema9Tests(unittest.TestCase):
             value["schema_version"] = 8
             path.write_text(json.dumps(value), encoding="utf-8")
         result = self.cli("status", expected=2)
-        self.assertIn("pre-v9", result.stderr)
+        self.assertIn("Unsupported pipeline state", result.stderr)
 
     def test_context_capsule_records_exact_metrics_and_detects_staleness(self) -> None:
-        self.initialize()
-        capsule = self.capsule("coverage_steward", "slice_coverage_planning", "steward")
-        value = json.loads((self.root / capsule).read_text(encoding="utf-8"))
-        self.assertGreater(value["metrics"]["payload_bytes"], self.prd.stat().st_size)
-        self.assertEqual((value["metrics"]["payload_bytes"] + 3) // 4, value["metrics"]["estimated_tokens"])
-        self.cli("context-capsule-check", "--capsule", capsule)
-        (self.root / capsule).write_text("{}", encoding="utf-8")
-        self.cli("context-capsule-check", "--capsule", capsule, expected=2)
+        self.initialize(research=False)
+        result = self.cli(
+            "context-capsule-create", "--role", "researcher",
+            "--phase", "slice_research", expected=2,
+        )
+        self.assertIn("invalid choice", result.stderr)
 
     def test_context_capsule_fails_closed_over_numeric_budget(self) -> None:
-        self.initialize()
+        self.initialize(research=False)
         result = self.cli(
             "context-capsule-create",
             "--role",
-            "coverage_steward",
+            "researcher",
             "--phase",
-            "slice_coverage_planning",
+            "slice_research",
             "--worker-id",
             "small-budget",
             "--plan-sha256",
@@ -1652,7 +2263,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             f"tests/{FEATURE}/verification/tiny.json",
             expected=2,
         )
-        self.assertIn("exceed approved development-plan ceilings", result.stderr)
+        self.assertIn("invalid choice", result.stderr)
 
     def test_exclusive_lease_and_drift_safe_release(self) -> None:
         self.initialize()
@@ -1680,6 +2291,26 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--reason", "blocked after edit", expected=2,
         )
         self.assertEqual(lease, self.state()["active_write_lease"]["lease_id"])
+
+    def test_release_lease_lost_response_replay_is_exact(self) -> None:
+        self.initialize()
+        capsule = self.begin_engineer_lease(allowed=("src/feature.py",))
+        lease = self.state()["active_write_lease"]["lease_id"]
+        command = (
+            "release-write-lease", "--lease-id", lease,
+            "--result", "blocked", "--reason", "external dependency",
+        )
+        self.cli(*command)
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        after_first = state_path.read_bytes()
+        self.cli(*command)
+        self.assertEqual(after_first, state_path.read_bytes())
+        mismatch = self.cli(
+            "release-write-lease", "--lease-id", lease,
+            "--result", "blocked", "--reason", "different dependency",
+            expected=2,
+        )
+        self.assertIn("lost-response replay mismatch", mismatch.stderr)
 
     def test_missing_scope_receipt_routes_to_scope_check_and_blocks_engineer_lease(self) -> None:
         self.initialize()
@@ -1803,6 +2434,13 @@ class PipelineSchema9Tests(unittest.TestCase):
     def test_new_lease_binds_scope_receipt_and_preserves_byte_exact_base(self) -> None:
         mixed = b"VALUE = 0\r\n# lf\n# crlf\r\n"
         self.src.write_bytes(mixed)
+        generated = self.root / "node_modules" / "generated-cache"
+        generated.mkdir(parents=True)
+        for index in range(1200):
+            (generated / f"asset-{index:04d}.js").write_text("generated\n", encoding="utf-8")
+        secret = self.root / "private" / "credentials.env"
+        secret.parent.mkdir(parents=True)
+        secret.write_text("token=must-not-enter-runtime\n", encoding="utf-8")
         self.initialize()
         self.plan_coverage()
         capsule = self.capsule(
@@ -1822,8 +2460,16 @@ class PipelineSchema9Tests(unittest.TestCase):
         state = self.state()
         snapshot = state["lease_snapshots"][lease["lease_id"]]
 
-        self.assertEqual(2, snapshot["snapshot_schema"])
-        self.assertEqual("sha256-raw-bytes-v1", snapshot["snapshot_format"])
+        self.assertEqual(4, snapshot["snapshot_schema"])
+        self.assertEqual("sha256-digest-lines-v1", snapshot["snapshot_format"])
+        self.assertNotIn("checkout_text", snapshot)
+        self.assertNotIn(self.rel(secret), snapshot["checkout"])
+        self.assertFalse(any(path.startswith("node_modules/") for path in snapshot["checkout"]))
+        self.assertNotIn("must-not-enter-runtime", json.dumps(state))
+        self.assertEqual(
+            [hashlib.sha256(line).hexdigest() for line in mixed.splitlines()],
+            snapshot["line_proofs"]["src/feature.py"]["line_hashes"],
+        )
         self.assertEqual(
             receipt["checkout_snapshot_sha256"],
             lease["scope_authorization"]["checkout_snapshot_sha256"],
@@ -1849,7 +2495,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             "engineer-complete", "--run-id", "tampered-snapshot-run",
             "--owner-id", "engineer-1", "--lease-id", lease_id,
             "--capsule", capsule, "--slice-id", "SLICE-001",
-            "--engineering-status", "pass", "--machine-checks", "pass",
+            "--machine-checks", "pass",
             "--diff-inspection", "pass",
             "--semantic-handoff", self.semantic_packet_for_change(self.src),
             "--report", self.artifact("verification", "tampered-snapshot-report"),
@@ -1858,242 +2504,772 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertIn("binding", result.stderr.lower())
         self.assertEqual(lease_id, self.state()["active_write_lease"]["lease_id"])
 
-    def test_legacy_active_lease_routes_to_audited_recovery_without_rollback(self) -> None:
-        base = b"VALUE = 0\r\n# lf\n# crlf\r\n"
-        candidate = b"VALUE = 1\r\n# lf\n# crlf\r\n"
-        lease_id, _, legacy_snapshot = self.install_legacy_engineer_lease(
-            base_bytes=base
-        )
-        state = self.state()
-        lifecycle_history = [{
-            "receipt_id": "LPR-0001",
-            "kind": "lifecycle_generated_dashboard_date",
-            "path": "tests/teleport-module/verification/controller/lifecycle.json",
-            "sha256": "a" * 64,
-        }]
-        state["lifecycle_projection_reconciliations"] = lifecycle_history
-        self.write_state(state)
-        self.src.write_bytes(candidate)
-
-        status = self.full_status()
-        route = status["next_action"]
-        self.assertEqual("recover_legacy_engineer_scope_authorization", route["action"])
-        self.assertEqual(lease_id, route["lease_id"])
-        self.assertEqual("SLICE-001", route["active_slice"])
-        self.assertEqual("engineer-1", route["engineering_owner_id"])
-        self.assertEqual(hashlib.sha256(base).hexdigest(), legacy_snapshot["checkout"]["src/feature.py"])
-
-        recovered = json.loads(self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "engineer-1", "--slice-id", "SLICE-001",
-        ).stdout)
-        state = self.state()
-        normalized_snapshot = state["lease_snapshots"][lease_id]
-        self.assertEqual(1, normalized_snapshot["snapshot_schema"])
-        self.assertEqual("legacy_pre_scope_gate", normalized_snapshot["provenance"])
-        summary = state["legacy_scope_recoveries"][-1]
-        self.assertEqual(["src/feature.py"], summary["observed_changed_paths"])
-        receipt_path = self.root / summary["path"]
-        self.assertEqual(summary["sha256"], self.sha(receipt_path))
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        self.assertEqual(1, receipt["schema"])
-        self.assertEqual("legacy_engineer_scope_authorization", receipt["kind"])
-        pre_edit = state["slices"]["SLICE-001"]["scope_pre_edit_check"]
-        self.assertEqual("LSR-0001", receipt["receipt_id"])
-        self.assertEqual(lease_id, receipt["lease_id"])
-        self.assertEqual(["src/feature.py"], receipt["observed_changed_paths"])
-        self.assertEqual(receipt["receipt_id"], pre_edit["recovery_receipt_id"])
-        self.assertEqual(receipt, recovered)
-        self.assertEqual(candidate, self.src.read_bytes())
-        self.assertEqual(lease_id, state["active_write_lease"]["lease_id"])
-        self.assertEqual(
-            receipt["checkout_snapshot_sha256"],
-            state["active_write_lease"]["scope_authorization"]["checkout_snapshot_sha256"],
-        )
-        after_recovery = self.full_status()
-        self.assertNotEqual(
-            "recover_legacy_engineer_scope_authorization",
-            after_recovery["next_action"]["action"],
-        )
-        self.assertEqual(1, len(self.state()["legacy_scope_recoveries"]))
-        self.assertEqual(
-            lifecycle_history,
-            self.state()["lifecycle_projection_reconciliations"],
+    def test_schema9_raw_snapshot_migrates_automatically_without_status_leak(self) -> None:
+        mixed = b"VALUE = 0\r\n# lf\n# crlf\r\n"
+        self.src.write_bytes(mixed)
+        self.initialize()
+        self.begin_engineer_lease(allowed=("src/feature.py",))
+        lease_id = self.state()["active_write_lease"]["lease_id"]
+        self.downgrade_active_snapshot_to_schema9(
+            lease_id, {"src/feature.py": self.src.read_text(encoding="utf-8")}
         )
 
-    def test_legacy_recovery_rejects_checkout_outside_original_allowlist(self) -> None:
-        lease_id, _, _ = self.install_legacy_engineer_lease()
-        outside = self.root / "src" / "outside.py"
-        outside.write_bytes(b"OUTSIDE = True\n")
-
-        result = self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
-        )
-        self.assertIn("authority", result.stderr.lower())
-        state = self.state()
-        self.assertEqual([], state["legacy_scope_recoveries"])
-        self.assertIsNone(state["slices"]["SLICE-001"]["scope_pre_edit_check"])
-
-    def test_legacy_recovery_rejects_snapshot_tampering(self) -> None:
-        self.assert_legacy_recovery_tampering_rejected("snapshot")
-
-    def test_legacy_recovery_rejects_capsule_tampering(self) -> None:
-        self.assert_legacy_recovery_tampering_rejected("capsule")
-
-    def test_legacy_recovery_rejects_base_revision_tampering(self) -> None:
-        self.assert_legacy_recovery_tampering_rejected("base")
-
-    def test_legacy_recovery_command_replay_fails_closed(self) -> None:
-        lease_id, _, _ = self.install_legacy_engineer_lease()
-        self.src.write_bytes(b"VALUE = 1\r\n# lf\n# crlf\r\n")
-        self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "engineer-1", "--slice-id", "SLICE-001",
-        )
-        before = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
-        replay = self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "engineer-1", "--slice-id", "SLICE-001",
-            expected=2,
-        )
-        self.assertIn("replay", replay.stderr.lower())
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        findings_path = self.root / ".agentic-pipeline" / "findings.json"
+        ledger_path = self.root / ".agentic-pipeline" / "decision-ledger.jsonl"
+        before = {
+            path: path.read_bytes() if path.exists() else None
+            for path in (state_path, findings_path, ledger_path)
+        }
+        status = self.cli("status", "--section", "leases")
+        self.assertNotIn("VALUE = 0", status.stdout)
         self.assertEqual(
             before,
-            (self.root / ".agentic-pipeline" / "state.json").read_bytes(),
+            {
+                path: path.read_bytes() if path.exists() else None
+                for path in (state_path, findings_path, ledger_path)
+            },
         )
-        mismatch = self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "different-owner", "--slice-id", "SLICE-001", expected=2,
+        migrated = runtime_controller.load_runtime(str(self.root))[3]
+        result = migrated["lease_snapshot_sanitizations"][-1]
+        migrated_snapshot = migrated["lease_snapshots"][lease_id]
+        self.assertEqual("continued", result["outcome"])
+        self.assertEqual(10, migrated["schema_version"])
+        self.assertEqual(4, migrated_snapshot["snapshot_schema"])
+        self.assertNotIn("checkout_text", migrated_snapshot)
+        self.assertEqual(
+            [hashlib.sha256(line).hexdigest() for line in mixed.splitlines()],
+            migrated_snapshot["line_proofs"]["src/feature.py"]["line_hashes"],
         )
-        self.assertIn("replay", mismatch.stderr.lower())
+        self.assertEqual("slice_engineering", migrated["phase"])
 
-    def test_legacy_recovery_rejects_tampered_audit_receipt(self) -> None:
-        lease_id, _, _ = self.install_legacy_engineer_lease()
-        self.src.write_bytes(b"VALUE = 1\r\n# lf\n# crlf\r\n")
-        self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "engineer-1", "--slice-id", "SLICE-001",
+    def test_schema9_automatic_migration_is_role_agnostic(self) -> None:
+        self.initialize(research=False)
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        state = self.state()
+        lease_id = "LEASE-0001"
+        checkout = runtime_controller.checkout_snapshot(self.root, FEATURE, state)
+        lease = {
+            "lease_id": lease_id,
+            "phase": "derived_documentation",
+            "write_scope": "support-docs",
+            "role": "documentation_finisher",
+            "worker_id": "doc-1",
+            "base_revision": state["revision"],
+            "allowed_paths": [self.rel(self.prd)],
+            "allowed_symbols": [],
+            "exclusions": [],
+            "status": "active",
+            "rebaseline_carried": False,
+            "scope_authorization": None,
+        }
+        state["phase"] = "derived_documentation"
+        state["active_write_lease"] = lease
+        state["lease_snapshots"][lease_id] = {
+            "capsule_path": "tests/doc-capsule.json",
+            "capsule_sha256": "a" * 64,
+            "checkout": checkout,
+            "authorization_checkout": checkout,
+            "checkout_text": {self.rel(self.prd): self.prd.read_text(encoding="utf-8")},
+            "snapshot_schema": 2,
+            "snapshot_format": "sha256-raw-bytes-v1",
+            "rebaseline_carried": False,
+            "scope_authorization": None,
+            "created_at": "2026-08-13T00:00:00+00:00",
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.downgrade_active_snapshot_to_schema9(
+            lease_id, {self.rel(self.prd): self.prd.read_text(encoding="utf-8")}
         )
-        summary = self.state()["legacy_scope_recoveries"][-1]
-        receipt_path = self.root / summary["path"]
+
+        state_bytes = state_path.read_bytes()
+        migrated = runtime_controller.load_runtime(str(self.root))[3]
+        self.assertEqual(state_bytes, state_path.read_bytes())
+        result = migrated["lease_snapshot_sanitizations"][-1]
+        self.assertEqual("continued", result["outcome"])
+        self.assertEqual("derived_documentation", migrated["phase"])
+        self.assertEqual("documentation_finisher", migrated["active_write_lease"]["role"])
+        self.assertEqual(4, migrated["lease_snapshots"][lease_id]["snapshot_schema"])
+
+    def test_schema9_changed_binary_is_audited_revoked_without_candidate_loss(self) -> None:
+        base = b"\x00\xfflegacy-base"
+        candidate = b"\x00\xffcandidate-change"
+        self.src.write_bytes(base)
+        self.initialize()
+        self.begin_engineer_lease(allowed=("src/feature.py",))
+        lease_id = self.state()["active_write_lease"]["lease_id"]
+        self.downgrade_active_snapshot_to_schema9(lease_id, {"src/feature.py": ""})
+        self.src.write_bytes(candidate)
+
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        findings_path = self.root / ".agentic-pipeline" / "findings.json"
+        ledger_path = self.root / ".agentic-pipeline" / "decision-ledger.jsonl"
+        before = {
+            path: path.read_bytes() if path.exists() else None
+            for path in (state_path, findings_path, ledger_path)
+        }
+        status = json.loads(self.cli("status", "--section", "leases").stdout)["data"]
+        self.assertEqual(
+            before,
+            {
+                path: path.read_bytes() if path.exists() else None
+                for path in (state_path, findings_path, ledger_path)
+            },
+        )
+        migrated = runtime_controller.load_runtime(str(self.root))[3]
+        result = migrated["lease_snapshot_sanitizations"][-1]
+        self.assertEqual("candidate_handoff_required", result["outcome"])
+        self.assertTrue(result["files_untouched"])
+        self.assertEqual(candidate, self.src.read_bytes())
+        self.assertIsNone(migrated["active_write_lease"])
+        self.assertNotIn(lease_id, migrated["lease_snapshots"])
+        self.assertEqual("owner_handoff_hold", migrated["phase"])
+        self.assertTrue(migrated["scope_guard"]["rebaseline_candidate"]["fresh_owner_required"])
+        self.assertEqual("migration_unverifiable", migrated["write_lease_history"][-1]["result"])
+        self.assertEqual(
+            "candidate_handoff_required",
+            status["last_snapshot_sanitization"]["outcome"],
+        )
+
+    def test_schema9_legacy_text_binary_zero_xml_and_symlink_matrix(self) -> None:
+        variants = {
+            "text": b"VALUE = 0\ntext\n",
+            "binary": b"\x00\xff\x10binary",
+            "zero": b"",
+            "xml": b'<?xml version="1.0"?><root value="1"/>\n',
+        }
+        for name, raw in variants.items():
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.src.write_bytes(raw)
+                self.initialize()
+                self.begin_engineer_lease(allowed=("src/feature.py",))
+                lease_id = self.state()["active_write_lease"]["lease_id"]
+                self.downgrade_active_snapshot_to_schema9(lease_id, {"src/feature.py": "legacy"})
+                before = self.src.read_bytes()
+                migrated = runtime_controller.load_runtime(str(self.root))[3]
+                self.assertEqual("continued", migrated["lease_snapshot_sanitizations"][-1]["outcome"])
+                self.assertTrue(migrated["lease_snapshot_sanitizations"][-1]["files_untouched"])
+                self.assertEqual(before, self.src.read_bytes())
+
+        self.tearDown()
+        self.setUp()
+        target = self.root / "src" / "target.py"
+        target.write_text("TARGET = 1\n", encoding="utf-8")
+        try:
+            self.src.unlink()
+            self.src.symlink_to(target)
+        except OSError as exc:
+            self.skipTest(f"file symlink creation unavailable: {exc}")
+        self.initialize()
+        self.begin_engineer_lease(allowed=("src/feature.py", "src/target.py"))
+        lease_id = self.state()["active_write_lease"]["lease_id"]
+        self.downgrade_active_snapshot_to_schema9(lease_id, {"src/feature.py": "legacy"})
+        link_target = os.readlink(self.src)
+        migrated = runtime_controller.load_runtime(str(self.root))[3]
+        self.assertEqual("continued", migrated["lease_snapshot_sanitizations"][-1]["outcome"])
+        self.assertTrue(self.src.is_symlink())
+        self.assertEqual(link_target, os.readlink(self.src))
+
+    def test_schema9_legacy_tampered_digest_holds_and_keeps_bytes(self) -> None:
+        raw = b"candidate-bytes\x00"
+        self.src.write_bytes(raw)
+        self.initialize()
+        self.begin_engineer_lease(allowed=("src/feature.py",))
+        lease_id = self.state()["active_write_lease"]["lease_id"]
+        self.downgrade_active_snapshot_to_schema9(lease_id, {"src/feature.py": "legacy"})
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        state = self.state()
+        state["lease_snapshots"][lease_id]["checkout"]["src/feature.py"] = "0" * 64
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        migrated = runtime_controller.load_runtime(str(self.root))[3]
+        event = migrated["lease_snapshot_sanitizations"][-1]
+        self.assertEqual("candidate_handoff_required", event["outcome"])
+        self.assertTrue(event["files_untouched"])
+        self.assertFalse(event["continuity_preserved"])
+        self.assertEqual("owner_handoff_hold", migrated["phase"])
+        self.assertEqual(raw, self.src.read_bytes())
+
+    def test_generated_output_policy_positive_negative_malformed_meta_and_tamper(self) -> None:
+        policy_path = self.root / runtime_controller.GENERATED_OUTPUT_POLICY_PATH
+        positive = ["Library/**", "Artifacts/**", "obj/**", "*.csproj", "*.sln"]
+        policy_path.write_text(
+            json.dumps({"schema_version": 1, "generated_paths": positive}),
+            encoding="utf-8",
+        )
+        policy = runtime_controller.load_generated_output_policy(self.root)
+        for relative in (
+            "Library/cache.bin", "Artifacts/build.dat", "obj/x.tmp",
+            "Game.csproj", "Game.sln",
+        ):
+            with self.subTest(relative=relative):
+                self.assertTrue(runtime_controller.excluded_source_path(relative, FEATURE, positive))
+        for relative in ("src/Game.cs", "ProjectSettings/ProjectSettings.asset", "Library/kept.meta"):
+            with self.subTest(legitimate=relative):
+                self.assertFalse(runtime_controller.excluded_source_path(relative, FEATURE, positive))
+        self.assertEqual(positive, policy["generated_paths"])
+
+        for invalid in ("../Library/**", "*.*", "*.meta", "Library/*.tmp", ""):
+            with self.subTest(invalid=invalid):
+                policy_path.write_text(
+                    json.dumps({"schema_version": 1, "generated_paths": [invalid]}),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(runtime_controller.PipelineError):
+                    runtime_controller.load_generated_output_policy(self.root)
+
+        policy_path.write_text(
+            json.dumps({"schema_version": 1, "generated_paths": positive}),
+            encoding="utf-8",
+        )
+        self.initialize(research=False)
+        policy_path.write_text(
+            json.dumps({"schema_version": 1, "generated_paths": positive[:-1]}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "policy drifted"):
+            runtime_controller.checkout_snapshot(self.root, FEATURE, self.state())
+
+    def test_dirty_candidate_gate_success_and_invalid_evidence_matrix(self) -> None:
+        self.initialize()
+        self.begin_engineer_lease(allowed=("src/feature.py",))
+        self.src.write_text("VALUE = 1\n", encoding="utf-8")
+        state = self.state()
+        lease = state["active_write_lease"]
+        candidate = runtime_controller.checkout_snapshot(self.root, FEATURE, state)
+        digest = runtime_controller.checkout_snapshot_sha256(candidate)
+        valid_gate = {
+            "schema": 1,
+            "lease_id": lease["lease_id"],
+            "base_revision": lease["base_revision"],
+            "candidate_before_sha256": digest,
+            "candidate_after_sha256": digest,
+            "outcome": "pass",
+            "tool": "project-test-runner",
+        }
+        report = self.root / "tests" / FEATURE / "verification" / "dirty-matrix.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        invalid = {
+            "missing_before": lambda row: row.pop("candidate_before_sha256"),
+            "bad_before": lambda row: row.update(candidate_before_sha256="0" * 64),
+            "bad_after": lambda row: row.update(candidate_after_sha256="0" * 64),
+            "missing_tool": lambda row: row.update(tool=""),
+            "bad_outcome": lambda row: row.update(outcome="fail"),
+            "wrong_lease": lambda row: row.update(lease_id="LEASE-WRONG"),
+            "wrong_base": lambda row: row.update(base_revision="0" * 64),
+        }
+        for name, mutate in invalid.items():
+            with self.subTest(name=name):
+                row = dict(valid_gate)
+                mutate(row)
+                report.write_text(json.dumps({"dirty_candidate_gate": row}), encoding="utf-8")
+                with self.assertRaisesRegex(runtime_controller.PipelineError, "unchanged exact candidate"):
+                    runtime_controller.write_dirty_candidate_gate_receipt(
+                        self.root, state, run_id=name, lease=lease, report=str(report)
+                    )
+
+        report.write_text(json.dumps({"dirty_candidate_gate": valid_gate}), encoding="utf-8")
+        record = runtime_controller.write_dirty_candidate_gate_receipt(
+            self.root, state, run_id="dirty-success", lease=lease, report=str(report)
+        )
+        pending = {
+            "lease_id": lease["lease_id"],
+            "base_revisions": {"revision": lease["base_revision"]},
+            "dirty_candidate_gate": record,
+        }
+        runtime_controller.validate_dirty_candidate_gate(self.root, pending)
+        wrong = json.loads(json.dumps(pending))
+        wrong["lease_id"] = "LEASE-WRONG"
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "binding"):
+            runtime_controller.validate_dirty_candidate_gate(self.root, wrong)
+        wrong = json.loads(json.dumps(pending))
+        wrong["base_revisions"]["revision"] = "0" * 64
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "binding"):
+            runtime_controller.validate_dirty_candidate_gate(self.root, wrong)
+        receipt_path = self.root / record["path"]
         receipt_path.write_bytes(receipt_path.read_bytes() + b" ")
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "tampered"):
+            runtime_controller.validate_dirty_candidate_gate(self.root, pending)
+
+    def test_post_engineer_completion_product_mutation_is_rejected(self) -> None:
+        self.initialize()
+        self.engineer()
+        self.src.write_text("VALUE = 2\n", encoding="utf-8")
         result = self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
+            "coverage-finalize", "--scope-id", "SLICE-001",
+            "--coverage-manifest", self.coverage_manifest("post-completion", "finalized"),
+            "--expected-actual-equality", "pass", "--mandatory-registration", "pass",
+            "--automated-execution", "pass",
+            "--report", self.artifact("verification", "post-completion-report"),
+            expected=2,
         )
-        self.assertIn("one-shot", result.stderr.lower())
+        self.assertIn("drift", result.stderr.lower())
 
-    def test_legacy_recovery_orphan_receipt_retry_is_deterministic(self) -> None:
-        lease_id, _, _ = self.install_legacy_engineer_lease()
-        self.src.write_bytes(b"VALUE = 1\r\n# lf\n# crlf\r\n")
-        original_save = runtime_controller.save_runtime
+    def test_coverage_defer_product_failure_and_authority_matrix(self) -> None:
+        self.initialize(research=False)
+        state = self.state()
+        base = json.loads(
+            (self.root / self.coverage_manifest("defer-matrix", "finalized")).read_text(
+                encoding="utf-8"
+            )
+        )
+        automated_id = base["automated_execution"][0]["identity_id"]
+        manual_id = base["manual_execution"][0]["identity_id"]
 
-        def fail_after_receipt(*_args, **_kwargs):
-            raise runtime_controller.PipelineError("simulated crash after receipt")
+        def validate(value: dict) -> dict:
+            return runtime_controller.validate_coverage_manifest(
+                self.root, state, value, scope_id="SLICE-001", require_finalized=True
+            )
 
-        runtime_controller.save_runtime = fail_after_receipt
+        product_failed = json.loads(json.dumps(base))
+        product_failed["automated_execution"][0].update(
+            outcome="product_failed", authority=None, executed=True, passed=False
+        )
+        product_failed["summary"].update(
+            automated="pending", implementation_eligible=False,
+            feature_verification_eligible=False,
+        )
+        failed = validate(product_failed)
+        self.assertEqual([automated_id], failed["product_failed_identity_ids"])
+        self.assertEqual([], failed["untested_identity_ids"])
+
+        def deferred(outcome: str, authority: dict) -> dict:
+            value = json.loads(json.dumps(base))
+            value["automated_execution"][0] = {
+                "identity_id": automated_id,
+                "executed": False,
+                "passed": None,
+                "command": "",
+                "evidence_path": None,
+                "evidence_sha256": None,
+                "outcome": outcome,
+                "authority": authority,
+            }
+            value["summary"].update(
+                automated="deferred", implementation_eligible=True,
+                feature_verification_eligible=False,
+                untested_identity_ids=[automated_id],
+            )
+            return value
+
+        manual_identity = next(
+            item for item in base["actual_identities"] if item["identity_id"] == manual_id
+        )
+        manual_authority = {
+            "kind": "manual",
+            "authority_id": manual_id,
+            "reference": runtime_controller.canonical_json_sha256(manual_identity),
+        }
+        for outcome in ("infra_unavailable", "manual_required"):
+            with self.subTest(outcome=outcome):
+                result = validate(deferred(outcome, manual_authority))
+                self.assertEqual([automated_id], result["untested_identity_ids"])
+                self.assertEqual([], result["product_failed_identity_ids"])
+
+        state["user_authorities"].append({"authority_id": "AUTH-DEFER-1"})
+        user_authority = {
+            "kind": "user", "authority_id": "AUTH-DEFER-1", "reference": "user-receipt"
+        }
+        self.assertEqual(
+            [automated_id],
+            validate(deferred("infra_unavailable", user_authority))["untested_identity_ids"],
+        )
+        unknown = dict(user_authority, authority_id="AUTH-UNKNOWN")
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "unknown user authority"):
+            validate(deferred("infra_unavailable", unknown))
+        forged = dict(manual_authority, reference="0" * 64)
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "exact registered manual"):
+            validate(deferred("manual_required", forged))
+
+        manual_deferred = json.loads(json.dumps(base))
+        manual_deferred["manual_execution"][0].update(
+            executed=False, passed=None, deferred=True, blocked_by_finding=None,
+            qa_evidence=None, gate="blocked_user", minimum_resume_action="run exact manual probe",
+        )
+        manual_deferred["summary"].update(
+            manual="deferred", feature_verification_eligible=False,
+        )
+        result = validate(manual_deferred)
+        self.assertFalse(result["manual_ok"])
+        self.assertEqual([], result["untested_identity_ids"])
+
+        impossible_summary = json.loads(json.dumps(base))
+        impossible_summary["summary"]["automated"] = "blocked"
+        with self.assertRaisesRegex(
+            runtime_controller.PipelineError, "summary does not match"
+        ):
+            validate(impossible_summary)
+
+    def test_pf0001_five_file_material_contract_exact_and_mismatch_holds_without_churn(self) -> None:
+        paths = [f"src/material-{index}.py" for index in range(1, 6)]
+        permissions = [
+            {
+                "permission_id": "PF-0001",
+                "change_type": "lifecycle_change",
+                "target_kind": "editable_path",
+                "target": paths[0],
+                "rationale": "approved lifecycle boundary",
+                "decision_authority": "DEC-MATERIAL",
+            },
+            {
+                "permission_id": "PF-0002",
+                "change_type": "ownership_change",
+                "target_kind": "editable_path",
+                "target": paths[1],
+                "rationale": "approved ownership boundary",
+                "decision_authority": "DEC-MATERIAL",
+            },
+            {
+                "permission_id": "PF-0003",
+                "change_type": "public_contract_change",
+                "target_kind": "editable_path",
+                "target": paths[2],
+                "rationale": "approved public contract boundary",
+                "decision_authority": "DEC-MATERIAL",
+            },
+        ]
+        slice_item = {
+            "scope_contract": {
+                "editable_paths": paths,
+                "shared_touchpoints": [],
+                "excluded_paths": [],
+                "excluded_components": [],
+                "max_product_files": 5,
+                "max_product_lines_changed": 50,
+                "planned_material_permissions": permissions,
+            }
+        }
+        changes = [
+            {"path": path, "change_kind": "modify", "touchpoint_id": None}
+            for path in paths
+        ]
+        diffs = [
+            {
+                "path": path,
+                "symbols": ["VALUE"],
+                "lines_changed": 1,
+                "component": "feature",
+                "change_kind": "modify",
+                "drive_by": False,
+                "lifecycle_change": index == 0,
+                "ownership_change": index == 1,
+                "public_contract_change": index == 2,
+            }
+            for index, path in enumerate(paths)
+        ]
+        frozen = json.dumps(slice_item, sort_keys=True)
+        self.assertEqual(
+            [],
+            runtime_controller.scope_violations(
+                slice_item, changes, diffs,
+                active_decision_ids={"DEC-MATERIAL"},
+            ),
+        )
+        self.assertEqual(frozen, json.dumps(slice_item, sort_keys=True))
+
+        for name, altered, decisions in (
+            ("missing_authority", slice_item, set()),
+            (
+                "wrong_target",
+                {"scope_contract": {**slice_item["scope_contract"],
+                    "planned_material_permissions": [
+                        {**permissions[0], "target": paths[4]}, *permissions[1:]
+                    ]}},
+                {"DEC-MATERIAL"},
+            ),
+            (
+                "wrong_type",
+                {"scope_contract": {**slice_item["scope_contract"],
+                    "planned_material_permissions": [
+                        {**permissions[0], "change_type": "ownership_change"}, *permissions[1:]
+                    ]}},
+                {"DEC-MATERIAL"},
+            ),
+            (
+                "missing_permission",
+                {"scope_contract": {**slice_item["scope_contract"],
+                    "planned_material_permissions": permissions[1:]
+                }},
+                {"DEC-MATERIAL"},
+            ),
+        ):
+            with self.subTest(name=name):
+                violations = runtime_controller.scope_violations(
+                    altered, changes, diffs, active_decision_ids=decisions
+                )
+                self.assertTrue(any("unapproved" in item for item in violations), violations)
+                self.assertEqual(frozen, json.dumps(slice_item, sort_keys=True))
+
+        state = self.initialize()
+        self.begin_engineer_lease(allowed=("src/feature.py",))
+        state = self.state()
+        plan_before = self.plan.read_bytes()
+        plan_sha_before = state["development_plan_sha256"]
+        active_slice = state["slices"]["SLICE-001"]
+        active_slice["scope_contract"] = slice_item["scope_contract"]
+        violations = runtime_controller.scope_violations(
+            slice_item, changes, diffs, active_decision_ids=set()
+        )
+        runtime_controller.open_scope_expansion_hold(
+            state, active_slice, violations,
+            lease=state["active_write_lease"],
+            inventory={"product": paths, "support": [], "evidence": []},
+            changes=changes, diff_files=diffs,
+            semantic_report="tests/semantic.json", engineer_report="tests/report.json",
+            run_id="pf0001-mismatch",
+        )
+        self.assertEqual("scope_expansion_hold", state["phase"])
+        self.assertEqual(plan_sha_before, state["development_plan_sha256"])
+        self.assertEqual(plan_before, self.plan.read_bytes())
+
+    def test_runtime_generation_cas_and_snapshot_file_guard(self) -> None:
+        self.initialize(research=False)
+        loaded_a = runtime_controller.load_runtime(str(self.root))
+        loaded_b = runtime_controller.load_runtime(str(self.root))
+        _, state_path, findings_path, state_a, findings_a = loaded_a
+        _, _, _, state_b, findings_b = loaded_b
+        state_a.setdefault("authority_recovery_history", []).append(
+            {"event": "cas-fixture-a"}
+        )
+        runtime_controller.save_runtime(state_path, findings_path, state_a, findings_a)
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "Concurrent runtime update"):
+            runtime_controller.save_runtime(state_path, findings_path, state_b, findings_b)
+
+        current = self.state()
+        original_limit = runtime_controller.MAX_SOURCE_SNAPSHOT_FILES
+        runtime_controller.MAX_SOURCE_SNAPSHOT_FILES = 1
         try:
-            args = type("Args", (), {
-                "project_root": str(self.root),
-                "lease_id": lease_id,
-                "owner_id": "engineer-1",
-                "slice_id": "SLICE-001",
-            })()
-            with self.assertRaisesRegex(
-                runtime_controller.PipelineError, "simulated crash after receipt"
-            ):
-                runtime_controller.cmd_recover_legacy_engineer_scope(args)
+            with self.assertRaisesRegex(runtime_controller.PipelineError, "file limit"):
+                runtime_controller.checkout_snapshot(self.root, FEATURE, current)
         finally:
-            runtime_controller.save_runtime = original_save
+            runtime_controller.MAX_SOURCE_SNAPSHOT_FILES = original_limit
+        original_size_limit = runtime_controller.MAX_LEASE_SNAPSHOT_BYTES
+        runtime_controller.MAX_LEASE_SNAPSHOT_BYTES = 1
+        try:
+            with self.assertRaisesRegex(runtime_controller.PipelineError, "serialized size limit"):
+                runtime_controller.build_lease_snapshot(
+                    self.root,
+                    current,
+                    capsule_path="tests/capsule.json",
+                    capsule_sha256="a" * 64,
+                    allowed_paths=["src/feature.py"],
+                )
+        finally:
+            runtime_controller.MAX_LEASE_SNAPSHOT_BYTES = original_size_limit
 
-        receipt_path = (
-            self.root / "tests" / FEATURE / "verification" / "controller"
-            / "legacy-scope-recovery-0001.json"
+    def test_crash_after_canonical_state_before_findings_projection_recovers(self) -> None:
+        self.initialize(research=False)
+        root, state_path, findings_path, state, findings = runtime_controller.load_runtime(
+            str(self.root)
         )
-        orphan_bytes = receipt_path.read_bytes()
-        self.assertEqual([], self.state()["legacy_scope_recoveries"])
-        result = json.loads(self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "engineer-1", "--slice-id", "SLICE-001",
-        ).stdout)
-        self.assertEqual("LSR-0001", result["receipt_id"])
-        self.assertEqual(orphan_bytes, receipt_path.read_bytes())
-        self.assertEqual(1, len(self.state()["legacy_scope_recoveries"]))
+        prior_generation = state["generation"]
+        findings["fault_injection_marker"] = "new-findings-generation"
+        original_write = runtime_controller.write_json
 
-    def test_legacy_recovery_rejects_receipt_symlink_outside_root(self) -> None:
-        lease_id, _, _ = self.install_legacy_engineer_lease()
-        self.src.write_bytes(b"VALUE = 1\r\n# lf\n# crlf\r\n")
+        def fail_after_canonical_state(path: Path, value: dict) -> None:
+            if path == findings_path:
+                raise runtime_controller.PipelineError("injected findings projection failure")
+            original_write(path, value)
+
+        runtime_controller.write_json = fail_after_canonical_state
+        try:
+            with self.assertRaisesRegex(
+                runtime_controller.PipelineError, "injected findings projection failure"
+            ):
+                runtime_controller.save_runtime(
+                    state_path, findings_path, state, findings
+                )
+        finally:
+            runtime_controller.write_json = original_write
+
+        disk_state = json.loads(state_path.read_text(encoding="utf-8"))
+        compatibility_findings = json.loads(findings_path.read_text(encoding="utf-8"))
+        self.assertEqual(prior_generation + 1, disk_state["generation"])
+        self.assertEqual(
+            "new-findings-generation",
+            disk_state["canonical_findings"]["fault_injection_marker"],
+        )
+        self.assertNotIn("fault_injection_marker", compatibility_findings)
+        _, _, _, recovered_state, recovered_findings = runtime_controller.load_runtime(
+            str(root)
+        )
+        self.assertEqual(prior_generation + 1, recovered_state["generation"])
+        self.assertEqual("new-findings-generation", recovered_findings["fault_injection_marker"])
+        runtime_controller.save_runtime(
+            state_path, findings_path, recovered_state, recovered_findings
+        )
+        self.assertEqual(
+            "new-findings-generation",
+            json.loads(findings_path.read_text(encoding="utf-8"))["fault_injection_marker"],
+        )
+        tampered = json.loads(state_path.read_text(encoding="utf-8"))
+        tampered["canonical_findings"]["tampered"] = True
+        state_path.write_text(json.dumps(tampered), encoding="utf-8")
+        with self.assertRaisesRegex(
+            runtime_controller.PipelineError, "generation/digest is inconsistent"
+        ):
+            runtime_controller.load_runtime(str(root))
+
+    def test_git_projection_keeps_tracked_ignored_and_drops_untracked_ignored(self) -> None:
+        self.initialize(research=False)
+        tracked = self.root / "src" / "tracked.ignored"
+        untracked = self.root / "src" / "untracked.ignored"
+        tracked.write_text("tracked\n", encoding="utf-8")
+        untracked.write_text("untracked\n", encoding="utf-8")
+        (self.root / ".gitignore").write_text("src/*.ignored\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "init", "-q"], cwd=self.root, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "add", "-f", self.rel(tracked)],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+        )
+        snapshot = runtime_controller.checkout_snapshot(
+            self.root, FEATURE, self.state()
+        )
+        self.assertIn(self.rel(tracked), snapshot)
+        self.assertNotIn(self.rel(untracked), snapshot)
+
+    def test_gitlink_in_source_projection_fails_closed_direct_and_cli(self) -> None:
+        self.initialize()
+        self.plan_coverage()
+        module = self.root / "external-module"
+        module.mkdir()
+        module_file = module / "inside.cs"
+        module_file.write_text("v1\n", encoding="utf-8")
+        for repository in (module, self.root):
+            subprocess.run(
+                ["git", "init", "-q"], cwd=repository, check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Pipeline Test"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+        subprocess.run(
+            ["git", "add", "inside.cs"], cwd=module, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "commit", "-qm", "module"],
+            cwd=module,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                str(module),
+                "src/sharedlib",
+            ],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+        )
+
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "gitlink/submodule"):
+            runtime_controller.checkout_snapshot(self.root, FEATURE, self.state())
+        state = self.state()
+        blocked = self.cli(
+            "slice-scope-check",
+            "--slice-id",
+            "SLICE-001",
+            "--base-revision",
+            state["revision"],
+            "--owner-id",
+            "engineer-1",
+            expected=2,
+        )
+        self.assertIn("gitlink/submodule", blocked.stderr)
+
+    def test_schema9_direct_load_migrates_before_writer_release(self) -> None:
+        self.initialize()
+        self.begin_engineer_lease(allowed=("src/feature.py",))
+        lease_id = self.state()["active_write_lease"]["lease_id"]
+        self.downgrade_active_snapshot_to_schema9(
+            lease_id, {"src/feature.py": self.src.read_text(encoding="utf-8")}
+        )
+        _, _, _, migrated, _ = runtime_controller.load_runtime(str(self.root))
+        self.assertEqual(10, migrated["schema_version"])
+        self.assertEqual(
+            4, migrated["lease_snapshots"][lease_id]["snapshot_schema"]
+        )
+        self.assertEqual(9, self.state()["schema_version"])
+        self.cli(
+            "release-write-lease",
+            "--lease-id",
+            lease_id,
+            "--result",
+            "blocked",
+            "--reason",
+            "migration completed before release",
+        )
+        self.assertIsNone(self.state()["active_write_lease"])
+        self.assertEqual(10, self.state()["schema_version"])
+
+    def test_runtime_control_directory_rejects_symlink_or_reparse_point(self) -> None:
+        project = tempfile.TemporaryDirectory()
         outside = tempfile.TemporaryDirectory()
+        self.addCleanup(project.cleanup)
         self.addCleanup(outside.cleanup)
-        outside_target = Path(outside.name) / "outside-receipt.json"
-        sentinel = b'{"outside":"unchanged"}\n'
-        outside_target.write_bytes(sentinel)
-        receipt_path = (
-            self.root / "tests" / FEATURE / "verification" / "controller"
-            / "legacy-scope-recovery-0001.json"
-        )
-        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        project_root = Path(project.name)
+        control = project_root / runtime_controller.STATE_DIR
+        junction_created = False
         try:
-            receipt_path.symlink_to(outside_target)
+            control.symlink_to(Path(outside.name), target_is_directory=True)
         except OSError as exc:
-            self.skipTest(f"symlink creation unavailable: {exc}")
-
-        result = self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
-        )
-        self.assertIn("symlink", result.stderr.lower())
-        self.assertEqual(sentinel, outside_target.read_bytes())
-        self.assertEqual([], self.state()["legacy_scope_recoveries"])
-
-    def test_legacy_recovery_rejects_broken_receipt_symlink(self) -> None:
-        lease_id, _, _ = self.install_legacy_engineer_lease()
-        outside = tempfile.TemporaryDirectory()
-        outside_path = Path(outside.name)
-        outside.cleanup()
-        broken_target = outside_path / "missing-receipt.json"
-        receipt_path = (
-            self.root / "tests" / FEATURE / "verification" / "controller"
-            / "legacy-scope-recovery-0001.json"
-        )
-        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            if os.name != "nt":
+                self.skipTest(f"directory symlink/reparse creation unavailable: {exc}")
+            junction = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(control), outside.name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if junction.returncode != 0:
+                self.skipTest(
+                    "directory symlink/junction creation unavailable: "
+                    + (junction.stderr or junction.stdout).strip()
+                )
+            junction_created = True
         try:
-            receipt_path.symlink_to(broken_target)
-        except OSError as exc:
-            self.skipTest(f"symlink creation unavailable: {exc}")
+            with self.assertRaisesRegex(
+                runtime_controller.PipelineError, "symlink/junction/reparse|escapes"
+            ):
+                runtime_controller.runtime_paths(str(project_root))
+            cli = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "status",
+                    "--project-root",
+                    str(project_root),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(2, cli.returncode, cli.stderr or cli.stdout)
+            self.assertRegex(cli.stderr, "symlink/junction/reparse|escapes")
+        finally:
+            if junction_created:
+                os.rmdir(control)
 
-        result = self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
-        )
-        self.assertIn("symlink", result.stderr.lower())
-        self.assertFalse(broken_target.exists())
-
-    def test_legacy_recovery_rejects_controller_root_symlink_outside(self) -> None:
-        lease_id, _, _ = self.install_legacy_engineer_lease()
-        outside = tempfile.TemporaryDirectory()
-        self.addCleanup(outside.cleanup)
-        outside_root = Path(outside.name)
-        marker = outside_root / "marker.txt"
-        marker.write_bytes(b"unchanged\n")
-        controller_root = (
-            self.root / "tests" / FEATURE / "verification" / "controller"
-        )
-        controller_root.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            controller_root.symlink_to(outside_root, target_is_directory=True)
-        except OSError as exc:
-            self.skipTest(f"directory symlink creation unavailable: {exc}")
-
-        result = self.cli(
-            "recover-legacy-engineer-scope", "--lease-id", lease_id,
-            "--owner-id", "engineer-1", "--slice-id", "SLICE-001", expected=2,
-        )
-        self.assertIn("escapes", result.stderr.lower())
-        self.assertEqual(b"unchanged\n", marker.read_bytes())
-        self.assertEqual([], self.state()["legacy_scope_recoveries"])
-
+    # Legacy in-schema scope recovery tests were superseded by the fail-closed schema-9 migration hold.
     def test_prepare_engineer_continuation_creates_exact_bound_handoff(self) -> None:
         self.initialize()
         self.plan_coverage()
@@ -2196,29 +3372,10 @@ class PipelineSchema9Tests(unittest.TestCase):
         fresh = json.loads((self.root / prepared["capsule"]["path"]).read_text(encoding="utf-8"))
         self.assertEqual(state["revision"], fresh["revisions"]["revision"])
         self.assertEqual(fixture["finding_ids"], fresh["finding_ids"])
-
-    def test_prepare_engineer_continuation_recovers_eligible_legacy_lease_without_rollback(self) -> None:
-        lease_id, capsule_path, _ = self.install_legacy_engineer_lease()
-        candidate = b"VALUE = 81\r\n# lf\n# crlf\r\n"
-        self.src.write_bytes(candidate)
-        before_history = list(self.state()["write_lease_history"])
-
-        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
-
-        state = self.state()
-        self.assertEqual("already_prepared", prepared["status"])
-        self.assertEqual(lease_id, prepared["lease"]["id"])
-        self.assertEqual(capsule_path, prepared["capsule"]["path"])
-        self.assertEqual(candidate, self.src.read_bytes())
-        self.assertEqual(lease_id, state["active_write_lease"]["lease_id"])
-        self.assertEqual(before_history, state["write_lease_history"])
-        self.assertEqual(1, len(state["legacy_scope_recoveries"]))
-        self.assertEqual("LSR-0001", prepared["scope_receipt"]["id"])
-        self.assertEqual(
-            ["src/feature.py"],
-            state["legacy_scope_recoveries"][0]["observed_changed_paths"],
-        )
-
+        reconciliation = state["lifecycle_projection_reconciliations"][-1]
+        self.assertTrue((self.root / reconciliation["path"]).is_file())
+        self.assertIn(reconciliation["path"], {item["path"] for item in fresh["evidence"]})
+    # Continuation never consumes a pre-schema-10 snapshot directly.
     def test_prepare_engineer_continuation_binds_remediation_findings_owner_slice_and_evidence(self) -> None:
         fixture = self.prepare_lifecycle_projection_recovery()
         state = self.state()
@@ -2270,7 +3427,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         semantic_path.write_text(json.dumps(semantic_value), encoding="utf-8")
         report_path = self.root / report_output
         report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(json.dumps({"status": "pass"}), encoding="utf-8")
+        report_path.write_text(json.dumps(self.dirty_candidate_report()), encoding="utf-8")
 
         completed = json.loads(
             self.cli(
@@ -2285,8 +3442,6 @@ class PipelineSchema9Tests(unittest.TestCase):
                 capsule_path,
                 "--slice-id",
                 "SLICE-001",
-                "--engineering-status",
-                "pass",
                 "--machine-checks",
                 "pass",
                 "--diff-inspection",
@@ -2431,7 +3586,7 @@ class PipelineSchema9Tests(unittest.TestCase):
                 report_path = self.root / report_output
                 report_path.parent.mkdir(parents=True, exist_ok=True)
                 report_path.write_text(
-                    json.dumps({"status": "pass"}), encoding="utf-8"
+                    json.dumps(self.dirty_candidate_report()), encoding="utf-8"
                 )
                 state = self.state()
                 lease_id = state["active_write_lease"]["lease_id"]
@@ -2450,8 +3605,6 @@ class PipelineSchema9Tests(unittest.TestCase):
                     capsule_relative,
                     "--slice-id",
                     "SLICE-001",
-                    "--engineering-status",
-                    "pass",
                     "--machine-checks",
                     "pass",
                     "--diff-inspection",
@@ -2524,6 +3677,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             second["lease"]["id"], self.state()["active_write_lease"]["lease_id"]
         )
 
+    # Schema-2/3 sanitizer cases were replaced by the schema-9 -> hold -> schema-4 regression.
     def test_prepare_engineer_continuation_rejects_controller_artifact_root_symlink(self) -> None:
         self.initialize()
         self.plan_coverage()
@@ -2582,7 +3736,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertEqual("prepared", prepared["status"])
         self.assertEqual(orphan_paths[0], self.root / prepared["capsule"]["path"])
         self.assertEqual(orphan_bytes, orphan_paths[0].read_bytes())
-        self.assertEqual(2, len(self.state()["context_capsules"]))
+        self.assertEqual(1, len(self.state()["context_capsules"]))
 
     def test_prepare_engineer_continuation_rejects_tampered_orphan_capsule(self) -> None:
         self.initialize()
@@ -2618,7 +3772,6 @@ class PipelineSchema9Tests(unittest.TestCase):
     def test_prepare_engineer_continuation_preserves_rebaseline_candidate_parity(self) -> None:
         self.initialize()
         self.engineer(forbidden_path=True)
-        held = self.state()
         text = self.plan.read_text(encoding="utf-8")
         text = text.replace(
             "- editable_paths: src/feature.py",
@@ -2626,15 +3779,12 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         text = text.replace("- excluded_components: commerce", "- excluded_components: payments")
         text = text.replace("- excluded_paths: src/commerce/**", "- excluded_paths: src/payments/**")
-        text = text.replace(
-            "- scope_baseline_revision: base-0",
-            f"- scope_baseline_revision: {held['revision']}",
-        )
         self.plan.write_text(text, encoding="utf-8")
         planning_path = self.root / ".agentic-pipeline" / "development-plan-state.json"
         planning = json.loads(planning_path.read_text(encoding="utf-8"))
         planning["approval"]["approved_sha256"] = self.sha(self.plan)
         planning_path.write_text(json.dumps(planning), encoding="utf-8")
+        self.accept_scope_authority("USER-SCOPE-APPROVAL-CONTINUE")
         self.cli(
             "rebaseline-scope",
             "--plan-sha256",
@@ -2656,7 +3806,8 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertTrue(lease["rebaseline_carried"])
         self.assertTrue(snapshot["rebaseline_carried"])
         self.assertEqual(carried["snapshot"]["checkout"], snapshot["checkout"])
-        self.assertEqual(carried["snapshot"]["checkout_text"], snapshot["checkout_text"])
+        self.assertEqual(carried["snapshot"]["line_proofs"], snapshot["line_proofs"])
+        self.assertNotIn("checkout_text", snapshot)
         self.assertNotIn(prepared["capsule"]["path"], snapshot["checkout"])
         self.assertEqual(lease["lease_id"], prepared["lease"]["id"])
         self.assertEqual("dispatch_engineer", prepared["next_action"]["action"])
@@ -2680,6 +3831,90 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertEqual(2, handoff["schema"])
         for field in ("decision_ids", "coverage_state", "documentation_state", "open_assumptions"):
             self.assertIn(field, handoff)
+
+    def test_coverage_plan_lost_response_replay_is_exact_and_idempotent(self) -> None:
+        self.initialize()
+        manifest = self.coverage_manifest("coverage-replay-plan", "planned")
+        report = self.artifact("verification", "coverage-replay-report")
+        command = (
+            "coverage-plan-complete", "--slice-id", "SLICE-001",
+            "--coverage-manifest", manifest, "--report", report,
+        )
+        self.cli(*command)
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        after_first = state_path.read_bytes()
+        self.cli(*command)
+        self.assertEqual(after_first, state_path.read_bytes())
+        mismatch = self.cli(
+            "coverage-plan-complete", "--slice-id", "SLICE-001",
+            "--coverage-manifest", manifest,
+            "--report", self.artifact("verification", "coverage-replay-other"),
+            expected=2,
+        )
+        self.assertIn("lost-response replay mismatch", mismatch.stderr)
+
+    def test_coverage_finalize_lost_response_replay_is_exact(self) -> None:
+        self.initialize()
+        self.engineer()
+        manifest = self.coverage_manifest("coverage-replay-final", "finalized")
+        report = self.artifact("verification", "coverage-replay-final-report")
+        command = (
+            "coverage-finalize", "--scope-id", "SLICE-001",
+            "--coverage-manifest", manifest,
+            "--expected-actual-equality", "pass",
+            "--mandatory-registration", "pass",
+            "--automated-execution", "pass", "--report", report,
+        )
+        self.cli(*command)
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        after_first = state_path.read_bytes()
+        self.cli(*command)
+        self.assertEqual(after_first, state_path.read_bytes())
+        mismatch = self.cli(
+            "coverage-finalize", "--scope-id", "SLICE-001",
+            "--coverage-manifest", manifest,
+            "--expected-actual-equality", "pass",
+            "--mandatory-registration", "pass",
+            "--automated-execution", "pass", "--report",
+            self.artifact("verification", "coverage-replay-final-other"),
+            expected=2,
+        )
+        self.assertIn("lost-response replay mismatch", mismatch.stderr)
+
+        state = self.state()
+        state["coverage"]["SLICE-001"]["finalized_manifest"]["revision"] = "0" * 64
+        state["phase"] = "slice_coverage_finalization"
+        self.write_state(state)
+        prior_revision = self.cli(
+            "coverage-finalize", "--scope-id", "SLICE-001",
+            "--coverage-manifest", manifest,
+            "--expected-actual-equality", "pass",
+            "--mandatory-registration", "pass",
+            "--automated-execution", "pass", "--report",
+            self.artifact("verification", "coverage-replay-prior-revision"),
+            expected=2,
+        )
+        self.assertNotIn("lost-response replay mismatch", prior_revision.stderr)
+        self.assertIn("controller-owned Engineer mechanics", prior_revision.stderr)
+
+    def test_documentation_not_required_lost_response_replay_is_exact(self) -> None:
+        state = self.implementation_complete()
+        command = (
+            "documentation-not-required", "--mode", "normative_pre_review",
+            "--plan-sha256", state["development_plan"]["sha256"],
+            "--policy-evidence", "POLICY-DOC-NONE",
+        )
+        self.cli(*command)
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        after_first = state_path.read_bytes()
+        self.cli(*command)
+        self.assertEqual(after_first, state_path.read_bytes())
+        mismatch = self.cli(
+            "documentation-not-required", "--mode", "normative_pre_review",
+            "--plan-sha256", state["development_plan"]["sha256"],
+            "--policy-evidence", "POLICY-OTHER", expected=2,
+        )
+        self.assertIn("lost-response replay mismatch", mismatch.stderr)
 
     def test_exact_identity_and_mandatory_set_mismatch_is_evidence_contract_violation(self) -> None:
         self.initialize()
@@ -2716,18 +3951,47 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         semantic = self.artifact("verification", "decision-packet", packet)
         state = self.state()
-        result = json.loads(
-            self.cli(
-                "decision-record-complete", "--recorder-id", "recorder-1", "--lease-id",
-                state["active_write_lease"]["lease_id"], "--capsule", capsule,
-                "--semantic-packet", semantic, "--report", self.artifact("verification", "decision-report"),
-            ).stdout
+        validated_items = runtime_controller.validate_decision_semantic_packet(
+            self.root,
+            state,
+            packet,
+            runtime_controller.read_json(self.root / capsule),
         )
+        self.assertEqual(["DEC-001"], [item["decision_id"] for item in validated_items])
+        report = self.artifact("verification", "decision-report")
+        command = (
+            "decision-record-complete", "--recorder-id", "recorder-1", "--lease-id",
+            state["active_write_lease"]["lease_id"], "--capsule", capsule,
+            "--semantic-packet", semantic, "--report", report,
+        )
+        self.cli(*command)
+        ledger_after_first = self.ledger.read_bytes()
+        self.cli(*command)
+        self.assertEqual(ledger_after_first, self.ledger.read_bytes())
+        mismatch = self.cli(
+            "decision-record-complete", "--recorder-id", "recorder-1", "--lease-id",
+            state["active_write_lease"]["lease_id"], "--capsule", capsule,
+            "--semantic-packet", semantic, "--report",
+            self.artifact("verification", "decision-other-report"), expected=2,
+        )
+        self.assertIn("lost-response replay mismatch", mismatch.stderr)
         result = self.full_status()
         self.assertEqual(["DEC-001"], result["decision_ledger"]["active_decision_ids"])
         entry = json.loads(self.ledger.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(1, entry["sequence"])
         self.assertIn("prior_ledger_sha256", entry)
+        self.assertEqual(
+            str(self.root / report),
+            result["decision_ledger"]["projection"]["report_path"],
+        )
+        self.assertEqual(
+            [],
+            list(
+                (self.root / "tests" / FEATURE / "verification" / "controller").glob(
+                    "decision-*-append-receipt.json"
+                )
+            ),
+        )
         self.assertIsNone(result["active_write_lease"])
 
     def test_qa_gate_preserves_implementation_and_uses_pending_exact_identities(self) -> None:
@@ -2738,7 +4002,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         self.prepare_qa_state()
         self.qa_probe(blocked=True)
-        capsule = self.capsule("qa", "qa", "qa-1")
+        capsule = self.capsule("reviewer", "qa", "qa-1")
         state = self.state()
         result = json.loads(
             self.cli(
@@ -2762,7 +4026,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         self.prepare_qa_state()
         self.qa_probe()
-        capsule = self.capsule("qa", "qa", "qa-1")
+        capsule = self.capsule("reviewer", "qa", "qa-1")
         state = self.state()
         passed = json.loads(
             self.cli(
@@ -2791,7 +4055,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         self.prepare_qa_state()
         self.qa_probe()
-        qa_capsule = self.capsule("qa", "qa", "qa-derived")
+        qa_capsule = self.capsule("reviewer", "qa", "qa-derived")
         state = self.state()
         self.cli(
             "qa-complete", "--revision", state["revision"], "--product-revision", state["product_revision"],
@@ -2820,8 +4084,10 @@ class PipelineSchema9Tests(unittest.TestCase):
             "domain_inventory": inventory,
             "changes": [
                 {
-                    "path": self.rel(support), "domain": "support", "symbols": ["operator-handoff"],
-                    "reason": "Synchronize immutable QA-observed operator path", "change_kind": "derived_docs",
+                    "path": self.rel(support), "domain": "support",
+                    "change_id": "DOC-CHG-OPERATOR-HANDOFF",
+                    "symbols": ["operator-handoff"],
+                    "reason": "assigned_goal_effect: PRD-REQ-001, PRD-AC-001 | synchronize the QA-observed operator path", "change_kind": "modify",
                     "component": "operator-docs", "lifecycle_change": False, "ownership_change": False,
                     "public_contract_change": False, "requirement_ids": ["PRD-REQ-001"],
                     "acceptance_ids": ["PRD-AC-001"], "decision_ids": [], "touchpoint_id": None,
@@ -2832,7 +4098,8 @@ class PipelineSchema9Tests(unittest.TestCase):
         semantic_path = self.artifact(
             "verification", "derived-semantic-packet", semantic_packet
         )
-        qa_report = Path(state["qa"]["report"])
+        qa_manual_relative = state["qa"]["manual_execution"]
+        qa_manual = self.root / qa_manual_relative
         source_path = self.artifact(
             "verification",
             "derived-source-map",
@@ -2841,12 +4108,13 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "mode": "derived_post_qa",
                 "statements": [
                     {
-                        "statement_id": "DOC-STMT-001",
+                        "statement_id": "DOC-CHG-OPERATOR-HANDOFF",
                         "path": self.rel(support),
                         "source_kind": "qa",
                         "source_id": state["qa"]["run_id"],
-                        "source_path": self.rel(qa_report),
-                        "source_sha256": self.sha(qa_report),
+                        "source_path": qa_manual_relative,
+                        "source_sha256": self.sha(qa_manual),
+                        "target_sha256": self.sha(support),
                     }
                 ],
             },
@@ -2869,6 +4137,32 @@ class PipelineSchema9Tests(unittest.TestCase):
             before_rejection,
             (self.root / ".agentic-pipeline" / "state.json").read_bytes(),
         )
+        for name, opaque_path in (
+            ("qa-report", state["qa"]["report"]),
+            ("capability-probe", state["qa_capability"]["report"]),
+        ):
+            opaque_map = json.loads(
+                (self.root / source_path).read_text(encoding="utf-8")
+            )
+            opaque_map["statements"][0]["source_path"] = self.rel(Path(opaque_path))
+            opaque_map["statements"][0]["source_sha256"] = self.sha(Path(opaque_path))
+            opaque_source_path = self.artifact(
+                "verification", f"derived-source-map-{name}", opaque_map
+            )
+            rejected = self.cli(
+                "documentation-complete", "--mode", "derived_post_qa",
+                "--worker-id", "docs-derived", "--lease-id",
+                state["active_write_lease"]["lease_id"], "--capsule", docs_capsule,
+                "--semantic-packet", semantic_path, "--source-map", opaque_source_path,
+                "--report", self.artifact(
+                    "verification", f"derived-docs-{name}-rejected-report"
+                ), expected=2,
+            )
+            self.assertIn("controller-verified evidence", rejected.stderr)
+            self.assertEqual(
+                before_rejection,
+                (self.root / ".agentic-pipeline" / "state.json").read_bytes(),
+            )
         completed = json.loads(
             self.cli(
                 "documentation-complete", "--mode", "derived_post_qa", "--worker-id", "docs-derived",
@@ -2879,36 +4173,226 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         self.assertEqual("documentation_review", completed["phase"])
         self.assertEqual("pass", completed["qa"]["status"])
-        review_capsule = self.capsule("reviewer", "documentation_review", "docs-reviewer")
+        reviewer_id = "qa-derived"
+        review_capsule = self.capsule("reviewer", "documentation_review", reviewer_id)
         state = self.state()
+        run_id = "docs-closure-1"
+        report = self.documentation_closure_report(
+            "docs-closure-report", run_id=run_id, reviewer_id=reviewer_id
+        )
+        credit = self.review_credit_manifest(
+            "docs-closure-credit", reviewer_id, "documentation_closure"
+        )
+        self.assertEqual(
+            str(self.root / report),
+            runtime_controller.resolve_documentation_closure_report(
+                self.root,
+                state,
+                report,
+                run_id=run_id,
+                reviewer_id=reviewer_id,
+                status="pass",
+            ),
+        )
+        runtime_controller.resolve_review_credit_manifest(
+            self.root,
+            state,
+            credit,
+            reviewer_id=reviewer_id,
+            review_mode="documentation_closure",
+        )
+        before_rejection = (
+            self.root / ".agentic-pipeline" / "state.json"
+        ).read_bytes()
+        rejected = self.cli(
+            "documentation-review-complete", "--revision", state["revision"],
+            "--product-revision", state["product_revision"], "--support-revision", state["support_revision"],
+            "--evidence-revision", state["evidence_revision"], "--run-id", run_id,
+            "--reviewer-id", reviewer_id, "--capsule", review_capsule, "--status", "pass",
+            "--report", self.artifact("reviews", "docs-closure-invalid"),
+            "--credit-manifest", credit, expected=2,
+        )
+        self.assertIn("exact schema-1 envelope", rejected.stderr)
+        self.assertEqual(
+            before_rejection,
+            (self.root / ".agentic-pipeline" / "state.json").read_bytes(),
+        )
+        finding_id = "F-DOC-CLOSURE-PRODUCT-001"
+        self.cli(
+            "add-finding", "--id", finding_id, "--source", "review",
+            "--finding-kind", "product", "--severity", "major",
+            "--scope-relation", "current_feature_path",
+            "--introduced-by-candidate", "false",
+            "--production-reachability", "normal",
+            "--blocks-acceptance-id", "PRD-AC-001",
+            "--violates-required-invariant", "false",
+            "--blocks-required-support-contract", "false",
+            "--mandatory-core-acceptance-evidence-missing", "false",
+            "--test-can-miss-product-defect", "false",
+            "--title", "Documentation closure exposed a product mismatch",
+            "--evidence",
+            "assigned_acceptance_evidence: PRD-AC-001 | exact documentation closure component evidence",
+            "--revision", state["revision"],
+        )
+        self.assertEqual("documentation_review", self.state()["phase"])
+        blocked = self.cli(
+            "documentation-review-complete", "--revision", state["revision"],
+            "--product-revision", state["product_revision"],
+            "--support-revision", state["support_revision"],
+            "--evidence-revision", state["evidence_revision"], "--run-id", run_id,
+            "--reviewer-id", reviewer_id, "--capsule", review_capsule, "--status", "pass",
+            "--report", report, "--credit-manifest", credit, expected=2,
+        )
+        self.assertIn("remediation-required findings remain open", blocked.stderr)
+        _, state_path, findings_path, persisted, findings = (
+            runtime_controller.load_runtime(str(self.root))
+        )
+        finding = next(item for item in findings["items"] if item["id"] == finding_id)
+        finding["status"] = "resolved"
+        finding["resolved_revision"] = persisted["revision"]
+        runtime_controller.save_runtime(state_path, findings_path, persisted, findings)
         closed = json.loads(
             self.cli(
                 "documentation-review-complete", "--revision", state["revision"],
                 "--product-revision", state["product_revision"], "--support-revision", state["support_revision"],
-                "--evidence-revision", state["evidence_revision"], "--run-id", "docs-closure-1",
-                "--reviewer-id", "docs-reviewer", "--capsule", review_capsule, "--status", "pass",
-                "--report", self.artifact("reviews", "docs-closure-report"),
+                "--evidence-revision", state["evidence_revision"], "--run-id", run_id,
+                "--reviewer-id", reviewer_id, "--capsule", review_capsule, "--status", "pass",
+                "--report", report, "--credit-manifest", credit,
             ).stdout
         )
         self.assertEqual("ready", closed["phase"])
         self.assertEqual("pass", closed["feature_verification_state"]["status"])
+        replay = json.loads(
+            self.cli(
+                "documentation-review-complete", "--revision", state["revision"],
+                "--product-revision", state["product_revision"], "--support-revision", state["support_revision"],
+                "--evidence-revision", state["evidence_revision"], "--run-id", run_id,
+                "--reviewer-id", reviewer_id, "--capsule", review_capsule, "--status", "pass",
+                "--report", report, "--credit-manifest", credit,
+            ).stdout
+        )
+        self.assertEqual("ready", replay["phase"])
+        self.assertEqual(1, len(self.state()["documentation_review_runs"]))
+        terminal = json.loads(self.cli("ready", expected=1).stdout)
+        self.assertNotIn(
+            "documentation closure report/credit receipt is stale or incomplete",
+            terminal["reasons"],
+        )
+        (self.root / report).write_text("{}", encoding="utf-8")
+        rejected_ready = json.loads(self.cli("ready", expected=1).stdout)
+        self.assertIn(
+            "documentation closure report/credit receipt is stale or incomplete",
+            rejected_ready["reasons"],
+        )
 
     def test_coverage_mapping_duplicate_acceptance_is_rejected(self) -> None:
         self.initialize()
-        capsule = self.capsule("coverage_steward", "slice_coverage_planning", "steward-plan")
         path = self.coverage_manifest("duplicate-ac", "planned")
         value = json.loads((self.root / path).read_text(encoding="utf-8"))
         value["ac_mappings"].append(dict(value["ac_mappings"][0]))
         (self.root / path).write_text(json.dumps(value), encoding="utf-8")
         self.cli(
-            "coverage-plan-complete", "--slice-id", "SLICE-001", "--steward-id", "steward-plan",
-            "--capsule", capsule, "--coverage-manifest", path,
+            "coverage-plan-complete", "--slice-id", "SLICE-001", "--coverage-manifest", path,
             "--report", self.artifact("verification", "duplicate-report"), expected=2,
         )
 
+    def test_feature_coverage_aggregate_unions_shared_ac_and_gap_wins(self) -> None:
+        state = self.initialize()
+        first_path = self.root / self.coverage_manifest(
+            "shared-ac-slice-1", "finalized"
+        )
+        second_manifest = json.loads(first_path.read_text(encoding="utf-8"))
+        second_manifest["slice_id"] = "SLICE-002"
+        for group in ("expected_identities", "actual_identities"):
+            for identity in second_manifest[group]:
+                identity["identity_id"] = identity["identity_id"].replace(
+                    "SLICE-001", "SLICE-002"
+                )
+                identity["slice_id"] = "SLICE-002"
+        for mapping in second_manifest["ac_mappings"]:
+            mapping["identity_ids"] = [
+                identity_id.replace("SLICE-001", "SLICE-002")
+                for identity_id in mapping["identity_ids"]
+            ]
+        for field in (
+            "mandatory_expected_identity_ids",
+            "mandatory_actual_identity_ids",
+        ):
+            second_manifest[field] = [
+                identity_id.replace("SLICE-001", "SLICE-002")
+                for identity_id in second_manifest[field]
+            ]
+        for group in ("automated_execution", "manual_execution"):
+            for row in second_manifest[group]:
+                row["identity_id"] = row["identity_id"].replace(
+                    "SLICE-001", "SLICE-002"
+                )
+        second_manifest["summary"] = runtime_controller.coverage_summary_for_manifest(
+            second_manifest
+        )
+        second_path = self.root / self.artifact(
+            "verification", "shared-ac-slice-2", second_manifest
+        )
+
+        second_slice = json.loads(json.dumps(state["slices"]["SLICE-001"]))
+        second_slice["id"] = "SLICE-002"
+        state["slices"]["SLICE-002"] = second_slice
+        state["ordered_slices"] = ["SLICE-001", "SLICE-002"]
+        state["coverage"]["SLICE-002"] = runtime_controller.empty_coverage_scope()
+        for scope_id, path in (
+            ("SLICE-001", first_path),
+            ("SLICE-002", second_path),
+        ):
+            state["coverage"][scope_id]["finalized_manifest"] = {
+                "path": str(path),
+                "sha256": self.sha(path),
+            }
+
+        _, mapped, _ = runtime_controller.write_feature_coverage_aggregate(
+            self.root, state, suffix="shared-ac-mapped"
+        )
+        self.assertEqual(1, len(mapped["ac_mappings"]))
+        self.assertEqual("mapped", mapped["ac_mappings"][0]["status"])
+        self.assertEqual(
+            [
+                "AUTO-SLICE-001-CORE",
+                "AUTO-SLICE-002-CORE",
+                "MANUAL-SLICE-001-RUNTIME",
+                "MANUAL-SLICE-002-RUNTIME",
+            ],
+            mapped["ac_mappings"][0]["identity_ids"],
+        )
+
+        second_manifest["ac_mappings"][0]["status"] = "gap"
+        second_manifest["gaps"] = ["PRD-AC-001"]
+        second_manifest["summary"] = runtime_controller.coverage_summary_for_manifest(
+            second_manifest
+        )
+        second_path.write_text(json.dumps(second_manifest), encoding="utf-8")
+        state["coverage"]["SLICE-002"]["finalized_manifest"]["sha256"] = self.sha(
+            second_path
+        )
+        _, gap, _ = runtime_controller.write_feature_coverage_aggregate(
+            self.root, state, suffix="shared-ac-gap"
+        )
+        self.assertEqual("gap", gap["ac_mappings"][0]["status"])
+
+        second_manifest["ac_mappings"][0].update(
+            {"status": "not_applicable", "identity_ids": [], "authority_id": "DEC-001"}
+        )
+        second_path.write_text(json.dumps(second_manifest), encoding="utf-8")
+        state["coverage"]["SLICE-002"]["finalized_manifest"]["sha256"] = self.sha(
+            second_path
+        )
+        with self.assertRaisesRegex(
+            runtime_controller.PipelineError, "mixes not_applicable"
+        ):
+            runtime_controller.write_feature_coverage_aggregate(
+                self.root, state, suffix="shared-ac-mixed-authority"
+            )
+
     def test_not_applicable_coverage_requires_active_decision_authority(self) -> None:
         self.initialize()
-        capsule = self.capsule("coverage_steward", "slice_coverage_planning", "steward-na")
         path = self.coverage_manifest("not-applicable", "planned")
         value = json.loads((self.root / path).read_text(encoding="utf-8"))
         value["ac_mappings"] = [
@@ -2921,8 +4405,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         ]
         (self.root / path).write_text(json.dumps(value), encoding="utf-8")
         result = self.cli(
-            "coverage-plan-complete", "--slice-id", "SLICE-001", "--steward-id", "steward-na",
-            "--capsule", capsule, "--coverage-manifest", path,
+            "coverage-plan-complete", "--slice-id", "SLICE-001", "--coverage-manifest", path,
             "--report", self.artifact("verification", "not-applicable-report"), expected=2,
         )
         self.assertIn("active accepted decision", result.stderr)
@@ -2932,6 +4415,65 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.plan.write_text(self.plan.read_text(encoding="utf-8") + "\nplan drift\n", encoding="utf-8")
         result = self.cli("status", expected=2)
         self.assertIn("revision inventory drifted", result.stderr)
+
+    def test_mutation_renders_validated_state_without_runtime_reload(self) -> None:
+        required = "- RESEARCH-001 | question=confirm exact edit surface | paths=src/feature.py | exclusions=src/commerce/** | evidence=approved spec | stop=scope is exact"
+        sentinel = "- research_not_required | reason=Exact authority and edit files answer the bounded question"
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(required, sentinel),
+            encoding="utf-8",
+        )
+        self.write_planning_state()
+        state = self.initialize(research=False)
+        calls = 0
+        original = runtime_controller.load_runtime
+
+        def counted(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        output = io.StringIO()
+        with mock.patch.object(runtime_controller, "load_runtime", counted):
+            with contextlib.redirect_stdout(output):
+                result = runtime_controller.main(
+                    [
+                        "slice-research-not-required",
+                        "--slice-id",
+                        "SLICE-001",
+                        "--base-revision",
+                        state["revision"],
+                        "--reason",
+                        "Exact authority and edit files answer the bounded question",
+                        "--project-root",
+                        str(self.root),
+                    ]
+                )
+        self.assertEqual(0, result)
+        self.assertEqual(1, calls)
+        self.assertEqual("slice_coverage_planning", json.loads(output.getvalue())["phase"])
+
+    def test_command_inventory_is_cached_but_boundary_hashes_remain_live(self) -> None:
+        state = self.initialize(research=False)
+        calls = 0
+        original = runtime_controller.subprocess.run
+
+        def counted(*args, **kwargs):
+            nonlocal calls
+            if "ls-files" in args[0]:
+                calls += 1
+            return original(*args, **kwargs)
+
+        runtime_controller._COMMAND_SOURCE_INVENTORY = {}
+        try:
+            with mock.patch.object(runtime_controller.subprocess, "run", counted):
+                before = runtime_controller.checkout_snapshot(self.root, FEATURE, state)
+                self.src.write_text("VALUE = 1\n", encoding="utf-8")
+                after = runtime_controller.checkout_snapshot(self.root, FEATURE, state)
+        finally:
+            runtime_controller._COMMAND_SOURCE_INVENTORY = None
+        self.assertEqual(1, calls)
+        self.assertNotEqual(before[self.rel(self.src)], after[self.rel(self.src)])
 
     def test_status_reconciles_exact_lifecycle_dashboard_date_and_preserves_remediation(self) -> None:
         fixture = self.prepare_lifecycle_projection_recovery()
@@ -2959,20 +4501,50 @@ class PipelineSchema9Tests(unittest.TestCase):
         }
         self.apply_lifecycle_projection_drift(fixture)
 
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        findings_path = self.root / ".agentic-pipeline" / "findings.json"
+        ledger_path = self.root / ".agentic-pipeline" / "decision-ledger.jsonl"
+        disk_before_status = {
+            path: path.read_bytes() if path.exists() else None
+            for path in (state_path, findings_path, ledger_path)
+        }
         status = json.loads(self.cli("status").stdout)
-        after = self.state()
+        self.assertEqual(
+            disk_before_status,
+            {
+                path: path.read_bytes() if path.exists() else None
+                for path in (state_path, findings_path, ledger_path)
+            },
+        )
+        after_status = self.state()
         self.assertEqual("engineering", status["phase"])
         self.assertEqual("run_slice_scope_check", status["next_action"]["action"])
         self.assertEqual("SLICE-001", status["next_action"]["active_slice"])
-        self.assertEqual(after["revision"], status["next_action"]["base_revision"])
+        self.assertEqual(status["revision"], status["next_action"]["base_revision"])
         self.assertFalse(status["next_action"]["user_input_required"])
         for field, expected in preserved.items():
-            self.assertEqual(expected, after[field], field)
+            self.assertEqual(expected, after_status[field], field)
         self.assertEqual(fixture["finding_ids"], status["active_ids"]["remediation_finding_ids"]["ids"])
-        self.assertNotEqual(before["revision"], after["revision"])
-        self.assertNotEqual(before["product_revision"], after["product_revision"])
-        self.assertEqual(before["support_revision"], after["support_revision"])
-        self.assertEqual(before["evidence_revision"], after["evidence_revision"])
+        self.assertEqual(before["revision"], after_status["revision"])
+        self.assertNotEqual(before["revision"], status["revision"])
+        self.assertNotEqual(before["product_revision"], status["product_revision"])
+        self.assertEqual(before["support_revision"], status["support_revision"])
+        self.assertEqual(before["evidence_revision"], status["evidence_revision"])
+        self.assertEqual([], after_status["lifecycle_projection_reconciliations"])
+
+        self.cli(
+            "slice-scope-check",
+            "--slice-id",
+            "SLICE-001",
+            "--base-revision",
+            status["revision"],
+            "--owner-id",
+            "engineer-1",
+        )
+        after = self.state()
+        self.assertEqual(status["revision"], after["revision"])
+        for field, expected in preserved.items():
+            self.assertEqual(expected, after[field], field)
 
         reconciliations = after["lifecycle_projection_reconciliations"]
         self.assertEqual(1, len(reconciliations))
@@ -3111,9 +4683,7 @@ class PipelineSchema9Tests(unittest.TestCase):
 
     def test_lifecycle_reconciliation_rejects_incomplete_open_finding_batch(self) -> None:
         fixture = self.prepare_lifecycle_projection_recovery()
-        findings_path = self.root / ".agentic-pipeline" / "findings.json"
-        findings = json.loads(findings_path.read_text(encoding="utf-8"))
-        findings["items"].append(
+        self.inject_canonical_finding(
             {
                 "id": "TF0008-CONV-005",
                 "status": "open",
@@ -3127,7 +4697,6 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "remediation_required": True,
             }
         )
-        findings_path.write_text(json.dumps(findings), encoding="utf-8")
         self.apply_lifecycle_projection_drift(fixture)
         self.assert_lifecycle_projection_drift_rejected(fixture)
 
@@ -3176,9 +4745,18 @@ class PipelineSchema9Tests(unittest.TestCase):
             / "controller"
             / "lifecycle-projection-reconciliation-0001.json"
         )
+        pending_receipt = in_memory["pending_lifecycle_projection_receipt"]
+        self.assertEqual(self.rel(receipt_path), pending_receipt["path"])
+        runtime_controller.write_json(receipt_path, pending_receipt["value"])
         self.assertTrue(receipt_path.is_file())
 
         self.cli("status")
+        self.assertEqual(0, len(self.state()["lifecycle_projection_reconciliations"]))
+        self.cli(
+            "slice-scope-check", "--slice-id", "SLICE-001",
+            "--base-revision", in_memory["revision"],
+            "--owner-id", original["engineering_owner_id"],
+        )
         recovered = self.state()
         self.assertEqual(1, len(recovered["lifecycle_projection_reconciliations"]))
         self.assertEqual("LPR-0001", recovered["lifecycle_projection_reconciliations"][0]["receipt_id"])
@@ -3209,6 +4787,9 @@ class PipelineSchema9Tests(unittest.TestCase):
             / "controller"
             / "lifecycle-projection-reconciliation-0001.json"
         )
+        pending_receipt = in_memory["pending_lifecycle_projection_receipt"]
+        self.assertEqual(self.rel(receipt_path), pending_receipt["path"])
+        runtime_controller.write_json(receipt_path, pending_receipt["value"])
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         receipt["finding_ids"] = ["REPLAYED-DIFFERENT-BATCH"]
         receipt_path.write_text(
@@ -3226,7 +4807,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.write_state(state)
         self.apply_lifecycle_projection_drift(fixture)
         self.cli("status")
-        self.assertEqual(1, len(self.state()["lifecycle_projection_reconciliations"]))
+        self.assertEqual(0, len(self.state()["lifecycle_projection_reconciliations"]))
 
     def test_legacy_lifecycle_reconciliation_rejects_excessive_date_candidates(self) -> None:
         fixture = self.prepare_lifecycle_projection_recovery()
@@ -3253,10 +4834,9 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertIn("revision inventory drifted", result.stderr)
 
     def test_context_gate_rehashes_inventory_before_capsule_validation(self) -> None:
-        self.initialize()
-        capsule = self.capsule("coverage_steward", "slice_coverage_planning", "steward-drift")
+        self.initialize(research=False)
         self.plan.write_text(self.plan.read_text(encoding="utf-8") + "\nplan drift\n", encoding="utf-8")
-        result = self.cli("context-capsule-check", "--capsule", capsule, expected=2)
+        result = self.cli("context-capsule-check", "--capsule", "missing.json", expected=2)
         self.assertIn("revision inventory drifted", result.stderr)
 
     def test_state_revision_tampering_cannot_hide_current_inventory(self) -> None:
@@ -3292,9 +4872,18 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         entry = json.loads(self.ledger.read_text(encoding="utf-8"))
         entry["authority"]["sha256"] = "f" * 64
-        self.ledger.write_text(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+        tampered_raw = (
+            json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        self.ledger.write_text(tampered_raw, encoding="utf-8")
         state = self.state()
         state["decision_ledger"]["sha256"] = self.sha(self.ledger)
+        projection = state["decision_ledger"]["projection"]
+        projection["append_jsonl"] = tampered_raw
+        projection["append_sha256"] = hashlib.sha256(
+            tampered_raw.encode("utf-8")
+        ).hexdigest()
+        projection["target_sha256"] = state["decision_ledger"]["sha256"]
         self.write_state(state)
         result = self.cli("status", expected=2)
         self.assertIn("acceptance receipt", result.stderr)
@@ -3309,15 +4898,31 @@ class PipelineSchema9Tests(unittest.TestCase):
         text = text.replace("- editable_paths: src/feature.py", "- editable_paths: src/feature.py, src/commerce/driveby.py")
         text = text.replace("- excluded_components: commerce", "- excluded_components: payments")
         text = text.replace("- excluded_paths: src/commerce/**", "- excluded_paths: src/payments/**")
-        text = text.replace("- scope_baseline_revision: base-0", f"- scope_baseline_revision: {held['revision']}")
         self.plan.write_text(text, encoding="utf-8")
         planning = json.loads((self.root / ".agentic-pipeline" / "development-plan-state.json").read_text(encoding="utf-8"))
         planning["approval"]["approved_sha256"] = self.sha(self.plan)
         (self.root / ".agentic-pipeline" / "development-plan-state.json").write_text(json.dumps(planning), encoding="utf-8")
+        frozen = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+        rejected = self.cli(
+            "rebaseline-scope", "--plan-sha256", self.sha(self.plan),
+            "--user-scope-approval", "FREE-FORM-TOKEN", expected=2,
+        )
+        self.assertIn("immutable user authority receipt", rejected.stderr)
+        self.assertEqual(frozen, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+        self.accept_scope_authority("USER-SCOPE-APPROVAL-1")
         result = json.loads(self.cli(
             "rebaseline-scope", "--plan-sha256", self.sha(self.plan),
             "--user-scope-approval", "USER-SCOPE-APPROVAL-1",
         ).stdout)
+        history_count = len(self.state()["scope_guard"]["rebaseline_history"])
+        replay = json.loads(self.cli(
+            "rebaseline-scope", "--plan-sha256", self.sha(self.plan),
+            "--user-scope-approval", "USER-SCOPE-APPROVAL-1",
+        ).stdout)
+        self.assertEqual(result["phase"], replay["phase"])
+        self.assertEqual(
+            history_count, len(self.state()["scope_guard"]["rebaseline_history"])
+        )
         result = self.full_status()
         self.assertIsNone(result["active_write_lease"])
         self.assertEqual("revoked", result["write_lease_history"][-1]["status"])
@@ -3325,7 +4930,10 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.cli("context-capsule-check", "--capsule", old_capsule, expected=2)
         fresh_capsule = self.capsule(
             "engineer", "slice_engineering", "engineer-1",
-            allowed=("src/feature.py", "src/commerce/driveby.py"),
+            allowed=(
+                "src/feature.py",
+                "src/commerce/driveby.py",
+            ),
         )
         state = self.state()
         self.cli(
@@ -3337,10 +4945,13 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--write-scope", "SLICE-001", "--worker-id", "engineer-1", "--capsule", fresh_capsule,
         )
         carried = self.state()["scope_guard"]["rebaseline_candidate"]
+        (self.root / carried["engineer_report"]).write_text(
+            json.dumps(self.dirty_candidate_report()), encoding="utf-8"
+        )
         completed = json.loads(self.cli(
             "engineer-complete", "--run-id", carried["run_id"], "--owner-id", "engineer-1",
             "--lease-id", self.state()["active_write_lease"]["lease_id"], "--capsule", fresh_capsule,
-            "--slice-id", "SLICE-001", "--engineering-status", "pass", "--machine-checks", "pass",
+            "--slice-id", "SLICE-001", "--machine-checks", "pass",
             "--diff-inspection", "pass", "--semantic-handoff", carried["semantic_report"],
             "--report", carried["engineer_report"], "--scope-approval", "USER-SCOPE-APPROVAL-1",
         ).stdout)
@@ -3350,17 +4961,9 @@ class PipelineSchema9Tests(unittest.TestCase):
     def test_scope_rebaseline_rejects_checkout_that_is_neither_candidate_nor_rollback(self) -> None:
         self.initialize()
         self.engineer(forbidden_path=True)
-        held = self.state()
         unrelated = self.root / "src" / "unexpected.py"
         unrelated.write_text("UNEXPECTED = True\n", encoding="utf-8")
-        text = self.plan.read_text(encoding="utf-8").replace(
-            "- scope_baseline_revision: base-0", f"- scope_baseline_revision: {held['revision']}"
-        )
-        self.plan.write_text(text, encoding="utf-8")
-        planning_path = self.root / ".agentic-pipeline" / "development-plan-state.json"
-        planning = json.loads(planning_path.read_text(encoding="utf-8"))
-        planning["approval"]["approved_sha256"] = self.sha(self.plan)
-        planning_path.write_text(json.dumps(planning), encoding="utf-8")
+        self.accept_scope_authority("USER-SCOPE-APPROVAL-2")
         result = self.cli(
             "rebaseline-scope", "--plan-sha256", self.sha(self.plan),
             "--user-scope-approval", "USER-SCOPE-APPROVAL-2", expected=2,
@@ -3383,15 +4986,13 @@ class PipelineSchema9Tests(unittest.TestCase):
     def test_finalized_coverage_cannot_change_planned_body_without_amendment(self) -> None:
         self.initialize()
         self.engineer()
-        capsule = self.capsule("coverage_steward", "slice_coverage_finalization", "steward-change")
         path = self.coverage_manifest("coverage-body-change", "finalized")
         value = json.loads((self.root / path).read_text(encoding="utf-8"))
         value["expected_identities"][0]["planned_assertion_or_observation"] = "changed after planning"
         value["actual_identities"][0]["planned_assertion_or_observation"] = "changed after planning"
         (self.root / path).write_text(json.dumps(value), encoding="utf-8")
         result = self.cli(
-            "coverage-finalize", "--scope-id", "SLICE-001", "--steward-id", "steward-change",
-            "--capsule", capsule, "--coverage-manifest", path, "--expected-actual-equality", "pass",
+            "coverage-finalize", "--scope-id", "SLICE-001", "--coverage-manifest", path, "--expected-actual-equality", "pass",
             "--mandatory-registration", "pass", "--automated-execution", "pass",
             "--report", self.artifact("verification", "coverage-body-change-report"), expected=2,
         )
@@ -3399,28 +5000,24 @@ class PipelineSchema9Tests(unittest.TestCase):
 
     def test_coverage_rejects_one_way_acceptance_mapping(self) -> None:
         self.initialize()
-        capsule = self.capsule("coverage_steward", "slice_coverage_planning", "steward-reverse")
         path = self.coverage_manifest("coverage-reverse", "planned")
         value = json.loads((self.root / path).read_text(encoding="utf-8"))
         value["ac_mappings"][0]["identity_ids"].remove("MANUAL-SLICE-001-RUNTIME")
         (self.root / path).write_text(json.dumps(value), encoding="utf-8")
         result = self.cli(
-            "coverage-plan-complete", "--slice-id", "SLICE-001", "--steward-id", "steward-reverse",
-            "--capsule", capsule, "--coverage-manifest", path,
+            "coverage-plan-complete", "--slice-id", "SLICE-001", "--coverage-manifest", path,
             "--report", self.artifact("verification", "coverage-reverse-report"), expected=2,
         )
         self.assertIn("reverse AC mapping", result.stderr)
 
     def test_coverage_rejects_identity_with_wrong_slice_coordinate(self) -> None:
         self.initialize()
-        capsule = self.capsule("coverage_steward", "slice_coverage_planning", "steward-slice")
         path = self.coverage_manifest("coverage-wrong-slice", "planned")
         value = json.loads((self.root / path).read_text(encoding="utf-8"))
         value["expected_identities"][0]["slice_id"] = "SLICE-999"
         (self.root / path).write_text(json.dumps(value), encoding="utf-8")
         result = self.cli(
-            "coverage-plan-complete", "--slice-id", "SLICE-001", "--steward-id", "steward-slice",
-            "--capsule", capsule, "--coverage-manifest", path,
+            "coverage-plan-complete", "--slice-id", "SLICE-001", "--coverage-manifest", path,
             "--report", self.artifact("verification", "coverage-slice-report"), expected=2,
         )
         self.assertIn("slice_id", result.stderr)
@@ -3428,14 +5025,12 @@ class PipelineSchema9Tests(unittest.TestCase):
     def test_coverage_rejects_empty_automated_command(self) -> None:
         self.initialize()
         self.engineer()
-        capsule = self.capsule("coverage_steward", "slice_coverage_finalization", "steward-command")
         path = self.coverage_manifest("coverage-command", "finalized")
         value = json.loads((self.root / path).read_text(encoding="utf-8"))
         value["automated_execution"][0]["command"] = ""
         (self.root / path).write_text(json.dumps(value), encoding="utf-8")
         result = self.cli(
-            "coverage-finalize", "--scope-id", "SLICE-001", "--steward-id", "steward-command",
-            "--capsule", capsule, "--coverage-manifest", path, "--expected-actual-equality", "pass",
+            "coverage-finalize", "--scope-id", "SLICE-001", "--coverage-manifest", path, "--expected-actual-equality", "pass",
             "--mandatory-registration", "pass", "--automated-execution", "pass",
             "--report", self.artifact("verification", "coverage-command-report"), expected=2,
         )
@@ -3444,14 +5039,12 @@ class PipelineSchema9Tests(unittest.TestCase):
     def test_coverage_rejects_stale_automated_evidence_sha(self) -> None:
         self.initialize()
         self.engineer()
-        capsule = self.capsule("coverage_steward", "slice_coverage_finalization", "steward-evidence")
         path = self.coverage_manifest("coverage-evidence", "finalized")
         value = json.loads((self.root / path).read_text(encoding="utf-8"))
         value["automated_execution"][0]["evidence_sha256"] = "0" * 64
         (self.root / path).write_text(json.dumps(value), encoding="utf-8")
         result = self.cli(
-            "coverage-finalize", "--scope-id", "SLICE-001", "--steward-id", "steward-evidence",
-            "--capsule", capsule, "--coverage-manifest", path, "--expected-actual-equality", "pass",
+            "coverage-finalize", "--scope-id", "SLICE-001", "--coverage-manifest", path, "--expected-actual-equality", "pass",
             "--mandatory-registration", "pass", "--automated-execution", "pass",
             "--report", self.artifact("verification", "coverage-evidence-report"), expected=2,
         )
@@ -3498,7 +5091,55 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--max-estimated-tokens", "200000", "--output",
             f"tests/{FEATURE}/verification/unassigned-decision-capsule.json", expected=2,
         )
-        self.assertIn("prior user receipt", result.stderr)
+        self.assertIn("exactly one assigned authority selector", result.stderr)
+
+    def test_decision_specification_authority_selector_is_reachable(self) -> None:
+        self.initialize()
+        state = self.state()
+        selector = "document_type: technical-specification"
+        output = f"tests/{FEATURE}/verification/spec-authority-capsule.json"
+        args = [
+            "context-capsule-create", "--role", "decision_recorder",
+            "--phase", "decision_recording", "--worker-id", "recorder-spec",
+            "--plan-sha256", state["development_plan_sha256"],
+            "--revision", state["revision"], "--allowed-path", self.rel(self.ledger),
+            "--output-path", self.rel(self.ledger),
+            "--stop-condition", "record only the assigned specification decision",
+            "--max-authority-files", "5", "--max-evidence-files", "5",
+            "--max-total-files", "10", "--max-payload-bytes", "500000",
+            "--max-estimated-tokens", "200000", "--output", output,
+        ]
+        for path, digest in sorted(
+            runtime_controller.capsule_exact_authority(self.root, state).items()
+        ):
+            suffix = f":{selector}" if path == self.rel(self.spec) else ""
+            args.extend(("--authority", f"{path}={digest}{suffix}"))
+        self.cli(*args)
+        capsule = json.loads((self.root / output).read_text(encoding="utf-8"))
+        packet = {
+            "schema": 1,
+            "items": [{
+                "schema": 1,
+                "decision_id": "DEC-SPEC-001",
+                "status": "accepted",
+                "statement": "Use the specification-defined boundary.",
+                "rationale": "The approved specification is exact authority.",
+                "consequences": [],
+                "scope_ids": ["PRD-AC-001", "SLICE-001"],
+                "authority": {
+                    "kind": "specification",
+                    "reference": "approved specification frontmatter",
+                    "path": self.rel(self.spec),
+                    "sha256": self.sha(self.spec),
+                    "section_or_id": selector,
+                },
+                "supersedes": [],
+            }],
+        }
+        items = runtime_controller.validate_decision_semantic_packet(
+            self.root, state, packet, capsule
+        )
+        self.assertEqual("DEC-SPEC-001", items[0]["decision_id"])
 
     def test_decision_ledger_append_requires_capsule_output_authority(self) -> None:
         self.initialize()
@@ -3588,9 +5229,9 @@ class PipelineSchema9Tests(unittest.TestCase):
         result = self.fail_engineer_completion(capsule, semantic)
         self.assertIn("cannot change the support domain", result.stderr)
 
-    def test_qa_worker_identity_must_be_fresh_from_engineering(self) -> None:
+    def test_qa_worker_identity_must_be_independent_from_engineering(self) -> None:
         state = self.ready_for_qa()
-        capsule = self.capsule("qa", "qa", "engineer-1")
+        capsule = self.capsule("reviewer", "qa", "engineer-1")
         result = self.cli(
             "qa-complete", "--revision", state["revision"], "--product-revision", state["product_revision"],
             "--support-revision", state["support_revision"], "--evidence-revision", state["evidence_revision"],
@@ -3598,13 +5239,173 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--status", "pass", "--manual-execution", self.qa_manual_artifact(),
             "--report", self.artifact("qa", "qa-reused-report"), expected=2,
         )
-        self.assertIn("fresh from every prior non-QA role", result.stderr)
+        self.assertIn("independent of every writer", result.stderr)
+
+    def test_ambiguous_verifier_history_fails_closed(self) -> None:
+        state = {
+            "worker_budget": {
+                "records": [
+                    {"role": "convergence_audit", "worker_id": "verifier-a"},
+                    {"role": "full_review", "worker_id": "verifier-b"},
+                ]
+            }
+        }
+        with self.assertRaisesRegex(
+            runtime_controller.PipelineError, "Verifier assignment history"
+        ):
+            runtime_controller.require_verifier_assignment(state, "verifier-c")
+
+    def test_one_sequential_verifier_can_complete_convergence_review_and_qa(self) -> None:
+        self.implementation_complete()
+        state = self.state()
+        self.cli(
+            "documentation-not-required", "--mode", "normative_pre_review",
+            "--plan-sha256", state["development_plan_sha256"],
+            "--policy-evidence", "POLICY-DOC-NONE",
+        )
+        state = self.state()
+        verifier = "verifier-1"
+        convergence_capsule = self.capsule(
+            "reviewer", "convergence", verifier
+        )
+        convergence_report = self.artifact("reviews", "convergence-verifier-report")
+        convergence_credit = self.review_credit_manifest(
+            "convergence-verifier-credit", verifier, "full_convergence"
+        )
+        direct_state = json.loads(json.dumps(state))
+        runtime_controller.resolve_review_credit_manifest(
+            self.root,
+            direct_state,
+            convergence_credit,
+            reviewer_id=verifier,
+            review_mode="full_convergence",
+            expected_lens="persistence-lifecycle",
+        )
+        old_literal = json.loads(
+            (self.root / convergence_credit).read_text(encoding="utf-8")
+        )
+        old_literal["review_mode"] = "convergence"
+        old_literal_path = self.artifact(
+            "reviews", "convergence-old-literal-credit", old_literal
+        )
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "review_mode mismatch"):
+            runtime_controller.resolve_review_credit_manifest(
+                self.root,
+                json.loads(json.dumps(state)),
+                old_literal_path,
+                reviewer_id=verifier,
+                review_mode="full_convergence",
+                expected_lens="persistence-lifecycle",
+            )
+        convergence_command = (
+            "convergence-audit-complete", "--revision", state["revision"],
+            "--product-revision", state["product_revision"],
+            "--support-revision", state["support_revision"],
+            "--evidence-revision", state["evidence_revision"],
+            "--run-id", "convergence-verifier-1", "--reviewer-id", verifier,
+            "--capsule", convergence_capsule, "--lens", "persistence-lifecycle",
+            "--status", "pass",
+            "--report", convergence_report,
+            "--credit-manifest", convergence_credit,
+        )
+        self.cli(*convergence_command)
+        self.cli(*convergence_command)
+        convergence_decision_report = self.artifact(
+            "reviews", "convergence-verifier-decision"
+        )
+        convergence_finalize_command = (
+            "convergence-finalize", "--revision", state["revision"],
+            "--decision", "pass",
+            "--report", convergence_decision_report,
+        )
+        self.cli(*convergence_finalize_command)
+        self.cli(*convergence_finalize_command)
+
+        state = self.state()
+        review_capsule = self.capsule("reviewer", "review", verifier)
+        review_credit = self.review_credit_manifest(
+            "final-verifier-credit", verifier, "final_whole_feature_review"
+        )
+        review_credit_path = self.root / review_credit
+        credit = json.loads(review_credit_path.read_text(encoding="utf-8"))
+        credit["composition_audit"] = True
+        credit["new_boundaries_audited"] = []
+        credit["components"][0]["mode"] = "reused"
+        credit["components"][0]["source_credit_id"] = state[
+            "component_review_credits"
+        ][-1]["id"]
+        review_credit_path.write_text(json.dumps(credit), encoding="utf-8")
+        review_report = self.artifact("reviews", "final-verifier-report")
+        review_command = (
+            "review-complete", "--revision", state["revision"],
+            "--product-revision", state["product_revision"],
+            "--support-revision", state["support_revision"],
+            "--evidence-revision", state["evidence_revision"],
+            "--run-id", "final-verifier-1", "--reviewer-id", verifier,
+            "--capsule", review_capsule, "--status", "pass",
+            "--report", review_report,
+            "--credit-manifest", review_credit,
+        )
+        self.cli(*review_command)
+        self.cli(*review_command)
+        review_decision_report = self.artifact("reviews", "final-verifier-decision")
+        review_finalize_command = (
+            "review-finalize", "--revision", state["revision"],
+            "--decision", "pass",
+            "--report", review_decision_report,
+        )
+        self.cli(*review_finalize_command)
+        self.cli(*review_finalize_command)
+
+        self.qa_probe()
+        state = self.state()
+        qa_capsule = self.capsule("reviewer", "qa", verifier)
+        manual_execution = self.qa_manual_artifact()
+        qa_report = self.artifact("qa", "qa-verifier-report")
+        qa_command = (
+            "qa-complete", "--revision", state["revision"],
+            "--product-revision", state["product_revision"],
+            "--support-revision", state["support_revision"],
+            "--evidence-revision", state["evidence_revision"],
+            "--run-id", "qa-verifier-1", "--worker-id", verifier,
+            "--capsule", qa_capsule, "--status", "pass",
+            "--manual-execution", manual_execution,
+            "--report", qa_report,
+        )
+        result = json.loads(self.cli(*qa_command).stdout)
+        self.cli(*qa_command)
+        self.assertEqual("derived_documentation", result["phase"])
+        self.assertEqual(
+            [verifier, verifier, verifier],
+            [
+                self.state()["convergence"]["runs"][0]["reviewer_id"],
+                self.state()["review"]["runs"][0]["reviewer_id"],
+                self.state()["qa"]["worker_id"],
+            ],
+        )
+        self.assertEqual(3, len({
+            self.state()["convergence"]["runs"][0]["capsule_id"],
+            self.state()["review"]["runs"][0]["capsule_id"],
+            self.state()["qa"]["capsule_id"],
+        }))
+        ready_state = json.loads(
+            self.cli(
+                "documentation-not-required",
+                "--mode", "derived_post_qa",
+                "--plan-sha256", self.state()["development_plan_sha256"],
+                "--policy-evidence", "POLICY-DOC-NONE",
+            ).stdout
+        )
+        self.assertEqual("ready", ready_state["phase"])
+        terminal = json.loads(self.cli("ready").stdout)
+        self.assertTrue(terminal["ready"])
+        self.assertEqual([], terminal["reasons"])
 
     def test_qa_rejects_stale_review_chain_identity(self) -> None:
         state = self.ready_for_qa()
         state["review"]["evidence_revision"] = "0" * 64
         self.write_state(state)
-        capsule = self.capsule("qa", "qa", "qa-stale-review")
+        capsule = self.capsule("reviewer", "qa", "qa-stale-review")
         state = self.state()
         result = self.cli(
             "qa-complete", "--revision", state["revision"], "--product-revision", state["product_revision"],
@@ -3617,7 +5418,7 @@ class PipelineSchema9Tests(unittest.TestCase):
 
     def test_qa_rejects_executed_identity_with_stale_evidence_sha(self) -> None:
         state = self.ready_for_qa()
-        capsule = self.capsule("qa", "qa", "qa-bad-evidence")
+        capsule = self.capsule("reviewer", "qa", "qa-bad-evidence")
         manual = self.qa_manual_artifact()
         value = json.loads((self.root / manual).read_text(encoding="utf-8"))
         value["manual_execution"][0]["qa_evidence"]["sha256"] = "0" * 64
@@ -3633,7 +5434,7 @@ class PipelineSchema9Tests(unittest.TestCase):
 
     def test_qa_rejects_executed_identity_without_evidence_object(self) -> None:
         state = self.ready_for_qa()
-        capsule = self.capsule("qa", "qa", "qa-no-evidence")
+        capsule = self.capsule("reviewer", "qa", "qa-no-evidence")
         manual = self.qa_manual_artifact()
         value = json.loads((self.root / manual).read_text(encoding="utf-8"))
         value["manual_execution"][0]["qa_evidence"] = None
@@ -3647,11 +5448,40 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         self.assertIn("requires immutable QA evidence", result.stderr)
 
+    def test_qa_manual_rows_reject_silent_outcome_and_stray_resume_action(self) -> None:
+        self.ready_for_qa()
+        state = self.state()
+        manual = self.qa_manual_artifact()
+        value = json.loads((self.root / manual).read_text(encoding="utf-8"))
+        row = value["manual_execution"][0]
+        row.update(
+            executed=False,
+            passed=None,
+            deferred=False,
+            blocked_by_finding=None,
+            qa_evidence=None,
+            gate=None,
+            minimum_resume_action=None,
+        )
+        silent = self.artifact("qa", "qa-silent-outcome", value)
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "deferred or bound"):
+            runtime_controller.validate_manual_execution_artifact(
+                self.root, state, silent
+            )
+
+        value = json.loads((self.root / self.qa_manual_artifact()).read_text(encoding="utf-8"))
+        value["manual_execution"][0]["minimum_resume_action"] = "unexpected retry"
+        stray = self.artifact("qa", "qa-stray-resume", value)
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "cannot carry a resume"):
+            runtime_controller.validate_manual_execution_artifact(
+                self.root, state, stray
+            )
+
     def test_qa_obeys_worker_budget_checkpoint(self) -> None:
         state = self.ready_for_qa()
         state["worker_budget"]["status"] = "checkpoint_required"
         self.write_state(state)
-        capsule = self.capsule("qa", "qa", "qa-over-budget")
+        capsule = self.capsule("reviewer", "qa", "qa-over-budget")
         state = self.state()
         result = self.cli(
             "qa-complete", "--revision", state["revision"], "--product-revision", state["product_revision"],
@@ -3664,13 +5494,15 @@ class PipelineSchema9Tests(unittest.TestCase):
 
     def test_qa_run_id_is_unique_across_gated_resumes(self) -> None:
         state = self.ready_for_qa()
-        state["qa_capability"]["status"] = "blocked"
-        state["qa_capability"]["capabilities"]["config-credentials"] = "blocked_user"
-        state["qa_capability"]["minimum_resume_actions"] = {
-            "config-credentials": "authorize exact QA credential"
-        }
-        self.write_state(state)
-        capsule = self.capsule("qa", "qa", "qa-unique")
+        self.cli(
+            "qa-capability-probe", "--revision", state["revision"],
+            "--probe-id", "probe-gated-unique",
+            "--capability", "test-server-two-clients=blocked_user",
+            "--minimum-resume-action",
+            "test-server-two-clients=user|true|authorize exact QA topology",
+            "--report", self.artifact("qa", "probe-gated-unique"),
+        )
+        capsule = self.capsule("reviewer", "qa", "qa-unique")
         state = self.state()
         common = (
             "qa-complete", "--revision", state["revision"], "--product-revision", state["product_revision"],
@@ -3681,8 +5513,14 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--report", self.artifact("qa", "qa-unique-report"),
         )
         self.cli(*common)
-        result = self.cli(*common, expected=2)
-        self.assertIn("QA run ID already recorded", result.stderr)
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        after_first = state_path.read_bytes()
+        self.cli(*common)
+        self.assertEqual(after_first, state_path.read_bytes())
+        changed = list(common)
+        changed[changed.index("operator authorization")] = "different authorization"
+        result = self.cli(*changed, expected=2)
+        self.assertIn("qa-complete lost-response replay mismatch", result.stderr)
 
     def test_documentation_not_required_rejects_caller_invented_policy(self) -> None:
         self.implementation_complete()
@@ -3711,7 +5549,7 @@ class PipelineSchema9Tests(unittest.TestCase):
 
     def test_qa_updates_terminal_feature_coverage_to_current_identity(self) -> None:
         state = self.ready_for_qa()
-        capsule = self.capsule("qa", "qa", "qa-aggregate")
+        capsule = self.capsule("reviewer", "qa", "qa-aggregate")
         result = json.loads(self.cli(
             "qa-complete", "--revision", state["revision"], "--product-revision", state["product_revision"],
             "--support-revision", state["support_revision"], "--evidence-revision", state["evidence_revision"],
@@ -3727,7 +5565,7 @@ class PipelineSchema9Tests(unittest.TestCase):
 
     def test_ready_revalidates_immutable_manual_qa_evidence_bytes(self) -> None:
         state = self.ready_for_qa()
-        capsule = self.capsule("qa", "qa", "qa-evidence-drift")
+        capsule = self.capsule("reviewer", "qa", "qa-evidence-drift")
         self.cli(
             "qa-complete", "--revision", state["revision"], "--product-revision", state["product_revision"],
             "--support-revision", state["support_revision"], "--evidence-revision", state["evidence_revision"],
@@ -3830,7 +5668,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         ).stdout)
         self.assertEqual("qa", reviewed["phase"])
         self.qa_probe()
-        qa_capsule = self.capsule("qa", "qa", "qa-after-recovery")
+        qa_capsule = self.capsule("reviewer", "qa", "qa-after-recovery")
         state = self.state()
         qa = json.loads(self.cli(
             "qa-complete", "--revision", state["revision"], "--product-revision", state["product_revision"],
@@ -3971,6 +5809,39 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertEqual("revoked", result["write_lease_history"][-1]["status"])
         self.assertIsNotNone(result["coverage"]["SLICE-001"]["planned_manifest"])
 
+    def test_context_exhausted_release_requires_fresh_engineer_and_carries_candidate(self) -> None:
+        self.initialize()
+        self.begin_engineer_lease(allowed=("src/feature.py",))
+        lease_id = self.state()["active_write_lease"]["lease_id"]
+        self.src.write_text("VALUE = 1\n", encoding="utf-8")
+
+        self.cli(
+            "release-write-lease", "--lease-id", lease_id,
+            "--result", "revoked", "--reason", "context_exhausted",
+        )
+        released = self.state()
+        self.assertEqual("owner_handoff_hold", released["phase"])
+        self.assertIn("engineer-1", released["exhausted_worker_ids"])
+        carried = released["scope_guard"]["rebaseline_candidate"]
+        self.assertTrue(carried["fresh_owner_required"])
+        self.assertEqual(["src/feature.py"], [item["path"] for item in carried["changes"]])
+        rejected = self.cli(
+            "transfer-engineering-owner", "--from-owner", "engineer-1",
+            "--to-owner", "engineer-1", "--reason", "context rotation",
+            "--slice-id", "SLICE-001", expected=2,
+        )
+        self.assertIn("fresh distinct Engineer", rejected.stderr)
+
+        self.cli(
+            "transfer-engineering-owner", "--from-owner", "engineer-1",
+            "--to-owner", "engineer-2", "--reason", "context rotation",
+            "--slice-id", "SLICE-001",
+        )
+        prepared = json.loads(self.cli("prepare-engineer-continuation").stdout)
+        self.assertEqual("engineer-2", prepared["owner_id"])
+        self.assertTrue(self.state()["active_write_lease"]["rebaseline_carried"])
+        self.assertEqual("VALUE = 1\n", self.src.read_text(encoding="utf-8"))
+
     def test_consecutive_product_change_checkpoint_survives_status_load(self) -> None:
         self.initialize(research=False)
         state = self.state()
@@ -3986,6 +5857,37 @@ class PipelineSchema9Tests(unittest.TestCase):
         result = json.loads(self.cli("status").stdout)
         self.assertEqual("convergence_hold", result["phase"])
         self.assertEqual("checkpoint_required", result["iteration_control"]["status"])
+
+    def test_review_routes_are_sequential_and_hold_packet_is_executable(self) -> None:
+        state = self.initialize(research=False)
+        state["phase"] = "convergence"
+        state["convergence"]["status"] = "running"
+        route = runtime_controller.next_action(state)
+        self.assertEqual("complete_read_only_convergence_audits", route["action"])
+        self.assertNotIn("parallel", route["action"])
+
+        state["phase"] = "review"
+        state["review"]["status"] = "running"
+        route = runtime_controller.next_action(state)
+        self.assertEqual("complete_final_review", route["action"])
+
+        state["phase"] = "convergence_hold"
+        state["iteration_control"].update(
+            reason="iteration checkpoint", resume_phase="engineering"
+        )
+        self.assertEqual(
+            {
+                "action": "authorize_iteration",
+                "owner": "technical_director",
+                "user_input_required": False,
+                "command": "authorize-iteration",
+                "hold_phase": "convergence_hold",
+                "resume_phase": "engineering",
+                "reason": "iteration checkpoint",
+                "required_argument": "reason",
+            },
+            runtime_controller.next_action(state),
+        )
 
     def test_status_defaults_compact_with_allowlisted_diagnostics(self) -> None:
         self.initialize(research=False)
@@ -4063,9 +5965,7 @@ class PipelineSchema9Tests(unittest.TestCase):
     def test_open_minor_residual_risk_blocks_readiness_until_explicit_acceptance(self) -> None:
         self.initialize(research=False)
         revision = self.state()["revision"]
-        findings_path = self.root / ".agentic-pipeline" / "findings.json"
-        findings = json.loads(findings_path.read_text(encoding="utf-8"))
-        findings["items"].append(
+        findings_path, findings = self.inject_canonical_finding(
             {
                 "id": "F-MINOR-1",
                 "status": "open",
@@ -4074,7 +5974,6 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "revision": revision,
             }
         )
-        findings_path.write_text(json.dumps(findings), encoding="utf-8")
         reasons = runtime_controller.readiness_reasons(self.state(), findings)
         self.assertIn("minor findings require resolution or explicit acceptance", reasons)
         reason = "bounded cosmetic residual"
@@ -4165,6 +6064,25 @@ class PipelineSchema9Tests(unittest.TestCase):
         drift = self.cli("status", expected=2)
         self.assertIn("receipt bytes drifted", drift.stderr)
 
+    def test_user_authority_adopts_exact_orphan_receipt_after_save_crash(self) -> None:
+        self.initialize()
+        packet, authority_id, _ = self.decision_packet()
+        item = packet["items"][0]
+        args = argparse.Namespace(
+            project_root=str(self.root),
+            authority_id=authority_id,
+            approval_reference=item["authority"]["reference"],
+            statement=item["statement"],
+        )
+        with mock.patch.object(runtime_controller, "save_runtime", side_effect=RuntimeError("crash")):
+            with self.assertRaisesRegex(RuntimeError, "crash"):
+                runtime_controller.cmd_user_authority_accept(args)
+        self.assertEqual([], self.state()["user_authorities"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            runtime_controller.cmd_user_authority_accept(args)
+        authorities = self.state()["user_authorities"]
+        self.assertEqual([authority_id], [entry["authority_id"] for entry in authorities])
+
     def test_late_decision_from_implementation_complete_is_rejected_without_state_mutation(self) -> None:
         self.implementation_complete()
         packet, authority_id, authority_digest = self.decision_packet()
@@ -4212,13 +6130,10 @@ class PipelineSchema9Tests(unittest.TestCase):
             "status": "awaiting_decision",
             "runs": [
                 {"reviewer_id": "reviewer-1", "status": "fail"},
-                {"reviewer_id": "reviewer-2", "status": "pass"},
             ],
         }
         self.write_state(state)
-        findings_path = self.root / ".agentic-pipeline" / "findings.json"
-        findings = json.loads(findings_path.read_text(encoding="utf-8"))
-        findings["items"].append(
+        findings_path, _ = self.inject_canonical_finding(
             {
                 "id": "F-REVIEW-EVIDENCE",
                 "status": "open",
@@ -4226,9 +6141,9 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "revision": state["revision"],
                 "finding_kind": "evidence",
                 "blocking": True,
+                "remediation_required": True,
             }
         )
-        findings_path.write_text(json.dumps(findings), encoding="utf-8")
         report = self.artifact("reviews", "misroute-review")
         state_path = self.root / ".agentic-pipeline" / "state.json"
         before_state = state_path.read_bytes()
@@ -4248,8 +6163,8 @@ class PipelineSchema9Tests(unittest.TestCase):
         state["slices"]["SLICE-001"]["scope_contract"]["acceptance_ids"].append("PRD-AC-002")
         findings_path = self.root / ".agentic-pipeline" / "findings.json"
         findings = json.loads(findings_path.read_text(encoding="utf-8"))
-        findings["items"].append(
-            {
+        canonical_findings = json.loads(json.dumps(state["canonical_findings"]))
+        amendment_finding = {
                 "id": "F-AMEND-001",
                 "source": "review",
                 "finding_kind": "product",
@@ -4264,7 +6179,7 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "test_can_miss_product_defect": False,
                 "deferred_reference": None,
                 "title": "Coverage expectation changed",
-                "evidence": "Exact accepted finding evidence",
+                "evidence": "assigned_acceptance_evidence: PRD-AC-001, PRD-AC-002 | exact accepted component evidence",
                 "revision": state["revision"],
                 "origin_slice": "SLICE-001",
                 "remediation_route": "SLICE-001",
@@ -4273,7 +6188,7 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "resolved_revision": None,
                 "blocking": True,
             }
-        )
+        findings["items"].append(amendment_finding)
         findings_path.write_text(json.dumps(findings), encoding="utf-8")
         planned = {
             "ac_mappings": [
@@ -4300,9 +6215,14 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "reason": "Update both exact acceptance observations",
             }
         ]
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "not controller-registered"):
+            runtime_controller.validate_coverage_continuity(
+                state, canonical_findings, planned, finalized
+            )
+        canonical_findings["items"].append(amendment_finding)
         with self.assertRaisesRegex(runtime_controller.PipelineError, "exactly equal"):
             runtime_controller.validate_coverage_continuity(
-                state, planned, finalized, authorized_new_ids={"F-AMEND-001"}
+                state, canonical_findings, planned, finalized
             )
         finalized["amendments"][0]["affected_acceptance_ids"] = [
             "PRD-AC-001", "PRD-AC-002"
@@ -4310,7 +6230,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertEqual(
             runtime_controller.coverage_plan_body_digest(finalized),
             runtime_controller.validate_coverage_continuity(
-                state, planned, finalized, authorized_new_ids={"F-AMEND-001"}
+                state, canonical_findings, planned, finalized
             ),
         )
         planned_with_bad_prefix = json.loads(json.dumps(planned))
@@ -4336,9 +6256,9 @@ class PipelineSchema9Tests(unittest.TestCase):
         with self.assertRaisesRegex(runtime_controller.PipelineError, "identity/hash chain"):
             runtime_controller.validate_coverage_continuity(
                 state,
+                canonical_findings,
                 planned_with_bad_prefix,
                 json.loads(json.dumps(planned_with_bad_prefix)),
-                authorized_new_ids=set(),
             )
 
     def test_positive_shared_touchpoint_path_preserves_exact_mapping(self) -> None:
@@ -4360,8 +6280,8 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "domain_inventory": inventory,
                 "changes": [{
                     "path": self.rel(shared), "domain": "product",
-                    "symbols": ["FeatureContract"], "reason": "Add approved feature contract",
-                    "change_kind": "additive contract", "component": "feature",
+                    "symbols": ["FeatureContract"], "reason": "assigned_goal_effect: PRD-REQ-001, PRD-AC-001 | add the approved feature contract",
+                    "change_kind": "add", "component": "feature",
                     "lifecycle_change": False, "ownership_change": False,
                     "public_contract_change": False, "requirement_ids": ["PRD-REQ-001"],
                     "acceptance_ids": ["PRD-AC-001"], "decision_ids": [],
@@ -4375,9 +6295,11 @@ class PipelineSchema9Tests(unittest.TestCase):
             "engineer-complete", "--run-id", "shared-touchpoint-run",
             "--owner-id", "engineer-1", "--lease-id", active["active_write_lease"]["lease_id"],
             "--capsule", capsule, "--slice-id", "SLICE-001",
-            "--engineering-status", "pass", "--machine-checks", "pass",
+            "--machine-checks", "pass",
             "--diff-inspection", "pass", "--semantic-handoff", semantic,
-            "--report", self.artifact("verification", "shared-touchpoint-report"),
+            "--report", self.artifact(
+                "verification", "shared-touchpoint-engineer-report"
+            ),
         ).stdout)
         self.assertEqual("slice_coverage_finalization", result["phase"])
         self.assertIsNone(result["active_write_lease"])
@@ -4540,7 +6462,7 @@ class PipelineSchema9Tests(unittest.TestCase):
 
     def test_ready_requires_terminal_handoff_coverage_exactly_equal_current_aggregate(self) -> None:
         state = self.ready_for_qa()
-        capsule = self.capsule("qa", "qa", "qa-terminal-equality")
+        capsule = self.capsule("reviewer", "qa", "qa-terminal-equality")
         self.cli(
             "qa-complete", "--revision", state["revision"],
             "--product-revision", state["product_revision"],
@@ -4562,6 +6484,24 @@ class PipelineSchema9Tests(unittest.TestCase):
         terminal_path = self.root / terminal_record["path"]
         terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
         terminal["coverage_state"]["manual"] = "pending"
+        terminal["handoff_sha256"] = runtime_controller.canonical_json_sha256(
+            {key: value for key, value in terminal.items() if key != "handoff_sha256"}
+        )
+        terminal_path.write_text(json.dumps(terminal), encoding="utf-8")
+        terminal_record["sha256"] = self.sha(terminal_path)
+        terminal_record["handoff_sha256"] = terminal["handoff_sha256"]
+        self.write_state(state)
+        result = self.cli("ready", expected=1)
+        self.assertIn("schema-2 terminal handoff is stale or incomplete", result.stdout)
+
+        terminal["coverage_state"]["manual"] = state["coverage"]["feature"]["state"]["manual"]
+        terminal["open_assumptions"] = [{
+            "assumption_id": "ASSUME-READY-001",
+            "statement": "An unresolved premise remains.",
+            "owner": "engineer-1",
+            "validation_point": "before readiness",
+            "impact_if_false": "accepted behavior is not established",
+        }]
         terminal["handoff_sha256"] = runtime_controller.canonical_json_sha256(
             {key: value for key, value in terminal.items() if key != "handoff_sha256"}
         )
@@ -4815,8 +6755,8 @@ class PipelineSchema9Tests(unittest.TestCase):
             "credit": lambda state, findings: state["closure_review"]["run"].update(
                 credit_manifest_sha256="0" * 64
             ),
-            "base_review_pair": lambda state, findings: state["closure_review"].update(
-                base_review_runs=state["closure_review"]["base_review_runs"][:1]
+            "base_review_missing": lambda state, findings: state["closure_review"].update(
+                base_review_runs=[]
             ),
             "qa": lambda state, findings: state["qa"].update(report_sha256="0" * 64),
             "coverage": lambda state, findings: state["coverage"]["feature"][
@@ -4838,20 +6778,28 @@ class PipelineSchema9Tests(unittest.TestCase):
                 }
             ),
         }
+        self.prepare_targeted_qa_closure_ready_state(
+            legacy_without_base_clean=True
+        )
+        state_path = self.root / ".agentic-pipeline" / "state.json"
+        findings_path = self.root / ".agentic-pipeline" / "findings.json"
+        baseline_state = state_path.read_bytes()
+        baseline_findings = findings_path.read_bytes()
         for name, mutate in mutations.items():
             with self.subTest(name=name):
-                self.tearDown()
-                self.setUp()
-                self.prepare_targeted_qa_closure_ready_state(
-                    legacy_without_base_clean=True
-                )
+                state_path.write_bytes(baseline_state)
+                findings_path.write_bytes(baseline_findings)
                 state = self.state()
-                findings_path = self.root / ".agentic-pipeline" / "findings.json"
                 findings = json.loads(findings_path.read_text(encoding="utf-8"))
                 mutate(state, findings)
+                if name == "open_finding":
+                    state["canonical_findings"] = json.loads(json.dumps(findings))
+                    state["findings_sha256"] = runtime_controller.canonical_json_sha256(
+                        findings
+                    )
                 self.write_state(state)
                 findings_path.write_text(json.dumps(findings), encoding="utf-8")
-                before_state = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
+                before_state = state_path.read_bytes()
                 before_findings = findings_path.read_bytes()
 
                 result = self.cli(
@@ -4859,7 +6807,7 @@ class PipelineSchema9Tests(unittest.TestCase):
                 )
 
                 self.assertTrue(result.stderr.strip())
-                self.assertEqual(before_state, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
+                self.assertEqual(before_state, state_path.read_bytes())
                 self.assertEqual(before_findings, findings_path.read_bytes())
                 self.assertIsNone(self.state()["engineer_clean"])
 
@@ -5091,10 +7039,10 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--resource-budget-check", "pass",
             "--report", self.artifact("verification", "preflight-incomplete"),
         ]
-        for name in sorted(runtime_controller.QA_CAPABILITY_NAMES - {"config-credentials"}):
+        for name in sorted(runtime_controller.required_preflight_capabilities(state) - {"test-server-two-clients"}):
             args.extend(("--capability", f"{name}=available"))
         result = self.cli(*args, expected=2)
-        self.assertIn("config-credentials", result.stderr)
+        self.assertIn("test-server-two-clients", result.stderr)
         self.assertEqual("preflight", self.state()["phase"])
 
     def test_all_controller_review_completions_require_capsules_and_recovery_credit(self) -> None:
@@ -5115,13 +7063,18 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertTrue(recovery_actions["credit_manifest"].required)
 
     def test_capsule_budget_may_be_below_but_not_above_plan_ceiling(self) -> None:
-        self.initialize(research=False)
+        state = self.implementation_complete()
+        self.cli(
+            "documentation-not-required", "--mode", "normative_pre_review",
+            "--plan-sha256", state["development_plan"]["sha256"],
+            "--policy-evidence", "POLICY-DOC-NONE",
+        )
         state = self.state()
         output = f"tests/{FEATURE}/verification/smaller-capsule.json"
-        result = json.loads(self.cli(
-            "context-capsule-create", "--role", "researcher",
-            "--phase", "slice_research",
-            "--worker-id", "smaller-researcher", "--plan-sha256", state["development_plan_sha256"],
+        args = [
+            "context-capsule-create", "--role", "reviewer",
+            "--phase", "convergence",
+            "--worker-id", "smaller-verifier", "--plan-sha256", state["development_plan_sha256"],
             "--revision", state["revision"],
             "--authority",
             f"{self.rel(self.prd)}={self.sha(self.prd)}:PRD-REQ-001,PRD-AC-001",
@@ -5132,39 +7085,53 @@ class PipelineSchema9Tests(unittest.TestCase):
             "--max-authority-files", "3", "--max-evidence-files", "2",
             "--max-total-files", "5", "--max-payload-bytes", "100000",
             "--max-estimated-tokens", "50000", "--output", output,
-        ).stdout)
+        ]
+        _, coverage_ids = runtime_controller.capsule_manifest_contract(
+            self.root, state, "convergence"
+        )
+        for identity_id in sorted(coverage_ids):
+            args.extend(("--coverage-identity-id", identity_id))
+        for evidence_path, evidence_sha in sorted(
+            runtime_controller.capsule_exact_evidence(
+                self.root, state, "reviewer", "convergence"
+            ).items()
+        ):
+            args.extend(("--evidence", f"{evidence_path}={evidence_sha}"))
+        result = json.loads(self.cli(*args).stdout)
         self.assertEqual(3, result["budget"]["max_authority_files"])
         self.assertLess(result["budget"]["max_payload_bytes"], 500000)
 
-    def test_generic_resolve_finding_is_fail_closed_and_nonmutating(self) -> None:
-        self.initialize(research=False)
-        state = self.state()
-        findings_path = self.root / ".agentic-pipeline" / "findings.json"
-        findings = json.loads(findings_path.read_text(encoding="utf-8"))
-        findings["items"].append(
-            {"id": "F-CLOSE-1", "status": "open", "severity": "major", "blocking": True}
+    def test_generic_resolve_finding_command_is_removed(self) -> None:
+        parser = runtime_controller.build_parser()
+        command_action = next(
+            action for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
         )
-        findings_path.write_text(json.dumps(findings), encoding="utf-8")
-        before_state = (self.root / ".agentic-pipeline" / "state.json").read_bytes()
-        before_findings = findings_path.read_bytes()
-        result = self.cli(
-            "resolve-finding", "--id", "F-CLOSE-1", "--revision", state["revision"],
-            expected=2,
-        )
-        self.assertIn("resolve-finding is disabled", result.stderr)
-        self.assertEqual(before_state, (self.root / ".agentic-pipeline" / "state.json").read_bytes())
-        self.assertEqual(before_findings, findings_path.read_bytes())
+        self.assertNotIn("resolve-finding", command_action.choices)
+
+    def test_completion_proof_flags_expose_only_pass(self) -> None:
+        commands = runtime_controller.build_parser()._subparsers._group_actions[0].choices
+        expected = {
+            "engineer-complete": {"machine_checks", "diff_inspection"},
+            "coverage-finalize": {
+                "expected_actual_equality",
+                "mandatory_registration",
+                "automated_execution",
+            },
+            "recovery-remediation-complete": {"machine_checks"},
+        }
+        for command, destinations in expected.items():
+            actions = {action.dest: action for action in commands[command]._actions}
+            for destination in destinations:
+                self.assertEqual(("pass",), actions[destination].choices)
 
     def test_accept_finding_rejects_generic_user_receipt(self) -> None:
         self.initialize(research=False)
         revision = self.state()["revision"]
-        findings_path = self.root / ".agentic-pipeline" / "findings.json"
-        findings = json.loads(findings_path.read_text(encoding="utf-8"))
-        findings["items"].append(
+        findings_path, _ = self.inject_canonical_finding(
             {"id": "F-RISK-BAD", "status": "open", "severity": "minor", "blocking": False,
              "revision": revision}
         )
-        findings_path.write_text(json.dumps(findings), encoding="utf-8")
         self.cli(
             "user-authority-accept", "--authority-id", "AUTH-RISK-BAD",
             "--approval-reference", "USER-RISK-BAD", "--statement", "Accept generic risk",
@@ -5193,7 +7160,6 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "evidence_revision": state["evidence_revision"],
                 "runs": [
                     {"reviewer_id": "r-support-1", "status": "fail"},
-                    {"reviewer_id": "r-support-2", "status": "pass"},
                 ],
             }
         )
@@ -5223,12 +7189,30 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertEqual(["F-SUPPORT-1"], routed["recovery"]["finding_ids"])
 
     def test_qa_mixed_external_gates_have_deterministic_overall_status(self) -> None:
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- capability_prerequisites: test-server-two-clients",
+                "- capability_prerequisites: test-server-two-clients, "
+                "config-credentials, persistence-datastore",
+            ),
+            encoding="utf-8",
+        )
+        self.write_planning_state()
         self.optional_manual_identities = [
-            self.optional_manual_identity("MANUAL-SLICE-001-OPTIONAL-USER"),
-            self.optional_manual_identity("MANUAL-SLICE-001-OPTIONAL-ENV"),
+            self.optional_manual_identity(
+                "MANUAL-SLICE-001-OPTIONAL-USER",
+                capability_prerequisites=("config-credentials",),
+            ),
+            self.optional_manual_identity(
+                "MANUAL-SLICE-001-OPTIONAL-ENV",
+                capability_prerequisites=("persistence-datastore",),
+            ),
         ]
         state = self.ready_for_qa()
-        statuses = {name: "available" for name in runtime_controller.QA_CAPABILITY_NAMES}
+        statuses = {
+            name: "available"
+            for name in runtime_controller.required_qa_capabilities(self.root, state)
+        }
         statuses["config-credentials"] = "blocked_user"
         statuses["persistence-datastore"] = "blocked_environment"
         probe_args = [
@@ -5252,7 +7236,7 @@ class PipelineSchema9Tests(unittest.TestCase):
                  "deferred": True, "blocked_by_finding": None, "qa_evidence": None,
                  "gate": gate, "minimum_resume_action": f"resume {identity_id}"}
             )
-        capsule = self.capsule("qa", "qa", "qa-mixed")
+        capsule = self.capsule("reviewer", "qa", "qa-mixed")
         state = self.state()
         result = json.loads(self.cli(
             "qa-complete", "--revision", state["revision"],
@@ -5310,7 +7294,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             self.passed_manual_row("MANUAL-SLICE-001-RUNTIME", "optional-mandatory"),
             optional_row,
         ]
-        capsule = self.capsule("qa", "qa", "qa-optional")
+        capsule = self.capsule("reviewer", "qa", "qa-optional")
         state = self.state()
         result = json.loads(self.cli(
             "qa-complete", "--revision", state["revision"],
@@ -5342,7 +7326,437 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         self.assertIn("capability ID", result.stderr)
 
-    def test_custom_plan_capability_is_accepted_by_exact_qa_probe(self) -> None:
+    def test_runtime_init_rejects_acceptance_range_shorthand(self) -> None:
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- acceptance_ids: PRD-AC-001",
+                "- acceptance_ids: PRD-AC-001..003",
+            ),
+            encoding="utf-8",
+        )
+        self.write_planning_state()
+        result = self.cli(
+            "init", "--feature", FEATURE, "--requirements", self.rel(self.prd),
+            "--spec", self.rel(self.spec), "--plan", self.rel(self.plan),
+            "--plan-sha256", self.sha(self.plan), "--base-revision", "base-0",
+            "--decision-ledger", self.rel(self.ledger), expected=2,
+        )
+        self.assertIn("non-literal acceptance ID", result.stderr)
+
+    def test_runtime_init_rejects_pending_plan_revision_transition(self) -> None:
+        self.write_planning_state()
+        planning_path = self.root / ".agentic-pipeline" / "development-plan-state.json"
+        planning = json.loads(planning_path.read_text(encoding="utf-8"))
+        planning["status"] = "revision_reopen_pending"
+        planning["revision_reopen"] = {
+            "prior_approved_sha256": self.sha(self.plan),
+            "draft_sha256": "0" * 64,
+        }
+        planning_path.write_text(json.dumps(planning), encoding="utf-8")
+
+        result = self.cli(
+            "init", "--feature", FEATURE, "--requirements", self.rel(self.prd),
+            "--spec", self.rel(self.spec), "--plan", self.rel(self.plan),
+            "--plan-sha256", self.sha(self.plan), "--base-revision", "base-0",
+            "--decision-ledger", self.rel(self.ledger), expected=2,
+        )
+
+        self.assertIn("does not prove approval", result.stderr)
+        self.assertFalse((self.root / ".agentic-pipeline" / "state.json").exists())
+
+    def test_runtime_init_rejects_unknown_only_acceptance_id(self) -> None:
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "PRD-AC-001", "PRD-AC-unknown-only"
+            ),
+            encoding="utf-8",
+        )
+        self.write_planning_state()
+        result = self.cli(
+            "init", "--feature", FEATURE, "--requirements", self.rel(self.prd),
+            "--spec", self.rel(self.spec), "--plan", self.rel(self.plan),
+            "--plan-sha256", self.sha(self.plan), "--base-revision", "base-0",
+            "--decision-ledger", self.rel(self.ledger), expected=2,
+        )
+        self.assertIn("absent from the approved PRD inventory", result.stderr)
+        self.assertIn("unknown-only", result.stderr)
+
+    def test_runtime_init_rejects_mixed_valid_and_unknown_acceptance_ids(self) -> None:
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8")
+            .replace(
+                "### Requirements\n\n- PRD-REQ-001\n- PRD-AC-001",
+                "### Requirements\n\n- PRD-REQ-001\n- PRD-AC-001\n- PRD-AC-unknown-mixed",
+            )
+            .replace(
+                "- acceptance_ids: PRD-AC-001",
+                "- acceptance_ids: PRD-AC-001, PRD-AC-unknown-mixed",
+            ),
+            encoding="utf-8",
+        )
+        self.write_planning_state()
+        result = self.cli(
+            "init", "--feature", FEATURE, "--requirements", self.rel(self.prd),
+            "--spec", self.rel(self.spec), "--plan", self.rel(self.plan),
+            "--plan-sha256", self.sha(self.plan), "--base-revision", "base-0",
+            "--decision-ledger", self.rel(self.ledger), expected=2,
+        )
+        self.assertIn("absent from the approved PRD inventory", result.stderr)
+        self.assertIn("unknown-mixed", result.stderr)
+
+    def test_runtime_parser_defense_rejects_unknown_only_and_mixed_ids(self) -> None:
+        approved_inventory = frozenset({"PRD-AC-001"})
+        original = self.plan.read_text(encoding="utf-8")
+        candidates = (
+            original.replace("PRD-AC-001", "PRD-AC-unknown-only"),
+            original
+            .replace(
+                "### Requirements\n\n- PRD-REQ-001\n- PRD-AC-001",
+                "### Requirements\n\n- PRD-REQ-001\n- PRD-AC-001\n- PRD-AC-unknown-mixed",
+            )
+            .replace(
+                "- acceptance_ids: PRD-AC-001",
+                "- acceptance_ids: PRD-AC-001, PRD-AC-unknown-mixed",
+            ),
+        )
+        for candidate in candidates:
+            with self.subTest(candidate="mixed" if "unknown-mixed" in candidate else "only"):
+                with self.assertRaisesRegex(
+                    runtime_controller.PipelineError, "absent from the approved PRD"
+                ):
+                    runtime_controller.plan_slice_blocks(candidate, approved_inventory)
+
+        coverage_unknown = original.replace(
+            "### Coverage Contract\n\n- acceptance_ids: PRD-AC-001",
+            "### Coverage Contract\n\n- acceptance_ids: PRD-AC-unknown-coverage",
+        )
+        valid_slices = runtime_controller.plan_slice_blocks(original, approved_inventory)
+        with self.assertRaisesRegex(
+            runtime_controller.PipelineError, "absent from the approved PRD"
+        ):
+            runtime_controller.runtime_plan_contracts(
+                coverage_unknown, valid_slices, approved_inventory
+            )
+
+    def test_runtime_direct_and_cli_ignore_incidental_acceptance_ids(self) -> None:
+        self.prd.write_text(
+            self.prd.read_text(encoding="utf-8").replace(
+                "The project baseline is available.",
+                "The project baseline is available.\n\nExample only: PRD-AC-incidental.",
+            ),
+            encoding="utf-8",
+        )
+        self.refresh_spec_plan_and_state_for_current_prd()
+        inventory = runtime_controller.derive_prd_acceptance_inventory(
+            self.prd.read_text(encoding="utf-8"), label="approved PRD"
+        )
+        self.assertNotIn("PRD-AC-incidental", inventory)
+        candidate = self.plan.read_text(encoding="utf-8").replace(
+            "PRD-AC-001", "PRD-AC-incidental"
+        )
+        with self.assertRaisesRegex(
+            runtime_controller.PipelineError, "absent from the approved PRD"
+        ):
+            runtime_controller.plan_slice_blocks(candidate, inventory)
+        self.plan.write_text(candidate, encoding="utf-8")
+        self.write_planning_state()
+        result = self.cli(
+            "init", "--feature", FEATURE, "--requirements", self.rel(self.prd),
+            "--spec", self.rel(self.spec), "--plan", self.rel(self.plan),
+            "--plan-sha256", self.sha(self.plan), "--base-revision", "base-0",
+            "--decision-ledger", self.rel(self.ledger), expected=2,
+        )
+        self.assertIn("absent from the approved PRD inventory", result.stderr)
+
+    def test_runtime_direct_and_cli_reject_unicode_text_ranges_and_duplicate_criteria(self) -> None:
+        invalid_declarations = (
+            "- PRD-AC-001",
+            "- PRD-AC-001:",
+            "- PRD-AC-001_invalid: adjacent invalid token",
+            "- PRD-AC-001…003 — Unicode range",
+            "- PRD-AC-001 to PRD-AC-003 — textual range",
+            "- PRD-AC-001\n  ..\n  003: multiline range",
+            "- PRD-AC-001 to\n  PRD-AC-003: multiline textual range",
+            "- PRD-AC-001: first\n- PRD-AC-001: duplicate",
+        )
+        for invalid in invalid_declarations:
+            with self.subTest(invalid=invalid):
+                text = self.prd.read_text(encoding="utf-8")
+                text = text.replace("- PRD-AC-001: approved criterion", invalid)
+                self.prd.write_text(text, encoding="utf-8")
+                self.refresh_spec_plan_and_state_for_current_prd()
+                with self.assertRaises(ValueError):
+                    runtime_controller.derive_prd_acceptance_inventory(
+                        text, label="approved PRD"
+                    )
+                result = self.cli(
+                    "init", "--feature", FEATURE,
+                    "--requirements", self.rel(self.prd), "--spec", self.rel(self.spec),
+                    "--plan", self.rel(self.plan), "--plan-sha256", self.sha(self.plan),
+                    "--base-revision", "base-0", "--decision-ledger", self.rel(self.ledger),
+                    expected=2,
+                )
+                self.assertRegex(
+                    result.stderr,
+                    "must use exact|range shorthand|repeats criterion|semantic",
+                )
+                self.temporary.cleanup()
+                self.setUp()
+
+    def test_runtime_direct_and_cli_use_markdown_structural_prd_authority(self) -> None:
+        examples = (
+            "```md\n## Acceptance Criteria\n- PRD-AC-fenced: no\n```",
+            "~~~~ markdown\n## Acceptance Criteria\n- PRD-AC-fenced: no\n~~~~",
+            "    ## Acceptance Criteria\n    - PRD-AC-indented: no",
+            "> ## Acceptance Criteria\n> - PRD-AC-quoted: no",
+        )
+        for example in examples:
+            with self.subTest(example=example):
+                self.prd.write_text(
+                    self.prd.read_text(encoding="utf-8").replace(
+                        "## Acceptance Criteria\n",
+                        "## Acceptance Criteria\n\n" + example + "\n",
+                    ),
+                    encoding="utf-8",
+                )
+                self.refresh_spec_plan_and_state_for_current_prd()
+                inventory = runtime_controller.derive_prd_acceptance_inventory(
+                    self.prd.read_text(encoding="utf-8"), label="approved PRD"
+                )
+                self.assertEqual(frozenset({"PRD-AC-001"}), inventory)
+                self.initialize(research=False)
+                self.temporary.cleanup()
+                self.setUp()
+
+    def test_runtime_direct_and_cli_accept_public_alnum_hyphen_id(self) -> None:
+        self.prd.write_text(
+            self.prd.read_text(encoding="utf-8").replace("PRD-AC-001", "PRD-AC-save-v2"),
+            encoding="utf-8",
+        )
+        self.refresh_spec_plan_and_state_for_current_prd()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace("PRD-AC-001", "PRD-AC-save-v2"),
+            encoding="utf-8",
+        )
+        self.write_planning_state()
+        inventory = runtime_controller.derive_prd_acceptance_inventory(
+            self.prd.read_text(encoding="utf-8"), label="approved PRD"
+        )
+        runtime_controller.plan_slice_blocks(self.plan.read_text(encoding="utf-8"), inventory)
+        self.initialize(research=False)
+
+    def test_runtime_direct_and_cli_reject_fenced_only_or_near_prd_heading(self) -> None:
+        replacements = (
+            "```\n## Acceptance Criteria\n- PRD-AC-001: hidden\n```",
+            "    ## Acceptance Criteria\n    - PRD-AC-001: hidden",
+            "> ## Acceptance Criteria\n> - PRD-AC-001: hidden",
+            "### Acceptance Criteria\n- PRD-AC-001: near",
+        )
+        canonical = "## Acceptance Criteria\n\n- PRD-AC-001: approved criterion"
+        for replacement in replacements:
+            with self.subTest(replacement=replacement):
+                text = self.prd.read_text(encoding="utf-8").replace(canonical, replacement)
+                self.prd.write_text(text, encoding="utf-8")
+                self.refresh_spec_plan_and_state_for_current_prd()
+                with self.assertRaisesRegex(ValueError, "exactly one exact top-level"):
+                    runtime_controller.derive_prd_acceptance_inventory(
+                        text, label="approved PRD"
+                    )
+                result = self.cli(
+                    "init", "--feature", FEATURE,
+                    "--requirements", self.rel(self.prd), "--spec", self.rel(self.spec),
+                    "--plan", self.rel(self.plan), "--plan-sha256", self.sha(self.plan),
+                    "--base-revision", "base-0", "--decision-ledger", self.rel(self.ledger),
+                    expected=2,
+                )
+                self.assertIn("exactly one exact top-level", result.stderr)
+                self.temporary.cleanup()
+                self.setUp()
+
+    def test_runtime_requirements_reject_shared_full_and_short_range_matrix(self) -> None:
+        inventory = runtime_controller.derive_prd_acceptance_inventory(
+            self.prd.read_text(encoding="utf-8"), label="approved PRD"
+        )
+        ranges = (
+            "PRD-AC-001.002",
+            "PRD-AC-001 .. PRD-AC-002",
+            "PRD-AC-001…002",
+            "PRD-AC-001 – PRD-AC-002",
+            "PRD-AC-001—002",
+            "PRD-AC-001 to PRD-AC-002",
+            "PRD-AC-save-v1 TO save-v2",
+            "PRD-AC-001\n  ..\n  PRD-AC-002",
+            "PRD-AC-001 to\n  002",
+            "PRD-AC-001\n  — 002",
+        )
+        for acceptance_range in ranges:
+            with self.subTest(acceptance_range=acceptance_range):
+                candidate = self.plan.read_text(encoding="utf-8").replace(
+                    "- PRD-AC-001\n", f"- {acceptance_range}\n"
+                )
+                with self.assertRaisesRegex(runtime_controller.PipelineError, "range shorthand"):
+                    runtime_controller.plan_slice_blocks(candidate, inventory)
+                self.plan.write_text(candidate, encoding="utf-8")
+                self.write_planning_state()
+                result = self.cli(
+                    "init", "--feature", FEATURE,
+                    "--requirements", self.rel(self.prd), "--spec", self.rel(self.spec),
+                    "--plan", self.rel(self.plan), "--plan-sha256", self.sha(self.plan),
+                    "--base-revision", "base-0", "--decision-ledger", self.rel(self.ledger),
+                    expected=2,
+                )
+                self.assertIn("range shorthand", result.stderr)
+                self.temporary.cleanup()
+                self.setUp()
+
+    def test_runtime_requirements_reject_adjacent_invalid_id_direct_and_cli(self) -> None:
+        inventory = runtime_controller.derive_prd_acceptance_inventory(
+            self.prd.read_text(encoding="utf-8"), label="approved PRD"
+        )
+        candidate = self.plan.read_text(encoding="utf-8").replace(
+            "- PRD-AC-001\n", "- PRD-AC-001_invalid\n"
+        )
+        with self.assertRaises(runtime_controller.PipelineError):
+            runtime_controller.plan_slice_blocks(candidate, inventory)
+        self.plan.write_text(candidate, encoding="utf-8")
+        self.write_planning_state()
+        result = self.cli(
+            "init", "--feature", FEATURE,
+            "--requirements", self.rel(self.prd), "--spec", self.rel(self.spec),
+            "--plan", self.rel(self.plan), "--plan-sha256", self.sha(self.plan),
+            "--base-revision", "base-0", "--decision-ledger", self.rel(self.ledger),
+            expected=2,
+        )
+        self.assertTrue(result.stderr)
+
+    def test_runtime_structural_html_rendering_and_nested_range_direct_cli(self) -> None:
+        hidden = "<pre>\n## Acceptance Criteria\n- PRD-AC-hidden: no\n</pre>"
+        self.prd.write_text(
+            self.prd.read_text(encoding="utf-8").replace(
+                "- PRD-AC-001: approved criterion",
+                "- PRD-AC-001: approved criterion\n" + hidden,
+            ),
+            encoding="utf-8",
+        )
+        self.refresh_spec_plan_and_state_for_current_prd()
+        inventory = runtime_controller.derive_prd_acceptance_inventory(
+            self.prd.read_text(encoding="utf-8"), label="approved PRD"
+        )
+        self.assertEqual(frozenset({"PRD-AC-001"}), inventory)
+        self.initialize(research=False)
+
+        self.temporary.cleanup()
+        self.setUp()
+        inventory = runtime_controller.derive_prd_acceptance_inventory(
+            self.prd.read_text(encoding="utf-8"), label="approved PRD"
+        )
+        candidate = self.plan.read_text(encoding="utf-8").replace(
+            "- PRD-AC-001\n", "- outer\n  - PRD-AC-001…002\n"
+        )
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "range shorthand"):
+            runtime_controller.plan_slice_blocks(candidate, inventory)
+        self.plan.write_text(candidate, encoding="utf-8")
+        self.write_planning_state()
+        result = self.cli(
+            "init", "--feature", FEATURE,
+            "--requirements", self.rel(self.prd), "--spec", self.rel(self.spec),
+            "--plan", self.rel(self.plan), "--plan-sha256", self.sha(self.plan),
+            "--base-revision", "base-0", "--decision-ledger", self.rel(self.ledger),
+            expected=2,
+        )
+        self.assertIn("range shorthand", result.stderr)
+
+    def test_runtime_rejects_hidden_rendering_and_unicode_boundary_direct_cli(self) -> None:
+        canonical = "- PRD-AC-001: approved criterion"
+        for invalid in (
+            "- PRD-AC-001: <!-- hidden -->",
+            "- PRD-AC-001: <br>",
+            "- PRD-AC-001: [](url)",
+            "- PRD-AC-001\u203f: invalid boundary",
+        ):
+            with self.subTest(invalid=invalid):
+                text = self.prd.read_text(encoding="utf-8").replace(canonical, invalid)
+                self.prd.write_text(text, encoding="utf-8")
+                self.refresh_spec_plan_and_state_for_current_prd()
+                with self.assertRaises(ValueError):
+                    runtime_controller.derive_prd_acceptance_inventory(text, label="approved PRD")
+                result = self.cli(
+                    "init", "--feature", FEATURE,
+                    "--requirements", self.rel(self.prd), "--spec", self.rel(self.spec),
+                    "--plan", self.rel(self.plan), "--plan-sha256", self.sha(self.plan),
+                    "--base-revision", "base-0", "--decision-ledger", self.rel(self.ledger),
+                    expected=2,
+                )
+                self.assertTrue(result.stderr)
+                self.temporary.cleanup()
+                self.setUp()
+
+    def test_runtime_commonmark_sixth_audit_matrix_direct_and_cli(self) -> None:
+        canonical = "- PRD-AC-001: approved criterion"
+        hidden = (
+            "<textarea>\n## Acceptance Criteria\n- PRD-AC-hidden: no\n</textarea>",
+            "<?pi\n## Acceptance Criteria\n?>",
+            "<![CDATA[\n## Acceptance Criteria\n]]>",
+            "<custom-tag>\n## Acceptance Criteria\n- PRD-AC-hidden: no\n\n",
+        )
+        for block in hidden:
+            with self.subTest(block=block):
+                self.prd.write_text(
+                    self.prd.read_text(encoding="utf-8").replace(canonical, canonical + "\n" + block),
+                    encoding="utf-8",
+                )
+                self.refresh_spec_plan_and_state_for_current_prd()
+                inventory = runtime_controller.derive_prd_acceptance_inventory(
+                    self.prd.read_text(encoding="utf-8"), label="approved PRD"
+                )
+                self.assertEqual(frozenset({"PRD-AC-001"}), inventory)
+                self.initialize(research=False)
+                self.temporary.cleanup()
+                self.setUp()
+        invalid = (
+            "- PRD-AC-001: <template>hidden</template>",
+            "- PRD-AC-001: ``unmatched `",
+            "- PRD-AC-001\u202e: boundary",
+            "- PRD-AC-001 **..** `002`: rendered range",
+        )
+        for declaration in invalid:
+            with self.subTest(declaration=declaration):
+                text = self.prd.read_text(encoding="utf-8").replace(canonical, declaration)
+                self.prd.write_text(text, encoding="utf-8")
+                self.refresh_spec_plan_and_state_for_current_prd()
+                with self.assertRaises(ValueError):
+                    runtime_controller.derive_prd_acceptance_inventory(text, label="approved PRD")
+                result = self.cli(
+                    "init", "--feature", FEATURE,
+                    "--requirements", self.rel(self.prd), "--spec", self.rel(self.spec),
+                    "--plan", self.rel(self.plan), "--plan-sha256", self.sha(self.plan),
+                    "--base-revision", "base-0", "--decision-ledger", self.rel(self.ledger),
+                    expected=2,
+                )
+                self.assertTrue(result.stderr)
+                self.temporary.cleanup()
+                self.setUp()
+
+        inventory = runtime_controller.derive_prd_acceptance_inventory(
+            self.prd.read_text(encoding="utf-8"), label="approved PRD"
+        )
+        candidate = self.plan.read_text(encoding="utf-8").replace(
+            "- PRD-AC-001\n", "- PRD-AC-001 &hellip; [002](trace)\n"
+        )
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "literal acceptance ID"):
+            runtime_controller.plan_slice_blocks(candidate, inventory)
+        self.plan.write_text(candidate, encoding="utf-8")
+        self.write_planning_state()
+        result = self.cli(
+            "init", "--feature", FEATURE,
+            "--requirements", self.rel(self.prd), "--spec", self.rel(self.spec),
+            "--plan", self.rel(self.plan), "--plan-sha256", self.sha(self.plan),
+            "--base-revision", "base-0", "--decision-ledger", self.rel(self.ledger),
+            expected=2,
+        )
+        self.assertIn("literal acceptance ID", result.stderr)
+
+    def test_qa_probe_excludes_plan_capability_unused_by_manual_identities(self) -> None:
         self.plan.write_text(
             self.plan.read_text(encoding="utf-8").replace(
                 "- capability_prerequisites: test-server-two-clients",
@@ -5351,21 +7765,33 @@ class PipelineSchema9Tests(unittest.TestCase):
             encoding="utf-8",
         )
         self.write_planning_state()
-        self.initialize(research=False)
+        self.initialize()
         state = self.state()
         self.assertEqual(
             "available", state["preflight"]["capabilities"]["custom-runtime-probe"]
         )
+        self.engineer()
+        self.finalize_coverage()
+        state = self.state()
         state["phase"] = "qa"
         self.write_state(state)
-        statuses = {name: "available" for name in runtime_controller.QA_CAPABILITY_NAMES}
-        statuses["custom-runtime-probe"] = "available"
+        statuses = {
+            name: "available"
+            for name in runtime_controller.required_qa_capabilities(self.root, state)
+        }
+        self.assertNotIn("custom-runtime-probe", statuses)
         args = [
             "qa-capability-probe", "--revision", state["revision"],
             "--probe-id", "probe-custom", "--report", self.artifact("qa", "probe-custom"),
         ]
         for name, status in statuses.items():
             args.extend(("--capability", f"{name}={status}"))
+        rejected = self.cli(
+            *args,
+            "--capability", "custom-runtime-probe=available",
+            expected=2,
+        )
+        self.assertIn("complete exact capability matrix", rejected.stderr)
         self.cli(*args)
         self.assertEqual("ready", self.state()["qa_capability"]["status"])
 
@@ -5373,6 +7799,9 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.initialize(research=False)
         state = self.state()
         state["phase"] = "preflight"
+        state["plan_contracts"]["coverage_strategy"][
+            "capability_prerequisites"
+        ] = "config-credentials, persistence-datastore"
         self.write_state(state)
         args = [
             "preflight-complete", "--run-id", "preflight-blocked-user",
@@ -5383,7 +7812,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             "persistence-datastore=technical_director|false|start local datastore",
             "--report", self.artifact("verification", "preflight-blocked-user"),
         ]
-        for name in sorted(runtime_controller.QA_CAPABILITY_NAMES):
+        for name in sorted(runtime_controller.required_preflight_capabilities(state)):
             status = {
                 "config-credentials": "blocked_user",
                 "persistence-datastore": "blocked_environment",
@@ -5408,6 +7837,9 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.initialize(research=False)
         state = self.state()
         state["phase"] = "preflight"
+        state["plan_contracts"]["coverage_strategy"][
+            "capability_prerequisites"
+        ] = "window-control-path"
         self.write_state(state)
         args = [
             "preflight-complete", "--run-id", "preflight-blocked-environment",
@@ -5415,7 +7847,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             "window-control-path=technical_director|false|repair window automation",
             "--report", self.artifact("verification", "preflight-blocked-environment"),
         ]
-        for name in sorted(runtime_controller.QA_CAPABILITY_NAMES):
+        for name in sorted(runtime_controller.required_preflight_capabilities(state)):
             status = "error_test" if name == "window-control-path" else "available"
             args.extend(("--capability", f"{name}={status}"))
         compact = json.loads(self.cli(*args).stdout)
@@ -5438,16 +7870,21 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "schema": 1,
                 "mode": "normative_pre_review",
                 "statements": [{
-                    "statement_id": "SELF-001", "path": relative,
+                    "statement_id": "DOC-CHG-SELF", "path": relative,
                     "source_kind": "public_contract", "source_id": relative,
                     "source_path": relative, "source_sha256": self.sha(self.src),
+                    "target_sha256": self.sha(self.src),
                 }],
             },
         )
         with self.assertRaisesRegex(runtime_controller.PipelineError, "changed path"):
             runtime_controller.validate_documentation_source_map(
                 self.root, state, source_map,
-                mode="normative_pre_review", changed_paths=[relative],
+                mode="normative_pre_review",
+                semantic_changes=[{
+                    "change_id": "DOC-CHG-SELF", "path": relative,
+                    "change_kind": "modify",
+                }],
             )
 
     def test_documentation_source_map_rejects_cross_citation_between_changed_paths(self) -> None:
@@ -5465,32 +7902,46 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "schema": 1,
                 "mode": "normative_pre_review",
                 "statements": [{
-                    "statement_id": "CROSS-001", "path": first,
+                    "statement_id": "DOC-CHG-CROSS-FIRST", "path": first,
                     "source_kind": "public_contract", "source_id": second,
                     "source_path": second, "source_sha256": self.sha(self.spec),
+                    "target_sha256": self.sha(self.src),
                 }],
             },
         )
         with self.assertRaisesRegex(runtime_controller.PipelineError, "changed path"):
             runtime_controller.validate_documentation_source_map(
                 self.root, state, source_map,
-                mode="normative_pre_review", changed_paths=[first, second],
+                mode="normative_pre_review",
+                semantic_changes=[
+                    {"change_id": "DOC-CHG-CROSS-FIRST", "path": first, "change_kind": "modify"},
+                    {"change_id": "DOC-CHG-CROSS-SECOND", "path": second, "change_kind": "modify"},
+                ],
             )
 
-    def test_documentation_source_map_accepts_immutable_prd_spec_decision_and_review(self) -> None:
+    def test_documentation_source_map_accepts_immutable_authoritative_review_credit(self) -> None:
         self.initialize(research=False)
         state = self.state()
         state["decision_ledger"]["active_decision_ids"] = ["DEC-SOURCE-001"]
         review_relative = self.artifact("reviews", "immutable-review-source")
         review_report = self.root / review_relative
+        review_credit_relative = self.review_credit_manifest(
+            "immutable-review-credit", "review-source-worker", "full_convergence"
+        )
+        review_credit = self.root / review_credit_relative
         state["review_runs"].append(
             {
                 "run_id": "review-source-1",
                 "report": str(review_report),
                 "report_sha256": self.sha(review_report),
+                "credit_manifest": str(review_credit),
+                "credit_manifest_sha256": self.sha(review_credit),
             }
         )
         normative_target = "docs/generated-contract.md"
+        normative_target_path = self.root / normative_target
+        normative_target_path.parent.mkdir(parents=True, exist_ok=True)
+        normative_target_path.write_text("generated contract\n", encoding="utf-8")
         normative_map = self.artifact(
             "verification", "immutable-normative-map",
             {
@@ -5498,32 +7949,67 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "mode": "normative_pre_review",
                 "statements": [
                     {
-                        "statement_id": "REQ-001", "path": normative_target,
+                        "statement_id": "DOC-CHG-NORMATIVE", "path": normative_target,
                         "source_kind": "requirement", "source_id": "PRD-REQ-001",
                         "source_path": self.rel(self.prd), "source_sha256": self.sha(self.prd),
+                        "target_sha256": self.sha(normative_target_path),
                     },
                     {
-                        "statement_id": "SPEC-001", "path": normative_target,
+                        "statement_id": "DOC-CHG-NORMATIVE", "path": normative_target,
                         "source_kind": "specification", "source_id": "approved-specification",
                         "source_path": self.rel(self.spec), "source_sha256": self.sha(self.spec),
+                        "target_sha256": self.sha(normative_target_path),
                     },
                     {
-                        "statement_id": "DEC-001", "path": normative_target,
+                        "statement_id": "DOC-CHG-NORMATIVE", "path": normative_target,
                         "source_kind": "decision", "source_id": "DEC-SOURCE-001",
                         "source_path": self.rel(self.ledger), "source_sha256": self.sha(self.ledger),
+                        "target_sha256": self.sha(normative_target_path),
                     },
                 ],
             },
         )
         _, normative_ids = runtime_controller.validate_documentation_source_map(
             self.root, state, normative_map,
-            mode="normative_pre_review", changed_paths=[normative_target],
+            mode="normative_pre_review", semantic_changes=[{
+                "change_id": "DOC-CHG-NORMATIVE", "path": normative_target,
+                "change_kind": "modify",
+            }],
         )
         self.assertEqual(
             ["decision:DEC-SOURCE-001", "requirement:PRD-REQ-001", "specification:approved-specification"],
             normative_ids,
         )
+        tampered_target = json.loads(
+            (self.root / normative_map).read_text(encoding="utf-8")
+        )
+        tampered_target["statements"][0]["target_sha256"] = "0" * 64
+        tampered_target_path = self.artifact(
+            "verification", "immutable-normative-target-tampered", tampered_target
+        )
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "target SHA"):
+            runtime_controller.validate_documentation_source_map(
+                self.root, state, tampered_target_path,
+                mode="normative_pre_review", semantic_changes=[{
+                    "change_id": "DOC-CHG-NORMATIVE", "path": normative_target,
+                    "change_kind": "modify",
+                }],
+            )
+        omitted_path = self.artifact(
+            "verification", "immutable-normative-omitted",
+            {"schema": 1, "mode": "normative_pre_review", "statements": []},
+        )
+        with self.assertRaisesRegex(runtime_controller.PipelineError, "omits semantic"):
+            runtime_controller.validate_documentation_source_map(
+                self.root, state, omitted_path,
+                mode="normative_pre_review", semantic_changes=[{
+                    "change_id": "DOC-CHG-NORMATIVE", "path": normative_target,
+                    "change_kind": "modify",
+                }],
+            )
         derived_target = "docs/generated-support.md"
+        derived_target_path = self.root / derived_target
+        derived_target_path.write_text("generated support\n", encoding="utf-8")
         derived_map = self.artifact(
             "verification", "immutable-derived-map",
             {
@@ -5531,26 +8017,50 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "mode": "derived_post_qa",
                 "statements": [
                     {
-                        "statement_id": "DEC-002", "path": derived_target,
+                        "statement_id": "DOC-CHG-DERIVED", "path": derived_target,
                         "source_kind": "decision", "source_id": "DEC-SOURCE-001",
                         "source_path": self.rel(self.ledger), "source_sha256": self.sha(self.ledger),
+                        "target_sha256": self.sha(derived_target_path),
                     },
                     {
-                        "statement_id": "REVIEW-001", "path": derived_target,
+                        "statement_id": "DOC-CHG-DERIVED", "path": derived_target,
                         "source_kind": "review", "source_id": "review-source-1",
-                        "source_path": self.rel(review_report),
-                        "source_sha256": self.sha(review_report),
+                        "source_path": self.rel(review_credit),
+                        "source_sha256": self.sha(review_credit),
+                        "target_sha256": self.sha(derived_target_path),
                     },
                 ],
             },
         )
         _, derived_ids = runtime_controller.validate_documentation_source_map(
             self.root, state, derived_map,
-            mode="derived_post_qa", changed_paths=[derived_target],
+            mode="derived_post_qa", semantic_changes=[{
+                "change_id": "DOC-CHG-DERIVED", "path": derived_target,
+                "change_kind": "modify",
+            }],
         )
         self.assertEqual(
             ["decision:DEC-SOURCE-001", "review:review-source-1"], derived_ids
         )
+        report_map = json.loads((self.root / derived_map).read_text(encoding="utf-8"))
+        report_map["statements"][1]["source_path"] = self.rel(review_report)
+        report_map["statements"][1]["source_sha256"] = self.sha(review_report)
+        report_map_path = self.artifact(
+            "verification", "non-authoritative-review-report-map", report_map
+        )
+        with self.assertRaisesRegex(
+            runtime_controller.PipelineError, "controller-verified evidence"
+        ):
+            runtime_controller.validate_documentation_source_map(
+                self.root,
+                state,
+                report_map_path,
+                mode="derived_post_qa",
+                semantic_changes=[{
+                    "change_id": "DOC-CHG-DERIVED", "path": derived_target,
+                    "change_kind": "modify",
+                }],
+            )
 
     def test_reviewer_capsule_rejects_semantically_empty_assignment(self) -> None:
         self.initialize(research=False)
@@ -5589,7 +8099,7 @@ class PipelineSchema9Tests(unittest.TestCase):
 
     def test_qa_capsule_rejects_unknown_coverage_identity(self) -> None:
         self.ready_for_qa()
-        capsule_path = self.capsule("qa", "qa", "qa-semantic-negative")
+        capsule_path = self.capsule("reviewer", "qa", "qa-semantic-negative")
         value = json.loads((self.root / capsule_path).read_text(encoding="utf-8"))
         value["coverage_identity_ids"].append("UNKNOWN-QA-IDENTITY")
         value["metrics"] = runtime_controller.capsule_metrics(value, self.root)
@@ -5755,7 +8265,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertEqual("reinitialize_preflight", compact["next_action"]["action"])
         blocked = self.cli(
             "slice-research-not-required", "--slice-id", "SLICE-001",
-            "--base-revision", state["revision"], "--owner-id", "engineer-1",
+            "--base-revision", state["revision"],
             "--reason", "legacy state must not activate a worker", expected=2,
         )
         self.assertIn("slice_research phase", blocked.stderr)
@@ -5782,8 +8292,8 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.initialize(research=False)
         state = self.state()
         state["phase"] = "slice_research"
-        only = sorted(runtime_controller.QA_CAPABILITY_NAMES)[0]
-        state["preflight"]["capabilities"] = {only: "available"}
+        self.assertEqual(1, len(runtime_controller.required_preflight_capabilities(state)))
+        state["preflight"]["capabilities"] = {}
         self.write_state(state)
         compact = json.loads(self.cli("status").stdout)
         self.assertEqual("preflight_migration_hold", compact["phase"])
@@ -5797,11 +8307,40 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertTrue(state["preflight"]["resume_contract_complete"])
         self.assertEqual("slice_research", state["phase"])
 
+    def test_capability_sets_are_plan_derived_and_qa_identity_scoped(self) -> None:
+        state = self.initialize()
+        self.assertEqual(
+            {"test-server-two-clients"},
+            runtime_controller.required_preflight_capabilities(state),
+        )
+        self.engineer()
+        self.finalize_coverage()
+        state = self.state()
+        self.assertEqual(
+            {"test-server-two-clients"},
+            runtime_controller.required_qa_capabilities(self.root, state),
+        )
+        self.assertNotIn("studio-editor-sync", state["preflight"]["capabilities"])
+
+    def test_capsule_roles_exclude_dead_researcher_and_separate_qa_role(self) -> None:
+        self.assertEqual(
+            {
+                "decision_recorder",
+                "engineer",
+                "documentation_finisher",
+                "recovery_remediator",
+                "reviewer",
+            },
+            runtime_controller.CAPSULE_ROLES,
+        )
+        self.assertNotIn("researcher", runtime_controller.CAPSULE_PHASES)
+        self.assertIn("qa", runtime_controller.CAPSULE_PHASES["reviewer"])
+
     def test_qa_capsule_is_exact_review_probe_coverage_handoff_packet(self) -> None:
         self.ready_for_qa()
         state = self.state()
         runs = []
-        for index in (1, 2):
+        for index in (1,):
             report_rel = self.artifact("reviews", f"qa-packet-review-{index}")
             credit_rel = self.artifact("reviews", f"qa-packet-credit-{index}")
             report = self.root / report_rel
@@ -5819,7 +8358,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         state["review"]["runs"] = runs
         state["review_runs"] = list(runs)
         self.write_state(state)
-        capsule_path = self.capsule("qa", "qa", "qa-exact-packet")
+        capsule_path = self.capsule("reviewer", "qa", "qa-exact-packet")
         value = json.loads((self.root / capsule_path).read_text(encoding="utf-8"))
         expected_evidence = {
             self.rel(Path(state["coverage"]["feature"]["finalized_manifest"]["path"])),
@@ -5828,7 +8367,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             *{
                 self.rel(Path(run[field]))
                 for run in runs
-                for field in ("report", "credit_manifest")
+                for field in ("credit_manifest",)
             },
         }
         self.assertEqual(expected_evidence, {item["path"] for item in value["evidence"]})
@@ -5839,7 +8378,7 @@ class PipelineSchema9Tests(unittest.TestCase):
 
     def test_qa_capsule_rejects_extra_controller_known_evidence_and_authority(self) -> None:
         self.ready_for_qa()
-        capsule_path = self.capsule("qa", "qa", "qa-extra-packet")
+        capsule_path = self.capsule("reviewer", "qa", "qa-extra-packet")
         state = self.state()
         value = json.loads((self.root / capsule_path).read_text(encoding="utf-8"))
         planned = state["coverage"]["SLICE-001"]["planned_manifest"]
@@ -5869,7 +8408,7 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
         state = self.state()
         convergence_runs = []
-        for index in (1, 2):
+        for index in (1,):
             report_rel = self.artifact("reviews", f"convergence-packet-{index}")
             credit_rel = self.artifact("reviews", f"convergence-credit-{index}")
             report = self.root / report_rel
@@ -5894,7 +8433,7 @@ class PipelineSchema9Tests(unittest.TestCase):
             *{
                 self.rel(Path(run[field]))
                 for run in convergence_runs
-                for field in ("report", "credit_manifest")
+                for field in ("credit_manifest",)
             },
         }
         self.assertEqual(expected_evidence, {item["path"] for item in value["evidence"]})
@@ -5908,7 +8447,10 @@ class PipelineSchema9Tests(unittest.TestCase):
     def test_compact_blocked_preflight_is_bounded_with_500_blockers(self) -> None:
         self.initialize(research=False)
         state = self.state()
-        custom = [f"bulk-blocker-{index:03d}" for index in range(500)]
+        base_required = runtime_controller.required_preflight_capabilities(state)
+        custom_count = 500 - len(base_required)
+        self.assertGreater(custom_count, 0)
+        custom = [f"bulk-blocker-{index:03d}" for index in range(custom_count)]
         state["plan_contracts"]["coverage_strategy"][
             "capability_prerequisites"
         ] = ", ".join(custom)
@@ -5943,10 +8485,10 @@ class PipelineSchema9Tests(unittest.TestCase):
         self.assertLessEqual(len(compact_result.stdout.encode("utf-8")), 8192)
         self.assertEqual("bulk-blocker-000", compact["next_action"]["capability_id"])
         self.assertEqual("repair bulk-blocker-000", compact["next_action"]["action"])
-        self.assertEqual(508, compact["next_action"]["capability_summary"]["total"])
+        self.assertEqual(500, compact["next_action"]["capability_summary"]["total"])
         self.assertTrue(compact["next_action"]["capability_summary"]["truncated"])
         section = json.loads(self.cli("status", "--section", "preflight").stdout)
-        self.assertEqual(508, len(section["data"]["capabilities"]))
+        self.assertEqual(500, len(section["data"]["capabilities"]))
 
     def test_compact_blocked_qa_is_bounded_with_500_blockers(self) -> None:
         self.initialize(research=False)
@@ -5974,7 +8516,7 @@ class PipelineSchema9Tests(unittest.TestCase):
                 "resume_contract_complete": True,
             }
         )
-        selected = "config-credentials"
+        selected = "qa-bulk-blocker-000"
         self.assertIn(selected, required)
         blocked = {
             name: (
@@ -6050,5 +8592,25 @@ class PipelineSchema9Tests(unittest.TestCase):
         )
 
 
+class RuntimeProgressResult(unittest.TextTestResult):
+    """Emit immediate per-test progress and duration for the large runtime suite."""
+
+    def startTest(self, test: unittest.TestCase) -> None:
+        self._runtime_started_at = time.perf_counter()
+        self.stream.writeln(f"[runtime-test:start] {test.id()}")
+        self.stream.flush()
+        super().startTest(test)
+
+    def stopTest(self, test: unittest.TestCase) -> None:
+        elapsed = time.perf_counter() - self._runtime_started_at
+        super().stopTest(test)
+        self.stream.writeln(f"[runtime-test:done] {test.id()} {elapsed:.3f}s")
+        self.stream.flush()
+
+
+class RuntimeProgressRunner(unittest.TextTestRunner):
+    resultclass = RuntimeProgressResult
+
+
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(testRunner=RuntimeProgressRunner, verbosity=2)

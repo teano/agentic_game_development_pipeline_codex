@@ -59,7 +59,7 @@ Unavailable tools/permissions/credentials/publication/manual actions and unexecu
 
 Each gate records the exact product/evidence revision, pending registered manual identity IDs, completed reusable evidence, reason, and minimum resume action. Mixed QA gates preserve every category/identity while the controller derives one deterministic overall status. Gates have no product severity. Only `blocked_user` inherently requires user input.
 
-Before QA spawn, the controller requires a complete capability probe on the exact reviewed revision: Studio/editor sync, single play, mandatory Test Server server plus two clients, stable window/control or declared human operator, logging/screenshots, persistence/DataStore, publication/place topology, and configuration/credentials. Known unavailable capability means no QA spawn. `blocked_environment` and `error_test` require the recorded failed probe plus a minimum resume action; they cannot be inferred from an unexecuted scenario.
+Before QA spawn, the controller requires a complete capability probe on the exact reviewed revision for the prerequisites of the registered manual identities. Engine/editor, topology, persistence, credentials, operator control, and evidence-capture capabilities are required only when an approved identity cites them. Known unavailable capability means no QA spawn. `blocked_environment` and `error_test` require the recorded failed probe plus a minimum resume action; they cannot be inferred from an unexecuted scenario.
 
 ## Production-ready candidate
 
@@ -72,12 +72,12 @@ Require all of the following:
 - required normative docs before Review and derived support after QA, or exact policy `not_required` evidence;
 - independent `implementation_state=pass`;
 - current schema-2 coverage: all acceptance IDs mapped, expected=actual identities, mandatory registration exact, no gap, mandatory automation passed;
-- a passed parallel convergence wave on current product; at most two append-only full waves per slice, with local remediation closed by fresh targeted Review unless a recorded material trigger requires a full wave;
+- one passed controller-required convergence Review on the current product; at most two append-only full waves per slice, with local remediation closed by fresh targeted Review unless a recorded material trigger requires a full wave;
 - valid component credits keyed by product/contract hashes, lenses, and review revision; reuse unchanged components and record Final Review composition/new-boundary coverage;
-- two distinct full Reviews on current identities with exact capsules/credit manifests, then either targeted product closure or support/evidence recovery Review preserving same-product reports and finalized coverage continuity;
+- one passed Final Review on current identities with its exact capsule/credit manifest, then either targeted product closure or support/evidence recovery Review preserving the accepted same-product credit lineage and finalized coverage continuity;
 - exact-product/evidence capability probe and runtime QA pass; every mandatory manual identity executed/passed, none deferred/blocked;
 - if post-QA derived support changed, unchanged QA product/evidence plus fresh documentation-closure Review on current support;
-- terminal schema-2 handoff with exact decisions, coverage, docs, and assumptions;
+- terminal schema-2 handoff with exact decisions, coverage, docs, and an empty `open_assumptions` list; every prior assumption is already resolved through an existing decision, finding, or gate route;
 - no open `remediation_required` finding; every Minor is closed or accepted by prior immutable receipt bound to finding, revision, and reason;
 - `feature_verification_state=pass` on current product/support/evidence with exact QA/support-closure credits;
 - controller phase `ready` and successful `ready` command.

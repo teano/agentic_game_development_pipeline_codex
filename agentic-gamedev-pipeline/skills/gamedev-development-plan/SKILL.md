@@ -16,7 +16,7 @@ Act as Development Plan Director: own source authority, deterministic state, int
 ## Establish authority
 
 1. Resolve the project root, lowercase feature, canonical PRD, specification, plan, and append-only decision ledger through the contract. Ask one path question only if ambiguity remains.
-2. Require exact `PRD_READY` and `SPEC_READY` evidence whose paths and hashes match the current files. Do not activate upstream stages; return a handoff to the missing/stale stage instead.
+2. Require the exact PRD to pass the complete current approved Requirements validator and require current schema-2 `SPEC_READY` evidence whose paths and hashes match the files. Planning never migrates legacy specification state or grandfathers malformed authority; return a controlled upstream revision/reconvergence handoff instead.
 3. Initialize `.agentic-pipeline/development-plan-state.json` with the resolved paths and exact source hashes.
 4. Assign exactly one fresh internal read-only Planning Analyst with bounded canonical inputs. Do not reuse an implementation or specification worker.
 5. Record the result with `accept-analysis`.
@@ -29,15 +29,17 @@ Use `sequential_slices` only when every slice yields an observable end-to-end re
 
 Read only component-relevant deferred findings as dependency/risk evidence. They do not add scope. The Analyst returns a compact decision packet with mode, complexity/working-set estimate, seams/dependencies, rejected decompositions, risks, slices/milestones, context ceilings, coverage boundaries, documentation outputs, and whether each slice needs bounded research.
 
-For each slice, use either one or more exact `RESEARCH-*` briefs or `research_not_required | reason=<exact source-backed reason>`. Never add a fake brief merely to satisfy structure.
+For each slice, use either one to three exact `RESEARCH-*` briefs or `research_not_required | reason=<exact source-backed reason>`. Brief IDs and content selectors are runtime authority and must be unique. Never add a fake brief merely to satisfy structure.
 
 ## Draft, approve, and complete
 
 Write only the canonical plan path and use the contract/template fields. Keep `status: draft` until the user explicitly approves the exact submitted SHA.
 
-Run `validate-plan`, then `submit`. Present decision, ordering, boundaries, ceilings, risks, and exact draft SHA. Every edit requires resubmission. Silence or upstream approval is not plan approval.
+Run `validate-plan`, then `submit`. Validation requires the exact union of all slice acceptance sets to cover the complete approved PRD inventory; cross-slice overlap is allowed only when each named slice genuinely contributes to that end-to-end criterion. Present decision, ordering, boundaries, ceilings, risks, and exact draft SHA. Every edit requires resubmission. Silence or upstream approval is not plan approval.
 
-After explicit approval of the exact current draft, run `approve --approved-by user --approval-note <decision>`. Only controller state may report `PLAN_READY`.
+After explicit approval of the exact current draft, run `approve --approved-by user --approval-note <decision>`. The controller persists a resumable approval transition before replacing plan bytes; retry an interrupted command with the exact same inputs. With unchanged sources, only that exact retry may finish a pending approval. If source authority drifts and is reconverged, `reinitialize` verifies the pending transition and exact submitted-or-deterministically-approved plan bytes, derives the deterministic draft form when necessary, records the superseded approval in history, and continues with a fresh Analyst. Completed exact approval replay is a source-revalidated no-op even after normal runtime binding. Only controller state may report `PLAN_READY`.
+
+If an already approved plan itself needs correction while PRD/SPEC authority remains current and no runtime state is bound, run `revise-approved --reopened-by <director-id> --analyst-id <fresh-analyst-id> --reason <exact reason>` before editing it. A bound runtime remains forbidden except during its exact controller-owned pre-engineering `authority_recovery_hold`; then supply the matching `--recovery-token`, unchanged reason, and prior plan authority. The token authorizes only the normal fresh analysis, submit, and explicit user approval sequence; it never carries approval forward. Director and Analyst identities must remain distinct after NFKC, surrounding-whitespace, and case normalization. Freshness applies the same normalization to the candidate and every Planning Analyst identity recursively retained in current state and all history/reinitialization shapes. This verifies the exact approved bytes, including exactly one positive-integer top-level `revision`, archives their submission/approval/source provenance, increments the plan revision without duplicating the field, removes approval metadata, installs the fresh Analyst identity, and returns to `analyzing`. Record that Analyst's fresh decision with `accept-analysis` before editing/submitting the revised draft. The revised plan must pass validation, receive a new `submit`, and receive fresh explicit user approval; prior analysis and approval never carry forward.
 
 Any PRD/spec byte drift, lost approval, lost `SPEC_READY`, or trace mismatch makes the plan stale. Preserve history and use `reinitialize` with a distinct fresh Analyst after upstream reconvergence. Never delete state or patch hashes manually.
 
@@ -48,3 +50,5 @@ Return:
 - `NEXT_ACTION: $gamedev-pipeline` when `PLAN_READY: yes`; otherwise `NEXT_ACTION: user-decision`, `$gamedev-requirements`, `$gamedev-specification`, or `$gamedev-development-plan` as proven by state.
 
 Do not initialize the runtime pipeline or start an Engineer. Stop after persisting planning state and returning the handoff.
+
+For a focused local regression with per-test progress, run `python -B -m unittest discover agentic-gamedev-pipeline/skills/gamedev-development-plan/scripts -p "test_*.py" -v` from the bundle repository root.

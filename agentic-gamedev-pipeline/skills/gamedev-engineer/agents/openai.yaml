@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Engineer"
   short_description: "Explicit-only bounded GameDev engineering pass"
-  default_prompt: "Use $gamedev-engineer for one exact research-briefing, implementation, or product-remediation pass; return ENGINEERING_COMPLETE plus NEXT_ACTION, then stop."
+  default_prompt: "Use $gamedev-engineer for one exact implementation or product-remediation pass after Director/controller research and coverage gates; return ENGINEERING_COMPLETE plus NEXT_ACTION, then stop."
 policy:
   allow_implicit_invocation: false

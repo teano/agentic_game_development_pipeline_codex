@@ -27,11 +27,11 @@ Support-only completion preserves QA credit only when product/evidence identitie
 
 ## Write exact packets
 
-Read the exact [cross-role semantic packet contract](../gamedev-pipeline/references/role-artifacts-and-context.md#controller-generated-handoff-schema-2) before producing the write packet; do not restate that shared envelope here.
+Before producing the write packet, read only the worker-owned [semantic write packet contract](../gamedev-pipeline/references/semantic-write-packet.md); the lane-specific statement-map contract remains in `documentation-contract.md`.
 
 1. Verify sources, IDs, output allowlist, exclusions, and current lane/revisions.
-2. Produce a schema-1 semantic write packet containing the complete domain inventory, exact changed paths with semantic annotations, and open assumptions.
-3. Produce a separate schema-1 statement source map. Each unique statement ID maps one changed path to an allowed source kind/ID/path and exact current SHA. Normative sources are decision/requirement/specification/public-contract; derived sources are decision/QA/capability-probe/Review/controller-handoff.
+2. Produce a schema-1 semantic write packet containing the complete domain inventory, exact changed paths with semantic annotations, and open assumptions. Every documentation-lane change carries one unique `DOC-CHG-*` `change_id`.
+3. Produce a separate schema-1 statement source map whose statement IDs are the exact union of semantic-packet `change_id` values. A statement ID may repeat only for distinct sources of the same change; every row maps one changed path to an allowed source kind/ID/path, exact current source SHA, and exact current target SHA (or `null` for deletion). Normative sources are decision/requirement/specification/public-contract; derived sources are active decisions, closed QA manual evidence, Final Review credit manifests, or controller handoffs present in the capsule. Generic role reports and capability-probe reports are audit artifacts, not documentation authority.
 4. Preserve repository style and terminology. Add no recommendation, promise, default, compatibility claim, operator step, or failure behavior absent from sources.
 5. Inspect the final diff for fidelity, confinement, stale references, and accidental product/test/lane changes.
 

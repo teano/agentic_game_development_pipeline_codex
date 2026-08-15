@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,10 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("deferred_findings.py")
+MODULE_SPEC = importlib.util.spec_from_file_location("deferred_findings_tested", SCRIPT)
+assert MODULE_SPEC and MODULE_SPEC.loader
+deferred_findings = importlib.util.module_from_spec(MODULE_SPEC)
+MODULE_SPEC.loader.exec_module(deferred_findings)
 
 
 class DeferredFindingsTests(unittest.TestCase):
@@ -68,6 +73,10 @@ class DeferredFindingsTests(unittest.TestCase):
             severity,
             "--reachability",
             "supported_failure_path",
+            "--owner",
+            "save-team",
+            "--rationale",
+            "SaveProfile is outside the accepted teleport feature goal",
             "--condition",
             "storage rejects second page",
             "--impact",
@@ -147,6 +156,12 @@ class DeferredFindingsTests(unittest.TestCase):
             "major",
             "--reachability",
             "supported_failure_path",
+            "--owner",
+            "save-team",
+            "--rationale",
+            "SaveProfile is outside the accepted teleport feature goal",
+            "--impact",
+            "player progress is lost",
             "--evidence",
             "rev-99 new trigger",
             "--occurrence-id",
@@ -166,6 +181,12 @@ class DeferredFindingsTests(unittest.TestCase):
             created["id"],
             "--provisional-severity",
             "critical",
+            "--owner",
+            "save-team",
+            "--rationale",
+            "SaveProfile is outside the accepted teleport feature goal",
+            "--impact",
+            "player progress is lost",
             expected=2,
         )
         self.run_command(
@@ -174,6 +195,12 @@ class DeferredFindingsTests(unittest.TestCase):
             created["id"],
             "--provisional-severity",
             "critical",
+            "--owner",
+            "save-team",
+            "--rationale",
+            "SaveProfile is outside the accepted teleport feature goal",
+            "--impact",
+            "player progress is lost",
             "--evidence",
             "production incident INC-42",
         )
@@ -204,7 +231,7 @@ class DeferredFindingsTests(unittest.TestCase):
         self.assertEqual("reopened", entry["status"])
         transitions = [(item["from"], item["to"]) for item in entry["status_history"]]
         self.assertEqual(
-            [("deferred_untriaged", "resolved"), ("resolved", "reopened")],
+            [("deferred_owned", "resolved"), ("resolved", "reopened")],
             transitions,
         )
         self.assertEqual(2, len(entry["occurrences"]))
@@ -276,7 +303,7 @@ class DeferredFindingsTests(unittest.TestCase):
             "convergence",
             expected=2,
         )
-        entry = self.defer()
+        entry = self.defer(occurrence="convergence:F-OUT-1")
         self.write_pipeline_findings(
             self.deferred_candidate(
                 f"docs/engineering/deferred-findings.json#{entry['id']}"
@@ -291,8 +318,46 @@ class DeferredFindingsTests(unittest.TestCase):
         )
         self.assertEqual("pass", json.loads(result.stdout)["status"])
 
+    def test_scope_check_rejects_stale_unrelated_occurrence_until_exact_upsert(self) -> None:
+        entry = self.defer(occurrence="convergence:F-OLD")
+        candidate = self.deferred_candidate(
+            f"docs/engineering/deferred-findings.json#{entry['id']}"
+        )
+        self.write_pipeline_findings(candidate)
+
+        direct = deferred_findings.backlog_scope_errors(
+            self.root,
+            {"items": [candidate]},
+            revision="rev-1",
+            sources={"convergence"},
+        )
+        self.assertEqual(1, len(direct))
+        self.assertIn("exact occurrence convergence:F-OUT-1", direct[0])
+        failed = self.run_command(
+            "backlog-scope-check",
+            "--revision",
+            "rev-1",
+            "--source",
+            "convergence",
+            expected=2,
+        )
+        self.assertIn("exact occurrence convergence:F-OUT-1", failed.stdout)
+
+        refreshed = self.defer(occurrence="convergence:F-OUT-1")
+        self.assertEqual(entry["id"], refreshed["id"])
+        before = self.backlog_path.read_bytes()
+        passed = self.run_command(
+            "backlog-scope-check",
+            "--revision",
+            "rev-1",
+            "--source",
+            "convergence",
+        )
+        self.assertEqual("pass", json.loads(passed.stdout)["status"])
+        self.assertEqual(before, self.backlog_path.read_bytes())
+
     def test_scope_check_returns_candidate_introduction_to_current_scope(self) -> None:
-        entry = self.defer()
+        entry = self.defer(occurrence="convergence:F-OUT-1")
         candidate = self.deferred_candidate(
             f"docs/engineering/deferred-findings.json#{entry['id']}"
         )
@@ -307,6 +372,46 @@ class DeferredFindingsTests(unittest.TestCase):
         )
         self.assertIn("must return to current scope", result.stdout)
         self.assertIn("scope_expansion_hold", result.stdout)
+
+    def test_legacy_entry_is_readable_but_cannot_authorize_scope_until_repaired(self) -> None:
+        created = self.defer(occurrence="convergence:F-OUT-1")
+        backlog = self.read_backlog()
+        legacy = backlog["entries"][created["id"]]
+        legacy["status"] = "deferred_untriaged"
+        legacy["owner"] = None
+        legacy["impacts"] = []
+        legacy.pop("deferral_rationale")
+        self.backlog_path.write_text(json.dumps(backlog), encoding="utf-8")
+
+        self.run_command("init")
+        self.write_pipeline_findings(
+            self.deferred_candidate(
+                f"docs/engineering/deferred-findings.json#{created['id']}"
+            )
+        )
+        failed = self.run_command("backlog-scope-check", expected=2)
+        self.assertIn("legacy deferred finding", failed.stdout)
+
+        self.run_command(
+            "extend",
+            "--id",
+            created["id"],
+            "--provisional-severity",
+            "major",
+            "--owner",
+            "save-team",
+            "--rationale",
+            "SaveProfile remains outside the accepted teleport feature goal",
+            "--impact",
+            "player progress is lost",
+        )
+        passed = self.run_command("backlog-scope-check")
+        self.assertEqual("pass", json.loads(passed.stdout)["status"])
+        repaired = self.read_backlog()["entries"][created["id"]]
+        self.assertEqual("deferred_owned", repaired["status"])
+        self.assertEqual("save-team", repaired["owner"])
+        self.assertTrue(repaired["impacts"])
+        self.assertTrue(repaired["deferral_rationale"])
 
 
 if __name__ == "__main__":

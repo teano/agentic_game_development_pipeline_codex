@@ -12,40 +12,43 @@ Only these authority forms can support an entry:
 
 An implementation choice discovered by an Engineer, an option preferred by a reviewer, or prose inferred from code is not accepted authority. Return `DECISION_INPUT_INCOMPLETE` instead of choosing.
 
-The user-acceptance checkpoint requires a stable authority ID, explicit approval reference, and exact accepted statement. It records the caller's approval assertion but does not authenticate the human. Its digest and receipt path/SHA are append-only controller state. Capsule creation and the Recorder semantic packet may only cite this prior authority ID/digest and cannot create or revise it. Recording is restricted to pre-implementation boundaries (`preflight`, `slice_research`, or `slice_coverage_planning`); a later decision must return for explicit replan/reinitialization rather than invalidating completed downstream state in place.
+Each Recorder capsule assigns exactly one authority selector. For user authority it is one prior accepted receipt ID/digest. For PRD, specification, development plan, or controller resolution it is one exact section/ID present in the assigned canonical path/SHA; an unrelated user receipt is neither required nor sufficient. The semantic packet must cite that same source and selector. The user-acceptance checkpoint requires a stable authority ID, explicit approval reference, and exact accepted statement. It records the caller's approval assertion but does not authenticate the human. Recording is restricted to pre-implementation boundaries (`preflight`, `slice_research`, or `slice_coverage_planning`); a later decision must return for explicit replan/reinitialization rather than invalidating completed downstream state in place.
 
 ## Schema 1 semantic packet and ledger entry
 
-The recorder prepares a semantic packet. Each item contains exactly:
+The recorder prepares exactly one envelope with integer `schema: 1` and a non-empty `items` array. Each item also has integer `schema: 1` and contains exactly the remaining fields shown here:
 
 ```json
 {
   "schema": 1,
-  "decision_id": "DEC-001",
-  "status": "accepted",
-  "statement": "accepted decision, without added scope",
-  "rationale": "supplied rationale or not_supplied",
-  "consequences": ["supplied consequence"],
-  "scope_ids": ["PRD-REQ-001", "PRD-AC-001", "SLICE-001"],
-  "authority": {
-    "kind": "user|prd|specification|development_plan|controller_resolution",
-    "reference": "stable authority reference or explicit approval reference",
-    "path": "repository-relative path or not_applicable",
-    "sha256": "64 lowercase hex or controller user-decision digest",
-    "section_or_id": "exact section, requirement, acceptance, decision, or prior user-authority ID"
-  },
-  "supersedes": []
+  "items": [{
+    "schema": 1,
+    "decision_id": "DEC-001",
+    "status": "accepted",
+    "statement": "accepted decision, without added scope",
+    "rationale": "supplied rationale or not_supplied",
+    "consequences": ["supplied consequence"],
+    "scope_ids": ["PRD-REQ-001", "PRD-AC-001", "SLICE-001"],
+    "authority": {
+      "kind": "user|prd|specification|development_plan|controller_resolution",
+      "reference": "stable authority reference or explicit approval reference",
+      "path": "repository-relative path or not_applicable",
+      "sha256": "64 lowercase hex or controller user-decision digest",
+      "section_or_id": "exact section, requirement, acceptance, decision, or prior user-authority ID"
+    },
+    "supersedes": []
+  }]
 }
 ```
 
 `decision_id`, `statement`, and authority fields are non-empty. `supersedes` may name only existing active `DEC-*` entries and never erases them. A correction is a new accepted decision ID. Duplicate IDs, changed payloads for an existing ID, or unsupported fields fail closed.
 
-After validation, the controller atomically appends a JSONL ledger entry by adding mechanical fields: `sequence`, `recorded_at`, `recorder_id`, `prior_ledger_sha256`, and `input_product_revision`. The recorder never invents or hand-maintains these fields. The controller rejects reordered, deleted, or modified prior bytes, then records the resulting ledger SHA and result product revision in controller state and the append receipt (not inside the product-domain ledger, avoiding a self-referential hash).
+After validation, the controller atomically appends a JSONL ledger entry by adding mechanical fields: `sequence`, `recorded_at`, `recorder_id`, `prior_ledger_sha256`, and `input_product_revision`. The recorder never invents or hand-maintains these fields. The controller rejects reordered, deleted, or modified prior bytes, then records the resulting ledger SHA, result product revision, semantic/report binding, and projection provenance in controller state (not inside the product-domain ledger, avoiding a self-referential hash).
 
 ## ADR synchronization
 
 An ADR synchronization assignment names exact ADR paths/sections and source `DEC-*` IDs. Every changed normative statement maps to at least one active decision ID. Preserve repository format. When the ledger lacks a needed rationale, alternative, consequence, lifecycle rule, or scope choice, write `not_supplied` only where the format permits; otherwise stop and request an accepted decision. ADR synchronization cannot introduce a new decision, reinterpret a superseded entry, or alter implementation artifacts.
 
-The controller generates the mechanical change/diff/revision manifest after the recorder's semantic diff inspection. Normative ADR drift invalidates downstream product evidence under ordinary product-revision rules.
+The controller generates the mechanical change/diff manifests after the recorder's semantic diff inspection. Normative ADR drift invalidates downstream product evidence under ordinary product-revision rules.
 
 After controller-validated completion, emit `RECORDING_COMPLETE` and `NEXT_ACTION: $gamedev-pipeline` for Director validation/resume, then stop. A late-phase or authority gap emits the exact upstream/user action instead and never activates it.

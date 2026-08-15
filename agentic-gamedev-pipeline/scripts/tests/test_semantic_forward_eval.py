@@ -34,6 +34,7 @@ CONTROLLER_SPEC.loader.exec_module(controller)
 REQUIRED_SCENARIOS = {
     "ordinary_non_trigger",
     "direct_stage",
+    "requirements_interview_round",
     "pipeline_delegated_stage",
     "director_execution_boundary",
     "prohibited_stage_to_stage_execution",
@@ -43,6 +44,7 @@ REQUIRED_SCENARIOS = {
     "mixed_qa_gates",
     "recovery",
     "long_resume",
+    "conversational_stop_nonmutation",
 }
 EXPECTED_ORACLE_FIELDS = {
     "activation",
@@ -80,7 +82,20 @@ class SemanticForwardEvalCorpusTests(unittest.TestCase):
             with self.subTest(case=case["id"]):
                 self.assertTrue(case["prompt"].strip())
                 expected = case["expected"]
-                self.assertEqual(EXPECTED_ORACLE_FIELDS, set(expected))
+                fields = set(expected)
+                self.assertEqual(
+                    EXPECTED_ORACLE_FIELDS,
+                    fields - {"requirements_round"},
+                )
+                self.assertEqual(
+                    case["id"] in {
+                        "direct_requirements_stage",
+                        "requirements_partial_answers_preserved",
+                        "requirements_grounded_options",
+                        "requirements_unchanged_round_idempotent",
+                    },
+                    "requirements_round" in fields,
+                )
                 self.assertIsInstance(expected["activation"], list)
                 self.assertIsInstance(expected["forbidden_actions"], list)
                 self.assertIsInstance(expected["required_references"], list)
@@ -118,6 +133,34 @@ class SemanticForwardEvalCorpusTests(unittest.TestCase):
             "$gamedev-requirements",
             by_id["upstream_order_prd_before_spec_plan"]["expected"]["next_action"],
         )
+        direct_requirements = by_id["direct_requirements_stage"]
+        self.assertEqual(
+            "ask_grouped_requirements_round",
+            direct_requirements["expected"]["allowed_action"],
+        )
+        self.assertEqual("PRD_READY: no", direct_requirements["expected"]["completion_token"])
+        self.assertEqual("user-decision", direct_requirements["expected"]["next_action"])
+        self.assertEqual(
+            ["outcome", "audience", "core_loop", "release_target", "scope"],
+            direct_requirements["setup"]["unanswered_decisions"],
+        )
+        partial = by_id["requirements_partial_answers_preserved"]
+        self.assertEqual(
+            {"minimum": 1, "maximum": 3}, partial["setup"]["expected_question_count"]
+        )
+        self.assertTrue(partial["setup"]["free_form_answers_allowed"])
+        self.assertIn("discard_partial_answer", partial["expected"]["forbidden_actions"])
+        grounded = by_id["requirements_grounded_options"]
+        self.assertEqual(
+            {"minimum": 2, "maximum": 3}, grounded["setup"]["expected_option_count"]
+        )
+        self.assertTrue(grounded["setup"]["proposal_labels_required"])
+        self.assertTrue(grounded["setup"]["tradeoffs_required"])
+        self.assertTrue(grounded["setup"]["free_form_alternative_allowed"])
+        unchanged = by_id["requirements_unchanged_round_idempotent"]
+        self.assertFalse(unchanged["setup"]["new_user_information"])
+        self.assertIn("mutate_prd", unchanged["expected"]["forbidden_actions"])
+        self.assertIn("increment_prd_revision", unchanged["expected"]["forbidden_actions"])
         self.assertIn(
             "execute_coverage_stage",
             by_id["stage_to_stage_execution_prohibited"]["expected"][
@@ -133,7 +176,7 @@ class SemanticForwardEvalCorpusTests(unittest.TestCase):
             prohibited["expected"]["completion_token"],
         )
         self.assertEqual(
-            "$gamedev-coverage-steward", prohibited["expected"]["next_action"]
+            "$gamedev-pipeline", prohibited["expected"]["next_action"]
         )
         self.assertEqual(
             [], by_id["stale_capsule_rejected"]["expected"]["activation"]
@@ -190,6 +233,11 @@ class SemanticForwardEvalCorpusTests(unittest.TestCase):
             "resolve_qa_gate",
             by_id["long_resume_compact_status"]["expected"]["next_action"],
         )
+        stop_case = by_id["conversational_stop_is_nonmutating"]
+        self.assertEqual("cancel_current_activity_only", stop_case["expected"]["allowed_action"])
+        self.assertIn("call_controller_mutator", stop_case["expected"]["forbidden_actions"])
+        self.assertIn("invoke_repository_pause", stop_case["expected"]["forbidden_actions"])
+        self.assertEqual([], stop_case["expected"]["activation"])
 
     def test_capability_probe_gates_cannot_claim_a_ready_probe(self) -> None:
         for case in self.cases:
@@ -266,8 +314,8 @@ class SemanticForwardEvalGraderTests(unittest.TestCase):
     def test_passing_fixture_grades_every_case_and_dimension(self) -> None:
         report = self.grade_fixture("semantic_candidate_pass.v1.json")
         self.assertTrue(report["summary"]["pass"])
-        self.assertEqual(12, report["summary"]["graded_cases"])
-        self.assertEqual(12, report["summary"]["passed_cases"])
+        self.assertEqual(16, report["summary"]["graded_cases"])
+        self.assertEqual(16, report["summary"]["passed_cases"])
         for result in report["results"]:
             self.assertTrue(result["pass"])
             self.assertTrue(all(item["pass"] for item in result["dimensions"].values()))
@@ -284,6 +332,43 @@ class SemanticForwardEvalGraderTests(unittest.TestCase):
             ["execute_coverage_stage"],
             result["dimensions"]["attempted_actions"]["forbidden_attempts"],
         )
+
+    def test_requirements_round_rejects_bad_counts_and_ungrounded_options(self) -> None:
+        responses = grader.load_candidate(FIXTURES / "semantic_candidate_pass.v1.json")
+        by_id = {item["case_id"]: item for item in responses}
+        for count in (0, 6):
+            with self.subTest(question_count=count):
+                candidate = json.loads(json.dumps(by_id["direct_requirements_stage"]))
+                candidate["requirements_round"]["question_count"] = count
+                report = grader.grade_candidates(
+                    self.corpus, [candidate], ["direct_requirements_stage"]
+                )
+                self.assertFalse(report["summary"]["pass"])
+                self.assertFalse(
+                    report["results"][0]["dimensions"]["requirements_round"]["pass"]
+                )
+
+        for field, value in (
+            ("related_group", False),
+            ("options_count", 1),
+            ("options_grounded", False),
+            ("proposals_not_confirmed", False),
+            ("preserves_partial_answers", False),
+        ):
+            with self.subTest(invalid_requirement_round_field=field):
+                grounded = json.loads(
+                    json.dumps(by_id["requirements_grounded_options"])
+                )
+                grounded["requirements_round"][field] = value
+                report = grader.grade_candidates(
+                    self.corpus, [grounded], ["requirements_grounded_options"]
+                )
+                self.assertFalse(report["summary"]["pass"])
+                self.assertFalse(
+                    report["results"][0]["dimensions"]["requirements_round"][
+                        "checks"
+                    ][field]
+                )
 
     def test_wrong_next_action_jsonl_is_caught_and_cli_is_nonzero(self) -> None:
         fixture = "semantic_candidate_fail_wrong_next.v1.jsonl"

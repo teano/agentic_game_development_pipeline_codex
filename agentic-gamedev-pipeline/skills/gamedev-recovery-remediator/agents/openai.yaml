@@ -1,0 +1,6 @@
+interface:
+  display_name: "GameDev Recovery Remediator"
+  short_description: "Bounded support and evidence recovery"
+  default_prompt: "Use $gamedev-recovery-remediator for one exact controller-assigned support/evidence recovery batch; return RECOVERY_COMPLETE plus NEXT_ACTION, and stop."
+policy:
+  allow_implicit_invocation: false

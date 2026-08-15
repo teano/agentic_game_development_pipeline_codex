@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.util
 import json
 import os
 import re
 import sys
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,10 +31,50 @@ except ImportError:  # pragma: no cover - importlib loading from the pipeline co
     _capability_spec.loader.exec_module(_capability_module)
     parse_capability_ids = _capability_module.parse_capability_ids
 
+_acceptance_path = Path(__file__).resolve().parents[3] / "scripts" / "acceptance_contract.py"
+_acceptance_spec = importlib.util.spec_from_file_location(
+    "gamedev_acceptance_contract", _acceptance_path
+)
+if _acceptance_spec is None or _acceptance_spec.loader is None:
+    raise RuntimeError("Cannot load the canonical acceptance contract")
+_acceptance_module = importlib.util.module_from_spec(_acceptance_spec)
+_acceptance_spec.loader.exec_module(_acceptance_module)
+extract_literal_acceptance_ids = _acceptance_module.extract_literal_acceptance_ids
+parse_acceptance_ids = _acceptance_module.parse_acceptance_ids
+derive_prd_acceptance_inventory = _acceptance_module.derive_prd_acceptance_inventory
+require_known_acceptance_ids = _acceptance_module.require_known_acceptance_ids
+require_complete_acceptance_coverage = (
+    _acceptance_module.require_complete_acceptance_coverage
+)
+
+_requirements_validator_spec = importlib.util.spec_from_file_location(
+    "gamedev_requirements_validator_for_planning",
+    Path(__file__).resolve().parents[2]
+    / "gamedev-requirements"
+    / "scripts"
+    / "validate_product_requirements.py",
+)
+if _requirements_validator_spec is None or _requirements_validator_spec.loader is None:
+    raise RuntimeError("Cannot load the approved PRD validator")
+_requirements_validator = importlib.util.module_from_spec(_requirements_validator_spec)
+_requirements_validator_spec.loader.exec_module(_requirements_validator)
+
+_plan_contract_path = Path(__file__).resolve().parents[3] / "scripts" / "development_plan_contract.py"
+_plan_contract_spec = importlib.util.spec_from_file_location(
+    "gamedev_development_plan_contract", _plan_contract_path
+)
+if _plan_contract_spec is None or _plan_contract_spec.loader is None:
+    raise RuntimeError("Cannot load the shared development-plan contract")
+_plan_contract = importlib.util.module_from_spec(_plan_contract_spec)
+_plan_contract_spec.loader.exec_module(_plan_contract)
+
 
 SCHEMA_VERSION = 1
+SPECIFICATION_STATE_SCHEMA_VERSION = 2
 STATE_RELATIVE_PATH = Path(".agentic-pipeline/development-plan-state.json")
 SPEC_STATE_RELATIVE_PATH = Path(".agentic-pipeline/specification-state.json")
+RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline/state.json")
+RUNTIME_FINDINGS_RELATIVE_PATH = Path(".agentic-pipeline/findings.json")
 MODES = {"single_owner", "sequential_slices"}
 REQUIRED_GLOBAL_SECTIONS = {
     "Decision",
@@ -70,7 +112,6 @@ REQUIRED_SCOPE_FIELDS = {
     "max_product_files",
     "max_product_lines_changed",
     "verification_scope",
-    "scope_baseline_revision",
 }
 REQUIRED_RESEARCH_FIELDS = {"question", "paths", "exclusions", "evidence", "stop"}
 CONTEXT_LIMITS = {
@@ -125,6 +166,57 @@ def parse_frontmatter(path: Path, label: str) -> tuple[dict[str, str], str]:
         elif parent and value:
             fields[f"{parent}.{key}"] = value
     return fields, parts[2].lstrip("\r\n")
+
+
+def exact_top_level_frontmatter_value(text: str, key: str, *, label: str) -> str:
+    parts = text.split("---", 2)
+    if len(parts) != 3 or parts[0] != "":
+        raise DevelopmentPlanError(f"{label} must contain terminated YAML frontmatter")
+    values = [
+        match.group(1).strip()
+        for line in parts[1].splitlines()
+        if (match := re.match(rf"^{re.escape(key)}\s*:\s*(.*?)\s*$", line))
+    ]
+    if len(values) != 1:
+        raise DevelopmentPlanError(
+            f"{label} must contain exactly one top-level {key}: field"
+        )
+    return values[0]
+
+
+def exact_positive_plan_revision(text: str, *, label: str) -> int:
+    value = exact_top_level_frontmatter_value(text, "revision", label=label)
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise DevelopmentPlanError(
+            f"{label} top-level revision must be one positive integer"
+        )
+    return int(value)
+
+
+def normalized_actor_id(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).strip().casefold()
+
+
+def normalized_planning_analyst_identities(value: Any) -> set[str]:
+    """Collect every stored Planning Analyst identity across current/history shapes."""
+    result: set[str] = set()
+
+    def visit(item: Any, key: str | None = None) -> None:
+        if isinstance(item, dict):
+            for child_key, child in item.items():
+                visit(child, child_key)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child, key)
+        elif (
+            isinstance(item, str)
+            and key is not None
+            and (key == "analyst_id" or key.endswith("_analyst_id"))
+        ):
+            result.add(normalized_actor_id(item))
+
+    visit(value)
+    return result
 
 
 def resolve_project_path(root: Path, supplied: str, label: str) -> Path:
@@ -197,11 +289,14 @@ def require_sources(
     )
     if decision_ledger.exists() and not decision_ledger.is_file():
         raise DevelopmentPlanError("decision ledger path must be a file or a creatable file path")
-    prd_meta, _ = parse_frontmatter(prd, "PRD")
-    if prd_meta.get("document_type") != "product-requirements":
-        raise DevelopmentPlanError("PRD document_type must be product-requirements")
-    if prd_meta.get("status") != "approved" or not prd_meta.get("revision"):
-        raise DevelopmentPlanError("PRD must have approved status and a revision")
+    prd_validation = _requirements_validator.validate(prd, True)
+    if not prd_validation.get("valid"):
+        raise DevelopmentPlanError(
+            "PRD does not pass the full approved requirements contract; perform a "
+            "controlled PRD revision and specification reconvergence: "
+            + "; ".join(prd_validation.get("errors") or [])
+        )
+    prd_revision = str(prd_validation["revision"])
 
     spec_meta, _ = parse_frontmatter(spec, "specification")
     if spec_meta.get("document_type") != "technical-specification":
@@ -209,7 +304,7 @@ def require_sources(
     if spec_meta.get("status") != "approved" or not spec_meta.get("revision"):
         raise DevelopmentPlanError("specification must have approved status and a revision")
 
-    prd_hash = sha256(prd)
+    prd_hash = prd_validation["sha256"]
     spec_hash = sha256(spec)
     expected_prd_path = prd.relative_to(root).as_posix()
     spec_product_trace = authority_trace(
@@ -217,12 +312,17 @@ def require_sources(
     )
     if spec_product_trace != {
         "path": expected_prd_path,
-        "revision": prd_meta["revision"],
+        "revision": prd_revision,
         "sha256": prd_hash,
     }:
         raise DevelopmentPlanError("specification does not trace the exact current approved PRD")
 
     specification_state = load_json(root / SPEC_STATE_RELATIVE_PATH, "specification state")
+    if specification_state.get("schema_version") != SPECIFICATION_STATE_SCHEMA_VERSION:
+        raise DevelopmentPlanError(
+            "specification state must use the current schema; reconverge specification "
+            "authority before planning"
+        )
     ready = specification_state.get("ready") or {}
     if specification_state.get("feature") != feature or specification_state.get("status") != "spec_ready":
         raise DevelopmentPlanError("specification state is not SPEC_READY for this feature")
@@ -240,7 +340,7 @@ def require_sources(
     return {
         "prd": {
             "path": expected_prd_path,
-            "revision": prd_meta["revision"],
+            "revision": prd_revision,
             "sha256": prd_hash,
         },
         "specification": {
@@ -278,7 +378,8 @@ def source_drift(root: Path, state: dict[str, Any]) -> list[str]:
 def require_current_sources(root: Path, state: dict[str, Any]) -> None:
     drift = source_drift(root, state)
     if drift:
-        state["status"] = "stale"
+        if state.get("status") not in {"approval_pending", "revision_reopen_pending"}:
+            state["status"] = "stale"
         state["drift"] = drift
         state["updated_at"] = utc_now()
         save_state(root, state)
@@ -306,8 +407,27 @@ def require_nonempty(section: str, slice_id: str, errors: list[str]) -> None:
 def validate_plan(root: Path, state: dict[str, Any], required_status: str = "draft") -> dict[str, Any]:
     require_current_sources(root, state)
     plan = root / state["plan_path"]
-    meta, body = parse_frontmatter(plan, "development plan")
+    try:
+        meta, body = _plan_contract.parse_development_plan_frontmatter(
+            plan.read_text(encoding="utf-8"), label="development plan"
+        )
+    except _plan_contract.PlanContractError as exc:
+        raise DevelopmentPlanError(str(exc)) from exc
     errors: list[str] = []
+    try:
+        exact_positive_plan_revision(
+            plan.read_text(encoding="utf-8"), label="development plan"
+        )
+    except DevelopmentPlanError as exc:
+        errors.append(str(exc))
+    try:
+        prd_acceptance_inventory = derive_prd_acceptance_inventory(
+            (root / state["prd"]["path"]).read_text(encoding="utf-8"),
+            label="approved PRD",
+        )
+    except ValueError as exc:
+        errors.append(str(exc))
+        prd_acceptance_inventory = frozenset()
     expected_meta = {
         "document_type": "development-plan",
         "status": required_status,
@@ -351,8 +471,6 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
                     f"frontmatter {label} {field}: expected {expected_value!r}, "
                     f"got {actual.get(field)!r}"
                 )
-    if not re.fullmatch(r"[1-9][0-9]*", meta.get("revision", "")):
-        errors.append("frontmatter revision must be a positive integer")
     if meta.get("mode") not in MODES:
         errors.append("frontmatter mode is invalid")
     if required_status == "draft" and ("approved_by" in meta or "approved_at" in meta):
@@ -429,35 +547,21 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         global_sections.get("Context Budget", ""), "Context Budget"
     )
     coverage_strategy = global_sections.get("Coverage Strategy", "")
-    for required_text in (
-        "manifest_path",
-        "automated_identity_namespace",
-        "manual_identity_namespace",
-        "mandatory_rule",
-        "capability_prerequisites",
-        "plan-before-engineering",
-        "finalize-after-code-freeze",
-    ):
-        if required_text not in coverage_strategy:
-            errors.append(f"Coverage Strategy must contain {required_text}")
-    global_capability_values = re.findall(
-        r"(?m)^\s*-\s*capability_prerequisites:\s*(\S(?:.*\S)?)\s*$",
-        coverage_strategy,
-    )
-    if len(global_capability_values) != 1:
-        errors.append("Coverage Strategy requires exactly one capability_prerequisites field")
-    else:
-        try:
-            parse_capability_ids(
-                global_capability_values[0],
-                label="Coverage Strategy capability_prerequisites",
-            )
-        except ValueError as exc:
-            errors.append(str(exc))
+    try:
+        _plan_contract.parse_coverage_strategy(coverage_strategy)
+    except _plan_contract.PlanContractError as exc:
+        errors.append(str(exc))
     documentation_strategy = global_sections.get("Documentation Strategy", "")
-    for required_text in ("normative_pre_review", "derived_post_qa"):
-        if required_text not in documentation_strategy:
-            errors.append(f"Documentation Strategy must contain {required_text}")
+    try:
+        _plan_contract.parse_exact_contract_rows(
+            documentation_strategy,
+            label="Documentation Strategy",
+            scalar_keys={"normative_pre_review", "derived_post_qa"},
+            optional_keys={"source_rule"},
+            path_or_policy_keys={"normative_pre_review", "derived_post_qa"},
+        )
+    except _plan_contract.PlanContractError as exc:
+        errors.append(str(exc))
 
     slices = slice_blocks(body)
     slice_ids = [item[0] for item in slices]
@@ -480,6 +584,7 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         if not re.search(r"(?m)^\s*-\s*MILESTONE-\d{3}\b", milestones):
             errors.append("single_owner requires at least one Integration Milestones entry")
 
+    slice_acceptance_by_id: dict[str, set[str]] = {}
     for index, (slice_id, content) in enumerate(slices):
         sections = section_map(content, 3)
         for name in sorted(REQUIRED_SLICE_SECTIONS):
@@ -495,8 +600,25 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         requirements = sections.get("Requirements", "")
         if not re.search(r"\bPRD-REQ-[A-Za-z0-9-]+\b", requirements):
             errors.append(f"{slice_id} must map at least one PRD-REQ")
-        if not re.search(r"\bPRD-AC-[A-Za-z0-9-]+\b", requirements):
-            errors.append(f"{slice_id} must map at least one PRD-AC")
+        try:
+            requirement_acceptance_ids = set(
+                extract_literal_acceptance_ids(
+                    requirements, label=f"{slice_id} Requirements"
+                )
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            requirement_acceptance_ids = set()
+        if not requirement_acceptance_ids:
+            errors.append(f"{slice_id} must map at least one literal PRD-AC")
+        try:
+            require_known_acceptance_ids(
+                requirement_acceptance_ids,
+                prd_acceptance_inventory,
+                label=f"{slice_id} Requirements",
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
 
         dependency_ids = re.findall(r"\bSLICE-\d{3}\b", sections.get("Dependencies", ""))
         allowed_dependencies = set(slice_ids[:index])
@@ -513,29 +635,40 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         missing_scope = sorted(REQUIRED_SCOPE_FIELDS - found_scope_fields)
         if missing_scope:
             errors.append(f"{slice_id} scope contract lacks: {', '.join(missing_scope)}")
-        if not re.search(
-            r"(?m)^\s*-\s*acceptance_ids:\s*.*\bPRD-AC-[A-Za-z0-9-]+\b", scope
-        ):
-            errors.append(f"{slice_id} acceptance_ids must contain at least one PRD-AC")
-        scope_acceptance = set(
-            re.findall(
-                r"\bPRD-AC-[A-Za-z0-9-]+\b",
-                next(
-                    (
-                        value
-                        for key, value in re.findall(
-                            r"(?m)^\s*-\s*([a-z_]+):\s*(.+?)\s*$", scope
-                        )
-                        if key == "acceptance_ids"
-                    ),
-                    "",
-                ),
+        scope_acceptance_values = [
+            value
+            for key, value in re.findall(
+                r"(?m)^\s*-\s*([a-z_]+):\s*(.+?)\s*$", scope
             )
+            if key == "acceptance_ids"
+        ]
+        if len(scope_acceptance_values) != 1:
+            errors.append(
+                f"{slice_id} Scope Contract requires exactly one acceptance_ids field"
+            )
+        scope_acceptance_value = (
+            scope_acceptance_values[0] if len(scope_acceptance_values) == 1 else ""
         )
-        requirement_acceptance = set(
-            re.findall(r"\bPRD-AC-[A-Za-z0-9-]+\b", requirements)
-        )
-        if not scope_acceptance.issubset(requirement_acceptance):
+        try:
+            scope_acceptance = set(
+                parse_acceptance_ids(
+                    scope_acceptance_value,
+                    label=f"{slice_id} Scope Contract acceptance_ids",
+                )
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            scope_acceptance = set()
+        slice_acceptance_by_id[slice_id] = scope_acceptance
+        try:
+            require_known_acceptance_ids(
+                scope_acceptance,
+                prd_acceptance_inventory,
+                label=f"{slice_id} Scope Contract acceptance_ids",
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+        if not scope_acceptance.issubset(requirement_acceptance_ids):
             errors.append(f"{slice_id} scope acceptance_ids must appear in Requirements")
         touchpoints = re.findall(
             r"(?m)^\s*-\s*shared_touchpoint:\s*(TP-\d{3})\s*\|\s*(.+)$", scope
@@ -567,6 +700,37 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
                 )
             if touchpoint_path:
                 seen_touchpoint_paths.add(touchpoint_path)
+        try:
+            editable_values = re.findall(
+                r"(?m)^\s*-\s*editable_paths:\s*(.+?)\s*$", scope
+            )
+            editable_paths = (
+                [item.strip().replace("\\", "/") for item in editable_values[0].split(",")]
+                if len(editable_values) == 1
+                else []
+            )
+            parsed_touchpoints = [
+                {
+                    "id": touchpoint_id,
+                    "path": next(
+                        (
+                            part.split("=", 1)[1].strip().replace("\\", "/")
+                            for part in fields_text.split("|")
+                            if "=" in part and part.split("=", 1)[0].strip() == "path"
+                        ),
+                        "",
+                    ),
+                }
+                for touchpoint_id, fields_text in touchpoints
+            ]
+            _plan_contract.parse_planned_material_permissions(
+                scope,
+                label=f"{slice_id} Scope Contract",
+                editable_paths=editable_paths,
+                shared_touchpoints=parsed_touchpoints,
+            )
+        except _plan_contract.PlanContractError as exc:
+            errors.append(str(exc))
         for budget in ("max_product_files", "max_product_lines_changed"):
             match = re.search(rf"(?m)^\s*-\s*{budget}:\s*([0-9]+)\s*$", scope)
             if not match or int(match.group(1)) < 1:
@@ -596,6 +760,11 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
             "none",
         }:
             errors.append(f"{slice_id} research_not_required requires a concrete reason")
+        elif len(research_rows) > 3:
+            errors.append(f"{slice_id} permits at most three Research Briefs")
+        research_ids = [research_id for research_id, _ in research_rows]
+        if len(research_ids) != len(set(research_ids)):
+            errors.append(f"{slice_id} Research Brief IDs must be unique")
         for research_id, fields_text in research_rows:
             found = {
                 part.split("=", 1)[0].strip()
@@ -607,44 +776,55 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
                 errors.append(f"{slice_id} {research_id} lacks: {', '.join(missing)}")
 
         coverage = sections.get("Coverage Contract", "")
-        for required_text in (
-            "acceptance_ids",
-            "automated_identity_namespace",
-            "manual_identity_namespace",
-            "mandatory_identity_ids",
-            "automation_feasibility",
-            "capability_prerequisites",
-            "planned_manifest",
-            "finalized_manifest",
-            "amendment_authorities",
-        ):
-            if required_text not in coverage:
-                errors.append(f"{slice_id} Coverage Contract must contain {required_text}")
-        slice_capability_values = re.findall(
-            r"(?m)^\s*-\s*capability_prerequisites:\s*(\S(?:.*\S)?)\s*$",
-            coverage,
+        try:
+            parsed_coverage_contract = _plan_contract.parse_slice_coverage_contract(
+                coverage, label=f"{slice_id} Coverage Contract"
+            )
+        except _plan_contract.PlanContractError as exc:
+            errors.append(str(exc))
+            parsed_coverage_contract = {}
+        coverage_acceptance_values = re.findall(
+            r"(?m)^\s*-\s*acceptance_ids:\s*(\S(?:.*\S)?)\s*$", coverage
         )
-        if len(slice_capability_values) != 1:
+        if len(coverage_acceptance_values) != 1:
             errors.append(
-                f"{slice_id} Coverage Contract requires exactly one capability_prerequisites field"
+                f"{slice_id} Coverage Contract requires exactly one acceptance_ids field"
             )
         else:
             try:
-                parse_capability_ids(
-                    slice_capability_values[0],
-                    label=f"{slice_id} Coverage Contract capability_prerequisites",
+                coverage_acceptance = set(
+                    parse_acceptance_ids(
+                        coverage_acceptance_values[0],
+                        label=f"{slice_id} Coverage Contract acceptance_ids",
+                    )
                 )
+                require_known_acceptance_ids(
+                    coverage_acceptance,
+                    prd_acceptance_inventory,
+                    label=f"{slice_id} Coverage Contract acceptance_ids",
+                )
+                if coverage_acceptance != scope_acceptance:
+                    errors.append(
+                        f"{slice_id} Coverage Contract acceptance_ids must exactly equal "
+                        "Scope Contract acceptance_ids"
+                    )
             except ValueError as exc:
                 errors.append(str(exc))
         documentation = sections.get("Documentation Contract", "")
-        for required_text in (
-            "normative_pre_review_paths",
-            "derived_post_qa_paths",
-            "decision_ids",
-            "evidence_sources",
-        ):
-            if required_text not in documentation:
-                errors.append(f"{slice_id} Documentation Contract must contain {required_text}")
+        try:
+            _plan_contract.parse_exact_contract_rows(
+                documentation,
+                label=f"{slice_id} Documentation Contract",
+                scalar_keys={
+                    "normative_pre_review_paths", "derived_post_qa_paths",
+                    "decision_ids", "evidence_sources",
+                },
+                path_or_policy_keys={
+                    "normative_pre_review_paths", "derived_post_qa_paths"
+                },
+            )
+        except _plan_contract.PlanContractError as exc:
+            errors.append(str(exc))
         capsule_budget = sections.get("Context Capsule Budget", "")
         slice_context_budget = validate_context_budget(
             capsule_budget, f"{slice_id} Context Capsule Budget"
@@ -673,6 +853,15 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         ):
             if required_text not in handoff:
                 errors.append(f"{slice_id} Handoff Contract must contain {required_text}")
+
+    try:
+        require_complete_acceptance_coverage(
+            slice_acceptance_by_id,
+            prd_acceptance_inventory,
+            label="Development plan slice acceptance_ids",
+        )
+    except ValueError as exc:
+        errors.append(str(exc))
 
     if errors:
         raise DevelopmentPlanError("invalid development plan: " + "; ".join(errors))
@@ -712,7 +901,11 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
             )
         drift = source_drift(root, state)
         if drift:
-            state["status"] = "stale"
+            if state["status"] not in {
+                "approval_pending",
+                "revision_reopen_pending",
+            }:
+                state["status"] = "stale"
             state["drift"] = drift
             state["updated_at"] = utc_now()
             save_state(root, state)
@@ -745,17 +938,100 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
 def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
-    if state["status"] != "stale":
+    if state.get("revision_reopen"):
+        raise DevelopmentPlanError(
+            "cannot reinitialize while an approved-plan revision transition is pending"
+        )
+    pending_transition = state.get("approval_transition")
+    pending_recovery = (
+        pending_transition is not None or state.get("status") == "approval_pending"
+    )
+    pending_drift: list[str] = []
+    pending_draft_bytes: bytes | None = None
+    pending_resulting_draft_sha256: str | None = None
+    pending_event: dict[str, Any] | None = None
+    if pending_recovery:
+        if state.get("status") != "approval_pending" or not isinstance(
+            pending_transition, dict
+        ):
+            raise DevelopmentPlanError(
+                "pending plan approval state and transition are inconsistent"
+            )
+        required_transition_fields = {
+            "approved_by",
+            "approval_note",
+            "submitted_sha256",
+            "approved_sha256",
+            "approved_at",
+        }
+        if (
+            set(pending_transition) != required_transition_fields
+            or pending_transition.get("approved_by") != "user"
+            or not isinstance(pending_transition.get("approval_note"), str)
+            or not pending_transition["approval_note"].strip()
+            or not isinstance(pending_transition.get("approved_at"), str)
+            or not pending_transition["approved_at"].strip()
+            or any(
+                not isinstance(pending_transition.get(field), str)
+                or re.fullmatch(r"[0-9a-f]{64}", pending_transition[field]) is None
+                for field in ("submitted_sha256", "approved_sha256")
+            )
+        ):
+            raise DevelopmentPlanError("pending plan approval transition is malformed")
+        pending_drift = source_drift(root, state)
+        if not pending_drift:
+            raise DevelopmentPlanError(
+                "cannot reinitialize an unchanged pending approval; resume approve with "
+                "the exact original approval inputs"
+            )
+        pending_plan = resolve_project_path(
+            root, state["plan_path"], "pending development plan"
+        )
+        current_sha = sha256(pending_plan)
+        submitted_sha = pending_transition["submitted_sha256"]
+        approved_sha = pending_transition["approved_sha256"]
+        if current_sha == approved_sha:
+            pending_draft_bytes = recovered_submitted_plan_bytes(pending_plan)
+            pending_resulting_draft_sha256 = hashlib.sha256(
+                pending_draft_bytes
+            ).hexdigest()
+        elif current_sha == submitted_sha:
+            pending_resulting_draft_sha256 = submitted_sha
+        else:
+            reproduced_approved = promoted_plan_bytes(
+                pending_plan,
+                pending_transition["approved_by"],
+                pending_transition["approved_at"],
+            )
+            deterministic_recovery = recovered_submitted_plan_bytes(
+                reproduced_approved
+            )
+            if (
+                hashlib.sha256(reproduced_approved).hexdigest() != approved_sha
+                or pending_plan.read_bytes() != deterministic_recovery
+            ):
+                raise DevelopmentPlanError(
+                    "pending plan approval found unexpected development-plan bytes"
+                )
+            pending_resulting_draft_sha256 = current_sha
+    elif state["status"] != "stale":
         raise DevelopmentPlanError("reinitialize is allowed only from stale state")
-    prior_analyst_ids = {state["analyst_id"]} | {
-        item.get("analyst_id")
-        for item in state.get("history", [])
-        if item.get("analyst_id")
-    }
-    if not args.analyst_id.strip() or args.analyst_id in prior_analyst_ids:
+    if (
+        not args.analyst_id.strip()
+        or normalized_actor_id(args.analyst_id)
+        in normalized_planning_analyst_identities(state)
+    ):
         raise DevelopmentPlanError(
             "reinitialize requires a Planning Analyst identity fresh across all planning history"
         )
+    prior_approval = state.get("approval") or {}
+    prior_plan_sha256 = prior_approval.get("approved_sha256")
+    authorization = require_runtime_unbound(
+        root,
+        recovery_token=getattr(args, "recovery_token", None),
+        reason=getattr(args, "reason", None),
+        prior_plan_sha256=prior_plan_sha256,
+    )
     sources = require_sources(
         root,
         state["feature"],
@@ -773,6 +1049,26 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
             if key not in {"schema_version", "feature", "history"}
         }
     )
+    if pending_recovery:
+        superseded_at = utc_now()
+        pending_event = copy.deepcopy(pending_transition)
+        pending_event.update(
+            {
+                "event": "plan_approval_superseded_by_reinitialize",
+                "superseded_at": superseded_at,
+                "source_drift": pending_drift,
+                "resulting_draft_sha256": pending_resulting_draft_sha256,
+                "reinitialized_by_analyst_id": args.analyst_id,
+            }
+        )
+        history.append(pending_event)
+        if pending_draft_bytes is not None:
+            write_bytes_atomically(
+                resolve_project_path(
+                    root, state["plan_path"], "pending development plan"
+                ),
+                pending_draft_bytes,
+            )
     renewed = {
         "schema_version": SCHEMA_VERSION,
         "feature": state["feature"],
@@ -790,6 +1086,8 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
         "created_at": now,
         "updated_at": now,
     }
+    if authorization:
+        renewed["recovery_authorization"] = authorization
     save_state(root, renewed)
     return renewed
 
@@ -797,6 +1095,7 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
 def command_accept_analysis(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
+    require_bound_recovery_continuation(root, state)
     if state["status"] != "analyzing":
         raise DevelopmentPlanError(f"cannot accept analysis in {state['status']}")
     require_current_sources(root, state)
@@ -827,6 +1126,7 @@ def command_accept_analysis(args: argparse.Namespace) -> dict[str, Any]:
 def command_validate(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
+    require_bound_recovery_continuation(root, state)
     if not state.get("analysis"):
         raise DevelopmentPlanError("Planning Analyst decision has not been accepted")
     required_status = "approved" if state["status"] == "approved" else "draft"
@@ -841,6 +1141,7 @@ def command_validate(args: argparse.Namespace) -> dict[str, Any]:
 def command_submit(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
+    require_bound_recovery_continuation(root, state)
     if state["status"] not in {"drafting", "awaiting_user_approval"}:
         raise DevelopmentPlanError(f"cannot submit plan in {state['status']}")
     result = validate_plan(root, state, "draft")
@@ -852,7 +1153,7 @@ def command_submit(args: argparse.Namespace) -> dict[str, Any]:
     return state
 
 
-def promote_plan(plan: Path, approved_by: str, approved_at: str) -> None:
+def promoted_plan_bytes(plan: Path, approved_by: str, approved_at: str) -> bytes:
     text = plan.read_text(encoding="utf-8")
     parts = text.split("---", 2)
     lines = parts[1].splitlines()
@@ -866,14 +1167,381 @@ def promote_plan(plan: Path, approved_by: str, approved_at: str) -> None:
             updated.append(line)
     updated.extend([f"approved_by: {approved_by}", f"approved_at: {approved_at}"])
     new_text = "---\n" + "\n".join(updated).strip() + "\n---\n" + parts[2].lstrip("\r\n")
-    temporary = plan.with_suffix(".tmp")
-    temporary.write_text(new_text, encoding="utf-8")
-    os.replace(temporary, plan)
+    return new_text.encode("utf-8")
+
+
+def recovered_submitted_plan_bytes(plan: Path | bytes) -> bytes:
+    """Reproduce submitted draft bytes from an interrupted deterministic promotion."""
+    raw = plan.read_bytes() if isinstance(plan, Path) else plan
+    text = raw.decode("utf-8")
+    parts = text.split("---", 2)
+    if len(parts) != 3:
+        raise DevelopmentPlanError("pending development plan lacks YAML frontmatter")
+    lines = parts[1].splitlines()
+    if sum(bool(re.match(r"^status\s*:", line)) for line in lines) != 1:
+        raise DevelopmentPlanError("pending development plan must contain exactly one status")
+    updated: list[str] = []
+    for line in lines:
+        if re.match(r"^(approved_by|approved_at)\s*:", line):
+            continue
+        if re.match(r"^status\s*:", line):
+            updated.append("status: draft")
+        else:
+            updated.append(line)
+    return (
+        "---\n" + "\n".join(updated).strip() + "\n---\n" + parts[2].lstrip("\r\n")
+    ).encode("utf-8")
+
+
+def reopened_plan_bytes(plan: Path, analyst_id: str) -> tuple[bytes, int, int]:
+    """Build the controller-owned mechanical reopening of exact approved bytes."""
+    text = plan.read_text(encoding="utf-8")
+    parts = text.split("---", 2)
+    if len(parts) != 3:
+        raise DevelopmentPlanError("approved development plan lacks YAML frontmatter")
+    lines = parts[1].splitlines()
+    prior_revision = exact_positive_plan_revision(
+        text, label="approved development plan"
+    )
+    next_revision = prior_revision + 1
+    analyst_fields = sum(
+        bool(re.match(r"^planning_analyst_id\s*:", line)) for line in lines
+    )
+    status_fields = sum(bool(re.match(r"^status\s*:", line)) for line in lines)
+    if analyst_fields != 1 or status_fields != 1:
+        raise DevelopmentPlanError(
+            "approved development plan must contain one status and planning_analyst_id field"
+        )
+    updated: list[str] = []
+    for line in lines:
+        if re.match(r"^(approved_by|approved_at)\s*:", line):
+            continue
+        if re.match(r"^status\s*:", line):
+            updated.append("status: draft")
+        elif re.match(r"^revision\s*:", line):
+            updated.append(f"revision: {next_revision}")
+        elif re.match(r"^planning_analyst_id\s*:", line):
+            updated.append(f"planning_analyst_id: {analyst_id}")
+        else:
+            updated.append(line)
+    new_text = "---\n" + "\n".join(updated).strip() + "\n---\n" + parts[2].lstrip("\r\n")
+    return new_text.encode("utf-8"), prior_revision, next_revision
+
+
+def write_bytes_atomically(path: Path, value: bytes) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(value)
+    os.replace(temporary, path)
+
+
+def runtime_recovery_authorization(
+    root: Path,
+    *,
+    recovery_token: str | None,
+    reason: str | None,
+    prior_plan_sha256: str | None,
+) -> dict[str, Any] | None:
+    bound = [
+        path.as_posix()
+        for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
+        if (root / path).exists()
+    ]
+    if not bound:
+        if recovery_token:
+            raise DevelopmentPlanError(
+                "--recovery-token is valid only for an open bound runtime recovery hold"
+            )
+        return None
+    if len(bound) != 2:
+        raise DevelopmentPlanError(
+            "runtime pipeline state binding is incomplete and cannot authorize plan recovery"
+        )
+    runtime = load_json(root / RUNTIME_STATE_RELATIVE_PATH, "runtime state")
+    hold = runtime.get("authority_recovery_hold") or {}
+    token_payload = {
+        "feature": hold.get("feature"),
+        "opened_at": hold.get("opened_at"),
+        "authorized_by": hold.get("authorized_by"),
+        "reason": hold.get("reason"),
+        "requirements_sha256": (hold.get("requirements") or {}).get("sha256"),
+        "spec_sha256": (hold.get("specification") or {}).get("sha256"),
+        "plan_sha256": (hold.get("development_plan") or {}).get("sha256"),
+        "revision": hold.get("revision"),
+    }
+    expected_token = "ARH-" + hashlib.sha256(
+        json.dumps(
+            token_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()[:32].upper()
+    if (
+        runtime.get("phase") != "authority_recovery_hold"
+        or hold.get("status") != "open"
+        or hold.get("token") != expected_token
+        or not recovery_token
+        or recovery_token != hold.get("token")
+        or reason != hold.get("reason")
+        or prior_plan_sha256 != (hold.get("development_plan") or {}).get("sha256")
+    ):
+        raise DevelopmentPlanError(
+            "bound plan recovery requires the exact open authority_recovery_hold token, "
+            "reason, and prior approved plan SHA"
+        )
+    return {
+        "schema": 1,
+        "token": recovery_token,
+        "reason": reason,
+        "runtime_state_path": RUNTIME_STATE_RELATIVE_PATH.as_posix(),
+        "hold_opened_at": hold.get("opened_at"),
+        "prior_plan_sha256": prior_plan_sha256,
+    }
+
+
+def require_runtime_unbound(
+    root: Path,
+    *,
+    recovery_token: str | None = None,
+    reason: str | None = None,
+    prior_plan_sha256: str | None = None,
+) -> dict[str, Any] | None:
+    return runtime_recovery_authorization(
+        root,
+        recovery_token=recovery_token,
+        reason=reason,
+        prior_plan_sha256=prior_plan_sha256,
+    )
+
+
+def require_bound_recovery_continuation(root: Path, state: dict[str, Any]) -> None:
+    bound = any(
+        (root / path).exists()
+        for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
+    )
+    if not bound:
+        return
+    authorization = state.get("recovery_authorization") or {}
+    runtime_recovery_authorization(
+        root,
+        recovery_token=authorization.get("token"),
+        reason=authorization.get("reason"),
+        prior_plan_sha256=authorization.get("prior_plan_sha256"),
+    )
+
+
+def finalize_approved_revision_reopen(
+    root: Path, state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
+    transition = state.get("revision_reopen") or {}
+    exact_args = {
+        "opened_by": args.reopened_by,
+        "reason": args.reason,
+        "new_analyst_id": args.analyst_id,
+        "recovery_token": getattr(args, "recovery_token", None),
+    }
+    if any(transition.get(key) != value for key, value in exact_args.items()):
+        raise DevelopmentPlanError(
+            "pending approved-plan revision must resume with the exact original identities and reason"
+        )
+    authorization = require_runtime_unbound(
+        root,
+        recovery_token=getattr(args, "recovery_token", None),
+        reason=args.reason,
+        prior_plan_sha256=transition["prior_approved_sha256"],
+    )
+    drift = source_drift(root, state)
+    if drift:
+        raise DevelopmentPlanError(
+            "pending approved-plan revision has source-authority drift: "
+            + "; ".join(drift)
+        )
+    plan = root / state["plan_path"]
+    current_sha256 = sha256(plan)
+    if current_sha256 == transition["prior_approved_sha256"]:
+        draft_bytes, prior_revision, next_revision = reopened_plan_bytes(
+            plan, transition["new_analyst_id"]
+        )
+        if (
+            prior_revision != transition["prior_revision"]
+            or next_revision != transition["next_revision"]
+            or hashlib.sha256(draft_bytes).hexdigest() != transition["draft_sha256"]
+        ):
+            raise DevelopmentPlanError(
+                "pending approved-plan revision no longer reproduces its audited draft"
+            )
+        write_bytes_atomically(plan, draft_bytes)
+    elif current_sha256 != transition["draft_sha256"]:
+        raise DevelopmentPlanError(
+            "pending approved-plan revision found unexpected plan bytes"
+        )
+
+    event = copy.deepcopy(transition)
+    event["event"] = "approved_plan_revision_opened"
+    state.setdefault("history", []).append(event)
+    state["status"] = "analyzing"
+    state["analyst_id"] = transition["new_analyst_id"]
+    state["analysis"] = None
+    state["submission"] = None
+    state["approval"] = None
+    state["drift"] = []
+    if authorization:
+        state["recovery_authorization"] = authorization
+    state["updated_at"] = transition["opened_at"]
+    state.pop("revision_reopen", None)
+    save_state(root, state)
+    return state
+
+
+def command_revise_approved(args: argparse.Namespace) -> dict[str, Any]:
+    """Open exact approved bytes as a new draft without carrying approval forward."""
+    root = Path(args.project_root).resolve()
+    state = load_state(root)
+    if state["status"] == "revision_reopen_pending":
+        return finalize_approved_revision_reopen(root, state, args)
+    if state["status"] != "approved":
+        raise DevelopmentPlanError(
+            f"revise-approved requires approved state, got {state['status']}"
+        )
+    if not args.reason.strip() or not args.reopened_by.strip() or not args.analyst_id.strip():
+        raise DevelopmentPlanError(
+            "revision reason, reopened-by identity, and fresh analyst identity are required"
+        )
+    if normalized_actor_id(args.analyst_id) == normalized_actor_id(args.reopened_by):
+        raise DevelopmentPlanError(
+            "revise-approved requires distinct Director and Planning Analyst identities"
+        )
+    if normalized_actor_id(args.analyst_id) in normalized_planning_analyst_identities(state):
+        raise DevelopmentPlanError(
+            "revise-approved requires a Planning Analyst identity fresh across all planning history"
+        )
+    require_current_sources(root, state)
+    plan = root / state["plan_path"]
+    approval = state.get("approval") or {}
+    prior_sha256 = sha256(plan)
+    if approval.get("approved_sha256") != prior_sha256:
+        raise DevelopmentPlanError(
+            "approved plan bytes do not match the controller-recorded approval SHA"
+        )
+    authorization = require_runtime_unbound(
+        root,
+        recovery_token=getattr(args, "recovery_token", None),
+        reason=args.reason,
+        prior_plan_sha256=prior_sha256,
+    )
+    meta, _ = parse_frontmatter(plan, "approved development plan")
+    if (
+        meta.get("document_type") != "development-plan"
+        or meta.get("status") != "approved"
+        or meta.get("feature") != state["feature"]
+        or meta.get("approved_by") != "user"
+    ):
+        raise DevelopmentPlanError(
+            "approved plan frontmatter does not match the recorded approved authority"
+        )
+    opened_at = utc_now()
+    draft_bytes, prior_revision, next_revision = reopened_plan_bytes(
+        plan, args.analyst_id
+    )
+    state["status"] = "revision_reopen_pending"
+    state["revision_reopen"] = {
+        "opened_at": opened_at,
+        "opened_by": args.reopened_by,
+        "reason": args.reason,
+        "new_analyst_id": args.analyst_id,
+        "plan_path": state["plan_path"],
+        "prior_revision": prior_revision,
+        "next_revision": next_revision,
+        "prior_approved_sha256": prior_sha256,
+        "prior_approval_disposition": "revoked_by_plan_revision",
+        "approval_revoked_at": opened_at,
+        "draft_sha256": hashlib.sha256(draft_bytes).hexdigest(),
+        "prior_submission": copy.deepcopy(state.get("submission")),
+        "prior_approval": copy.deepcopy(approval),
+        "prd": copy.deepcopy(state["prd"]),
+        "specification": copy.deepcopy(state["specification"]),
+        "analyst_id": state["analyst_id"],
+        "recovery_token": getattr(args, "recovery_token", None),
+        "recovery_authorization": copy.deepcopy(authorization),
+    }
+    state["updated_at"] = opened_at
+    save_state(root, state)
+    return finalize_approved_revision_reopen(root, state, args)
+
+
+def finalize_plan_approval(
+    root: Path, state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
+    transition = state.get("approval_transition") or {}
+    if (
+        transition.get("approved_by") != args.approved_by
+        or transition.get("approval_note") != args.approval_note
+    ):
+        raise DevelopmentPlanError(
+            "pending plan approval must resume with the exact original approval inputs"
+        )
+    require_current_sources(root, state)
+    plan = root / state["plan_path"]
+    current_sha = sha256(plan)
+    if current_sha == transition.get("submitted_sha256"):
+        approved_bytes = promoted_plan_bytes(
+            plan, transition["approved_by"], transition["approved_at"]
+        )
+        if hashlib.sha256(approved_bytes).hexdigest() != transition.get(
+            "approved_sha256"
+        ):
+            raise DevelopmentPlanError(
+                "pending plan approval no longer reproduces its audited approved bytes"
+            )
+        write_bytes_atomically(plan, approved_bytes)
+    elif current_sha != transition.get("approved_sha256"):
+        reproduced_approved = promoted_plan_bytes(
+            plan, transition["approved_by"], transition["approved_at"]
+        )
+        deterministic_recovery = recovered_submitted_plan_bytes(
+            reproduced_approved
+        )
+        if (
+            hashlib.sha256(reproduced_approved).hexdigest()
+            != transition.get("approved_sha256")
+            or plan.read_bytes() != deterministic_recovery
+        ):
+            raise DevelopmentPlanError(
+                "pending plan approval found unexpected development-plan bytes"
+            )
+        write_bytes_atomically(plan, reproduced_approved)
+
+    result = validate_plan(root, state, "approved")
+    if result["sha256"] != transition["approved_sha256"]:
+        raise DevelopmentPlanError("approved development-plan SHA is inconsistent")
+    state["approval"] = {
+        "approved_by": transition["approved_by"],
+        "approval_note": transition["approval_note"],
+        "submitted_sha256": transition["submitted_sha256"],
+        "approved_sha256": transition["approved_sha256"],
+        "approved_at": transition["approved_at"],
+    }
+    state["status"] = "approved"
+    state["drift"] = []
+    state["updated_at"] = utc_now()
+    state.pop("approval_transition", None)
+    save_state(root, state)
+    return state
 
 
 def command_approve(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
+    if state["status"] == "approved":
+        approval = state.get("approval") or {}
+        if (
+            approval.get("approved_by") == args.approved_by
+            and approval.get("approval_note") == args.approval_note
+            and sha256(root / state["plan_path"]) == approval.get("approved_sha256")
+        ):
+            require_current_sources(root, state)
+            return state
+        raise DevelopmentPlanError("development plan is already approved with different inputs")
+    require_bound_recovery_continuation(root, state)
+    if state["status"] == "approval_pending":
+        return finalize_plan_approval(root, state, args)
     if state["status"] != "awaiting_user_approval" or not state.get("submission"):
         raise DevelopmentPlanError("approval requires a submitted draft")
     require_current_sources(root, state)
@@ -885,26 +1553,29 @@ def command_approve(args: argparse.Namespace) -> dict[str, Any]:
     if sha256(plan) != state["submission"]["sha256"]:
         raise DevelopmentPlanError("draft changed after submission; resubmit before approval")
     approved_at = utc_now()
-    promote_plan(plan, args.approved_by, approved_at)
-    result = validate_plan(root, state, "approved")
-    state["approval"] = {
+    approved_bytes = promoted_plan_bytes(plan, args.approved_by, approved_at)
+    state["approval_transition"] = {
         "approved_by": args.approved_by,
         "approval_note": args.approval_note,
         "submitted_sha256": state["submission"]["sha256"],
-        "approved_sha256": result["sha256"],
+        "approved_sha256": hashlib.sha256(approved_bytes).hexdigest(),
         "approved_at": approved_at,
     }
-    state["status"] = "approved"
+    state["status"] = "approval_pending"
     state["updated_at"] = utc_now()
     save_state(root, state)
-    return state
+    return finalize_plan_approval(root, state, args)
 
 
 def command_status(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
     drift = source_drift(root, state)
-    if drift and state["status"] != "stale":
+    if drift and state["status"] in {"approval_pending", "revision_reopen_pending"}:
+        state["drift"] = drift
+        state["updated_at"] = utc_now()
+        save_state(root, state)
+    elif drift and state["status"] != "stale":
         state["status"] = "stale"
         state["drift"] = drift
         state["updated_at"] = utc_now()
@@ -932,7 +1603,31 @@ def build_parser() -> argparse.ArgumentParser:
     reinitialize.add_argument("--spec")
     reinitialize.add_argument("--plan")
     reinitialize.add_argument("--decision-ledger")
+    reinitialize.add_argument("--recovery-token")
+    reinitialize.add_argument("--reason")
     reinitialize.set_defaults(handler=command_reinitialize)
+
+    revise = commands.add_parser(
+        "revise-approved",
+        help=(
+            "revoke exact approved bytes and open a resumable new draft revision; "
+            "after runtime binding requires an exact authority_recovery_hold token"
+        ),
+    )
+    revise.add_argument("--reason", required=True, help="exact audited revision reason")
+    revise.add_argument(
+        "--reopened-by", required=True, help="Development Plan Director identity"
+    )
+    revise.add_argument(
+        "--analyst-id",
+        required=True,
+        help="Planning Analyst identity unused across all planning history",
+    )
+    revise.add_argument(
+        "--recovery-token",
+        help="exact token from a controller-owned authority_recovery_hold",
+    )
+    revise.set_defaults(handler=command_revise_approved)
 
     analysis = commands.add_parser("accept-analysis")
     analysis.add_argument("--analyst-id", required=True)

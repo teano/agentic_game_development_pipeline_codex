@@ -16,13 +16,53 @@
     {
       "case_id": "direct_requirements_stage",
       "activation": ["gamedev-requirements"],
-      "current_action": "complete_requirements_stage",
-      "completion_token": "PRD_READY: yes",
-      "next_action": "$gamedev-specification",
-      "forbidden_actions": ["execute_specification_stage"],
+      "current_action": "ask_grouped_requirements_round",
+      "completion_token": "PRD_READY: no",
+      "next_action": "user-decision",
+      "forbidden_actions": ["ask_single_question_round", "invent_requirements", "promote_proposals_to_confirmed", "execute_specification_stage"],
       "attempted_actions": [],
+      "requirements_round": {"question_count": 5, "related_group": true, "options_count": 0, "options_grounded": false, "proposals_not_confirmed": true, "preserves_partial_answers": true},
       "references_read": ["skills/gamedev-pipeline/references/stage-handoff-invariant.md"],
-      "stop_result": "stop_after_handoff",
+      "stop_result": "stop_after_grouped_question_round",
+      "authority_result": "explicit_user_invocation"
+    },
+    {
+      "case_id": "requirements_partial_answers_preserved",
+      "activation": ["gamedev-requirements"],
+      "current_action": "ask_remaining_grouped_requirements_round",
+      "completion_token": "PRD_READY: no",
+      "next_action": "user-decision",
+      "forbidden_actions": ["repeat_answered_question", "discard_partial_answer", "invent_missing_answer", "force_option_only_response"],
+      "attempted_actions": [],
+      "requirements_round": {"question_count": 3, "related_group": true, "options_count": 0, "options_grounded": false, "proposals_not_confirmed": true, "preserves_partial_answers": true},
+      "references_read": ["skills/gamedev-pipeline/references/stage-handoff-invariant.md"],
+      "stop_result": "stop_after_grouped_question_round",
+      "authority_result": "explicit_user_invocation"
+    },
+    {
+      "case_id": "requirements_grounded_options",
+      "activation": ["gamedev-requirements"],
+      "current_action": "offer_grounded_options_and_ask_grouped_round",
+      "completion_token": "PRD_READY: no",
+      "next_action": "user-decision",
+      "forbidden_actions": ["invent_repository_option", "present_proposal_as_requirement", "impose_recommendation", "force_option_only_response"],
+      "attempted_actions": [],
+      "requirements_round": {"question_count": 1, "related_group": true, "options_count": 2, "options_grounded": true, "proposals_not_confirmed": true, "preserves_partial_answers": true},
+      "references_read": ["skills/gamedev-pipeline/references/stage-handoff-invariant.md"],
+      "stop_result": "stop_after_grouped_question_round",
+      "authority_result": "explicit_user_invocation"
+    },
+    {
+      "case_id": "requirements_unchanged_round_idempotent",
+      "activation": ["gamedev-requirements"],
+      "current_action": "repeat_identical_pending_round_without_prd_mutation",
+      "completion_token": "PRD_READY: no",
+      "next_action": "user-decision",
+      "forbidden_actions": ["change_pending_question_set", "mutate_prd", "increment_prd_revision", "invent_requirement"],
+      "attempted_actions": [],
+      "requirements_round": {"question_count": 3, "related_group": true, "options_count": 0, "options_grounded": false, "proposals_not_confirmed": true, "preserves_partial_answers": true},
+      "references_read": ["skills/gamedev-pipeline/references/stage-handoff-invariant.md"],
+      "stop_result": "stop_after_identical_question_round",
       "authority_result": "explicit_user_invocation"
     },
     {
@@ -30,7 +70,7 @@
       "activation": ["gamedev-engineer"],
       "current_action": "complete_bounded_engineering_lane",
       "completion_token": "ENGINEERING_COMPLETE: yes",
-      "next_action": "$gamedev-coverage-steward",
+      "next_action": "$gamedev-pipeline",
       "forbidden_actions": ["execute_coverage_stage", "activate_unlisted_stage"],
       "attempted_actions": [],
       "references_read": [
@@ -62,8 +102,8 @@
       "activation": ["gamedev-engineer"],
       "current_action": "complete_current_engineering_lane_only",
       "completion_token": "ENGINEERING_COMPLETE: yes",
-      "next_action": "$gamedev-coverage-steward",
-      "forbidden_actions": ["execute_coverage_stage", "delegate_coverage_steward"],
+      "next_action": "$gamedev-pipeline",
+      "forbidden_actions": ["execute_coverage_stage", "continue_pipeline_without_director"],
       "attempted_actions": [],
       "references_read": [
         "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
@@ -116,7 +156,7 @@
       "activation": ["gamedev-engineer"],
       "current_action": "record_research_not_required",
       "completion_token": "RESEARCH_NOT_REQUIRED: yes",
-      "next_action": "$gamedev-coverage-steward",
+      "next_action": "$gamedev-pipeline",
       "forbidden_actions": ["activate_gamedev_research_without_brief", "skip_coverage_planning"],
       "attempted_actions": [],
       "references_read": [
@@ -173,6 +213,20 @@
       ],
       "stop_result": "continue_with_controller_next_action",
       "authority_result": "active_pipeline_director"
+    },
+    {
+      "case_id": "conversational_stop_is_nonmutating",
+      "activation": [],
+      "current_action": "cancel_current_activity_only",
+      "completion_token": null,
+      "next_action": null,
+      "forbidden_actions": ["call_controller_mutator", "release_write_lease", "invoke_repository_pause", "change_pipeline_phase"],
+      "attempted_actions": [],
+      "references_read": [
+        "skills/gamedev-pipeline/references/pipeline-protocol.md"
+      ],
+      "stop_result": "stop_without_mutation",
+      "authority_result": "no_repository_pause_authority"
     }
   ]
 }

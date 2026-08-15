@@ -168,6 +168,35 @@ def unique_extend(target: list[str], additions: list[str] | None) -> list[str]:
     return sorted(combined)
 
 
+def metadata_errors(entry: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(entry.get("owner"), str) or not entry["owner"].strip():
+        errors.append("owner")
+    impacts = entry.get("impacts")
+    if (
+        not isinstance(impacts, list)
+        or not impacts
+        or any(not isinstance(item, str) or not item.strip() for item in impacts)
+    ):
+        errors.append("impact")
+    if (
+        not isinstance(entry.get("deferral_rationale"), str)
+        or not entry["deferral_rationale"].strip()
+    ):
+        errors.append("rationale")
+    return errors
+
+
+def require_complete_metadata(entry: dict[str, Any]) -> None:
+    errors = metadata_errors(entry)
+    if errors:
+        raise BacklogError(
+            f"Deferred finding {entry.get('id', '<unknown>')} lacks required "
+            + ", ".join(errors)
+            + "; repair it with backlog-upsert or extend before use"
+        )
+
+
 def change_status(entry: dict[str, Any], status: str, *, reason: str, actor: str) -> None:
     if status not in STATUSES:
         raise BacklogError(f"Unsupported deferred finding status: {status}")
@@ -218,18 +247,25 @@ def append_occurrence(entry: dict[str, Any], occurrence: dict[str, Any] | None) 
 
 
 def update_entry(entry: dict[str, Any], args: argparse.Namespace, now: str) -> None:
-    prior_evidence = set(entry["evidence"])
-    entry["conditions"] = unique_extend(entry["conditions"], args.condition)
-    entry["impacts"] = unique_extend(entry["impacts"], args.impact)
-    entry["evidence"] = unique_extend(entry["evidence"], args.evidence)
+    owner = args.owner.strip()
+    rationale = args.rationale.strip()
+    existing_owner = entry.get("owner")
+    if isinstance(existing_owner, str) and existing_owner.strip() and existing_owner != owner:
+        raise BacklogError("Use assign to transfer an existing deferred finding owner")
+    entry["owner"] = owner
+    entry["deferral_rationale"] = rationale
+    prior_evidence = set(entry.get("evidence", []))
+    entry["conditions"] = unique_extend(entry.get("conditions", []), args.condition)
+    entry["impacts"] = unique_extend(entry.get("impacts", []), args.impact)
+    entry["evidence"] = unique_extend(entry.get("evidence", []), args.evidence)
     entry["observed_by"] = unique_extend(
-        entry["observed_by"], [args.observed_by] if args.observed_by else []
+        entry.get("observed_by", []), [args.observed_by] if args.observed_by else []
     )
     entry["origin_features"] = unique_extend(
-        entry["origin_features"], [args.origin_feature] if args.origin_feature else []
+        entry.get("origin_features", []), [args.origin_feature] if args.origin_feature else []
     )
     entry["reentry_conditions"] = unique_extend(
-        entry["reentry_conditions"], args.reentry_condition
+        entry.get("reentry_conditions", []), args.reentry_condition
     )
     new_evidence = sorted(set(entry["evidence"]) - prior_evidence)
     if SEVERITIES[args.provisional_severity] > SEVERITIES[entry["provisional_severity"]]:
@@ -258,6 +294,14 @@ def update_entry(entry: dict[str, Any], args: argparse.Namespace, now: str) -> N
             reason="rediscovered with an independent occurrence or new evidence",
             actor=args.observed_by,
         )
+    if entry["status"] == "deferred_untriaged":
+        change_status(
+            entry,
+            "deferred_owned",
+            reason="required deferred metadata recorded",
+            actor=args.observed_by or owner,
+        )
+    require_complete_metadata(entry)
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -296,12 +340,11 @@ def cmd_upsert(args: argparse.Namespace) -> int:
             created = False
         else:
             entry_id = stable_id(fingerprint, entries)
-            status = "deferred_owned" if args.owner else "deferred_untriaged"
             occurrence = occurrence_from_args(args, now)
             entry = {
                 "id": entry_id,
                 "fingerprint": fingerprint,
-                "status": status,
+                "status": "deferred_owned",
                 "title": args.title,
                 "component": args.component,
                 "contract": args.contract,
@@ -312,7 +355,8 @@ def cmd_upsert(args: argparse.Namespace) -> int:
                 "violated_invariant": args.violated_invariant,
                 "provisional_severity": args.provisional_severity,
                 "reachability": args.reachability,
-                "owner": args.owner,
+                "owner": args.owner.strip(),
+                "deferral_rationale": args.rationale.strip(),
                 "conditions": unique_extend([], args.condition),
                 "impacts": unique_extend([], args.impact),
                 "evidence": unique_extend([], args.evidence),
@@ -327,6 +371,7 @@ def cmd_upsert(args: argparse.Namespace) -> int:
                 "status_history": [],
                 "severity_history": [],
             }
+            require_complete_metadata(entry)
             entries[entry_id] = entry
             created = True
         atomic_write_json(path, backlog)
@@ -360,6 +405,7 @@ def mutate_one(args: argparse.Namespace, callback: Any) -> int:
         backlog = load_backlog(path)
         entry = require_entry(backlog, args.id)
         callback(backlog, entry)
+        require_complete_metadata(entry)
         atomic_write_json(path, backlog)
     print(json.dumps({"id": args.id, "status": entry["status"]}, indent=2))
     return 0
@@ -405,6 +451,8 @@ def cmd_link_duplicate(args: argparse.Namespace) -> int:
         backlog = load_backlog(path)
         duplicate = require_entry(backlog, args.id)
         canonical = require_entry(backlog, args.canonical_id)
+        require_complete_metadata(duplicate)
+        require_complete_metadata(canonical)
         if duplicate["id"] == canonical["id"]:
             raise BacklogError("A deferred finding cannot be a duplicate of itself")
         change_status(duplicate, "duplicate", reason=args.reason, actor=args.linked_by)
@@ -489,6 +537,20 @@ def backlog_scope_errors(
             errors.append(
                 f"{finding_id} references terminal deferred finding {entry_id} ({entry.get('status')}); reactivate/upsert it"
             )
+        elif metadata_errors(entry):
+            errors.append(
+                f"{finding_id} references legacy deferred finding {entry_id} without "
+                "owner, impact, and rationale; repair it with backlog-upsert or extend"
+            )
+        elif not any(
+            occurrence.get("occurrence_id") == f"{item.get('source')}:{finding_id}"
+            for occurrence in entry.get("occurrences", [])
+            if isinstance(occurrence, dict)
+        ):
+            errors.append(
+                f"{finding_id} references deferred finding {entry_id} without exact "
+                f"occurrence {item.get('source')}:{finding_id}; upsert the current candidate"
+            )
     return errors
 
 
@@ -524,9 +586,9 @@ def add_project_root(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project-root", default=".")
 
 
-def add_lists(parser: argparse.ArgumentParser) -> None:
+def add_lists(parser: argparse.ArgumentParser, *, require_impact: bool = False) -> None:
     parser.add_argument("--condition", action="append", default=[])
-    parser.add_argument("--impact", action="append", default=[])
+    parser.add_argument("--impact", action="append", default=[], required=require_impact)
     parser.add_argument("--evidence", action="append", default=[])
     parser.add_argument("--reentry-condition", action="append", default=[])
 
@@ -562,8 +624,9 @@ def build_parser() -> argparse.ArgumentParser:
     upsert.add_argument("--violated-invariant", required=True)
     upsert.add_argument("--provisional-severity", choices=tuple(SEVERITIES), required=True)
     upsert.add_argument("--reachability", choices=tuple(sorted(REACHABILITY)), required=True)
-    upsert.add_argument("--owner")
-    add_lists(upsert)
+    upsert.add_argument("--owner", required=True)
+    upsert.add_argument("--rationale", required=True)
+    add_lists(upsert, require_impact=True)
     add_observation(upsert, required=True)
     upsert.set_defaults(handler=cmd_upsert)
 
@@ -571,7 +634,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_project_root(extend)
     extend.add_argument("--id", required=True)
     extend.add_argument("--provisional-severity", choices=tuple(SEVERITIES), required=True)
-    add_lists(extend)
+    extend.add_argument("--owner", required=True)
+    extend.add_argument("--rationale", required=True)
+    add_lists(extend, require_impact=True)
     add_observation(extend, required=False)
     extend.set_defaults(handler=cmd_extend)
 

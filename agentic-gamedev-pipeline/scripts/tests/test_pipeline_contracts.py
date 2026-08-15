@@ -121,13 +121,6 @@ class PipelineCommandContractTests(unittest.TestCase):
         )
         cls.commands = cls.command_action.choices
 
-    def advertised_phase_commands(self) -> set[str]:
-        protocol = PROTOCOL_PATH.read_text(encoding="utf-8")
-        table = protocol.split("Phase routing uses these command families:", 1)[1].split(
-            "Generic `resolve-finding`", 1
-        )[0]
-        return set(re.findall(r"`([a-z][a-z0-9-]+)`", table))
-
     def required_flags(self, command: str) -> set[str]:
         return {
             option
@@ -136,14 +129,19 @@ class PipelineCommandContractTests(unittest.TestCase):
             for option in action.option_strings
         }
 
-    def test_every_phase_map_command_resolves_in_argparse(self) -> None:
-        advertised = self.advertised_phase_commands()
-        self.assertTrue(advertised)
-        self.assertEqual(set(), advertised - set(self.commands))
-        self.assertNotIn("resolve-finding", advertised)
+    def test_protocol_delegates_exact_command_syntax_to_argparse_help(self) -> None:
+        protocol = PROTOCOL_PATH.read_text(encoding="utf-8")
+        self.assertIn("exact CLI syntax stays in each command's `--help`", protocol)
+        self.assertNotIn("| Purpose | Commands |", protocol)
+        for command in self.commands:
+            with self.subTest(command=command):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        self.parser.parse_args([command, "--help"])
+                self.assertEqual(0, raised.exception.code)
 
-    def test_fail_closed_resolve_is_parseable_but_not_advertised(self) -> None:
-        self.assertIn("resolve-finding", self.commands)
+    def test_generic_resolve_command_is_removed(self) -> None:
+        self.assertNotIn("resolve-finding", self.commands)
         self.assertNotIn("resolve-finding", self.parser.format_help())
         self.assertNotIn("resolve-finding", PROTOCOL_PATH.read_text(encoding="utf-8").split(
             "## Revision and completion invariants", 1

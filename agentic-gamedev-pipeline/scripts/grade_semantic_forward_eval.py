@@ -7,7 +7,8 @@ line. Every response contains: case_id, activation, current_action,
 completion_token, next_action, forbidden_actions, attempted_actions,
 references_read, stop_result, and authority_result.
 ``references_read`` contains repository skill-reference paths only; omit the
-activated SKILL.md and ordinary project/source artifacts.
+activated SKILL.md and ordinary project/source artifacts. Requirements interview
+responses also contain ``requirements_round`` with the observed round shape.
 
 Examples:
   python scripts/grade_semantic_forward_eval.py --candidate candidate.json
@@ -38,6 +39,15 @@ CANDIDATE_FIELDS = {
     "references_read",
     "stop_result",
     "authority_result",
+}
+OPTIONAL_CANDIDATE_FIELDS = {"requirements_round"}
+REQUIREMENTS_ROUND_FIELDS = {
+    "question_count",
+    "related_group",
+    "options_count",
+    "options_grounded",
+    "proposals_not_confirmed",
+    "preserves_partial_answers",
 }
 LIST_FIELDS = {
     "activation",
@@ -84,7 +94,7 @@ def validate_candidate_response(value: Any, label: str) -> dict[str, Any]:
             f"{label} schema_version must be {CANDIDATE_SCHEMA_VERSION}"
         )
     missing = sorted(CANDIDATE_FIELDS - set(response))
-    extra = sorted(set(response) - CANDIDATE_FIELDS)
+    extra = sorted(set(response) - CANDIDATE_FIELDS - OPTIONAL_CANDIDATE_FIELDS)
     if missing or extra:
         details: list[str] = []
         if missing:
@@ -111,6 +121,24 @@ def validate_candidate_response(value: Any, label: str) -> dict[str, Any]:
     ):
         if response[field] is not None and not isinstance(response[field], str):
             raise GradeInputError(f"{label}.{field} must be a string or null")
+    requirements_round = response.get("requirements_round")
+    if requirements_round is not None:
+        if not isinstance(requirements_round, dict) or set(requirements_round) != REQUIREMENTS_ROUND_FIELDS:
+            raise GradeInputError(
+                f"{label}.requirements_round must use the exact interview-round fields"
+            )
+        for field in ("question_count", "options_count"):
+            if isinstance(requirements_round[field], bool) or not isinstance(
+                requirements_round[field], int
+            ):
+                raise GradeInputError(
+                    f"{label}.requirements_round.{field} must be an integer"
+                )
+        for field in REQUIREMENTS_ROUND_FIELDS - {"question_count", "options_count"}:
+            if not isinstance(requirements_round[field], bool):
+                raise GradeInputError(
+                    f"{label}.requirements_round.{field} must be boolean"
+                )
     return response
 
 
@@ -187,6 +215,28 @@ def set_dimension(expected: list[str], actual: list[str]) -> dict[str, Any]:
     }
 
 
+def requirements_round_dimension(expected: Any, actual: Any) -> dict[str, Any]:
+    if expected is None:
+        return scalar_dimension(None, actual)
+    if not isinstance(actual, dict):
+        return {"pass": False, "expected": expected, "actual": actual}
+    questions = expected["question_count"]
+    checks = {
+        "question_count": questions["minimum"] <= actual["question_count"] <= questions["maximum"],
+        "related_group": actual["related_group"] is True,
+        "options_count": actual["options_count"] in expected["options_count"]["allowed"],
+        "options_grounded": actual["options_count"] == 0 or actual["options_grounded"] is True,
+        "proposals_not_confirmed": actual["proposals_not_confirmed"] is True,
+        "preserves_partial_answers": actual["preserves_partial_answers"] is True,
+    }
+    return {
+        "pass": all(checks.values()),
+        "expected": expected,
+        "actual": actual,
+        "checks": checks,
+    }
+
+
 def grade_response(case: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
     expected = case["expected"]
     forbidden_attempts = sorted(
@@ -220,6 +270,9 @@ def grade_response(case: dict[str, Any], response: dict[str, Any]) -> dict[str, 
         ),
         "authority_result": scalar_dimension(
             expected["authority_result"], response["authority_result"]
+        ),
+        "requirements_round": requirements_round_dimension(
+            expected.get("requirements_round"), response.get("requirements_round")
         ),
     }
     return {

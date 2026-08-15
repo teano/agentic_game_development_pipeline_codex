@@ -9,11 +9,11 @@ description: Explicit-invocation only. Use only when the user explicitly request
 
 Proceed only on the explicit activation described above. An Engineer brief is input, not activation authority; only the user or active Pipeline Director may start this stage. Reject an incomplete brief or any write authority.
 
-Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md). Remain read-only except for the assigned result bundle. Do not edit project/controller/product/test files, change the brief, activate another stage, or spawn subagents. Report revision drift instead of continuing.
+Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md) and [research-bundle-contract.md](references/research-bundle-contract.md). Remain read-only except for the assigned result bundle. Do not edit project/controller/product/test files, change the brief, activate another stage, or spawn subagents. Report revision drift instead of continuing.
 
 ## Execute one bounded brief
 
-Require one concrete question, active `SLICE-*` and related `REQ/AC` IDs, exact base revision, seed and allowed paths/symbols, exclusions, requested evidence, positive `max_files`, deterministic stop condition, and one output path under the assigned research area.
+Require one concrete question, active `SLICE-*` and a non-empty exact subset of that slice's canonical `PRD-REQ-*` and `PRD-AC-*` IDs, exact base revision, existing file seeds, existing allowed file/directory paths, allowed symbols, exclusions, requested evidence, positive `max_files`, deterministic stop condition, and one output path under the assigned research area.
 
 1. Verify revision and boundary before opening project files.
 2. Start from supplied seeds and follow only links required to answer the question.
@@ -27,8 +27,8 @@ Persist inspected paths/symbols, owners/contracts/precedents, lifecycle/integrat
 
 Return `RESEARCH_COMPLETE: yes|no` with `COMPLETE`, `LIMIT_REACHED`, `STALE_REVISION`, or `INVALID_BRIEF`.
 
-- `COMPLETE` -> `NEXT_ACTION: $gamedev-coverage-steward`;
-- `LIMIT_REACHED` -> `NEXT_ACTION: $gamedev-engineer` for a revised brief or scope decision;
+- `COMPLETE` -> `NEXT_ACTION: $gamedev-pipeline` for controller-owned coverage planning;
+- `LIMIT_REACHED` -> `NEXT_ACTION: $gamedev-pipeline` for Director-owned brief revision or an exact user scope decision;
 - `STALE_REVISION` or `INVALID_BRIEF` -> `NEXT_ACTION: $gamedev-pipeline` Director correction, or the equivalent user action for standalone use.
 
 Research evidence never authorizes production edits. Do not execute `NEXT_ACTION`; stop after returning the result bundle.

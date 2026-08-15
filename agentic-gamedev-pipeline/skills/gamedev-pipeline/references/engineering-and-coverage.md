@@ -4,11 +4,9 @@ Read this reference only before slice research, coverage, engineering, normative
 
 ## Slice research and coverage planning
 
-For each active slice, the Director first activates `$gamedev-engineer` in `research-briefing` mode without a write lease. The Engineer returns either one to three exact briefs plus `NEXT_ACTION: $gamedev-research`, or exact `research_not_required` evidence plus `NEXT_ACTION: $gamedev-coverage-steward`. The Engineer never activates those stages.
+Read the approved slice's exact Research Briefs decision. For `research_not_required`, the Director records `slice-research-not-required` with that non-empty source-backed reason; create no briefing or owner worker. Only explicit approved `RESEARCH-*` briefs make research required: activate those bounded Research assignments, validate every exact-revision result bundle, and record `slice-research-complete`. Research reports are excluded from product/support/evidence identities.
 
-The Director activates each bounded Research stage, validates every exact-revision result bundle, and records `slice-research-complete`; alternatively it records `slice-research-not-required` with the non-empty source-backed reason. Research reports are excluded from product/support/evidence identities.
-
-Next activate a fresh Coverage Steward in `plan-before-engineering`. Accept only a schema-2 planned manifest with every assigned acceptance criterion mapped or explicitly gapped, complete expected identities, a separately explicit mandatory set, exact coordinates/prerequisites, and owning slice.
+Next, mechanically project every assigned acceptance ID into the approved gate categories and expected automated/manual registrations, then use `coverage-plan-complete`. The controller still validates the schema-2 manifest, exact acceptance mapping, expected and mandatory identity sets, coordinates/prerequisites, and owning slice. Coverage is Director/controller work and activates no coverage worker. Route a real gap to the Engineer for evidence/registration work, the current verification worker for a missing/invalid receipt, or the exact manual/user policy action.
 
 No product edit is legal before accepted research decision, accepted coverage plan, current `slice-scope-check`, validated Engineer capsule, and exclusive lease.
 
@@ -20,22 +18,12 @@ The Scope Contract is an allowlist. The controller compares the actual diff with
 
 An Engineer returns bounded semantic annotations and final diff inspection; the controller authors revisions, change/diff manifests, and sealed handoff. `ENGINEERING_PASS` covers assigned product/root-cause work, tightly coupled automated tests, targeted checks, and final diff inspection. Manual QA/DataStore/operator/publication work may remain pending.
 
-Route remediation to origin slice or integration scope in plan dependency order. Every return gets a new lease. A fourth route return requires a fresh Engineer and controller-generated exact-revision transfer.
+Route remediation to origin slice or integration scope in plan dependency order. Every return gets a new lease. Preserve the controller's two-cycle Review/remediation breaker; after it opens, use the required fresh Engineer transfer or recorded manual/user policy action rather than starting another identical cycle.
 
 ## Coverage finalization and implementation completion
 
-After every code freeze, activate a fresh Coverage Steward in `finalize-after-code-freeze`. Require exact expected/actual identity equality, separate mandatory-set equality, all assigned acceptance IDs mapped, no gap, and mandatory automated execution pass. Controlled amendments remain append-only and require exact accepted authority.
+After every code freeze, run controller-owned `coverage-finalize`. Require exact expected/actual identity equality, separate mandatory-set equality, all assigned acceptance IDs mapped, no gap, and mandatory automated execution pass. Controlled amendments remain append-only and require exact accepted authority. Route a gap through the same Engineer, verification, or manual/user policy owners; never activate a coverage worker.
 
 The final feature aggregate establishes `implementation_state=pass` when all slices and mandatory automated identities pass; manual identities may remain pending. It does not establish feature verification.
 
-After implementation completion, activate Documentation Finisher in `normative-pre-review` when exact plan outputs are required, or use `documentation-not-required` with the exact approved `policy=<reference>`. Normative docs are product inputs and must be frozen before convergence.
-
-## Capsules and payload ceilings
-
-Before each specialized stage, create and validate a schema-1 capsule under `role-artifacts-and-context.md`. A stage may choose positive ceilings smaller than or equal to the approved plan ceilings; it may never exceed them. `max_total_files` must cover each authority/evidence file ceiling.
-
-Controller telemetry measures only capsule JSON plus referenced authority/evidence bytes. It is `capsule_payload` telemetry, not total prompt/system context. Track static skill/reference bundles separately in CI.
-
-## Completion routes
-
-Every specialized stage returns its completion token and `NEXT_ACTION`, then stops. The Director validates state before activating the next stage. No stage-produced token authorizes the next stage by itself.
+After implementation completion, activate Documentation Finisher in `normative-pre-review` only when required normative outputs have an actual delta. Otherwise use `documentation-not-required` with the exact approved `policy=<reference>`. Normative docs are product inputs and must be frozen before convergence.

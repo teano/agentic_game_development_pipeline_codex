@@ -110,12 +110,12 @@ Controller-generated schema-2 handoff with exact revisions/change evidence plus 
 - editable_paths: path/to/expected-write
 - shared_touchpoints: see structured rows below
 - shared_touchpoint: TP-001 | path=path/to/shared-contract | symbols=ExactSymbol | allowed_change=exact permitted change kind | forbidden_change=lifecycle, ownership, removals
+- planned_material_permission: PF-0001 | change_type=lifecycle_change | target_kind=editable_path | target=path/to/exact-file | rationale=accepted lifecycle integration | decision_authority=DEC-001
 - excluded_components: adjacent-system
 - excluded_paths: path/to/adjacent-system/**
 - max_product_files: 10
 - max_product_lines_changed: 500
 - verification_scope: exact affected suites and smoke scenarios
-- scope_baseline_revision: EXACT_BASE_REVISION
 
 ### Research Briefs
 

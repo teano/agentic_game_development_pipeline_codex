@@ -20,6 +20,7 @@ STAGE_TOKENS = {
     "gamedev-decision-recorder": "RECORDING_COMPLETE",
     "gamedev-coverage-steward": "COVERAGE_COMPLETE",
     "gamedev-documentation-finisher": "DOCUMENTATION_COMPLETE",
+    "gamedev-recovery-remediator": "RECOVERY_COMPLETE",
 }
 
 PIPELINE_ALWAYS_CORE = (
@@ -28,13 +29,30 @@ PIPELINE_ALWAYS_CORE = (
     "references/pipeline-protocol.md",
 )
 PIPELINE_CONDITIONAL_REFERENCES = (
-    "references/role-artifacts-and-context.md",
     "references/engineering-and-coverage.md",
     "references/review-qa-and-recovery.md",
     "references/severity-and-readiness.md",
     "references/deferred-findings.md",
     "references/lifecycle-projection-recovery.md",
 )
+PIPELINE_ALWAYS_CORE_MAX_BYTES = 16_384
+RUNTIME_ROLE_SKILLS = {
+    "decision_recorder": ("gamedev-decision-recorder",),
+    "documentation_finisher": ("gamedev-documentation-finisher",),
+    "engineer": ("gamedev-engineer",),
+    "recovery_remediator": ("gamedev-recovery-remediator",),
+    "reviewer": ("gamedev-review", "gamedev-qa"),
+}
+WORKER_SCHEMA_REFERENCES = {
+    "gamedev-engineer": "../gamedev-pipeline/references/semantic-write-packet.md",
+    "gamedev-documentation-finisher": "../gamedev-pipeline/references/semantic-write-packet.md",
+    "gamedev-recovery-remediator": "../gamedev-pipeline/references/semantic-write-packet.md",
+    "gamedev-review": "references/review-output-contract.md",
+    "gamedev-qa": "references/qa-output-contract.md",
+    "gamedev-research": "references/research-bundle-contract.md",
+}
+
+
 class ExplicitActivationPolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -69,8 +87,11 @@ class ExplicitActivationPolicyTests(unittest.TestCase):
                 self.assertIn("Use only when the user explicitly requests", description)
                 self.assertIn(f"`${skill_name}`", description)
                 self.assertRegex(description, r"Do not activate|Never trigger")
-                if skill_name != "gamedev-pipeline":
+                if skill_name not in {"gamedev-pipeline", "gamedev-coverage-steward"}:
                     self.assertIn("`$gamedev-pipeline` Director delegates", description)
+                if skill_name == "gamedev-coverage-steward":
+                    self.assertIn("standalone advisory", description)
+                    self.assertNotIn("Director delegates", description)
 
     def test_runtime_gate_and_shared_handoff_contract_are_present(self) -> None:
         shared_link = "stage-handoff-invariant.md"
@@ -121,7 +142,12 @@ class ExplicitActivationPolicyTests(unittest.TestCase):
         self.assertIn("routing data, not permission", contract)
         self.assertIn("PRD_READY -> SPEC_READY -> PLAN_READY -> runtime pipeline", contract)
         self.assertIn("distinct delegated subagent context", contract)
-        self.assertIn("One delegated agent performs one named specialized role only", contract)
+        self.assertIn(
+            "one logical independent non-writer verifier ID across sequential convergence Review, Final Review, QA",
+            contract,
+        )
+        self.assertIn("Every phase starts a new isolated session", contract)
+        self.assertIn("must never be the Engineer or any writer", contract)
 
     def test_pipeline_director_is_orchestration_only_and_compaction_safe(self) -> None:
         skill = self.read_skill("gamedev-pipeline")
@@ -133,11 +159,17 @@ class ExplicitActivationPolicyTests(unittest.TestCase):
             / "pipeline-protocol.md"
         ).read_text(encoding="utf-8")
         self.assertIn("The Director is orchestration-only", skill)
-        self.assertIn("distinct non-Director subagent", skill)
-        self.assertIn("no inherited chat history", skill)
-        self.assertIn("context compaction", skill)
-        self.assertIn("never substitutes itself for a role", protocol)
-        self.assertIn("A lost conversational window is not user input", protocol)
+        self.assertIn("real non-Director worker", skill)
+        self.assertIn("no inherited Director or worker chat history", skill)
+        self.assertIn("After compaction/replacement", skill)
+        self.assertIn("never substitutes itself for a specialized role", protocol)
+        self.assertIn("prior conversation is never retained or supplied", protocol)
+
+    def test_engineer_rejects_unrelated_allowed_path_cleanup(self) -> None:
+        skill = self.read_skill("gamedev-engineer")
+        self.assertIn("unrelated allowed-path cleanup", skill)
+        self.assertIn("is not an `assigned_goal_effect`", skill)
+        self.assertIn("candidate for Director backlog routing", skill)
 
     def test_pipeline_instruction_bundles_are_structurally_progressive(self) -> None:
         pipeline_root = self.plugin_root / "skills" / "gamedev-pipeline"
@@ -166,12 +198,11 @@ class ExplicitActivationPolicyTests(unittest.TestCase):
         )
 
         trigger_by_path = {
-            "references/role-artifacts-and-context.md": "Before the first capsule, lease, semantic packet, revision manifest, or handoff",
             "references/engineering-and-coverage.md": "Before slice research, coverage, engineering, normative docs, product remediation, or scope rebaseline",
             "references/review-qa-and-recovery.md": "Before convergence, Final Review, recovery, QA, derived docs, documentation closure, or readiness",
-            "references/severity-and-readiness.md": "Before classifying any finding/gate/risk or evaluating readiness",
+            "references/severity-and-readiness.md": "Before classifying a finding/gate/risk or evaluating readiness",
             "references/deferred-findings.md": "Before routing a supported out-of-scope candidate",
-            "references/lifecycle-projection-recovery.md": "On generated dashboard revision drift",
+            "references/lifecycle-projection-recovery.md": "Only when compact status reports generated dashboard revision drift",
         }
         conditional_lines = {
             linked_path.search(line).group(1): line
@@ -188,10 +219,6 @@ class ExplicitActivationPolicyTests(unittest.TestCase):
             for path in PIPELINE_ALWAYS_CORE
         )
         unique_contract = {
-            "references/role-artifacts-and-context.md": (
-                "# Role artifacts and bounded context",
-                "capsule_plus_referenced_files",
-            ),
             "references/engineering-and-coverage.md": (
                 "# Engineering and coverage phases",
                 "research_not_required",
@@ -223,12 +250,9 @@ class ExplicitActivationPolicyTests(unittest.TestCase):
 
         lifecycle_path = "references/lifecycle-projection-recovery.md"
         self.assertIn(lifecycle_path, PIPELINE_CONDITIONAL_REFERENCES)
-        protocol = (pipeline_root / "references" / "pipeline-protocol.md").read_text(
-            encoding="utf-8"
-        )
         self.assertIn(
-            "](lifecycle-projection-recovery.md)",
-            protocol,
+            "](references/lifecycle-projection-recovery.md)",
+            conditional_block,
         )
         lifecycle = (pipeline_root / lifecycle_path).read_text(encoding="utf-8")
         for invariant in (
@@ -247,9 +271,148 @@ class ExplicitActivationPolicyTests(unittest.TestCase):
         telemetry_contract = (
             pipeline_root / "references" / "role-artifacts-and-context.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("capsule_plus_referenced_files", telemetry_contract)
-        self.assertIn("Never report it as total agent context", telemetry_contract)
-        self.assertIn("structural progressive disclosure", telemetry_contract)
+        self.assertIn("not Director startup material", telemetry_contract)
+        self.assertIn("never reported as total agent context", telemetry_contract)
+        self.assertIn("prior worker chat history", telemetry_contract)
+
+    def test_pipeline_always_core_has_a_hard_startup_ceiling(self) -> None:
+        pipeline_root = self.plugin_root / "skills" / "gamedev-pipeline"
+        files = [pipeline_root / "agents" / "openai.yaml"] + [
+            pipeline_root / path for path in PIPELINE_ALWAYS_CORE
+        ]
+        total_bytes = sum(path.stat().st_size for path in files)
+        self.assertLessEqual(total_bytes, PIPELINE_ALWAYS_CORE_MAX_BYTES)
+        self.assertLessEqual((total_bytes + 3) // 4, PIPELINE_ALWAYS_CORE_MAX_BYTES // 4)
+        skill = (pipeline_root / "SKILL.md").read_text(encoding="utf-8")
+        self.assertNotIn("role-artifacts-and-context.md", skill)
+        self.assertIn("Do not preload conditional references or worker-owned schema", skill)
+
+    def test_each_runtime_role_has_explicit_skill_documentation(self) -> None:
+        controller = (
+            self.plugin_root
+            / "skills"
+            / "gamedev-pipeline"
+            / "scripts"
+            / "pipeline_state.py"
+        ).read_text(encoding="utf-8")
+        for role, skill_names in RUNTIME_ROLE_SKILLS.items():
+            with self.subTest(runtime_role=role):
+                self.assertIn(f'"{role}"', controller)
+                for skill_name in skill_names:
+                    skill_root = self.plugin_root / "skills" / skill_name
+                    self.assertTrue((skill_root / "SKILL.md").is_file())
+                    self.assertTrue((skill_root / "agents" / "openai.yaml").is_file())
+
+    def test_worker_output_schemas_are_role_owned_and_not_director_preloads(self) -> None:
+        pipeline_skill = self.read_skill("gamedev-pipeline")
+        self.assertNotIn("role-artifacts-and-context.md", pipeline_skill)
+        for skill_name, reference in WORKER_SCHEMA_REFERENCES.items():
+            with self.subTest(skill=skill_name):
+                skill = self.read_skill(skill_name)
+                self.assertIn(reference, skill)
+        for skill_name in ("gamedev-engineer", "gamedev-documentation-finisher"):
+            self.assertNotIn("role-artifacts-and-context.md", self.read_skill(skill_name))
+
+    def test_worker_contract_markers_match_controller_validators(self) -> None:
+        pipeline_root = self.plugin_root / "skills" / "gamedev-pipeline"
+        controller = (pipeline_root / "scripts" / "pipeline_state.py").read_text(
+            encoding="utf-8"
+        )
+        contracts = {
+            "semantic": (
+                pipeline_root / "references" / "semantic-write-packet.md"
+            ).read_text(encoding="utf-8"),
+            "review": (
+                self.plugin_root
+                / "skills"
+                / "gamedev-review"
+                / "references"
+                / "review-output-contract.md"
+            ).read_text(encoding="utf-8"),
+            "qa": (
+                self.plugin_root
+                / "skills"
+                / "gamedev-qa"
+                / "references"
+                / "qa-output-contract.md"
+            ).read_text(encoding="utf-8"),
+            "research": (
+                self.plugin_root
+                / "skills"
+                / "gamedev-research"
+                / "references"
+                / "research-bundle-contract.md"
+            ).read_text(encoding="utf-8"),
+        }
+        for marker in (
+            "inventory_complete",
+            "domain_inventory",
+            "assigned_goal_effect:",
+            "open_assumptions",
+        ):
+            with self.subTest(semantic_marker=marker):
+                self.assertIn(marker, contracts["semantic"])
+                self.assertIn(marker, controller)
+        for marker in (
+            "full_convergence",
+            "final_whole_feature_review",
+            "targeted_closure",
+            "recovery_verification",
+            "documentation_closure",
+        ):
+            with self.subTest(review_mode=marker):
+                self.assertIn(marker, contracts["review"])
+                self.assertIn(marker, controller)
+        for marker in (
+            "manual_execution",
+            "blocked_by_finding",
+            "minimum_resume_action",
+        ):
+            with self.subTest(qa_marker=marker):
+                self.assertIn(marker, contracts["qa"])
+                self.assertIn(marker, controller)
+        for marker in (
+            "schema_version",
+            "brief_sha256",
+            "limit_reached",
+        ):
+            with self.subTest(research_marker=marker):
+                self.assertIn(marker, contracts["research"])
+                self.assertIn(marker, controller)
+
+    def test_review_count_is_singular_and_phase_context_is_isolated(self) -> None:
+        pipeline_root = self.plugin_root / "skills" / "gamedev-pipeline"
+        routed = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                pipeline_root / "SKILL.md",
+                pipeline_root / "references" / "pipeline-protocol.md",
+                pipeline_root / "references" / "review-qa-and-recovery.md",
+                pipeline_root / "references" / "severity-and-readiness.md",
+                pipeline_root / "references" / "role-artifacts-and-context.md",
+            )
+        )
+        self.assertNotIn("two distinct full Reviews", routed)
+        self.assertNotRegex(routed, r"Review A\s*\|\|")
+        self.assertIn("single controller-required Final Review", routed)
+        self.assertIn("fork_turns: none", routed)
+        self.assertIn("never predecessor human conclusions", routed)
+
+    def test_derived_documentation_sources_match_worker_capsule_contract(self) -> None:
+        contract = (
+            self.plugin_root
+            / "skills"
+            / "gamedev-documentation-finisher"
+            / "references"
+            / "documentation-contract.md"
+        ).read_text(encoding="utf-8")
+        derived_line = next(
+            line for line in contract.splitlines() if "derived source kinds are" in line
+        )
+        self.assertIn(
+            "`decision`, `qa`, `review`, and `controller_handoff`", derived_line
+        )
+        self.assertNotIn("capability_probe", derived_line)
 
     def test_every_skill_disables_implicit_invocation_in_agent_metadata(self) -> None:
         for skill_name in STAGE_TOKENS:

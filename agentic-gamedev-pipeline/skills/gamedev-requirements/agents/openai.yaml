@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Requirements"
   short_description: "Explicit-only GameDev requirements workflow"
-  default_prompt: "Use $gamedev-requirements to produce the canonical approved PRD, return PRD_READY plus NEXT_ACTION, and stop without starting specification."
+  default_prompt: "Use $gamedev-requirements to maintain the canonical PRD without inventing requirements. Ask one grouped round of 1-5 related highest-impact questions, preserve partial answers, offer only repository/user-grounded proposal options with tradeoffs when useful, require explicit user approval before PRD_READY, return NEXT_ACTION, and stop without starting specification."
 policy:
   allow_implicit_invocation: false

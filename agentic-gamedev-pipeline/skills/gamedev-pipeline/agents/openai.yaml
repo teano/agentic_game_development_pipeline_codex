@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Production Pipeline"
   short_description: "Explicit-only bounded GameDev production pipeline"
-  default_prompt: "Use $gamedev-pipeline as the sole Director for exact PRD_READY, SPEC_READY, and PLAN_READY inputs; activate bounded runtime stages only after validated handoffs and stop at the production-ready candidate."
+  default_prompt: "Use $gamedev-pipeline as the sole Director for exact PRD_READY, SPEC_READY, and PLAN_READY inputs; perform controller mechanics directly, delegate only required specialized work, and stop at the production-ready candidate."
 policy:
   allow_implicit_invocation: false

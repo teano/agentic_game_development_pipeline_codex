@@ -1,34 +1,22 @@
 ---
 name: gamedev-coverage-steward
-description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-coverage-steward` or an active, explicitly invoked `$gamedev-pipeline` Director delegates exact coverage planning or finalization. Register and validate exact automated/manual identities without editing product or tests. Do not activate for ordinary testing, QA, or coverage work.
+description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-coverage-steward` for a standalone advisory review of supplied coverage data. Inspect exact automated/manual identity mappings without editing product, tests, artifacts, or controller state. Do not activate for pipeline runtime, ordinary testing, QA, or coverage execution.
 ---
 
-# GameDev Test Coverage Steward
+# GameDev Coverage Advisory
 
 ## Activation gate
 
-Proceed only on the explicit activation described above. A request to add tests, run QA, review code, or improve coverage is not authorization. Do not activate another GameDev stage.
+Proceed only on direct explicit user invocation. Pipeline runtime coverage is controller-owned; this skill has no pipeline assignment, capsule, worker, state, or handoff authority. A request to add tests, run QA, review code, improve coverage, or complete a runtime transition is not authorization. Do not activate another GameDev stage.
 
 Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md) and [coverage-contract.md](references/coverage-contract.md). The contract is canonical for schema 2, identity equality, amendments, execution dimensions, and implementation/verification eligibility.
 
-Accept only a controller-validated capsule with exact authority, IDs, revisions, allowed evidence/output paths, and capsule payload ceilings. Remain read-only to product source, configuration, tests, fixtures, approved documents, decisions, and controller state. Write only the assigned coverage artifact/report.
+Remain read-only. Inspect only coverage data and exact source references supplied or explicitly authorized by the user. Do not persist or mutate coverage artifacts.
 
-## Use one mode
+## Review supplied coverage
 
-### `plan-before-engineering`
+- For planned data, inspect acceptance-to-identity mappings, expected and mandatory sets, coordinates, assertions/observations, prerequisites, and ownership.
+- For finalized data, inspect expected/actual equality, mandatory-set equality, acceptance mappings, automated results, gaps, and the manual matrix.
+- Report missing authority or evidence as an advisory gap; do not invent behavior, amend registrations, or route runtime work.
 
-Map every assigned approved acceptance ID to exact planned automated/manual identities. Register the complete expected set, explicit mandatory set, coordinates, assertions/observations, prerequisites, and owning slice. Return gaps instead of inventing behavior; a missing product choice needs accepted authority, not a coverage convention.
-
-### `finalize-after-code-freeze`
-
-Read the frozen plan and actual registrations at exact identities. Validate sorted unique expected/actual equality, separate mandatory-set equality, acceptance mappings, planned proof adequacy, automated results, gaps, and the exact manual matrix. Accept an amendment only under the authority/hash-chain rules in the contract. Manual work remains pending until QA records its independent dimensions.
-
-## Complete the stage
-
-Return `COVERAGE_COMPLETE: yes|no`, mode, steward/capsule IDs, exact revisions, schema-2 manifest path/SHA, mapping and identity-set results, automated/manual dimensions, gaps, pending identities/prerequisites, amendment authorities, and exclusions.
-
-- successful planning -> `NEXT_ACTION: $gamedev-engineer`;
-- successful finalization -> `NEXT_ACTION: $gamedev-documentation-finisher` when normative docs are required, otherwise `NEXT_ACTION: $gamedev-review`;
-- incomplete/gap -> `NEXT_ACTION` names the same stage, exact decision, or exact remediation owner required by the controller.
-
-Do not implement/change tests, execute QA, set product `blocking`, waive mandatory identities, edit controller state, or spawn another stage. Do not execute `NEXT_ACTION`; stop.
+Return `COVERAGE_COMPLETE: yes|no`, inspected inputs, mapping/set results, gaps, prerequisites, exclusions, and `NEXT_ACTION: terminal-advisory-coverage`. Do not implement/change tests, execute QA, set product `blocking`, waive identities, edit controller state, or spawn another stage. Stop.

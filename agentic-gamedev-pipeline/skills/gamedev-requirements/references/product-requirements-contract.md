@@ -51,7 +51,23 @@ Use stable identifiers:
 - `PRD-AC-001` for acceptance criteria;
 - `PRD-OQ-001` for open questions.
 
-Mark a blocking open question with `[blocking]` on the same line as its `PRD-OQ-*` ID. An approved PRD may contain only non-blocking open questions.
+An identifier is declared only by an exact literal list row in its canonical
+section: `- PRD-REQ-001: plain-text description` under Functional Requirements,
+`- PRD-NFR-001: plain-text description` under Quality Requirements, or
+`- PRD-OQ-001: plain-text description` under Open Questions. The `- ` marker,
+literal ID, `: ` delimiter, and non-empty plain-text description are mandatory;
+indentation, alternate/numbered markers, bare IDs, code-wrapped IDs, empty
+descriptions, GFM emphasis/strikethrough or other inline Markdown, and prose
+beginning with the ID are invalid inventory rows.
+References outside the canonical section do not declare or duplicate the
+identifier. Blocking status is read only from a canonical `PRD-OQ-*`
+declaration.
+
+The one structural exact `## Acceptance Criteria` H2 is the sole acceptance-authority inventory. Declare every criterion as one literal list row in exact `- PRD-AC-ID: plain-text description` form. Code-wrapped IDs, hidden declarations, duplicate IDs, and range shorthand are invalid authority. References outside this section do not declare acceptance IDs. Legacy declaration grammar changes remain a controlled PRD revision requiring PRD reapproval and downstream hash reconvergence.
+
+Mark a blocking open question in its description, for example
+`- PRD-OQ-001: [blocking] choose the launch platform`. An approved PRD may
+contain only non-blocking open questions.
 
 ## Content boundary
 

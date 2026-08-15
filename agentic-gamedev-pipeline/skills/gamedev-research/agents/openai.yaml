@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Researcher"
   short_description: "Bounded read-only repository research"
-  default_prompt: "Use $gamedev-research for one Director-assigned bounded read-only brief; persist RESEARCH_COMPLETE, return NEXT_ACTION, and stop."
+  default_prompt: "Use $gamedev-research for one Director-assigned bounded read-only brief; persist only its exact result bundle, return RESEARCH_COMPLETE plus NEXT_ACTION, and stop."
 policy:
   allow_implicit_invocation: false

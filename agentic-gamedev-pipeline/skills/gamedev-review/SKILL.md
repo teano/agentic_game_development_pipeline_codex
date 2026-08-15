@@ -11,12 +11,12 @@ Proceed only on the explicit activation described above. Ordinary review, audit,
 
 Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md). Remain immutable to product, evidence, support, approved documents, decisions, coverage, and controller state. Write only the assigned isolated report/credit artifact.
 
-Every mode requires a controller-validated reviewer capsule with exact revisions, paths/SHAs/IDs/evidence, exclusions, output paths, and capsule payload ceilings. Every completion also requires the exact controller-validated component-credit manifest expected by its command, including recovery verification. Never use sibling conclusions or long chat history.
+Every mode requires a controller-validated reviewer capsule with exact revisions, paths/SHAs/IDs/evidence, read boundary, output paths, and capsule payload ceilings. Before work, read only [review-output-contract.md](references/review-output-contract.md). Every completion requires its exact component-credit manifest, including recovery verification. The reviewer must be independent of every Engineer/writer. A logical verifier ID may be reused later, but every phase starts in a fresh no-history session with a new capsule. Never use sibling conclusions or unbounded chat history.
 
 ## Use one mode
 
 - `risk-audit`: one assigned convergence lens;
-- `full`: one member of the independent Final Review pair;
+- `full`: the controller-required independent Final Review assignment;
 - `targeted-product-closure`: verify a frozen local product remediation and induced boundaries;
 - `recovery-verification`: verify frozen support/evidence recovery, its finalized coverage aggregate, and unchanged product identity;
 - `documentation-closure`: verify derived support changes against immutable post-QA sources.
@@ -25,13 +25,15 @@ Reuse an exact component product hash + contract hash + lens credit. Overall com
 
 For `full`, verify repository policy, approved feature documents, active decisions, exact revisions, controller manifests/handoffs, finalized coverage, normative documentation state, Scope Contract, assigned acceptance criteria, and the assigned architecture/correctness or verification/integration lens. Input mechanics gaps are `INCOMPLETE`, not product findings.
 
-For closure modes, inspect only frozen findings, changed components/inputs, induced boundaries, and preserved complementary credits. Recovery verification requires exact capsule and credit manifest plus current finalized coverage continuity. Documentation closure requires passed QA, unchanged product/evidence identities, exact statement source mappings, and current support revision.
+For closure modes, inspect only frozen findings, changed components/inputs, induced boundaries, and preserved complementary credits. Recovery verification requires exact capsule and credit manifest plus current finalized coverage continuity. Documentation closure requires passed QA, unchanged product/evidence identities, exact statement source mappings, current support revision, the worker-owned documentation-closure report schema, and `review_mode: documentation_closure` credit.
 
 Do not read sibling conclusions, edit, request early remediation, use runtime/Computer Use, rerun broad green suites, set `blocking`/`remediation_required`, mutate deferred findings, prescribe a writer wave, decide behavior, accept risk, edit state, or spawn another stage.
 
 ## Complete the stage
 
 Return `REVIEW_COMPLETE: yes|no`, mode, reviewer/capsule IDs, exact revisions, `PASS|FAIL|INCOMPLETE`, inspected IDs/scope/exclusions, context payload metrics, credit identities/status, complete candidate findings with exact evidence/dimensions, source gaps, report path, and mode-specific composition/support proof.
+
+The generic human-readable report is audit-only: it cannot authorize documentation, decisions, or findings. Register every candidate finding through the Director/controller `add-finding` boundary; only validated component credit and the mode-specific structured closure receipt are authoritative artifacts.
 
 A required support-contract defect is a `support` candidate with the exact approved support path evidence; the controller may derive `remediation_required=true` without product `blocking`.
 

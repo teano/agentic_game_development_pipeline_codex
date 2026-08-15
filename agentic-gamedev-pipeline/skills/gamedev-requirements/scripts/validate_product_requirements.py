@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 from collections import Counter
@@ -39,7 +40,25 @@ REQUIRED_APPROVED_SECTIONS = (
     "## Quality Requirements",
     "## Acceptance Criteria",
 )
-ID_PATTERN = re.compile(r"\bPRD-(?:REQ|NFR|AC|OQ)-\d{3}\b")
+DECLARATION_SECTIONS = {
+    "PRD-REQ": "## Functional Requirements",
+    "PRD-NFR": "## Quality Requirements",
+    "PRD-OQ": "## Open Questions",
+}
+
+_acceptance_contract_path = (
+    Path(__file__).resolve().parents[3] / "scripts" / "acceptance_contract.py"
+)
+_acceptance_contract_spec = importlib.util.spec_from_file_location(
+    "gamedev_acceptance_contract", _acceptance_contract_path
+)
+if _acceptance_contract_spec is None or _acceptance_contract_spec.loader is None:
+    raise RuntimeError("Cannot load the canonical acceptance contract")
+_acceptance_contract = importlib.util.module_from_spec(_acceptance_contract_spec)
+_acceptance_contract_spec.loader.exec_module(_acceptance_contract)
+derive_prd_acceptance_inventory = _acceptance_contract.derive_prd_acceptance_inventory
+markdown_authority_lines = _acceptance_contract.markdown_authority_lines
+plain_text_description = _acceptance_contract._plain_description
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, str], str, list[str]]:
@@ -65,22 +84,52 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str, list[str]]:
     return metadata, "\n".join(lines[end + 1 :]), errors
 
 
-def section_content(body: str, heading: str) -> str:
-    lines = body.splitlines()
+def section_authority_lines(body: str, heading: str) -> list[tuple[int, str]]:
+    lines = list(markdown_authority_lines(body))
     try:
-        start = lines.index(heading) + 1
-    except ValueError:
-        return ""
+        start = next(index for index, (_, line) in enumerate(lines) if line == heading) + 1
+    except StopIteration:
+        return []
     level = len(heading) - len(heading.lstrip("#"))
-    content: list[str] = []
-    for line in lines[start:]:
-        stripped = line.lstrip()
-        if stripped.startswith("#"):
-            next_level = len(stripped) - len(stripped.lstrip("#"))
+    content: list[tuple[int, str]] = []
+    for line_number, line in lines[start:]:
+        if line.startswith("#"):
+            next_level = len(line) - len(line.lstrip("#"))
             if next_level <= level:
                 break
-        content.append(line)
-    return "\n".join(content).strip()
+        content.append((line_number, line))
+    return content
+
+
+def section_content(body: str, heading: str) -> str:
+    return "\n".join(
+        line for _, line in section_authority_lines(body, heading)
+    ).strip()
+
+
+def canonical_declarations(
+    body: str, heading: str, identifier_prefix: str
+) -> tuple[list[tuple[str, str]], list[tuple[int, str]]]:
+    """Return exact declarations and declaration-like invalid rows from one section."""
+    identifier = rf"{re.escape(identifier_prefix)}-\d{{3}}"
+    declaration = re.compile(
+        rf"^- (?P<id>{identifier}): (?P<description>\S(?:.*\S)?)$"
+    )
+    candidate = re.compile(
+        rf"^[ \t]*(?:(?:[-+*]|\d+[.)])\s+)?`?{re.escape(identifier_prefix)}-"
+    )
+    result: list[tuple[str, str]] = []
+    invalid: list[tuple[int, str]] = []
+    for line_number, line in section_authority_lines(body, heading):
+        match = declaration.fullmatch(line)
+        description = match.group("description") if match else ""
+        if identifier_prefix == "PRD-OQ" and description.lower().startswith("[blocking] "):
+            description = description[len("[blocking] ") :]
+        if match and plain_text_description(description):
+            result.append((match.group("id"), line))
+        elif candidate.match(line):
+            invalid.append((line_number, line))
+    return result, invalid
 
 
 def validate(path: Path, require_approved: bool) -> dict:
@@ -113,10 +162,10 @@ def validate(path: Path, require_approved: bool) -> dict:
     if not metadata.get("language") or metadata.get("language") == "unspecified":
         errors.append("language must be specified")
 
-    body_lines = body.splitlines()
+    body_lines = list(markdown_authority_lines(body))
     positions: list[int] = []
     for heading in REQUIRED_HEADINGS:
-        matches = [index for index, line in enumerate(body_lines) if line == heading]
+        matches = [line_number for line_number, line in body_lines if line == heading]
         if not matches:
             errors.append(f"missing heading: {heading}")
             positions.append(-1)
@@ -128,7 +177,25 @@ def validate(path: Path, require_approved: bool) -> dict:
     if present_positions != sorted(present_positions):
         errors.append("required headings are out of order")
 
-    ids = ID_PATTERN.findall(body)
+    declaration_inventory = {
+        prefix: canonical_declarations(body, heading, prefix)
+        for prefix, heading in DECLARATION_SECTIONS.items()
+    }
+    declarations = {
+        prefix: inventory[0] for prefix, inventory in declaration_inventory.items()
+    }
+    for prefix, (_, invalid) in declaration_inventory.items():
+        heading = DECLARATION_SECTIONS[prefix]
+        errors.extend(
+            f"{heading} line {line_number} has invalid {prefix} declaration; "
+            f"use exact `- {prefix}-001: plain-text description` format"
+            for line_number, _ in invalid
+        )
+    ids = [
+        identifier
+        for section_declarations in declarations.values()
+        for identifier, _ in section_declarations
+    ]
     duplicates = sorted(
         identifier for identifier, count in Counter(ids).items() if count > 1
     )
@@ -150,13 +217,27 @@ def validate(path: Path, require_approved: bool) -> dict:
         for heading in REQUIRED_APPROVED_SECTIONS:
             if not section_content(body, heading):
                 errors.append(f"approved PRD section is empty: {heading}")
-        if not re.search(r"\bPRD-REQ-\d{3}\b", body):
-            errors.append("approved PRD requires at least one PRD-REQ identifier")
-        if not re.search(r"\bPRD-AC-\d{3}\b", body):
-            errors.append("approved PRD requires at least one PRD-AC identifier")
-        if not re.search(r"\bPRD-NFR-\d{3}\b", body):
-            errors.append("approved PRD requires at least one PRD-NFR identifier")
-        if re.search(r"PRD-OQ-\d{3}.*\[blocking\]", body, flags=re.IGNORECASE):
+        try:
+            acceptance_inventory = derive_prd_acceptance_inventory(
+                body, label="approved PRD"
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            acceptance_inventory = frozenset()
+        if not declarations["PRD-REQ"]:
+            errors.append(
+                "approved PRD requires at least one PRD-REQ declaration in Functional Requirements"
+            )
+        if not acceptance_inventory:
+            errors.append("approved PRD requires a canonical PRD-AC inventory")
+        if not declarations["PRD-NFR"]:
+            errors.append(
+                "approved PRD requires at least one PRD-NFR declaration in Quality Requirements"
+            )
+        if any(
+            re.search(r"\[blocking\]", line, flags=re.IGNORECASE)
+            for _, line in declarations["PRD-OQ"]
+        ):
             errors.append("approved PRD contains a blocking open question")
     elif approved_at != "null":
         errors.append("draft PRD must use approved_at: null")

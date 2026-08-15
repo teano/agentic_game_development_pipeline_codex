@@ -1,6 +1,6 @@
 interface:
-  display_name: "GameDev Coverage Steward"
-  short_description: "Plan and finalize exact feature coverage"
-  default_prompt: "Use $gamedev-coverage-steward for one exact planning or finalization assignment, persist the coverage artifact, return NEXT_ACTION, and stop."
+  display_name: "GameDev Coverage Advisory"
+  short_description: "Advisory review of exact feature coverage"
+  default_prompt: "Use $gamedev-coverage-steward only for a standalone advisory review of supplied coverage data; return COVERAGE_COMPLETE plus NEXT_ACTION, and stop."
 policy:
   allow_implicit_invocation: false

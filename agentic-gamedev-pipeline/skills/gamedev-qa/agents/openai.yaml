@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Runtime QA"
   short_description: "Explicit-only GameDev runtime QA mode"
-  default_prompt: "Use $gamedev-qa to execute every exact manual identity, persist the controller-compatible aggregate, return NEXT_ACTION, and stop."
+  default_prompt: "Use $gamedev-qa to execute every exact manual identity, return the schema-2 execution envelope and evidence for controller aggregation plus NEXT_ACTION, and stop."
 policy:
   allow_implicit_invocation: false

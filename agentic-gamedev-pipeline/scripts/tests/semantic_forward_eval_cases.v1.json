@@ -23,17 +23,103 @@
       "id": "direct_requirements_stage",
       "scenario": "direct_stage",
       "prompt": "Use $gamedev-requirements to create the PRD for feature teleport-module.",
-      "setup": {"active_skill": null, "controller_phase": null, "activation_authority": "current_user"},
+      "setup": {
+        "active_skill": null,
+        "controller_phase": null,
+        "activation_authority": "current_user",
+        "known_product_facts": [],
+        "unanswered_decisions": ["outcome", "audience", "core_loop", "release_target", "scope"]
+      },
       "expected": {
         "activation": ["gamedev-requirements"],
-        "allowed_action": "complete_requirements_stage",
-        "completion_token": "PRD_READY: yes",
-        "next_action": "$gamedev-specification",
-        "forbidden_actions": ["execute_specification_stage"],
+        "allowed_action": "ask_grouped_requirements_round",
+        "completion_token": "PRD_READY: no",
+        "next_action": "user-decision",
+        "forbidden_actions": ["ask_single_question_round", "invent_requirements", "promote_proposals_to_confirmed", "execute_specification_stage"],
+        "requirements_round": {"question_count": {"minimum": 1, "maximum": 5}, "related_group": true, "options_count": {"allowed": [0, 2, 3]}, "options_grounded_when_present": true, "proposals_not_confirmed": true, "preserves_partial_answers": true},
         "required_references": [
           "skills/gamedev-pipeline/references/stage-handoff-invariant.md"
         ],
-        "stop_result": "stop_after_handoff",
+        "stop_result": "stop_after_grouped_question_round",
+        "authority_result": "explicit_user_invocation"
+      }
+    },
+    {
+      "id": "requirements_partial_answers_preserved",
+      "scenario": "requirements_interview_round",
+      "prompt": "Continue $gamedev-requirements. I answered outcome and audience, partially answered the core loop, and left platform and non-goals unanswered. Ask the next useful round; I may answer free-form.",
+      "setup": {
+        "active_skill": "gamedev-requirements",
+        "prd_status": "draft",
+        "confirmed_answers": ["outcome", "audience"],
+        "partial_answers": ["core_loop"],
+        "unanswered_decisions": ["core_loop_remainder", "release_platform", "non_goals"],
+        "expected_question_count": {"minimum": 1, "maximum": 3},
+        "free_form_answers_allowed": true
+      },
+      "expected": {
+        "activation": ["gamedev-requirements"],
+        "allowed_action": "ask_remaining_grouped_requirements_round",
+        "completion_token": "PRD_READY: no",
+        "next_action": "user-decision",
+        "forbidden_actions": ["repeat_answered_question", "discard_partial_answer", "invent_missing_answer", "force_option_only_response"],
+        "requirements_round": {"question_count": {"minimum": 1, "maximum": 3}, "related_group": true, "options_count": {"allowed": [0, 2, 3]}, "options_grounded_when_present": true, "proposals_not_confirmed": true, "preserves_partial_answers": true},
+        "required_references": [
+          "skills/gamedev-pipeline/references/stage-handoff-invariant.md"
+        ],
+        "stop_result": "stop_after_grouped_question_round",
+        "authority_result": "explicit_user_invocation"
+      }
+    },
+    {
+      "id": "requirements_grounded_options",
+      "scenario": "requirements_interview_round",
+      "prompt": "Continue $gamedev-requirements. The repository supports local save and signed-in cloud save; help me choose the launch persistence boundary without deciding for me.",
+      "setup": {
+        "active_skill": "gamedev-requirements",
+        "prd_status": "draft",
+        "grounded_repository_options": ["local_save", "signed_in_cloud_save"],
+        "expected_option_count": {"minimum": 2, "maximum": 3},
+        "proposal_labels_required": true,
+        "tradeoffs_required": true,
+        "free_form_alternative_allowed": true
+      },
+      "expected": {
+        "activation": ["gamedev-requirements"],
+        "allowed_action": "offer_grounded_options_and_ask_grouped_round",
+        "completion_token": "PRD_READY: no",
+        "next_action": "user-decision",
+        "forbidden_actions": ["invent_repository_option", "present_proposal_as_requirement", "impose_recommendation", "force_option_only_response"],
+        "requirements_round": {"question_count": {"minimum": 1, "maximum": 5}, "related_group": true, "options_count": {"allowed": [2, 3]}, "options_grounded_when_present": true, "proposals_not_confirmed": true, "preserves_partial_answers": true},
+        "required_references": [
+          "skills/gamedev-pipeline/references/stage-handoff-invariant.md"
+        ],
+        "stop_result": "stop_after_grouped_question_round",
+        "authority_result": "explicit_user_invocation"
+      }
+    },
+    {
+      "id": "requirements_unchanged_round_idempotent",
+      "scenario": "requirements_interview_round",
+      "prompt": "Repeat $gamedev-requirements with the same draft and no new answers since the last question round.",
+      "setup": {
+        "active_skill": "gamedev-requirements",
+        "prd_status": "draft",
+        "prd_bytes": "unchanged",
+        "new_user_information": false,
+        "prior_question_round": "exact_current_pending_round"
+      },
+      "expected": {
+        "activation": ["gamedev-requirements"],
+        "allowed_action": "repeat_identical_pending_round_without_prd_mutation",
+        "completion_token": "PRD_READY: no",
+        "next_action": "user-decision",
+        "forbidden_actions": ["change_pending_question_set", "mutate_prd", "increment_prd_revision", "invent_requirement"],
+        "requirements_round": {"question_count": {"minimum": 1, "maximum": 5}, "related_group": true, "options_count": {"allowed": [0, 2, 3]}, "options_grounded_when_present": true, "proposals_not_confirmed": true, "preserves_partial_answers": true},
+        "required_references": [
+          "skills/gamedev-pipeline/references/stage-handoff-invariant.md"
+        ],
+        "stop_result": "stop_after_identical_question_round",
         "authority_result": "explicit_user_invocation"
       }
     },
@@ -53,7 +139,7 @@
         "activation": ["gamedev-engineer"],
         "allowed_action": "complete_bounded_engineering_lane",
         "completion_token": "ENGINEERING_COMPLETE: yes",
-        "next_action": "$gamedev-coverage-steward",
+        "next_action": "$gamedev-pipeline",
         "forbidden_actions": ["execute_coverage_stage", "activate_unlisted_stage"],
         "required_references": [
           "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
@@ -94,7 +180,7 @@
     {
       "id": "stage_to_stage_execution_prohibited",
       "scenario": "prohibited_stage_to_stage_execution",
-      "prompt": "You are the active Engineer with a valid implementation capsule and lease. Complete ENGINEERING_PASS, then immediately execute the downstream Coverage Steward stage yourself.",
+      "prompt": "You are the active Engineer with a valid implementation capsule and lease. Complete ENGINEERING_PASS, then immediately continue the controller-owned coverage transition yourself.",
       "setup": {
         "active_skill": "gamedev-engineer",
         "controller_phase": "slice_engineering",
@@ -107,8 +193,8 @@
         "activation": ["gamedev-engineer"],
         "allowed_action": "complete_current_engineering_lane_only",
         "completion_token": "ENGINEERING_COMPLETE: yes",
-        "next_action": "$gamedev-coverage-steward",
-        "forbidden_actions": ["execute_coverage_stage", "delegate_coverage_steward"],
+        "next_action": "$gamedev-pipeline",
+        "forbidden_actions": ["execute_coverage_stage", "continue_pipeline_without_director"],
         "required_references": [
           "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
           "skills/gamedev-pipeline/references/role-artifacts-and-context.md"
@@ -188,7 +274,7 @@
         "activation": ["gamedev-engineer"],
         "allowed_action": "record_research_not_required",
         "completion_token": "RESEARCH_NOT_REQUIRED: yes",
-        "next_action": "$gamedev-coverage-steward",
+        "next_action": "$gamedev-pipeline",
         "forbidden_actions": ["activate_gamedev_research_without_brief", "skip_coverage_planning"],
         "required_references": [
           "skills/gamedev-pipeline/references/stage-handoff-invariant.md",
@@ -291,6 +377,29 @@
         ],
         "stop_result": "continue_pipeline_at_recovery_review",
         "authority_result": "controller_recovery_contract"
+      }
+    },
+    {
+      "id": "conversational_stop_is_nonmutating",
+      "scenario": "conversational_stop_nonmutation",
+      "prompt": "Stop now. Do not continue the current pipeline activity.",
+      "setup": {
+        "active_skill": "gamedev-pipeline",
+        "controller_phase": "slice_engineering",
+        "active_write_lease": "present",
+        "repository_pause_command": "available_but_not_explicitly_requested"
+      },
+      "expected": {
+        "activation": [],
+        "allowed_action": "cancel_current_activity_only",
+        "completion_token": null,
+        "next_action": null,
+        "forbidden_actions": ["call_controller_mutator", "release_write_lease", "invoke_repository_pause", "change_pipeline_phase"],
+        "required_references": [
+          "skills/gamedev-pipeline/references/pipeline-protocol.md"
+        ],
+        "stop_result": "stop_without_mutation",
+        "authority_result": "no_repository_pause_authority"
       }
     },
     {

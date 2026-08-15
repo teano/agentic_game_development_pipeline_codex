@@ -42,7 +42,7 @@ Decision ledger and ADR decision capture remain owned by the Decision Recorder. 
 
 ## Derived post-QA mode
 
-Derived outputs summarize an already reviewed and QA-observed result for handoff, indexes, operators, or support. They are support-domain inputs. Sources are limited to exact active `DEC-*` records, current normative documents, controller-generated revision/change/handoff manifests, immutable Review reports, QA scenario evidence, and capability results named in the capsule.
+Derived outputs summarize an already reviewed and QA-observed result for handoff, indexes, operators, or support. They are support-domain inputs. Worker-authorable sources are limited to exact active `DEC-*` records, the closed QA manual-execution envelope, validated Review component-credit manifests, and controller handoffs named by path/SHA in the capsule. Generic QA, capability-probe, and Review reports are audit-only and never source authority.
 
 Derived completion happens after QA so the documents can cite actual operator paths and observed evidence. It may not rewrite QA evidence or turn a deferred/manual gate into a pass. Each operator step must identify its source scenario/capability evidence; each troubleshooting claim must identify its finding or observed failure path.
 
@@ -60,7 +60,7 @@ Otherwise fail closed to the ordinary invalidation route. The new composite revi
 
 The Finisher returns two separate inputs:
 
-1. the shared schema-1 semantic write packet with complete domain inventory, exact changed-path annotations, and open assumptions;
+1. the worker-owned schema-1 semantic write packet linked from `SKILL.md`, with complete domain inventory, exact changed-path annotations, one unique `DOC-CHG-*` `change_id` per change, and open assumptions;
 2. this exact schema-1 statement source map:
 
 ```json
@@ -69,17 +69,18 @@ The Finisher returns two separate inputs:
   "mode": "normative_pre_review|derived_post_qa",
   "statements": [
     {
-      "statement_id": "DOC-STMT-001",
+      "statement_id": "DOC-CHG-001",
       "path": "one actually changed allowed output",
       "source_kind": "lane-allowed kind",
       "source_id": "controller-recognized ID",
       "source_path": "exact controller-recognized source",
-      "source_sha256": "current 64 lowercase hex"
+      "source_sha256": "current 64 lowercase hex",
+      "target_sha256": "exact current changed artifact SHA, or null for deletion"
     }
   ]
 }
 ```
 
-Every changed path needs at least one statement mapping. Statement IDs are non-empty and unique. Normative source kinds are `decision`, `requirement`, `specification`, and `public_contract`; derived source kinds are `decision`, `qa`, `capability_probe`, `review`, and `controller_handoff`. Source ID/path/SHA must match controller-known authority for the lane. A stale or unrecognized source fails closed without state mutation.
+The set of `statement_id` values must exactly equal the semantic packet's `change_id` set, and every row must name that change's exact path and current target SHA. One change ID may repeat only to cite distinct sources; duplicate source mappings are invalid. Normative source kinds are `decision`, `requirement`, `specification`, and `public_contract`; derived source kinds are `decision`, `qa`, `review`, and `controller_handoff`. `qa` means the closed manual-execution envelope, not the generic QA report. Source ID/path/SHA must match exact capsule evidence and controller-known authority for the lane. A stale or unrecognized source fails closed without state mutation.
 
 The controller validates both packets, computes revisions, enumerates changed paths/symbols/lines, classifies domain drift, records the source-map path/SHA, and generates the handoff `documentation_state`. A worker-authored revision hash, change count, or sealed manifest is advisory and cannot satisfy a gate.

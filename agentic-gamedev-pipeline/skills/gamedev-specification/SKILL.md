@@ -16,9 +16,13 @@ Act as Specification Director. Own orchestration, deterministic state, hashes, b
 ## Establish authority
 
 1. Resolve the project root, lowercase feature, canonical PRD, and canonical specification through the contract. Ask one path question only if ambiguity remains.
-2. Require `PRD_READY` on the exact canonical approved PRD. Independently run `../gamedev-requirements/scripts/validate_product_requirements.py <prd> --require-approved` and record its exact-byte SHA-256; do not activate the Requirements stage.
+2. Require `PRD_READY` on the exact canonical approved PRD. Independently run `../gamedev-requirements/scripts/validate_product_requirements.py <prd> --require-approved` and record its exact-byte SHA-256; `init`, `accept-spec`, schema migration, and both `revise-ready` routes repeat that complete validator before mutating state or specification bytes. Legacy/malformed authority requires a controlled PRD revision and reapproval; do not activate the Requirements stage or grandfather it.
 3. Initialize `.agentic-pipeline/specification-state.json` with `init --prd <resolved-prd> --spec <resolved-spec>`. Treat controller output as phase authority.
 4. Assign one persistent Technical Spec Architect as the sole writer. Give every internal worker only canonical paths, exact hashes, role contract, current finding IDs, and a bounded task packet—not accumulated chat history.
+
+If an exact `SPEC_READY` specification is bound to an earlier approved PRD and the PRD has since been freshly approved at a higher revision, use controller `revise-ready --reason <exact reason> --architect-id <fresh-id>` before editing the specification. A bound runtime normally forbids this transition; the sole exception is its exact pre-engineering `authority_recovery_hold`, supplied via matching `--recovery-token`. The transition archives prior PRD/SPEC/Proofreader/Architect readiness provenance, increments the sole specification revision, installs the new PRD trace, demotes to draft, revokes readiness, and enters `awaiting_accept`. After the revised draft bytes are ready, run `accept-spec` to persist a receipt bound to the exact PRD/spec/revision/token; `start-cycle` rejects absent or stale receipts. Then run fresh proofreading cycle(s) and `confirm-ready`; old confirmation never carries forward.
+
+When product authority is unchanged and only the exact ready specification needs a sanctioned correction, use the same command with `--specification-only`. This route requires the exact unchanged approved PRD to pass the complete current Requirements validator before reopening and preserves its trace; it never invents a PRD revision or legitimizes a legacy invalid PRD. The same fresh Architect, runtime recovery, acceptance, proofreading, and fresh confirmation invariants apply.
 
 ## Generate only when required
 
