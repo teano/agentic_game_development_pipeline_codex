@@ -51,4 +51,6 @@ Continue ordinary in-scope transitions when `user_input_required=false`. Ask the
 
 Respect controller worker/review/convergence/recovery budgets and circuit breakers. Report phase transitions, current revisions, active lease/hold, frozen inventories, verified closure, capsule metrics, credits, gates, and controller `next_action`.
 
+Name every intermediate result by its exact controller gate state; implementation, Review, or QA success is not general readiness.
+
 Declare only `PRODUCTION_READY_CANDIDATE` after successful `ready`. Return `NEXT_ACTION: terminal-production-ready-candidate` and stop. Deployment, publication, migration, store submission, spending, and risk acceptance remain external.

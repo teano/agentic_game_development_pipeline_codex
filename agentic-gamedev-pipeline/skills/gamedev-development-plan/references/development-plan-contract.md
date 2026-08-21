@@ -54,6 +54,8 @@ Analyze product and technical breadth, estimated files/symbols/tests, context wo
 
 Use `sequential_slices` only if every slice is independently understandable and produces an observable end-to-end outcome. A later slice may consume a sealed earlier handoff, but writers never overlap. Do not create layer-only slices such as backend, UI, or tests. When boundaries are inseparable, retain one integration owner and add `MILESTONE-*` checkpoints.
 
+Preserve the specification's semantic and responsibility boundaries. Acceptance-ID membership is trace metadata, not proof that a slice implements the criterion. Wildcard paths and budgets bound authorized work; they never merge component responsibilities or replace explicit owner and boundary design.
+
 ## Required plan body
 
 Include `Decision`, `Planning Analysis`, `Scope Boundaries`, `Decision Ledger`, `Coverage Strategy`, `Documentation Strategy`, and `Context Budget`. `Decision` must declare `Writer sequencing: one-at-a-time` and `Ownership meaning: phase-scoped write lease`. A `single_owner` plan also includes at least one `MILESTONE-*` under `Integration Milestones`.

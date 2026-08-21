@@ -8,6 +8,8 @@ For convergence, activate the single controller-required read-only Review assign
 
 Full convergence accounting is per slice and append-only. The initial whole-candidate cycle credits every covered slice once. Local remediation uses one targeted closure receipt. A second full cycle requires an actual architecture, lifecycle, ownership, public-contract, expanded shared-touchpoint, or broad/high-risk trigger; a third cycle on the same lineage is forbidden.
 
+A theoretical, unsupported-configuration, or out-of-scope finding alone triggers neither remediation, rebaseline, nor another full Review.
+
 After clean convergence, obtain the single controller-required Final Review receipt. The same logical independent non-writer ID may produce convergence and Final Review receipts sequentially, but every phase starts in a fresh no-history session after Director boundary validation and receives a new exact capsule. Final Review receives predecessor credit manifests, never predecessor human conclusions. Product rework returns one combined batch to an origin/integration Engineer lease followed by controller-owned coverage finalization and targeted or full revalidation as state requires.
 
 Every convergence/full/targeted completion uses the current command's required capsule and credit manifest. Recovery verification also requires both; no review path relies on an unbounded inherited context.

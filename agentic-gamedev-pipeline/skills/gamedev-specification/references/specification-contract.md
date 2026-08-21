@@ -60,6 +60,10 @@ Keep stable, machine-addressable identifiers. Trace every normative technical re
 - acceptance mapping and deterministic verification strategy;
 - open questions, with category and blocking status.
 
+Coverage is semantic: for each approved behavior or invariant, state its technical realization and verification, or an explicit justified non-applicability. Repeating its source ID alone is not coverage.
+
+For every central component, state its primary responsibility, owned state and lifecycle, dependencies, and prohibited responsibilities. A folder/module/path allocation or component list is not an ownership design.
+
 Do not invent product behavior to fill a technical gap. Prefer the smallest design consistent with the approved PRD and established project architecture.
 
 ## Worker contracts

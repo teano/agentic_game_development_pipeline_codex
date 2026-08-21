@@ -20,8 +20,8 @@ Do not edit until the Director has accepted research or `research_not_required`,
 1. Implement only approved behavior and assigned root causes in dependency order.
 2. Add or update only automated tests tightly coupled to changed behavior and registered exact identities. Return an amendment need rather than silently changing the coverage inventory.
 3. Inspect affected lifecycle, concurrency, persistence, trust, failure/recovery, performance, cleanup, and platform behavior required for correctness; do not perform a repository-wide audit.
-4. Run changed tests, affected suites, targeted build/static/engine checks, and one bounded aggregate regression as assigned. Manual runtime/DataStore/operator scenarios remain QA work.
-5. Inspect the actual final diff for correctness, unintended edits, scope confinement, and test coupling. Remove drive-by cleanup/refactors.
+4. Run changed tests, affected suites, targeted build/static/engine checks, and one bounded aggregate regression as assigned. For an integration criterion, do not report proof unless evidence exercises a supported end-to-end path; evidence that bypasses the supported entry/integration path, replaces production composition with a synthetic fixture, or derives its oracle from implementation logic is supplementary only. Manual runtime/DataStore/operator scenarios remain QA work.
+5. Inspect the cumulative current candidate and actual final diff for semantic preservation, correctness, unintended edits, scope confinement, responsibility boundaries, and test coupling. Remove drive-by cleanup/refactors.
 
 The Scope Contract is an allowlist. Stop at `scope_expansion_hold` for excluded/unmapped paths or symbols, unapproved touchpoints, budget breach, or material lifecycle, ownership, public-contract, or slice-boundary change. An unrelated allowed-path cleanup is not an `assigned_goal_effect`: remove it, or return a supported out-of-scope problem as a candidate for Director backlog routing. Severity never grants remediation authority; report new candidates with complete dimensions and never set `blocking` or mutate the deferred backlog.
 

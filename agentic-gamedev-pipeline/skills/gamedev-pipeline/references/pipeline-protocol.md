@@ -33,6 +33,10 @@ derived_documentation -> documentation_review -> ready
 
 A hold preserves its source phase and completed work. Its compact route must name the exact resume action, owner, user-input flag, reason, and resume phase. Authority/scope rebaseline, migration, budget authorization, and circuit-breaker release are controller operations, never worker calls.
 
+Before any affected worker assignment, route every explicit user run constraint through the existing immutable `user-authority-accept` and Decision Recorder flow, then include its active `DEC-*` ID in the capsule. Prompt text, checkpoint prose, and chat history are not substitutes. A new constraint follows the same authority/rebaseline route before the next affected assignment; if that route is unavailable in the current phase, stop at its exact authority gate.
+
+During an active product run, pipeline skills, controller code, and gates are read-only and outside candidate scope. Changing them requires a separate explicitly authorized pipeline-maintenance task and cannot be used to make the active candidate pass.
+
 Continue only the controller's deterministic route. Ask the user only when `user_input_required=true` or the action is inherently user-owned. Completion tokens and worker `NEXT_ACTION` values are routing evidence, never activation authority.
 
 `ready` declares only a production-ready candidate. It never authorizes publication, deployment, migration, spending, submission, or risk acceptance.
