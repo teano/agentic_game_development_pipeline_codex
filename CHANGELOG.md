@@ -7,6 +7,47 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-26
+
+### Добавлено
+
+- Добавлен модульный controller-owned Pipeline v2 с семью фиксированными фазами, девятью публичными командами, атомарным state store, native process lock и единым `active_assignment` вместо разрозненных leases, capsules и recovery handlers.
+- Controller теперь самостоятельно выводит worker identity, read/write scope, output path, checks, checkout inventory, command intent и replay receipts; workers возвращают только ограниченные semantic artifacts своей роли.
+- Добавлены fail-closed reconfiguration, schema-10 import, process-tree containment и regression coverage для Windows/POSIX, lost-response replay, stale CAS, authority drift, reparse paths и interrupted writes.
+- Добавлен общий operational-invariant test, который проверяет согласованность stable launcher, skill contracts и единственного runtime v2.
+
+### Изменено
+
+- Стабильный `pipeline_state.py` теперь является компактным launcher для `pipeline_v2`; основной runtime использует schema 2 и последовательность `plan -> slice -> engineering -> review -> qa -> docs -> ready`.
+- Requirements, Specification и Development Plan сохраняют только явно подтверждённые решения, требуют semantic coverage и направляют пользовательские ограничения без engine-specific предположений.
+- Engineering и Docs остаются единственными writing roles; Review и QA получают свежие независимые identities, а любое rework инвалидирует downstream credit и требует повторной проверки текущего candidate.
+- Development Plan и runtime используют controller-owned ordered slices с раздельными read/write paths; public `status` возвращает один точный `next_action`, а reconfiguration и replay используют ту же canonical authority.
+- Test runner рекурсивно обнаруживает модульные runtime-тесты и распространяет запрет bytecode-cache в дочерние процессы.
+
+### Исправлено
+
+- Исправлены checkout/evidence recovery, stale replay baselines, nonzero planned-command gate и восстановление после Docs без ручной правки controller state.
+- Исправлены mixed authority binding, delegated technical approval, retired lineage, integer/bool generation contracts и выбор актуальной same-plan archive при продолжении Development Plan.
+- Exact replay для committed Specification и sealed Slice completion теперь возвращает byte-identical no-op; изменённый intent, stale generation или authority drift отклоняются до mutation.
+- Review/QA больше не переносят устаревший credit через rework, а `ready` повторно сверяет authority, inventory, gates, questions и завершение ordered slices.
+
+### Удалено
+
+- Удалены legacy Decision Recorder, Research и Recovery Remediator skills, deferred-findings runtime, semantic-forward grader и монолитные schema-10 controller tests/references.
+- Удалены отдельные legacy handlers и контракты, дублировавшие controller-owned decisions, remediation gates, scope и replay bookkeeping.
+
+### Миграция
+
+- Существующий schema-10 run импортируется только явной командой `migrate` в пустой v2 state. Legacy candidate и lineage сохраняются как audit context, но не получают v2 verification credit; выполнение возобновляется с Plan и проходит полный v2 lifecycle.
+- Интеграции, вызывавшие удалённые Decision Recorder, Research, Recovery Remediator или deferred-findings entrypoints, должны использовать `$gamedev-pipeline` и оставшиеся role-owned semantic artifacts.
+- Публичный launcher сохраняет прежний путь, но callers должны использовать девять команд v2 и controller-derived `next_action`, не передавая собственные assignment, scope, hashes или replay identity.
+
+### Проверено
+
+- Полный shared-pipeline regression: 310/310 PASS; три POSIX-only process-tree проверки ожидаемо пропускаются на Windows.
+- Реальный Roblox UI System run достиг generation 228, `production_ready_candidate`, с финальными Review/QA, 17/17 Studio checks и 397/397 product tests.
+- Exact replay, authority/inventory reconciliation, cache hygiene и отсутствие ручных controller-state edits независимо перепроверены; неблокирующие deferred P2 не включались в release scope.
+
 ## [0.7.0] - 2026-08-15
 
 ### Добавлено
@@ -172,7 +213,8 @@
 - Полный набор из 97 тестов контроллеров, активации и межрежимных контрактов.
 - Валидация manifest плагина и всех восьми skill-пакетов.
 
-[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.4.0...v0.5.0
