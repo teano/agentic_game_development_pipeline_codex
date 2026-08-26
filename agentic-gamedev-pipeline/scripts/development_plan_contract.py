@@ -205,6 +205,91 @@ def parse_exact_contract_rows(
     return result
 
 
+CONTEXT_CAPSULE_KEYS = {
+    "max_authority_files",
+    "max_evidence_files",
+    "max_total_files",
+    "max_payload_bytes",
+    "max_estimated_tokens",
+    "metric_scope",
+    "authority_paths",
+    "evidence_paths",
+}
+
+
+def _controller_read_path(value: str, label: str) -> str:
+    """Validate one canonical runtime read rule from an approved plan."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\\" in value
+        or value.startswith(("/", "//"))
+        or re.match(r"^[A-Za-z]:", value)
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise PlanContractError(f"{label} must be a canonical project-relative read path")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise PlanContractError(f"{label} must be a canonical project-relative read path")
+    if value == "**":
+        raise PlanContractError(f"{label} cannot grant whole-project '**' read access")
+    wildcard = value.endswith("/**")
+    source = value[:-3] if wildcard else value
+    if not source or any(char in source for char in "*?[]") or (not wildcard and "*" in value):
+        raise PlanContractError(
+            f"{label} allows only exact paths or a terminal dir/** rule"
+        )
+    return value
+
+
+def parse_slice_read_paths(
+    text: str, *, label: str = "approved development plan"
+) -> dict[str, list[str]]:
+    """Return controller read scopes sealed from each slice Context Capsule."""
+    meta, body = parse_development_plan_frontmatter(text, label=label)
+    if meta["status"] != "approved":
+        raise PlanContractError(f"{label} must be approved before read scopes are sealed")
+    matches = list(re.finditer(r"(?m)^## Slice ([A-Za-z0-9][A-Za-z0-9._-]*)\s*$", body))
+    if len(matches) != int(meta["slice_count"]):
+        raise PlanContractError(f"{label} slice_count does not match its Slice sections")
+    result: dict[str, list[str]] = {}
+    for index, match in enumerate(matches):
+        slice_id = match.group(1)
+        if slice_id in result:
+            raise PlanContractError(f"{label} repeats slice ID: {slice_id}")
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+        block = body[match.end():end]
+        headings = list(re.finditer(r"(?m)^### Context Capsule Budget\s*$", block))
+        if len(headings) != 1:
+            raise PlanContractError(
+                f"{label} {slice_id} requires exactly one Context Capsule Budget"
+            )
+        start = headings[0].end()
+        following = re.search(r"(?m)^#{2,3} ", block[start:])
+        section = block[start:start + following.start()] if following else block[start:]
+        rows = parse_exact_contract_rows(
+            section,
+            label=f"{label} {slice_id} Context Capsule Budget",
+            scalar_keys=CONTEXT_CAPSULE_KEYS,
+        )
+        combined: list[str] = []
+        for key in ("authority_paths", "evidence_paths"):
+            items = rows[key].split(",")
+            if not items or any(not item for item in items):
+                raise PlanContractError(
+                    f"{label} {slice_id} {key} must be a non-empty comma-separated list"
+                )
+            for path in items:
+                canonical = _controller_read_path(
+                    path, f"{label} {slice_id} {key}"
+                )
+                if canonical not in combined:
+                    combined.append(canonical)
+        result[slice_id] = combined
+    return result
+
+
 def parse_planned_material_permissions(
     section: str,
     *,
@@ -279,7 +364,6 @@ COVERAGE_GATES = {
     "qa-updated",
 }
 COVERAGE_STRATEGY_KEYS = {
-    "manifest_path",
     "automated_identity_namespace",
     "manual_identity_namespace",
     "mandatory_rule",
@@ -293,8 +377,6 @@ SLICE_COVERAGE_KEYS = {
     "mandatory_identity_ids",
     "automation_feasibility",
     "capability_prerequisites",
-    "planned_manifest",
-    "finalized_manifest",
     "amendment_authorities",
 }
 
@@ -323,8 +405,12 @@ def parse_coverage_strategy(section: str, *, label: str = "Coverage Strategy") -
         label=label,
         scalar_keys=COVERAGE_STRATEGY_KEYS,
         list_keys={"gates"},
+        optional_keys={"manifest_path"},
     )
-    result["manifest_path"] = _repo_path(result["manifest_path"], f"{label} manifest_path")
+    if "manifest_path" in result:
+        result["manifest_path"] = _repo_path(
+            result["manifest_path"], f"{label} manifest_path"
+        )
     _identity_namespace(result["automated_identity_namespace"], f"{label} automated_identity_namespace", "AUTO")
     _identity_namespace(result["manual_identity_namespace"], f"{label} manual_identity_namespace", "MANUAL")
     _capability_ids(result["capability_prerequisites"], f"{label} capability_prerequisites")
@@ -342,10 +428,12 @@ def parse_slice_coverage_contract(section: str, *, label: str) -> dict[str, Any]
         section,
         label=label,
         scalar_keys=SLICE_COVERAGE_KEYS,
+        optional_keys={"planned_manifest", "finalized_manifest"},
     )
     _identity_namespace(result["automated_identity_namespace"], f"{label} automated_identity_namespace", "AUTO")
     _identity_namespace(result["manual_identity_namespace"], f"{label} manual_identity_namespace", "MANUAL")
     _capability_ids(result["capability_prerequisites"], f"{label} capability_prerequisites")
     for key in ("planned_manifest", "finalized_manifest"):
-        result[key] = _repo_path(result[key], f"{label} {key}")
+        if key in result:
+            result[key] = _repo_path(result[key], f"{label} {key}")
     return result

@@ -36,16 +36,15 @@ Feature scope, non-goals, protected systems, and authorized shared boundaries.
 
 - ledger_path: DECISION_LEDGER_PATH
 - active_decision_ids: DEC-001 | none
-- new_decision_route: explicit authority -> Decision Recorder -> controller append validation
+- new_decision_route: explicit authority -> planning controller internal append validation
 
 ## Coverage Strategy
 
-- manifest_path: tests/FEATURE_SLUG/verification/coverage-schema-2.json
 - automated_identity_namespace: AUTO-FEATURE-*
 - manual_identity_namespace: MANUAL-FEATURE-*
 - mandatory_rule: explicit identity registration mapped to approved PRD-AC IDs
 - automation_feasibility: exact boundary
-- capability_prerequisites: studio-editor-sync, test-server-two-clients, window-control-path
+- capability_prerequisites: project-runtime-capability
 - gates: plan-before-engineering, finalize-after-code-freeze, qa-updated
 
 ## Documentation Strategy
@@ -128,9 +127,7 @@ Controller-generated schema-2 handoff with exact revisions/change evidence plus 
 - manual_identity_namespace: MANUAL-SLICE-001-*
 - mandatory_identity_ids: exact IDs or controller-validated derivation source
 - automation_feasibility: exact automated boundary
-- capability_prerequisites: test-server-two-clients, persistence-datastore, window-control-path
-- planned_manifest: tests/FEATURE_SLUG/verification/SLICE-001-coverage-planned.json
-- finalized_manifest: tests/FEATURE_SLUG/verification/SLICE-001-coverage-finalized.json
+- capability_prerequisites: project-runtime-capability
 - amendment_authorities: DEC-*, normalized finding IDs, or approved scope rebaseline only
 
 ### Documentation Contract

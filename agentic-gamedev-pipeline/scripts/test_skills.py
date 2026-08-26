@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import os
 import re
 import sys
 import time
@@ -19,7 +20,7 @@ from typing import TextIO
 
 sys.dont_write_bytecode = True
 
-RUNTIME_GROUPS = {"state", "findings", "activation", "other"}
+RUNTIME_GROUPS = {"state", "other"}
 FAST_EXCLUDED_RUNTIME_GROUPS = {"state"}
 RUNTIME_PARTITION_PATTERN = re.compile(r"([1-9][0-9]*)/([1-9][0-9]*)")
 
@@ -50,11 +51,9 @@ def _flatten(suite: unittest.TestSuite) -> tuple[unittest.TestCase, ...]:
 
 
 def _runtime_group(path: Path) -> str:
-    return {
-        "test_pipeline_state.py": "runtime-state",
-        "test_deferred_findings.py": "runtime-findings",
-        "test_skill_activation.py": "runtime-activation",
-    }.get(path.name, "runtime-other")
+    if "pipeline_v2" in path.parts:
+        return "runtime-state"
+    return "runtime-other"
 
 
 def _group(root: Path, path: Path) -> str:
@@ -90,7 +89,7 @@ def discover(
 ) -> list[TestFile]:
     paths: set[Path] = set()
     for scripts_dir in (root / "skills").glob("*/scripts"):
-        paths.update(scripts_dir.glob("test_*.py"))
+        paths.update(scripts_dir.rglob("test_*.py"))
     bundle_tests = root / "scripts" / "tests"
     if bundle_tests.is_dir():
         paths.update(bundle_tests.glob("test_*.py"))
@@ -244,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="NAME|N/TOTAL",
         help=(
-            "select runtime file groups (all/state/findings/activation/other) or "
+            "select runtime file groups (all/state/other) or "
             "a deterministic N/TOTAL partition after discovery; repeat to combine "
             "named groups with one partition"
         ),
@@ -277,6 +276,9 @@ def run(
     root: Path | None = None,
     stream: TextIO | None = None,
 ) -> int:
+    # Child CLI/process tests inherit this; sys.dont_write_bytecode affects only
+    # this interpreter and otherwise leaves caches in the source checkout.
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     args = build_parser().parse_args(argv)
     root = root or Path(__file__).resolve().parents[1]
     stream = stream or sys.stdout

@@ -1,13 +1,23 @@
 # Stage handoff invariant
 
-This contract applies to every Agentic GameDev Pipeline skill.
+A GameDev stage starts only when the user explicitly invokes it or an explicitly invoked `$gamedev-pipeline` Director assigns that exact phase. A completion token, repository state, or suggested next action is never activation authority.
 
-1. A stage starts only after the current user explicitly invokes its named skill or an active `$gamedev-pipeline` Director, itself explicitly invoked by the user, assigns that exact stage. A completion token, `NEXT_ACTION`, repository state, or another stage is never activation authority.
-2. A specialized stage may use bounded internal workers only inside its own contract. It must not invoke, delegate, spawn, or execute another Agentic GameDev stage. Only the user or the active Pipeline Director may activate the next stage.
-3. Before returning, the stage persists its contracted artifact or controller completion state on exact revisions and emits its completion token plus `NEXT_ACTION: $skill-name` or a named terminal action. `NEXT_ACTION` is routing data, not permission to perform the action.
-4. After emitting the handoff, stop that stage. The Pipeline Director validates the token/state and chooses the authorized transition; a directly invoked standalone stage leaves the next invocation to the user. A live worker performs no next-stage work until the Director explicitly reassigns it under the next validated capsule.
-5. Internal workers cannot award their parent stage's completion token. The owning stage validates their outputs and records completion itself.
-6. A Director-activated stage runs in a distinct delegated subagent context; role-play, capsules, leases, or worker IDs inside Director context do not count. The controller may preserve one logical independent non-writer verifier ID across sequential convergence Review, Final Review, QA, and documentation-closure assignments. Every phase starts a new isolated session (`fork_turns: none` or equivalent) with no prior worker or Director chat history and a new exact capsule. The verifier ID must never be the Engineer or any writer.
-7. The stage receives only its bounded packet and returns compact artifact references, not raw reasoning or large logs.
+Each assigned phase runs in a fresh worker context. The worker receives a bounded task, relevant approved sources, read/write limits, checks, and the controller-derived `active_assignment.artifact_schema` and `active_assignment.output_path`. It follows that schema instead of reading runtime code or guessing, and writes its JSON artifact only to that exact `.agentic-pipeline/outputs/<safe-assignment-id>.json` path; this controller-owned output area is outside candidate checkout evidence. It does not receive other controller bookkeeping, previous worker conversation, or authority to start another phase.
 
-The approved top-level order is `PRD_READY -> SPEC_READY -> PLAN_READY -> runtime pipeline`. Remediation and verification loops may route between runtime stages only through controller state and the active Pipeline Director.
+## Context checkpoint and rotation
+
+Context-use percentages describe the current agent session, not the plan's capsule/file/token budgets. An agent MAY stop earlier because the task or assignment is complete, a controller-required phase boundary has been reached, or a real blocker prevents safe progress. Those are lifecycle outcomes, not context-only rotation.
+
+An active agent MUST NOT rotate or hand off solely because of context below 70%; it continues useful in-scope work. At 70% context use, record or refresh a compact checkpoint and continue. At 90% context use, hand off and stop: start no new work and perform only the minimum needed to leave durable, internally consistent state before 100%.
+
+The checkpoint and final handoff contain only the current project root, phase and generation, active assignment, completed changes, test results, open blockers, exact next public action, files still authorized for change, and any unavailable environment already tried with its capability evidence. Do not transfer prior conversation or raw reasoning. A replacement validates current controller state and authority artifacts before continuing.
+
+## Platform and evidence discipline
+
+Pipeline and skill defaults are platform-neutral: they do not assume or prescribe a particular operating system, browser, runner, or interactive tool. A platform-bound choice is permitted only by explicit user-approved product authority or observed project or runtime capability supported by current evidence. Before a platform-bound command or scenario, probe its availability through a safe read-only check; if availability is not proven, fail closed and record the minimum recovery action.
+
+The checkpoint records an unavailable choice. A Director or worker MUST NOT retry the same unavailable environment while inputs are unchanged; retry is allowed only when authority or capability evidence changes. This prevents a replacement session from selecting the same unavailable path merely because its chat history is fresh.
+
+Review, QA, and pipeline-observation workers report every issue observed within the assigned read scope, including independent issues found after the first failure, and verify the evidence before concluding. The pipeline-maintenance observer ledger classifies its issues as `pipeline`, `test`, `product`, or `environment`. Review and QA follow their assigned semantic artifact schemas instead of adding that observer classification: Review uses its existing finding fields and QA uses its existing checks/blocker fields. Review and QA remain read-only. A pipeline-maintenance observer authorized to repair a pipeline defect first preserves the minimal reproduction, then adds a compact regression and makes the smallest simplifying pipeline-only change before focused and adjacent regression runs.
+
+The worker stops after returning its artifact. The Director validates it through the controller and decides the next transition. Only controller state records pipeline progress.

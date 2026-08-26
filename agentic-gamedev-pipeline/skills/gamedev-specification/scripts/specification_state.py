@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib
 import importlib.util
 import json
 import os
@@ -21,7 +22,47 @@ SCHEMA_VERSION = 2
 STATE_RELATIVE_PATH = Path(".agentic-pipeline/specification-state.json")
 RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline/state.json")
 RUNTIME_FINDINGS_RELATIVE_PATH = Path(".agentic-pipeline/findings.json")
+V2_RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline-v2/state.json")
 MAX_CYCLES_PER_ARCHITECT = 5
+
+
+_DEVELOPMENT_PLAN_CONTROLLER_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "gamedev-development-plan"
+    / "scripts"
+    / "development_plan_state.py"
+)
+_DEVELOPMENT_PLAN_CONTROLLER_SPEC = importlib.util.spec_from_file_location(
+    "gamedev_development_plan_for_specification",
+    _DEVELOPMENT_PLAN_CONTROLLER_PATH,
+)
+if (
+    _DEVELOPMENT_PLAN_CONTROLLER_SPEC is None
+    or _DEVELOPMENT_PLAN_CONTROLLER_SPEC.loader is None
+):
+    raise RuntimeError("Cannot load the canonical Development Plan runtime classifier")
+_development_plan_controller = importlib.util.module_from_spec(
+    _DEVELOPMENT_PLAN_CONTROLLER_SPEC
+)
+_DEVELOPMENT_PLAN_CONTROLLER_SPEC.loader.exec_module(_development_plan_controller)
+
+_PIPELINE_V2_PACKAGE_ROOT = (
+    Path(__file__).resolve().parents[2] / "gamedev-pipeline" / "scripts"
+)
+_pipeline_v2_package_root_text = str(_PIPELINE_V2_PACKAGE_ROOT)
+_pipeline_v2_path_added = _pipeline_v2_package_root_text not in sys.path
+if _pipeline_v2_path_added:
+    sys.path.insert(0, _pipeline_v2_package_root_text)
+try:
+    _pipeline_v2_runner = importlib.import_module("pipeline_v2.runner")
+    _pipeline_v2_transaction = importlib.import_module("pipeline_v2.transaction")
+finally:
+    if _pipeline_v2_path_added:
+        sys.path.remove(_pipeline_v2_package_root_text)
+if Path(_pipeline_v2_runner.__file__).resolve() != (
+    _PIPELINE_V2_PACKAGE_ROOT / "pipeline_v2" / "runner.py"
+).resolve():
+    raise RuntimeError("Cannot load the canonical pipeline-v2 runner")
 
 
 class SpecificationStateError(RuntimeError):
@@ -159,16 +200,16 @@ def reopened_specification_bytes(
     text = spec.read_text(encoding="utf-8")
     parts = text.split("---", 2)
     if len(parts) != 3:
-        raise SpecificationStateError("ready specification lacks YAML frontmatter")
-    prior_revision = exact_positive_revision(spec, "ready specification")
+        raise SpecificationStateError("specification lacks YAML frontmatter")
+    prior_revision = exact_positive_revision(spec, "specification")
     next_revision = prior_revision + 1
     lines = parts[1].splitlines()
     if sum(bool(re.match(r"^status\s*:", line)) for line in lines) != 1:
-        raise SpecificationStateError("ready specification must contain exactly one status")
+        raise SpecificationStateError("specification must contain exactly one status")
     flat = any(re.match(r"^source_prd_(?:path|revision|sha256)\s*:", line) for line in lines)
     nested = any(re.match(r"^product_authority\s*:\s*$", line) for line in lines)
     if flat == nested:
-        raise SpecificationStateError("ready specification has ambiguous product authority trace")
+        raise SpecificationStateError("specification has ambiguous product authority trace")
     updated: list[str] = []
     parent: str | None = None
     for line in lines:
@@ -381,13 +422,132 @@ def runtime_recovery_authorization(
     recovery_token: str | None,
     reason: str | None,
     prior_spec_sha256: str | None,
+    requirements_path: str | None = None,
+    requirements_sha256: str | None = None,
+    specification_path: str | None = None,
+    specification_only: bool = False,
+    expected_authorization: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    try:
+        v2_paths = _development_plan_controller.discover_v2_runtime_states(root)
+        legacy_presence = [
+            _development_plan_controller.runtime_path_exists(root / path)
+            for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
+        ]
+    except _development_plan_controller.DevelopmentPlanError as error:
+        raise SpecificationStateError(
+            f"cannot classify the bound runtime safely: {error}"
+        ) from error
+    if v2_paths:
+        if len(v2_paths) != 1:
+            raise SpecificationStateError(
+                "multiple v2 runtime state candidates exist; specification authority "
+                "binding is ambiguous and fails closed"
+            )
+        if recovery_token:
+            raise SpecificationStateError(
+                "v2 specification revision uses the public tokenless reopen route"
+            )
+        if not specification_only:
+            raise SpecificationStateError(
+                "bound v2 runtime permits only a specification-only revision"
+            )
+        v2_path = v2_paths[0]
+        try:
+            before = v2_path.read_bytes()
+            runtime = _development_plan_controller.load_valid_v2_runtime(v2_path)
+            if any(legacy_presence):
+                if not all(legacy_presence):
+                    raise _development_plan_controller.DevelopmentPlanError(
+                        "retired schema-10 lineage requires the complete legacy "
+                        "state/findings pair"
+                    )
+                _development_plan_controller.require_retired_schema10_lineage(root, runtime)
+        except (
+            OSError,
+            _development_plan_controller.DevelopmentPlanError,
+        ) as error:
+            raise SpecificationStateError(
+                f"bound v2 specification lineage is invalid: {error}"
+            ) from error
+        authority = runtime.get("authority")
+        items = authority.get("items") if isinstance(authority, dict) else None
+        requirements = items.get("requirements") if isinstance(items, dict) else None
+        specification = items.get("specification") if isinstance(items, dict) else None
+        if (
+            runtime.get("schema") != 2
+            or Path(str(runtime.get("project_root", ""))).resolve() != root
+            or not isinstance(authority, dict)
+            or set(authority) != {"items", "digest"}
+            or set(items or {}) != {"requirements", "specification", "plan"}
+            or authority.get("digest") != canonical_json_sha256(items)
+            or not isinstance(requirements, dict)
+            or set(requirements) != {"path", "sha256"}
+            or requirements.get("path") != requirements_path
+            or requirements.get("sha256") != requirements_sha256
+            or not isinstance(specification, dict)
+            or set(specification) != {"path", "sha256"}
+            or specification.get("path") != specification_path
+            or specification.get("sha256") != prior_spec_sha256
+        ):
+            raise SpecificationStateError(
+                "bound v2 runtime does not match the exact project, requirements, "
+                "and prior specification authority"
+            )
+        if runtime.get("active_assignment") is not None:
+            raise SpecificationStateError(
+                "bound v2 runtime is not at the quiescent specification-reopen boundary"
+            )
+        try:
+            view = _pipeline_v2_runner.Controller(
+                _pipeline_v2_transaction.StateStore(v2_path)
+            ).status()
+            after = v2_path.read_bytes()
+        except (OSError, _pipeline_v2_runner.PipelineError) as error:
+            raise SpecificationStateError(
+                f"bound v2 public status cannot prove a safe checkout: {error}"
+            ) from error
+        next_action = view.get("next_action") if isinstance(view, dict) else None
+        if (
+            before != after
+            or not isinstance(view, dict)
+            or view.get("active_assignment") is not None
+            or view.get("open_gates") != []
+            or view.get("open_questions") != []
+            or not isinstance(next_action, dict)
+            or next_action.get("kind") != "command"
+        ):
+            raise SpecificationStateError(
+                "bound v2 public status is not a safe quiescent boundary: it is "
+                "terminal, requires checkout recovery, has an open gate/question, "
+                "exposes an unknown effect, or changed during authorization"
+            )
+        authorization = {
+            "schema": 1,
+            "token": None,
+            "reason": reason,
+            "runtime_state_path": v2_path.relative_to(root).as_posix(),
+            "runtime_state_sha256": hashlib.sha256(before).hexdigest(),
+            "prior_spec_sha256": prior_spec_sha256,
+        }
+        if (
+            expected_authorization is not None
+            and authorization != expected_authorization
+        ):
+            raise SpecificationStateError(
+                "bound v2 runtime authorization changed after the audited reopen boundary"
+            )
+        return authorization
     bound = [
         path
         for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
         if (root / path).exists()
     ]
     if not bound:
+        if expected_authorization is not None:
+            raise SpecificationStateError(
+                "bound runtime authorization disappeared after the audited reopen boundary"
+            )
         if recovery_token:
             raise SpecificationStateError(
                 "--recovery-token is valid only for an open bound runtime recovery hold"
@@ -422,7 +582,7 @@ def runtime_recovery_authorization(
             "token, reason, and prior specification SHA"
         )
     require_runtime_preengineering_gate(runtime)
-    return {
+    authorization = {
         "schema": 1,
         "token": recovery_token,
         "reason": reason,
@@ -430,20 +590,48 @@ def runtime_recovery_authorization(
         "hold_opened_at": hold.get("opened_at"),
         "prior_spec_sha256": prior_spec_sha256,
     }
+    if expected_authorization is not None and authorization != expected_authorization:
+        raise SpecificationStateError(
+            "bound runtime authorization changed after the audited reopen boundary"
+        )
+    return authorization
 
 
 def require_bound_recovery_continuation(root: Path, state: dict[str, Any]) -> None:
-    if not any(
-        (root / path).exists()
-        for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
-    ):
-        return
     authorization = state.get("recovery_authorization") or {}
+    if not authorization:
+        try:
+            v2_paths = _development_plan_controller.discover_v2_runtime_states(root)
+            legacy_presence = [
+                _development_plan_controller.runtime_path_exists(root / path)
+                for path in (
+                    RUNTIME_STATE_RELATIVE_PATH,
+                    RUNTIME_FINDINGS_RELATIVE_PATH,
+                )
+            ]
+        except _development_plan_controller.DevelopmentPlanError as error:
+            raise SpecificationStateError(
+                f"cannot classify the bound runtime safely: {error}"
+            ) from error
+        if not v2_paths and not any(legacy_presence):
+            return
+    runtime_state_path = authorization.get("runtime_state_path")
+    authorized_v2_path = (
+        isinstance(runtime_state_path, str)
+        and Path(runtime_state_path).parent
+        == V2_RUNTIME_STATE_RELATIVE_PATH.parent
+        and Path(runtime_state_path).suffix == ".json"
+    )
     runtime_recovery_authorization(
         root,
         recovery_token=authorization.get("token"),
         reason=authorization.get("reason"),
         prior_spec_sha256=authorization.get("prior_spec_sha256"),
+        requirements_path=(state.get("prd") or {}).get("path"),
+        requirements_sha256=(state.get("prd") or {}).get("sha256"),
+        specification_path=(state.get("specification") or {}).get("path"),
+        specification_only=authorized_v2_path,
+        expected_authorization=authorization,
     )
 
 
@@ -455,6 +643,16 @@ def active_architect(state: dict[str, Any]) -> dict[str, Any]:
     raise SpecificationStateError("active Architect is missing from history")
 
 
+def require_no_runtime_binding(root: Path) -> None:
+    if any(
+        (root / path).exists()
+        for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
+    ):
+        raise SpecificationStateError(
+            "revise-in-progress is allowed only before runtime pipeline binding"
+        )
+
+
 def require_source_unchanged(root: Path, state: dict[str, Any]) -> tuple[Path, Path]:
     prd = root / state["prd"]["path"]
     spec = root / state["specification"]["path"]
@@ -462,12 +660,228 @@ def require_source_unchanged(root: Path, state: dict[str, Any]) -> tuple[Path, P
     current_prd_hash = sha256(prd)
     if current_prd_hash != state["prd"]["sha256"]:
         raise SpecificationStateError(
-            "PRD bytes changed; reinitialize specification work from the new approved PRD"
+            "PRD bytes changed; use the sanctioned PRD revision command for the current state"
         )
     _, drift = specification_trace(root, prd, spec)
     if drift:
         raise SpecificationStateError("stale specification trace: " + "; ".join(drift))
     return prd, spec
+
+
+def finalize_in_progress_revision(
+    root: Path, state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
+    transition = state.get("in_progress_revision") or {}
+    if (
+        transition.get("reason") != args.reason.strip()
+        or not same_actor(transition.get("new_architect_id", ""), args.architect_id)
+    ):
+        raise SpecificationStateError(
+            "pending in-progress revision must resume with exact original inputs"
+        )
+    require_no_runtime_binding(root)
+    prd = root / transition["new_prd"]["path"]
+    if sha256(prd) != transition["new_prd"]["sha256"]:
+        raise SpecificationStateError("pending in-progress revision found changed PRD bytes")
+    validate_approved_prd_contract(prd, label="new PRD")
+    spec = root / transition["specification_path"]
+    current_sha = sha256(spec)
+    if current_sha == transition["prior_spec_sha256"]:
+        draft_bytes, prior_revision, next_revision = reopened_specification_bytes(
+            spec,
+            transition["new_prd"]["path"],
+            transition["new_prd"]["revision"],
+            transition["new_prd"]["sha256"],
+        )
+        if (
+            prior_revision != transition["prior_revision"]
+            or next_revision != transition["next_revision"]
+            or hashlib.sha256(draft_bytes).hexdigest() != transition["draft_sha256"]
+        ):
+            raise SpecificationStateError(
+                "pending in-progress revision no longer reproduces its audited draft"
+            )
+        write_bytes_atomically(spec, draft_bytes)
+    elif current_sha != transition["draft_sha256"]:
+        raise SpecificationStateError(
+            "pending in-progress revision found unexpected specification bytes"
+        )
+    event = copy.deepcopy(transition)
+    event["event"] = "in_progress_prd_revision_opened"
+    state.setdefault("history", []).append(event)
+    now = transition["opened_at"]
+    state["prd"] = copy.deepcopy(transition["new_prd"])
+    state["specification"] = {
+        "path": transition["specification_path"],
+        "sha256": transition["draft_sha256"],
+        "status": "draft",
+        "trace_errors": [],
+    }
+    state["status"] = "awaiting_accept"
+    state["active_architect_id"] = transition["new_architect_id"]
+    state["architects"] = [
+        {
+            "id": transition["new_architect_id"],
+            "cycles_completed": 0,
+            "started_at": now,
+            "ended_at": None,
+            "handoff_reason": None,
+        }
+    ]
+    state["total_cycles_completed"] = 0
+    state["waves"] = []
+    state["active_wave"] = None
+    state["hold"] = None
+    state["hold_history"] = []
+    state["ready"] = None
+    state["acceptance"] = None
+    state.pop("in_progress_revision", None)
+    state["updated_at"] = now
+    save_state(root, state)
+    return state
+
+
+def command_revise_in_progress(args: argparse.Namespace) -> dict[str, Any]:
+    root = Path(args.project_root).resolve()
+    state = load_state(root)
+    if state.get("status") == "in_progress_revision_pending":
+        return finalize_in_progress_revision(root, state, args)
+    if state.get("status") == "spec_ready":
+        raise SpecificationStateError("spec_ready authority must use revise-ready")
+    if state.get("status") != "reviewing":
+        raise SpecificationStateError("revise-in-progress requires exact reviewing state")
+    if state.get("ready") is not None:
+        raise SpecificationStateError("reviewing state must not retain SPEC_READY evidence")
+    reason = args.reason.strip()
+    architect_id = args.architect_id.strip()
+    if not reason or not architect_id:
+        raise SpecificationStateError("revision reason and fresh Architect identity are required")
+    if normalized_actor_id(architect_id) in historical_worker_ids(state):
+        raise SpecificationStateError(
+            "revise-in-progress requires an Architect identity fresh across specification history"
+        )
+    require_no_runtime_binding(root)
+    prd = resolve_project_path(root, state["prd"]["path"], "canonical PRD")
+    spec = resolve_project_path(
+        root, state["specification"]["path"], "canonical technical specification"
+    )
+    if (
+        prd.relative_to(root).as_posix() != state["prd"]["path"]
+        or spec.relative_to(root).as_posix() != state["specification"]["path"]
+    ):
+        raise SpecificationStateError("in-progress authority paths are not canonical")
+    validation = validate_approved_prd_contract(prd, label="new PRD")
+    if not spec.is_file():
+        raise SpecificationStateError("in-progress specification does not exist")
+    current_spec_sha = sha256(spec)
+    if current_spec_sha != state["specification"].get("sha256"):
+        raise SpecificationStateError(
+            "in-progress specification bytes do not equal controller-recorded SHA"
+        )
+    active_wave = state.get("active_wave")
+    if not isinstance(active_wave, dict) or not isinstance(
+        active_wave.get("proofread"), dict
+    ):
+        raise SpecificationStateError(
+            "revise-in-progress requires an active wave with a recorded Proofreader result"
+        )
+    if active_wave.get("spec_sha256") != current_spec_sha:
+        raise SpecificationStateError(
+            "active Proofreader wave does not reference the current specification SHA"
+        )
+    meta = parse_frontmatter(spec, "in-progress specification")
+    prior_prd_trace = {
+        key: state["prd"].get(key) for key in ("path", "revision", "sha256")
+    }
+    if (
+        meta.get("document_type") != "technical-specification"
+        or product_authority_trace(meta) != prior_prd_trace
+    ):
+        raise SpecificationStateError(
+            "in-progress specification frontmatter does not match prior PRD authority"
+        )
+    acceptance = state.get("acceptance") or {}
+    expected_acceptance = {
+        "prd_path": state["prd"]["path"],
+        "prd_revision": state["prd"]["revision"],
+        "prd_sha256": state["prd"]["sha256"],
+        "specification_path": state["specification"]["path"],
+        "specification_revision": exact_positive_revision(
+            spec, "in-progress specification"
+        ),
+        "specification_sha256": current_spec_sha,
+        "accepted_by": state["active_architect_id"],
+        "recovery_token": None,
+    }
+    if (
+        not acceptance.get("accepted_at")
+        or any(acceptance.get(key) != value for key, value in expected_acceptance.items())
+    ):
+        raise SpecificationStateError(
+            "revise-in-progress requires the exact prior accept-spec receipt"
+        )
+    accepted_at = utc_timestamp(
+        acceptance["accepted_at"], "in-progress acceptance"
+    )
+    new_prd_meta = require_approved_prd(prd)
+    new_prd_sha = sha256(prd)
+    try:
+        old_revision = int(state["prd"]["revision"])
+        new_revision = int(new_prd_meta["revision"])
+    except (TypeError, ValueError) as exc:
+        raise SpecificationStateError("PRD revisions must be positive integers") from exc
+    if new_prd_sha == state["prd"]["sha256"] or new_revision <= old_revision:
+        raise SpecificationStateError(
+            "revise-in-progress requires a newly approved higher PRD revision and changed SHA"
+        )
+    prd_approved_at = utc_timestamp(
+        new_prd_meta["approved_at"], "new PRD approved_at"
+    )
+    if prd_approved_at <= accepted_at:
+        raise SpecificationStateError(
+            "new PRD approval must be fresh after in-progress specification acceptance"
+        )
+    draft_bytes, prior_revision, next_revision = reopened_specification_bytes(
+        spec,
+        state["prd"]["path"],
+        new_prd_meta["revision"],
+        new_prd_sha,
+    )
+    opened_at = utc_now()
+    state["status"] = "in_progress_revision_pending"
+    state["in_progress_revision"] = {
+        "opened_at": opened_at,
+        "reason": reason,
+        "new_architect_id": architect_id,
+        "revision_kind": "prd_revision",
+        "specification_path": state["specification"]["path"],
+        "prior_revision": prior_revision,
+        "next_revision": next_revision,
+        "prior_spec_sha256": current_spec_sha,
+        "draft_sha256": hashlib.sha256(draft_bytes).hexdigest(),
+        "prior_status": "reviewing",
+        "prior_prd": copy.deepcopy(state["prd"]),
+        "new_prd": {
+            "path": state["prd"]["path"],
+            "revision": new_prd_meta["revision"],
+            "sha256": new_prd_sha,
+            "approved_at": new_prd_meta["approved_at"],
+            "validation_sha256": validation["sha256"],
+        },
+        "prior_specification": copy.deepcopy(state["specification"]),
+        "prior_acceptance": copy.deepcopy(state.get("acceptance")),
+        "prior_ready": copy.deepcopy(state.get("ready")),
+        "prior_architects": copy.deepcopy(state.get("architects", [])),
+        "prior_waves": copy.deepcopy(state.get("waves", [])),
+        "prior_active_wave": copy.deepcopy(state.get("active_wave")),
+        "prior_hold": copy.deepcopy(state.get("hold")),
+        "prior_hold_history": copy.deepcopy(state.get("hold_history", [])),
+        "prior_total_cycles_completed": state.get("total_cycles_completed", 0),
+        "in_progress_disposition": "superseded_by_prd_revision",
+    }
+    state["updated_at"] = opened_at
+    save_state(root, state)
+    return finalize_in_progress_revision(root, state, args)
 
 
 def finalize_ready_revision(
@@ -490,6 +904,11 @@ def finalize_ready_revision(
         recovery_token=getattr(args, "recovery_token", None),
         reason=args.reason,
         prior_spec_sha256=transition["prior_ready_sha256"],
+        requirements_path=transition["prior_prd"]["path"],
+        requirements_sha256=transition["prior_prd"]["sha256"],
+        specification_path=transition["specification_path"],
+        specification_only=bool(transition.get("specification_only")),
+        expected_authorization=transition.get("recovery_authorization"),
     )
     prd = root / transition["new_prd"]["path"]
     if sha256(prd) != transition["new_prd"]["sha256"]:
@@ -561,11 +980,501 @@ def finalize_ready_revision(
     return state
 
 
+def _is_receipt_timestamp(value: Any) -> bool:
+    try:
+        utc_timestamp(value, "committed replay receipt timestamp")
+    except SpecificationStateError:
+        return False
+    return True
+
+
+def _is_receipt_digest(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
+
+
+def _is_receipt_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _normalized_receipt_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    return normalized or None
+
+
+def _is_canonical_receipt_id_list(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    normalized = [_normalized_receipt_id(item) for item in value]
+    return (
+        all(item is not None for item in normalized)
+        and len(normalized) == len(set(normalized))
+        and value == sorted(set(value))
+    )
+
+
+def _is_canonical_prd_receipt(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    base_keys = {"path", "revision", "sha256"}
+    extended_keys = base_keys | {"approved_at", "validation_sha256"}
+    if set(value) not in (base_keys, extended_keys):
+        return False
+    revision = value.get("revision")
+    if not (
+        isinstance(value.get("path"), str)
+        and bool(value["path"])
+        and _is_receipt_digest(value.get("sha256"))
+        and (
+            isinstance(revision, str)
+            and bool(re.fullmatch(r"[1-9][0-9]*", revision))
+            or isinstance(revision, int)
+            and not isinstance(revision, bool)
+            and revision > 0
+        )
+    ):
+        return False
+    return set(value) == base_keys or (
+        _is_receipt_timestamp(value.get("approved_at"))
+        and _is_receipt_digest(value.get("validation_sha256"))
+    )
+
+
+def _canonical_ready_archive(event: dict[str, Any]) -> bool:
+    prior_ready = event.get("prior_ready")
+    prior_specification = event.get("prior_specification")
+    prior_prd = event.get("prior_prd")
+    new_prd = event.get("new_prd")
+    architects = event.get("prior_architects")
+    waves = event.get("prior_waves")
+    holds = event.get("prior_hold_history")
+    total = event.get("prior_total_cycles_completed")
+    specification_only = event.get("specification_only")
+    if (
+        type(specification_only) is not bool
+        or not _is_canonical_prd_receipt(prior_prd)
+        or not _is_canonical_prd_receipt(new_prd)
+        or not isinstance(prior_ready, dict)
+        or set(prior_ready)
+        != {"prd_sha256", "spec_sha256", "proofreader_id", "architect_id", "confirmed_at"}
+        or prior_ready.get("prd_sha256") != prior_prd.get("sha256")
+        or prior_ready.get("spec_sha256") != event.get("prior_ready_sha256")
+        or not all(
+            _normalized_receipt_id(prior_ready.get(key)) is not None
+            for key in ("proofreader_id", "architect_id")
+        )
+        or not _is_receipt_timestamp(prior_ready.get("confirmed_at"))
+        or prior_specification
+        != {
+            "path": event.get("specification_path"),
+            "sha256": event.get("prior_ready_sha256"),
+            "status": "approved",
+            "trace_errors": [],
+        }
+        or specification_only
+        and new_prd != prior_prd
+        or not isinstance(architects, list)
+        or not architects
+        or not isinstance(waves, list)
+        or not waves
+        or not isinstance(holds, list)
+        or not _is_receipt_count(total)
+        or total != len(waves)
+    ):
+        return False
+
+    architect_keys = {"id", "cycles_completed", "started_at", "ended_at", "handoff_reason"}
+    architect_ids: list[str] = []
+    architect_cycles: dict[str, int] = {}
+    for index, architect in enumerate(architects):
+        if not isinstance(architect, dict) or set(architect) != architect_keys:
+            return False
+        actor_id = architect.get("id")
+        cycles = architect.get("cycles_completed")
+        if (
+            _normalized_receipt_id(actor_id) is None
+            or normalized_actor_id(actor_id) in architect_ids
+            or not _is_receipt_count(cycles)
+            or cycles < 1
+            or cycles > MAX_CYCLES_PER_ARCHITECT
+            or not _is_receipt_timestamp(architect.get("started_at"))
+        ):
+            return False
+        normalized_id = normalized_actor_id(actor_id)
+        architect_ids.append(normalized_id)
+        architect_cycles[normalized_id] = cycles
+        if index == len(architects) - 1:
+            if architect.get("ended_at") is not None or architect.get("handoff_reason") is not None:
+                return False
+        elif (
+            cycles != MAX_CYCLES_PER_ARCHITECT
+            or not _is_receipt_timestamp(architect.get("ended_at"))
+            or not isinstance(architect.get("handoff_reason"), str)
+            or not architect["handoff_reason"].strip()
+        ):
+            return False
+    if (
+        sum(architect_cycles.values()) != total
+        or not same_actor(prior_ready["architect_id"], architects[-1]["id"])
+    ):
+        return False
+
+    proofread_keys = {
+        "critical",
+        "major",
+        "minor",
+        "questions",
+        "minors_engineer_resolvable",
+        "coverage_complete",
+        "report_path",
+        "finding_ids",
+        "question_ids",
+        "recorded_at",
+    }
+    question_keys = {"product", "scope", "boundary", "ownership", "public_contract"}
+    base_wave_keys = {
+        "number",
+        "architect_id",
+        "proofreader_id",
+        "spec_sha256",
+        "started_at",
+        "proofread",
+        "outcome",
+        "result_spec_sha256",
+        "completed_at",
+    }
+    wave_counts = {actor_id: 0 for actor_id in architect_ids}
+    proofreader_ids: set[str] = set()
+    for index, wave in enumerate(waves):
+        if not isinstance(wave, dict):
+            return False
+        outcome = wave.get("outcome")
+        expected_wave_keys = base_wave_keys | (
+            {"architect_response", "user_decision"}
+            if outcome == "revised"
+            else {"architect_confirmation"}
+            if outcome == "spec_ready"
+            else set()
+        )
+        wave_architect_id = wave.get("architect_id")
+        wave_proofreader_id = wave.get("proofreader_id")
+        if (
+            _normalized_receipt_id(wave_architect_id) is None
+            or _normalized_receipt_id(wave_proofreader_id) is None
+        ):
+            return False
+        actor_id = normalized_actor_id(wave_architect_id)
+        proofreader_id = normalized_actor_id(wave_proofreader_id)
+        proofread = wave.get("proofread")
+        if (
+            set(wave) != expected_wave_keys
+            or not _is_receipt_count(wave.get("number"))
+            or wave["number"] != index + 1
+            or actor_id not in wave_counts
+            or not proofreader_id
+            or proofreader_id in proofreader_ids
+            or proofreader_id in architect_ids
+            or not _is_receipt_digest(wave.get("spec_sha256"))
+            or not _is_receipt_digest(wave.get("result_spec_sha256"))
+            or not _is_receipt_timestamp(wave.get("started_at"))
+            or not _is_receipt_timestamp(wave.get("completed_at"))
+            or not isinstance(proofread, dict)
+            or set(proofread) != proofread_keys
+        ):
+            return False
+        wave_counts[actor_id] += 1
+        proofreader_ids.add(proofreader_id)
+        questions = proofread.get("questions")
+        finding_ids = proofread.get("finding_ids")
+        question_ids = proofread.get("question_ids")
+        if (
+            not all(_is_receipt_count(proofread.get(key)) for key in ("critical", "major", "minor"))
+            or not isinstance(questions, dict)
+            or set(questions) != question_keys
+            or not all(_is_receipt_count(questions.get(key)) for key in question_keys)
+            or type(proofread.get("minors_engineer_resolvable")) is not bool
+            or type(proofread.get("coverage_complete")) is not bool
+            or not isinstance(proofread.get("report_path"), str)
+            or not proofread["report_path"].strip()
+            or not _is_canonical_receipt_id_list(finding_ids)
+            or len(finding_ids)
+            != proofread["critical"] + proofread["major"] + proofread["minor"]
+            or not _is_canonical_receipt_id_list(question_ids)
+            or len(question_ids) != sum(questions.values())
+            or not _is_receipt_timestamp(proofread.get("recorded_at"))
+        ):
+            return False
+        if outcome == "revised":
+            user_decision = wave.get("user_decision")
+            if (
+                index == len(waves) - 1
+                or not isinstance(wave.get("architect_response"), str)
+                or not wave["architect_response"].strip()
+                or user_decision is not None
+                and not isinstance(user_decision, str)
+                or sum(questions.values()) > 0
+                and (not isinstance(user_decision, str) or not user_decision.strip())
+            ):
+                return False
+        elif (
+            index != len(waves) - 1
+            or wave.get("result_spec_sha256") != wave.get("spec_sha256")
+            or not isinstance(wave.get("architect_confirmation"), str)
+            or not wave["architect_confirmation"].strip()
+            or proofread["critical"]
+            or proofread["major"]
+            or any(questions.values())
+            or not proofread["coverage_complete"]
+            or proofread["minor"]
+            and not proofread["minors_engineer_resolvable"]
+        ):
+            return False
+    last_wave = waves[-1]
+    if (
+        wave_counts != architect_cycles
+        or last_wave.get("result_spec_sha256") != prior_ready.get("spec_sha256")
+        or not same_actor(last_wave.get("architect_id", ""), prior_ready["architect_id"])
+        or not same_actor(last_wave.get("proofreader_id", ""), prior_ready["proofreader_id"])
+    ):
+        return False
+
+    open_hold_keys = {
+        "reason",
+        "architect_id",
+        "cycles_completed",
+        "attempted_proofreader_id",
+        "entered_at",
+        "next_actions",
+    }
+    resolved_hold_keys = open_hold_keys | {
+        "resolved_by",
+        "new_architect_id",
+        "decision_note",
+        "resolved_at",
+    }
+    if len(holds) != 2 * (len(architects) - 1):
+        return False
+    for index in range(len(architects) - 1):
+        opened = holds[2 * index]
+        resolved = holds[2 * index + 1]
+        old_architect = architects[index]
+        new_architect = architects[index + 1]
+        opened_architect_id = opened.get("architect_id") if isinstance(opened, dict) else None
+        resolved_architect_id = (
+            resolved.get("new_architect_id") if isinstance(resolved, dict) else None
+        )
+        if (
+            not isinstance(opened, dict)
+            or set(opened) != open_hold_keys
+            or not isinstance(resolved, dict)
+            or set(resolved) != resolved_hold_keys
+            or opened.get("reason") != "architect_cycle_limit"
+            or _normalized_receipt_id(opened_architect_id) is None
+            or not same_actor(opened_architect_id, old_architect["id"])
+            or not _is_receipt_count(opened.get("cycles_completed"))
+            or opened["cycles_completed"] != MAX_CYCLES_PER_ARCHITECT
+            or _normalized_receipt_id(opened.get("attempted_proofreader_id")) is None
+            or not _is_receipt_timestamp(opened.get("entered_at"))
+            or opened.get("next_actions") != ["handoff-architect", "user-gate"]
+            or any(resolved.get(key) != value for key, value in opened.items())
+            or resolved.get("resolved_by") != "handoff-architect"
+            or _normalized_receipt_id(resolved_architect_id) is None
+            or not same_actor(resolved_architect_id, new_architect["id"])
+            or resolved.get("decision_note") != old_architect["handoff_reason"]
+            or resolved.get("resolved_at") != old_architect["ended_at"]
+            or resolved.get("resolved_at") != new_architect["started_at"]
+            or not _is_receipt_timestamp(resolved.get("resolved_at"))
+        ):
+            return False
+    return True
+
+
+def replay_committed_ready_revision(
+    root: Path,
+    state: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    history = state.get("history")
+    event = history[-1] if isinstance(history, list) and history else None
+    if not isinstance(event, dict) or event.get("event") != "ready_specification_revision_opened":
+        raise SpecificationStateError("revise-ready requires exact spec_ready state")
+    if (
+        type(event.get("specification_only")) is not bool
+        or not isinstance(event.get("reason"), str)
+        or not event["reason"].strip()
+        or _normalized_receipt_id(event.get("new_architect_id")) is None
+        or event.get("recovery_token") is not None
+        and (
+            not isinstance(event.get("recovery_token"), str)
+            or not event["recovery_token"].strip()
+        )
+        or not isinstance(event.get("specification_path"), str)
+        or not event["specification_path"]
+        or not _is_receipt_timestamp(event.get("opened_at"))
+        or event.get("recovery_authorization") is not None
+        and not isinstance(event.get("recovery_authorization"), dict)
+    ):
+        raise SpecificationStateError("committed replay receipt changed after commit")
+    if (
+        event.get("reason") != args.reason
+        or not same_actor(event.get("new_architect_id", ""), args.architect_id)
+        or event.get("recovery_token") != getattr(args, "recovery_token", None)
+        or event["specification_only"] != bool(getattr(args, "specification_only", False))
+    ):
+        raise SpecificationStateError(
+            "committed ready-specification replay requires exact original inputs"
+        )
+
+    expected_event_keys = {
+        "opened_at",
+        "reason",
+        "new_architect_id",
+        "recovery_token",
+        "specification_only",
+        "revision_kind",
+        "recovery_authorization",
+        "specification_path",
+        "prior_revision",
+        "next_revision",
+        "prior_ready_sha256",
+        "draft_sha256",
+        "prior_prd",
+        "new_prd",
+        "prior_specification",
+        "prior_ready",
+        "prior_architects",
+        "prior_waves",
+        "prior_hold_history",
+        "prior_total_cycles_completed",
+        "spec_ready_disposition",
+        "event",
+    }
+    prior_ready = event.get("prior_ready")
+    prior_specification = event.get("prior_specification")
+    prior_prd = event.get("prior_prd")
+    new_prd = event.get("new_prd")
+    prior_revision = event.get("prior_revision")
+    next_revision = event.get("next_revision")
+    specification_only = event.get("specification_only")
+    if (
+        set(event) != expected_event_keys
+        or not isinstance(prior_ready, dict)
+        or not isinstance(prior_specification, dict)
+        or not isinstance(prior_prd, dict)
+        or not isinstance(new_prd, dict)
+        or not isinstance(prior_revision, int)
+        or isinstance(prior_revision, bool)
+        or not isinstance(next_revision, int)
+        or isinstance(next_revision, bool)
+        or prior_revision < 1
+        or next_revision != prior_revision + 1
+        or not _canonical_ready_archive(event)
+        or event.get("revision_kind")
+        != ("specification_only" if specification_only else "prd_revision")
+        or event.get("spec_ready_disposition")
+        != (
+            "revoked_by_specification_revision"
+            if specification_only
+            else "revoked_by_prd_revision"
+        )
+    ):
+        raise SpecificationStateError("committed replay receipt changed after commit")
+    for digest in (event.get("prior_ready_sha256"), event.get("draft_sha256")):
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise SpecificationStateError("committed replay receipt changed after commit")
+
+    runtime_recovery_authorization(
+        root,
+        recovery_token=getattr(args, "recovery_token", None),
+        reason=args.reason,
+        prior_spec_sha256=event["prior_ready_sha256"],
+        requirements_path=prior_prd.get("path"),
+        requirements_sha256=prior_prd.get("sha256"),
+        specification_path=event["specification_path"],
+        specification_only=specification_only,
+        expected_authorization=event.get("recovery_authorization"),
+    )
+
+    prd = resolve_project_path(root, new_prd.get("path"), "committed replay PRD")
+    if prd.relative_to(root).as_posix() != new_prd.get("path"):
+        raise SpecificationStateError("committed replay PRD path changed")
+    if sha256(prd) != new_prd.get("sha256"):
+        raise SpecificationStateError("committed replay found changed PRD bytes")
+    validate_approved_prd_contract(prd, label="committed replay PRD")
+
+    spec = resolve_project_path(
+        root, event.get("specification_path"), "committed replay specification"
+    )
+    if spec.relative_to(root).as_posix() != event.get("specification_path"):
+        raise SpecificationStateError("committed replay specification path changed")
+    if sha256(spec) != event.get("draft_sha256"):
+        raise SpecificationStateError("committed replay draft bytes changed")
+    meta = parse_frontmatter(spec, "committed replay specification")
+    expected_trace = {
+        key: new_prd.get(key) for key in ("path", "revision", "sha256")
+    }
+    if (
+        meta.get("status") != "draft"
+        or exact_positive_revision(spec, "committed replay specification")
+        != next_revision
+        or product_authority_trace(meta) != expected_trace
+    ):
+        raise SpecificationStateError("committed replay draft authority changed")
+
+    expected_projection = {
+        "status": "awaiting_accept",
+        "prd": copy.deepcopy(new_prd),
+        "specification": {
+            "path": event["specification_path"],
+            "sha256": event["draft_sha256"],
+            "status": "draft",
+            "trace_errors": [],
+        },
+        "active_architect_id": event["new_architect_id"],
+        "architects": [
+            {
+                "id": event["new_architect_id"],
+                "cycles_completed": 0,
+                "started_at": event["opened_at"],
+                "ended_at": None,
+                "handoff_reason": None,
+            }
+        ],
+        "total_cycles_completed": 0,
+        "waves": [],
+        "active_wave": None,
+        "hold": None,
+        "hold_history": [],
+        "ready": None,
+        "acceptance": None,
+        "recovery_authorization": copy.deepcopy(event.get("recovery_authorization")),
+        "updated_at": event["opened_at"],
+    }
+    if (
+        "ready_revision" in state
+        or normalized_actor_id(event["new_architect_id"])
+        not in state.get("identity_history", [])
+        or any(state.get(key) != value for key, value in expected_projection.items())
+    ):
+        raise SpecificationStateError("committed state projection changed after replay receipt")
+    return state
+
+
 def command_revise_ready(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
     if state.get("status") == "ready_revision_pending":
         return finalize_ready_revision(root, state, args)
+    if state.get("status") == "awaiting_accept":
+        history = state.get("history")
+        if (
+            isinstance(history, list)
+            and history
+            and isinstance(history[-1], dict)
+            and history[-1].get("event") == "ready_specification_revision_opened"
+        ):
+            return replay_committed_ready_revision(root, state, args)
     if state.get("status") != "spec_ready" or not isinstance(state.get("ready"), dict):
         raise SpecificationStateError("revise-ready requires exact spec_ready state")
     specification_only = bool(getattr(args, "specification_only", False))
@@ -646,6 +1555,10 @@ def command_revise_ready(args: argparse.Namespace) -> dict[str, Any]:
         recovery_token=getattr(args, "recovery_token", None),
         reason=args.reason,
         prior_spec_sha256=state["ready"]["spec_sha256"],
+        requirements_path=state["prd"]["path"],
+        requirements_sha256=state["prd"]["sha256"],
+        specification_path=state["specification"]["path"],
+        specification_only=specification_only,
     )
     if (
         authorization
@@ -898,6 +1811,8 @@ def command_start_cycle(args: argparse.Namespace) -> dict[str, Any]:
 def command_record_proofread(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
+    if state["status"] != "reviewing":
+        raise SpecificationStateError(f"cannot record Proofreader result in {state['status']}")
     require_bound_recovery_continuation(root, state)
     wave = state.get("active_wave")
     if not wave or wave["proofread"] is not None:
@@ -963,6 +1878,8 @@ def close_active_wave(state: dict[str, Any], outcome: str, spec_hash: str) -> No
 def command_complete_cycle(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
+    if state["status"] != "reviewing":
+        raise SpecificationStateError(f"cannot complete cycle in {state['status']}")
     require_bound_recovery_continuation(root, state)
     wave = state.get("active_wave")
     if not wave or wave["proofread"] is None:
@@ -990,6 +1907,8 @@ def command_complete_cycle(args: argparse.Namespace) -> dict[str, Any]:
 def command_confirm_ready(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
+    if state["status"] != "reviewing":
+        raise SpecificationStateError(f"cannot confirm readiness in {state['status']}")
     require_bound_recovery_continuation(root, state)
     wave = state.get("active_wave")
     if not wave or wave["proofread"] is None:
@@ -1095,18 +2014,36 @@ def build_parser() -> argparse.ArgumentParser:
     accept = commands.add_parser("accept-spec")
     accept.set_defaults(handler=command_accept_spec)
 
+    revise_in_progress = commands.add_parser(
+        "revise-in-progress",
+        help=(
+            "replace stale PRD authority during an active reviewed wave before runtime "
+            "binding, archive that wave, and require fresh acceptance and convergence"
+        ),
+    )
+    revise_in_progress.add_argument("--reason", required=True)
+    revise_in_progress.add_argument("--architect-id", required=True)
+    revise_in_progress.set_defaults(handler=command_revise_in_progress)
+
     revise_ready = commands.add_parser(
         "revise-ready",
         aliases=["reopen-ready"],
         help=(
             "revoke exact SPEC_READY bytes for a sanctioned specification revision or "
             "a newly approved PRD revision; "
-            "a bound runtime requires an exact authority_recovery_hold token"
+            "a legacy bound runtime requires an exact authority_recovery_hold token, "
+            "while a proven v2 specification-only revision is tokenless"
         ),
     )
     revise_ready.add_argument("--reason", required=True)
     revise_ready.add_argument("--architect-id", required=True)
-    revise_ready.add_argument("--recovery-token")
+    revise_ready.add_argument(
+        "--recovery-token",
+        help=(
+            "required only for an exact legacy authority_recovery_hold; "
+            "v2 specification-only revisions are tokenless"
+        ),
+    )
     revise_ready.add_argument(
         "--specification-only",
         action="store_true",

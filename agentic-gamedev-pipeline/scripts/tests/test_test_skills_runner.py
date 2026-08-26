@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 import sys
 import tempfile
 import unittest
@@ -42,8 +43,8 @@ class TestSkillsRunnerTests(unittest.TestCase):
 
     def test_fast_mode_reports_the_exact_runtime_state_exclusion(self) -> None:
         self.write_test("scripts/tests/test_bundle.py")
-        self.write_test("skills/gamedev-pipeline/scripts/test_pipeline_state.py")
-        self.write_test("skills/gamedev-pipeline/scripts/test_deferred_findings.py")
+        self.write_test("skills/gamedev-pipeline/scripts/pipeline_v2/tests/test_core.py")
+        self.write_test("skills/gamedev-pipeline/scripts/test_runtime_smoke.py")
         output = io.StringIO()
 
         exit_code = runner.run(["fast"], root=self.root, stream=output)
@@ -58,7 +59,7 @@ class TestSkillsRunnerTests(unittest.TestCase):
 
     def test_runtime_filter_is_explicit_and_failures_are_nonzero(self) -> None:
         self.write_test(
-            "skills/gamedev-pipeline/scripts/test_pipeline_state.py",
+            "skills/gamedev-pipeline/scripts/pipeline_v2/tests/test_core.py",
             """import unittest
 
 class RuntimeTests(unittest.TestCase):
@@ -106,7 +107,7 @@ class RuntimeTests(unittest.TestCase):
             for index in range(23)
         )
         self.write_test(
-            "skills/gamedev-pipeline/scripts/test_pipeline_state.py",
+            "skills/gamedev-pipeline/scripts/pipeline_v2/tests/test_core.py",
             f"import unittest\n\nclass RuntimeTests(unittest.TestCase):\n{methods}\n",
         )
         files = runner.discover(self.root)
@@ -140,6 +141,36 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertEqual(sum(map(len, partitions)), len(set().union(*partitions)))
         self.assertEqual(all_runtime_ids, set().union(*partitions))
+
+    def test_full_runner_propagates_no_bytecode_policy_to_child_processes(self) -> None:
+        helper = self.root / "scripts" / "tests" / "runner_helper.py"
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_text("VALUE = 1\n", encoding="utf-8")
+        self.write_test(
+            "scripts/tests/test_child_import.py",
+            """import pathlib
+import subprocess
+import sys
+import unittest
+
+class ChildImportTests(unittest.TestCase):
+    def test_child_import(self):
+        subprocess.check_call(
+            [sys.executable, '-c', 'import runner_helper'],
+            cwd=pathlib.Path(__file__).parent,
+        )
+""",
+        )
+        old = os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
+        try:
+            output = io.StringIO()
+            self.assertEqual(0, runner.run(["full"], root=self.root, stream=output), output.getvalue())
+            self.assertFalse(any(self.root.rglob("__pycache__")))
+        finally:
+            if old is not None:
+                os.environ["PYTHONDONTWRITEBYTECODE"] = old
+            else:
+                os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
 
 
 if __name__ == "__main__":

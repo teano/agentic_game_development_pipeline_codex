@@ -1,15 +1,13 @@
-# Semantic write packet
+# Engineering semantic artifact
 
-This worker-owned contract applies only to a write role whose skill links it. The controller, not the worker, generates revisions, counts, manifests, and sealed handoffs.
+Follow `assignment.artifact_schema` exactly; it is authoritative. Do not inspect runtime code or guess the output shape.
 
-Return exactly one JSON object with integer `schema: 1`, literal `inventory_complete: true`, exact `domain_inventory`, `changes`, and `open_assumptions` fields:
+Return one JSON object containing only:
 
 ```json
-{"schema":1,"inventory_complete":true,"domain_inventory":{"product":["src/feature.py"],"support":[],"evidence":["tests/test_feature.py"]},"changes":[{"path":"src/feature.py","domain":"product","symbols":["VALUE"],"reason":"assigned_goal_effect: PRD-REQ-001, PRD-AC-001 | Implement approved behavior.","change_kind":"modify","component":"feature-core","lifecycle_change":false,"ownership_change":false,"public_contract_change":false,"requirement_ids":["PRD-REQ-001"],"acceptance_ids":["PRD-AC-001"],"decision_ids":[],"touchpoint_id":null}],"open_assumptions":[]}
+{"outcome":"pass","summary":"Implemented the assigned behavior and coupled tests.","assumptions":[],"questions":[]}
 ```
 
-`domain_inventory` has exactly duplicate-free, non-overlapping `product`, `support`, and `evidence` path arrays and describes the complete post-pass inventory. A deleted path is absent; every other changed path is present.
+`outcome` is `pass`, `fail`, or `blocked`. `summary` is a non-empty statement of the assigned result. `assumptions` and `questions` are optional arrays of concise strings. Omit them when empty.
 
-Each `changes` row has exactly string `path`; enum `domain: product|support|evidence`; string arrays `symbols`, `requirement_ids`, `acceptance_ids`, `decision_ids`; non-empty strings `reason` and `component`; enum `change_kind: add|modify|delete`; booleans `lifecycle_change`, `ownership_change`, `public_contract_change`; and `touchpoint_id`, either `null` or exact `TP-NNN`. A Documentation Finisher row additionally has exactly one unique `change_id: DOC-CHG-*`; no other role may add that field. `reason` starts with `assigned_goal_effect: <sorted requirement IDs>, <sorted acceptance IDs> | ` and a non-empty direct-effect explanation.
-
-Requirement/acceptance IDs are non-empty assigned-scope subsets; decisions are active. Each assumption has exactly non-empty `assumption_id`, `statement`, `owner`, `validation_point`, and `impact_if_false`. Assumptions must be resolved through an existing decision, finding, or gate before terminal readiness; a ready handoff has an empty array. Missing/extra fields, paths, IDs, or domains fail closed.
+Do not include changed-path listings, SHA values, inventory flags, command output, mechanical checkout evidence, or controller state. The controller derives the actual diff and runs the current slice's planned checks independently.

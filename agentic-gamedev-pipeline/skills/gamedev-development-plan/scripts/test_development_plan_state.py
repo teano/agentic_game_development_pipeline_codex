@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import subprocess
 import tempfile
@@ -218,7 +219,8 @@ product_authority:
         self.write_plan()
         controller.command_submit(self.args())
         approval_args = self.args(
-            approved_by="user", approval_note="exact interrupted approval"
+            approved_by="delegated-technical-approver",
+            approval_note="exact interrupted approval",
         )
         real_save_state = controller.save_state
         save_count = 0
@@ -248,6 +250,272 @@ product_authority:
                 seams_assessment="fresh review confirms one coherent integration seam",
             )
         )
+
+    @staticmethod
+    def canonical_digest(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def approve_current_plan(self) -> dict:
+        self.initialize()
+        self.write_plan()
+        controller.command_submit(self.args())
+        return controller.command_approve(
+            self.args(approved_by="user", approval_note="exact SHA approval")
+        )
+
+    def write_v2_runtime_binding(
+        self,
+        *,
+        plan_path: str | None = None,
+        plan_sha256: str | None = None,
+        filename: str = "state.json",
+    ) -> Path:
+        items = {
+            "requirements": {
+                "path": self.prd.relative_to(self.root).as_posix(),
+                "sha256": controller.sha256(self.prd),
+            },
+            "specification": {
+                "path": self.spec.relative_to(self.root).as_posix(),
+                "sha256": controller.sha256(self.spec),
+            },
+            "plan": {
+                "path": plan_path or self.plan.relative_to(self.root).as_posix(),
+                "sha256": plan_sha256 or controller.sha256(self.plan),
+            },
+        }
+        runtime = {
+            "schema": 2,
+            "run_id": f"{self.feature}-runtime",
+            "generation": 0,
+            "project_root": str(self.root),
+            "authority": {"items": items, "digest": self.canonical_digest(items)},
+            "phase": "plan",
+            "active_assignment": None,
+            "slices": [
+                {
+                    "id": "SLICE-001",
+                    "allowed_paths": ["src/example.txt"],
+                    "planned_commands": [["python", "-B", "-c", "pass"]],
+                }
+            ],
+            "artifacts": {},
+            "questions": {},
+            "gates": {},
+            "history": [],
+        }
+        runtime_path = self.root / ".agentic-pipeline-v2" / filename
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+        return runtime_path
+
+    def write_same_lineage_retired_schema10_bindings(
+        self, *, legacy_generation: int = 14, evolved: bool = False,
+    ) -> tuple[Path, Path, Path]:
+        legacy_state_path = self.root / controller.RUNTIME_STATE_RELATIVE_PATH
+        legacy_findings_path = self.root / controller.RUNTIME_FINDINGS_RELATIVE_PATH
+        v2_path = self.root / controller.V2_RUNTIME_STATE_RELATIVE_PATH
+        slices = [
+            {
+                "id": "SLICE-001",
+                "allowed_paths": ["src/example.txt"],
+                "planned_commands": [["python", "-B", "-c", "pass"]],
+            }
+        ]
+        selected = slices[0]
+        legacy_state = {
+            "schema_version": 10,
+            "project_root": str(self.root),
+            "feature": self.feature,
+            "generation": legacy_generation,
+            "requirements_path": self.prd.relative_to(self.root).as_posix(),
+            "requirements_sha256": controller.sha256(self.prd),
+            "spec_path": self.spec.relative_to(self.root).as_posix(),
+            "spec_sha256": controller.sha256(self.spec),
+            "development_plan_path": self.plan.relative_to(self.root).as_posix(),
+            "development_plan_sha256": (
+                "a" * 64 if evolved else controller.sha256(self.plan)
+            ),
+            "active_write_lease": {
+                "lease_id": "LEASE-0001",
+                "role": "engineer",
+                "worker_id": "legacy-engineer",
+                "capsule_id": "legacy-capsule",
+                "phase": "slice_engineering",
+                "write_scope": selected["id"],
+                "status": "active",
+                "rebaseline_carried": False,
+                "allowed_paths": list(selected["allowed_paths"]),
+            },
+            "lease_snapshots": {
+                "LEASE-0001": {"checkout": {"src/example.txt": "1" * 64}}
+            },
+            "phase": "scope_expansion_hold",
+            "execution_stage": "implementation",
+            "active_slice": selected["id"],
+            "slice_id": selected["id"],
+            "ordered_slices": [selected["id"]],
+            "slices": {
+                selected["id"]: {
+                    "id": selected["id"],
+                    "status": "active",
+                    "scope_contract": {
+                        "editable_paths": list(selected["allowed_paths"])
+                    },
+                    "scope_pre_edit_check": {
+                        "slice_id": selected["id"],
+                        "owner_id": "legacy-engineer",
+                        "development_plan_sha256": (
+                            "a" * 64 if evolved else controller.sha256(self.plan)
+                        ),
+                        "scope_contract": {
+                            "editable_paths": list(selected["allowed_paths"])
+                        },
+                        "status": "passed",
+                    },
+                }
+            },
+            "engineer_runs": [],
+            "pending_engineer_completion": None,
+            "last_engineer_run_id": None,
+            "last_engineer_outcome": None,
+            "scope_guard": {
+                "status": "scope_expansion_hold",
+                "hold": {
+                    "slice_id": selected["id"],
+                    "resume_phase": "slice_engineering",
+                    "lease_id": "LEASE-0001",
+                    "candidate_paths": list(selected["allowed_paths"]),
+                    "development_plan_sha256": (
+                        "a" * 64 if evolved else controller.sha256(self.plan)
+                    ),
+                },
+            },
+            "retired_controller_evidence": "preserved after public schema10 cutover",
+        }
+        legacy_findings = {
+            "schema_version": 10,
+            "items": [],
+            "generation": legacy_generation,
+        }
+        legacy_state_path.write_text(json.dumps(legacy_state), encoding="utf-8")
+        legacy_findings_path.write_text(json.dumps(legacy_findings), encoding="utf-8")
+
+        imported = controller._pipeline_v2_legacy.import_schema10(legacy_state, slices)
+        authority = imported["authority"]
+        migrate = {
+            "id": "MIGRATE-SCHEMA10",
+            "command": "migrate",
+            "command_digest": self.canonical_digest(
+                {"name": "migrate", "id": "MIGRATE-SCHEMA10", "imported": imported}
+            ),
+            "generation": legacy_generation,
+            "result": "migrated",
+        }
+        current = __import__("copy").deepcopy(imported)
+        current["generation"] = legacy_generation
+        current["history"].append(migrate)
+        if evolved:
+            current_items = {
+                "requirements": {
+                    "path": self.prd.relative_to(self.root).as_posix(),
+                    "sha256": controller.sha256(self.prd),
+                },
+                "specification": {
+                    "path": self.spec.relative_to(self.root).as_posix(),
+                    "sha256": controller.sha256(self.spec),
+                },
+                "plan": {
+                    "path": self.plan.relative_to(self.root).as_posix(),
+                    "sha256": controller.sha256(self.plan),
+                },
+            }
+            bridge_generation = legacy_generation + 1
+            current["authority"] = {
+                "items": current_items,
+                "digest": self.canonical_digest(current_items),
+            }
+            current["phase"] = "plan"
+            current["slices"] = [
+                {**item, "read_paths": ["docs/evolved-context.md"]}
+                for item in slices
+            ]
+            current["gates"] = {}
+            current["generation"] = bridge_generation
+            current["history"].append({
+                "id": "reconfigure-evolved-lineage",
+                "command": "init",
+                "command_digest": self.canonical_digest(
+                    ["public-reconfigure", bridge_generation]
+                ),
+                "generation": bridge_generation,
+                "result": "authority_scope_reconfigured",
+                "prior": {
+                    "phase": imported["phase"],
+                    "authority_digest": authority["digest"],
+                    "slices_digest": self.canonical_digest(slices),
+                    "candidate": None,
+                    "artifact_phases": [],
+                    "question_ids": [],
+                    "gate_ids": ["migration-audit"],
+                },
+            })
+        v2_path.parent.mkdir(parents=True, exist_ok=True)
+        v2_path.write_text(json.dumps(current), encoding="utf-8")
+        return legacy_state_path, legacy_findings_path, v2_path
+
+    def reinitialize_revised_plan_with_evolved_bindings(self) -> dict[str, object]:
+        first = self.approve_current_plan()
+        first_sha256 = first["approval"]["approved_sha256"]
+        controller.command_revise_approved(
+            self.args(
+                reason="Open the first approved revision",
+                reopened_by="development-plan-director-2",
+                analyst_id="planning-analyst-2",
+            )
+        )
+        self.accept_revised_analysis()
+        controller.command_submit(self.args())
+        second = controller.command_approve(
+            self.args(
+                approved_by="delegated-technical-approver",
+                approval_note="Approve the revised authority",
+            )
+        )
+        second_sha256 = second["approval"]["approved_sha256"]
+        self.assertNotEqual(first_sha256, second_sha256)
+        old_prd_sha256 = controller.sha256(self.prd)
+        old_spec_sha256 = controller.sha256(self.spec)
+        bindings = self.write_same_lineage_retired_schema10_bindings(evolved=True)
+        binding_bytes = {path: path.read_bytes() for path in bindings}
+
+        self.prd.write_text(
+            self.prd.read_text(encoding="utf-8") + "\nRevised authority input.\n",
+            encoding="utf-8",
+        )
+        self.write_spec_and_ready_state()
+        self.assertEqual("stale", controller.command_status(self.args())["status"])
+        renewed = controller.command_reinitialize(
+            self.args(analyst_id="planning-analyst-3")
+        )
+        self.assertEqual("analyzing", renewed["status"])
+        self.assertEqual(first_sha256, renewed["history"][0]["prior_approved_sha256"])
+        self.assertEqual(
+            second_sha256,
+            renewed["history"][-1]["approval"]["approved_sha256"],
+        )
+        return {
+            "bindings": bindings,
+            "binding_bytes": binding_bytes,
+            "first_sha256": first_sha256,
+            "second_sha256": second_sha256,
+            "old_prd_sha256": old_prd_sha256,
+            "old_spec_sha256": old_spec_sha256,
+        }
 
     def slice_text(self, number: int, dependencies: str) -> str:
         return f"""## Slice SLICE-{number:03d}
@@ -405,7 +673,7 @@ Only the approved feature and named shared symbol are in scope.
 
 - ledger_path: docs/Features/template/{self.feature}/decision-ledger.jsonl
 - active_decision_ids: none
-- new_decision_route: explicit authority -> Decision Recorder -> controller append validation
+- new_decision_route: explicit authority -> planning controller internal append validation
 
 ## Coverage Strategy
 
@@ -482,7 +750,7 @@ Only the approved feature and named shared symbol are in scope.
         self.initialize()
         self.write_plan()
         submitted = controller.command_submit(self.args())
-        self.assertEqual(submitted["status"], "awaiting_user_approval")
+        self.assertEqual(submitted["status"], "awaiting_approval")
         self.assertIn("status: draft", self.plan.read_text(encoding="utf-8"))
         approved = controller.command_approve(
             self.args(approved_by="user", approval_note="User approved exact submitted SHA")
@@ -493,12 +761,128 @@ Only the approved feature and named shared symbol are in scope.
             approved["approval"]["submitted_sha256"], submitted["submission"]["sha256"]
         )
 
+    def test_delegated_technical_approval_records_the_true_actor_and_revises(self) -> None:
+        self.initialize()
+        self.write_plan()
+        submitted = controller.command_submit(self.args())
+        approval_args = self.args(
+            approved_by="development-plan-director-2",
+            approval_note="Approved under the user's delegated technical authority",
+        )
+
+        approved = controller.command_approve(approval_args)
+
+        self.assertEqual("approved", approved["status"])
+        self.assertEqual(
+            "development-plan-director-2", approved["approval"]["approved_by"]
+        )
+        self.assertEqual(
+            submitted["submission"]["sha256"],
+            approved["approval"]["submitted_sha256"],
+        )
+        plan_text = self.plan.read_text(encoding="utf-8")
+        self.assertIn("approved_by: development-plan-director-2", plan_text)
+        self.assertNotIn("approved_by: user", plan_text)
+
+        replay_state = controller.state_path(self.root).read_bytes()
+        replay_plan = self.plan.read_bytes()
+        self.assertEqual(approved, controller.command_approve(approval_args))
+        self.assertEqual(replay_state, controller.state_path(self.root).read_bytes())
+        self.assertEqual(replay_plan, self.plan.read_bytes())
+
+        reopened = controller.command_revise_approved(
+            self.args(
+                reason="Correct the approved technical scope",
+                reopened_by="development-plan-director-3",
+                analyst_id="planning-analyst-2",
+            )
+        )
+        self.assertEqual("analyzing", reopened["status"])
+        self.assertEqual(
+            "development-plan-director-2",
+            reopened["history"][-1]["prior_approval"]["approved_by"],
+        )
+
+    def test_legacy_awaiting_user_approval_state_accepts_truthful_delegated_actor(self) -> None:
+        self.initialize()
+        self.write_plan()
+        controller.command_submit(self.args())
+        state = controller.load_state(self.root)
+        state["status"] = "awaiting_user_approval"
+        controller.save_state(self.root, state)
+
+        approved = controller.command_approve(
+            self.args(
+                approved_by="delegated-technical-approver",
+                approval_note="Legacy pending state approved under current delegation",
+            )
+        )
+
+        self.assertEqual("approved", approved["status"])
+        self.assertEqual(
+            "delegated-technical-approver", approved["approval"]["approved_by"]
+        )
+
+    def test_approval_actor_is_a_safe_single_frontmatter_scalar(self) -> None:
+        self.initialize()
+        self.write_plan()
+        controller.command_submit(self.args())
+        state_before = controller.state_path(self.root).read_bytes()
+        plan_before = self.plan.read_bytes()
+
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "approval actor"):
+            controller.command_approve(
+                self.args(
+                    approved_by="agent\napproved_at: forged",
+                    approval_note="unsafe actor must not reach frontmatter",
+                )
+            )
+
+        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
+        self.assertEqual(plan_before, self.plan.read_bytes())
+
+    def test_exact_submit_replay_is_state_and_artifact_byte_noop(self) -> None:
+        self.initialize()
+        self.write_plan()
+        state_path = controller.state_path(self.root)
+        with mock.patch.object(
+            controller, "utc_now", return_value="2026-08-24T02:35:45+00:00"
+        ):
+            submitted = controller.command_submit(self.args())
+        state_before = state_path.read_bytes()
+        plan_before = self.plan.read_bytes()
+        history_before = submitted["history"]
+        submitted_at_before = submitted["submission"]["submitted_at"]
+        updated_at_before = submitted["updated_at"]
+
+        with mock.patch.object(
+            controller, "utc_now", return_value="2026-08-24T02:36:08+00:00"
+        ):
+            replay = controller.command_submit(self.args())
+
+        self.assertEqual(submitted, replay)
+        self.assertEqual(state_before, state_path.read_bytes())
+        self.assertEqual(plan_before, self.plan.read_bytes())
+        self.assertEqual(history_before, replay["history"])
+        self.assertEqual(submitted_at_before, replay["submission"]["submitted_at"])
+        self.assertEqual(updated_at_before, replay["updated_at"])
+
+        result = self.cli("submit")
+        self.assertEqual(0, result.returncode, msg=result.stdout or result.stderr)
+        self.assertEqual(state_before, state_path.read_bytes())
+        self.assertEqual(plan_before, self.plan.read_bytes())
+        replay_cli = controller.load_state(self.root)
+        self.assertEqual(history_before, replay_cli["history"])
+        self.assertEqual(submitted_at_before, replay_cli["submission"]["submitted_at"])
+        self.assertEqual(updated_at_before, replay_cli["updated_at"])
+
     def test_approval_recovers_after_plan_replace_and_is_idempotent(self) -> None:
         self.initialize()
         self.write_plan()
         controller.command_submit(self.args())
         approval_args = self.args(
-            approved_by="user", approval_note="exact resumable approval"
+            approved_by="delegated-technical-approver",
+            approval_note="exact resumable approval",
         )
         real_save_state = controller.save_state
         save_count = 0
@@ -619,7 +1003,7 @@ Only the approved feature and named shared symbol are in scope.
                     result = self.cli(
                         "approve",
                         "--approved-by",
-                        "user",
+                        "delegated-technical-approver",
                         "--approval-note",
                         "exact interrupted approval",
                     )
@@ -739,7 +1123,7 @@ Only the approved feature and named shared symbol are in scope.
                 before_plan = self.plan.read_bytes()
                 if tamper == "transition":
                     state = controller.load_state(self.root)
-                    state["approval_transition"]["approved_by"] = "director"
+                    state["approval_transition"]["approved_by"] = "director\nforged: true"
                     controller.save_state(self.root, state)
                     with self.assertRaisesRegex(
                         controller.DevelopmentPlanError, "transition is malformed"
@@ -819,7 +1203,7 @@ Only the approved feature and named shared symbol are in scope.
             self.args(approved_by="user", approval_note="exact SHA approved")
         )
         self.plan.write_text(self.plan.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "changed after user approval"):
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "changed after recorded approval"):
             controller.command_validate(self.args())
 
     def test_acceptance_ranges_are_rejected_in_every_slice_contract_surface(self) -> None:
@@ -1029,6 +1413,801 @@ Only the approved feature and named shared symbol are in scope.
                 )
             )
 
+    def test_same_lineage_retired_schema10_pair_allows_initial_revise_approved(self) -> None:
+        self.approve_current_plan()
+        bindings = self.write_same_lineage_retired_schema10_bindings()
+        binding_bytes = {path: path.read_bytes() for path in bindings}
+
+        reopened = controller.command_revise_approved(
+            self.args(
+                reason="Add the approved integration context",
+                reopened_by="development-plan-director-2",
+                analyst_id="planning-analyst-2",
+            )
+        )
+
+        self.assertEqual("analyzing", reopened["status"])
+        self.assertNotIn("recovery_authorization", reopened)
+        self.assertEqual(binding_bytes, {path: path.read_bytes() for path in bindings})
+
+    def test_same_lineage_classifier_is_reused_by_bound_continuation(self) -> None:
+        self.approve_current_plan()
+        bindings = self.write_same_lineage_retired_schema10_bindings()
+        binding_bytes = {path: path.read_bytes() for path in bindings}
+        controller.command_revise_approved(
+            self.args(
+                reason="Add the approved integration context",
+                reopened_by="development-plan-director-2",
+                analyst_id="planning-analyst-2",
+            )
+        )
+
+        accepted = self.accept_revised_analysis()
+        validated = controller.command_validate(self.args())
+
+        self.assertEqual("drafting", accepted["status"])
+        self.assertEqual(self.plan.relative_to(self.root).as_posix(), accepted["plan_path"])
+        self.assertEqual(controller.sha256(self.plan), validated["sha256"])
+        self.assertEqual(binding_bytes, {path: path.read_bytes() for path in bindings})
+
+    def test_evolved_retired_schema10_bridge_allows_reopen_and_continuation(self) -> None:
+        self.approve_current_plan()
+        bindings = self.write_same_lineage_retired_schema10_bindings(evolved=True)
+        binding_bytes = {path: path.read_bytes() for path in bindings}
+
+        reopened = controller.command_revise_approved(
+            self.args(
+                reason="Use the current publicly reconfigured plan authority",
+                reopened_by="development-plan-director-2",
+                analyst_id="planning-analyst-2",
+            )
+        )
+        accepted = self.accept_revised_analysis()
+        validated = controller.command_validate(self.args())
+
+        self.assertEqual("analyzing", reopened["status"])
+        self.assertEqual("drafting", accepted["status"])
+        self.assertEqual(controller.sha256(self.plan), validated["sha256"])
+        self.assertEqual(binding_bytes, {path: path.read_bytes() for path in bindings})
+
+    def test_reinitialized_revised_v2_plan_uses_latest_archive_direct_and_cli(
+        self,
+    ) -> None:
+        for route in ("direct", "cli"):
+            with self.subTest(route=route):
+                try:
+                    context = self.reinitialize_revised_plan_with_evolved_bindings()
+                    bindings = context["bindings"]
+                    binding_bytes = context["binding_bytes"]
+                    state_before = controller.state_path(self.root).read_bytes()
+                    plan_before = self.plan.read_bytes()
+                    if route == "direct":
+                        accepted = self.accept_revised_analysis(
+                            analyst_id="planning-analyst-3"
+                        )
+                    else:
+                        result = self.cli(
+                            "accept-analysis",
+                            "--analyst-id",
+                            "planning-analyst-3",
+                            "--mode",
+                            "single_owner",
+                            "--rationale",
+                            "fresh analysis for the revised plan authority",
+                            "--working-set",
+                            "8 files, 3 tests, one revised planning packet",
+                            "--seams-assessment",
+                            "fresh review confirms one coherent integration seam",
+                        )
+                        self.assertEqual(0, result.returncode, result.stderr)
+                        accepted = json.loads(result.stdout)
+                    self.assertEqual("drafting", accepted["status"])
+                    self.assertNotEqual(
+                        state_before, controller.state_path(self.root).read_bytes()
+                    )
+                    self.assertEqual(plan_before, self.plan.read_bytes())
+                    self.assertEqual(
+                        binding_bytes, {path: path.read_bytes() for path in bindings}
+                    )
+
+                    draft_bytes, _, _ = controller.reopened_plan_bytes(
+                        self.plan, "planning-analyst-3"
+                    )
+                    draft_text = draft_bytes.decode("utf-8").replace(
+                        str(context["old_prd_sha256"]), controller.sha256(self.prd)
+                    ).replace(
+                        str(context["old_spec_sha256"]), controller.sha256(self.spec)
+                    )
+                    self.plan.write_text(draft_text, encoding="utf-8")
+                    self.assertEqual(
+                        controller.sha256(self.plan),
+                        controller.command_validate(self.args())["sha256"],
+                    )
+                    submitted = controller.command_submit(self.args())
+                    self.assertEqual("awaiting_approval", submitted["status"])
+                    approved = controller.command_approve(
+                        self.args(
+                            approved_by="delegated-plan-revision-approver",
+                            approval_note="Approve the specification-aligned plan",
+                        )
+                    )
+                    self.assertEqual("approved", approved["status"])
+                    self.assertEqual(
+                        binding_bytes, {path: path.read_bytes() for path in bindings}
+                    )
+                finally:
+                    self.tearDown()
+                    self.setUp()
+
+    def test_reinitialized_v2_plan_archive_tampering_never_falls_back(self) -> None:
+        cases = (
+            (
+                "changed approval SHA",
+                "direct",
+                "plan SHA",
+                lambda archive: archive["approval"].update(
+                    {"approved_sha256": "f" * 64}
+                ),
+            ),
+            (
+                "missing approval",
+                "cli",
+                "reinitialized plan authority history",
+                lambda archive: archive.pop("approval"),
+            ),
+            (
+                "malformed approval",
+                "direct",
+                "reinitialized plan authority history",
+                lambda archive: archive.update({"approval": []}),
+            ),
+            (
+                "wrong archived plan path",
+                "cli",
+                "reinitialized plan authority history",
+                lambda archive: archive.update(
+                    {"plan_path": "docs/foreign/development-plan.md"}
+                ),
+            ),
+        )
+        for label, route, message, mutate in cases:
+            with self.subTest(label=label, route=route):
+                try:
+                    context = self.reinitialize_revised_plan_with_evolved_bindings()
+                    state = controller.load_state(self.root)
+                    mutate(state["history"][-1])
+                    controller.state_path(self.root).write_text(
+                        json.dumps(state), encoding="utf-8"
+                    )
+                    protected = {
+                        controller.state_path(self.root): controller.state_path(
+                            self.root
+                        ).read_bytes(),
+                        self.plan: self.plan.read_bytes(),
+                        **{
+                            path: path.read_bytes()
+                            for path in context["bindings"]
+                        },
+                    }
+                    if route == "direct":
+                        with self.assertRaisesRegex(
+                            controller.DevelopmentPlanError, message
+                        ):
+                            self.accept_revised_analysis(
+                                analyst_id="planning-analyst-3"
+                            )
+                    else:
+                        result = self.cli(
+                            "accept-analysis",
+                            "--analyst-id",
+                            "planning-analyst-3",
+                            "--mode",
+                            "single_owner",
+                            "--rationale",
+                            "fresh analysis for the revised plan authority",
+                            "--working-set",
+                            "8 files, 3 tests, one revised planning packet",
+                            "--seams-assessment",
+                            "fresh review confirms one coherent integration seam",
+                        )
+                        self.assertEqual(2, result.returncode)
+                        self.assertIn(message, result.stderr)
+                    self.assertEqual(
+                        protected,
+                        {path: path.read_bytes() for path in protected},
+                    )
+                finally:
+                    self.tearDown()
+                    self.setUp()
+
+    def test_reinitialized_v2_plan_missing_latest_archive_rejects_old_fallback(
+        self,
+    ) -> None:
+        context = self.reinitialize_revised_plan_with_evolved_bindings()
+        state = controller.load_state(self.root)
+        state["history"].pop()
+        state["history"][-1]["prior_approved_sha256"] = context["second_sha256"]
+        controller.state_path(self.root).write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        protected = {
+            controller.state_path(self.root): controller.state_path(
+                self.root
+            ).read_bytes(),
+            self.plan: self.plan.read_bytes(),
+            **{path: path.read_bytes() for path in context["bindings"]},
+        }
+
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "plan SHA"):
+            self.accept_revised_analysis(analyst_id="planning-analyst-3")
+
+        self.assertEqual(
+            protected,
+            {path: path.read_bytes() for path in protected},
+        )
+
+    def test_evolved_retired_schema10_bridge_replays_interrupted_reopen(self) -> None:
+        self.approve_current_plan()
+        bindings = self.write_same_lineage_retired_schema10_bindings(evolved=True)
+        binding_bytes = {path: path.read_bytes() for path in bindings}
+        args = self.args(
+            reason="Replay the current publicly reconfigured plan authority",
+            reopened_by="development-plan-director-2",
+            analyst_id="planning-analyst-2",
+        )
+        real_save_state = controller.save_state
+        save_count = 0
+
+        def fail_final_save(root: Path, state: dict) -> None:
+            nonlocal save_count
+            save_count += 1
+            if save_count == 2:
+                raise OSError("simulated evolved-lineage lost response")
+            real_save_state(root, state)
+
+        with mock.patch.object(controller, "save_state", side_effect=fail_final_save):
+            with self.assertRaisesRegex(OSError, "evolved-lineage lost response"):
+                controller.command_revise_approved(args)
+        pending = controller.load_state(self.root)
+        self.assertEqual("revision_reopen_pending", pending["status"])
+
+        resumed = controller.command_revise_approved(args)
+        self.assertEqual("analyzing", resumed["status"])
+        self.assertEqual(binding_bytes, {path: path.read_bytes() for path in bindings})
+
+    def test_evolved_retired_schema10_bridge_adversarial_matrix_fails_closed(self) -> None:
+        def rewrite(path: Path, mutate: object) -> None:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            mutate(value)
+            path.write_text(json.dumps(value), encoding="utf-8")
+
+        def mismatch_current_plan(value: dict) -> None:
+            value["authority"]["items"]["plan"]["sha256"] = "e" * 64
+            value["authority"]["digest"] = self.canonical_digest(
+                value["authority"]["items"]
+            )
+
+        cases = {
+            "unbridged authority change": lambda value: value["history"].pop(),
+            "migrate command digest mismatch": lambda value: value["history"][1].update(
+                {"command_digest": "f" * 64}
+            ),
+            "malformed bridge": lambda value: value["history"][2]["prior"].pop(
+                "slices_digest"
+            ),
+            "wrong bridge authority": lambda value: value["history"][2]["prior"].update(
+                {"authority_digest": "f" * 64}
+            ),
+            "wrong bridge order": lambda value: value["history"].__setitem__(
+                slice(1, 3), [value["history"][2], value["history"][1]]
+            ),
+            "non-newer bridge generation": lambda value: value["history"][2].update(
+                {"generation": 14}
+            ),
+            "wrong bridge result": lambda value: value["history"][2].update(
+                {"result": "initialized"}
+            ),
+            "invalid prior slices digest": lambda value: value["history"][2]["prior"].update(
+                {"slices_digest": "not-a-digest"}
+            ),
+            "mismatched prior slices digest": lambda value: value["history"][2]["prior"].update(
+                {"slices_digest": "e" * 64}
+            ),
+            "missing migration audit gate": lambda value: value["history"][2]["prior"].update(
+                {"gate_ids": []}
+            ),
+            "current plan mismatch": mismatch_current_plan,
+            "multiple v2 states": lambda value: (
+                self.root / controller.V2_RUNTIME_STATE_RELATIVE_PATH
+            ).with_name("alternate-state.json").write_text(
+                json.dumps(value), encoding="utf-8"
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                try:
+                    self.approve_current_plan()
+                    _, _, v2 = self.write_same_lineage_retired_schema10_bindings(
+                        evolved=True
+                    )
+                    rewrite(v2, mutate)
+                    state_before = controller.state_path(self.root).read_bytes()
+                    plan_before = self.plan.read_bytes()
+
+                    with self.assertRaises(controller.DevelopmentPlanError):
+                        controller.command_revise_approved(
+                            self.args(
+                                reason="Reject an invalid lineage evolution",
+                                reopened_by="development-plan-director-2",
+                                analyst_id="planning-analyst-2",
+                            )
+                        )
+
+                    self.assertEqual(
+                        state_before, controller.state_path(self.root).read_bytes()
+                    )
+                    self.assertEqual(plan_before, self.plan.read_bytes())
+                finally:
+                    self.tearDown()
+                    self.setUp()
+
+    def test_retired_schema10_public_history_sequence_fails_closed(self) -> None:
+        def append_record(
+            value: dict, *, record_id: str, generation: int, result: str = "advanced",
+        ) -> None:
+            value["history"].append({
+                "id": record_id,
+                "command": "next",
+                "command_digest": "d" * 64,
+                "generation": generation,
+                "result": result,
+            })
+
+        def duplicate_bridge(value: dict) -> None:
+            bridge = __import__("copy").deepcopy(value["history"][2])
+            bridge.update({
+                "id": "reconfigure-duplicate-lineage",
+                "command_digest": "e" * 64,
+                "generation": 16,
+            })
+            value["history"].append(bridge)
+            value["generation"] = 16
+
+        cases = {
+            "negative history generation": (
+                True, lambda value: value["history"][2].update({"generation": -1})
+            ),
+            "future history generation": (
+                True, lambda value: value["history"][2].update({"generation": 99})
+            ),
+            "boolean history generation": (
+                True, lambda value: value["history"][2].update({"generation": True})
+            ),
+            "runtime generation below bridge": (
+                True, lambda value: value.update({"generation": 14})
+            ),
+            "post-bridge generation exceeds runtime": (
+                True,
+                lambda value: append_record(
+                    value, record_id="future-record", generation=16
+                ),
+            ),
+            "duplicate public generation": (
+                True,
+                lambda value: append_record(
+                    value, record_id="duplicate-generation", generation=15
+                ),
+            ),
+            "duplicate public id": (
+                True,
+                lambda value: (
+                    append_record(
+                        value,
+                        record_id="reconfigure-evolved-lineage",
+                        generation=16,
+                    ),
+                    value.update({"generation": 16}),
+                ),
+            ),
+            "duplicate legacy bridge": (True, duplicate_bridge),
+            "missing public result": (
+                True, lambda value: value["history"][2].pop("result")
+            ),
+            "empty public id": (
+                True, lambda value: value["history"][2].update({"id": ""})
+            ),
+            "empty public command": (
+                True, lambda value: value["history"][2].update({"command": ""})
+            ),
+            "no-bridge trailing generation gap": (
+                False,
+                lambda value: (
+                    append_record(value, record_id="gap-record", generation=16),
+                    value.update({"generation": 16}),
+                ),
+            ),
+        }
+        for label, (evolved, mutate) in cases.items():
+            with self.subTest(label=label):
+                try:
+                    self.approve_current_plan()
+                    _, _, v2 = self.write_same_lineage_retired_schema10_bindings(
+                        evolved=evolved
+                    )
+                    runtime = json.loads(v2.read_text(encoding="utf-8"))
+                    mutate(runtime)
+                    v2.write_text(json.dumps(runtime), encoding="utf-8")
+                    state_before = controller.state_path(self.root).read_bytes()
+                    plan_before = self.plan.read_bytes()
+
+                    with self.assertRaises(controller.DevelopmentPlanError):
+                        controller.command_revise_approved(
+                            self.args(
+                                reason="Reject impossible public history",
+                                reopened_by="development-plan-director-2",
+                                analyst_id="planning-analyst-2",
+                            )
+                        )
+
+                    self.assertEqual(
+                        state_before, controller.state_path(self.root).read_bytes()
+                    )
+                    self.assertEqual(plan_before, self.plan.read_bytes())
+                finally:
+                    self.tearDown()
+                    self.setUp()
+
+    def test_malformed_same_lineage_v2_rejects_initial_reopen_without_mutation(
+        self,
+    ) -> None:
+        self.approve_current_plan()
+        _, _, v2 = self.write_same_lineage_retired_schema10_bindings()
+        runtime = json.loads(v2.read_text(encoding="utf-8"))
+        runtime.pop("artifacts")
+        v2.write_text(json.dumps(runtime), encoding="utf-8")
+        state_before = controller.state_path(self.root).read_bytes()
+        plan_before = self.plan.read_bytes()
+
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "v2 runtime state"):
+            controller.command_revise_approved(
+                self.args(
+                    reason="reject malformed v2 before reopen",
+                    reopened_by="development-plan-director-2",
+                    analyst_id="planning-analyst-2",
+                )
+            )
+
+        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
+        self.assertEqual(plan_before, self.plan.read_bytes())
+
+    def test_malformed_same_lineage_v2_rejects_continuation_without_mutation(
+        self,
+    ) -> None:
+        self.approve_current_plan()
+        _, _, v2 = self.write_same_lineage_retired_schema10_bindings()
+        controller.command_revise_approved(
+            self.args(
+                reason="open a valid same-lineage revision",
+                reopened_by="development-plan-director-2",
+                analyst_id="planning-analyst-2",
+            )
+        )
+        runtime = json.loads(v2.read_text(encoding="utf-8"))
+        runtime.pop("artifacts")
+        v2.write_text(json.dumps(runtime), encoding="utf-8")
+        state_before = controller.state_path(self.root).read_bytes()
+        plan_before = self.plan.read_bytes()
+
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "v2 runtime state"):
+            self.accept_revised_analysis()
+
+        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
+        self.assertEqual(plan_before, self.plan.read_bytes())
+
+    def test_retired_schema10_findings_bool_generation_fails_without_mutation(
+        self,
+    ) -> None:
+        self.approve_current_plan()
+        _, findings, _ = self.write_same_lineage_retired_schema10_bindings(
+            legacy_generation=1
+        )
+        finding_state = json.loads(findings.read_text(encoding="utf-8"))
+        finding_state["generation"] = True
+        findings.write_text(json.dumps(finding_state), encoding="utf-8")
+        state_before = controller.state_path(self.root).read_bytes()
+        plan_before = self.plan.read_bytes()
+
+        with self.assertRaisesRegex(
+            controller.DevelopmentPlanError, "same-generation schema-10 findings"
+        ):
+            controller.command_revise_approved(
+                self.args(
+                    reason="reject boolean legacy findings generation",
+                    reopened_by="development-plan-director-2",
+                    analyst_id="planning-analyst-2",
+                )
+            )
+
+        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
+        self.assertEqual(plan_before, self.plan.read_bytes())
+
+    def test_retired_schema10_lineage_adversarial_matrix_fails_closed(self) -> None:
+        def rewrite(path: Path, mutate: object) -> None:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            mutate(value)
+            path.write_text(json.dumps(value), encoding="utf-8")
+
+        cases = {
+            "legacy digest mismatch": lambda legacy, findings, v2: rewrite(
+                legacy, lambda value: value.update({"unexpected_mutation": True})
+            ),
+            "legacy wrong project": lambda legacy, findings, v2: rewrite(
+                legacy, lambda value: value.update({"project_root": str(self.root.parent)})
+            ),
+            "missing import proof": lambda legacy, findings, v2: rewrite(
+                v2, lambda value: value["history"].pop(0)
+            ),
+            "import id mismatch": lambda legacy, findings, v2: rewrite(
+                v2, lambda value: value["history"][0].update({"id": "legacy-forged"})
+            ),
+            "import generation mismatch": lambda legacy, findings, v2: rewrite(
+                v2, lambda value: value["history"][0].update({"generation": 13})
+            ),
+            "run id mismatch": lambda legacy, findings, v2: rewrite(
+                v2, lambda value: value.update({"run_id": "migrated-other-forged"})
+            ),
+            "public migrate digest mismatch": lambda legacy, findings, v2: rewrite(
+                v2,
+                lambda value: value["history"][1].update(
+                    {"command_digest": "f" * 64}
+                ),
+            ),
+            "authority mismatch": lambda legacy, findings, v2: rewrite(
+                v2,
+                lambda value: value["authority"].update(
+                    {
+                        "items": {
+                            **value["authority"]["items"],
+                            "plan": {
+                                **value["authority"]["items"]["plan"],
+                                "sha256": "e" * 64,
+                            },
+                        }
+                    }
+                ),
+            ),
+            "nonempty findings": lambda legacy, findings, v2: rewrite(
+                findings, lambda value: value.update({"items": [{"id": "F-OPEN"}]})
+            ),
+            "findings generation mismatch": lambda legacy, findings, v2: rewrite(
+                findings, lambda value: value.update({"generation": 15})
+            ),
+            "findings schema mismatch": lambda legacy, findings, v2: rewrite(
+                findings, lambda value: value.update({"schema_version": 9})
+            ),
+            "partial legacy pair": lambda legacy, findings, v2: findings.unlink(),
+            "malformed legacy": lambda legacy, findings, v2: legacy.write_text(
+                "{", encoding="utf-8"
+            ),
+            "multiple v2 states": lambda legacy, findings, v2: (
+                v2.with_name("custom-state.json").write_bytes(v2.read_bytes())
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                try:
+                    self.approve_current_plan()
+                    legacy, findings, v2 = self.write_same_lineage_retired_schema10_bindings()
+                    mutate(legacy, findings, v2)
+                    state_before = controller.state_path(self.root).read_bytes()
+                    plan_before = self.plan.read_bytes()
+
+                    with self.assertRaisesRegex(
+                        controller.DevelopmentPlanError, "retired schema-10 lineage"
+                    ):
+                        controller.command_revise_approved(
+                            self.args(
+                                reason="unsafe ambiguous revision",
+                                reopened_by="development-plan-director-2",
+                                analyst_id="planning-analyst-2",
+                            )
+                        )
+
+                    self.assertEqual(
+                        state_before, controller.state_path(self.root).read_bytes()
+                    )
+                    self.assertEqual(plan_before, self.plan.read_bytes())
+                finally:
+                    self.tearDown()
+                    self.setUp()
+
+    def test_retired_schema10_link_like_pair_is_rejected(self) -> None:
+        self.approve_current_plan()
+        legacy, _, _ = self.write_same_lineage_retired_schema10_bindings()
+        state_before = controller.state_path(self.root).read_bytes()
+        plan_before = self.plan.read_bytes()
+        original_is_symlink = Path.is_symlink
+
+        with mock.patch.object(
+            Path,
+            "is_symlink",
+            autospec=True,
+            side_effect=lambda path: path == legacy or original_is_symlink(path),
+        ):
+            with self.assertRaisesRegex(
+                controller.DevelopmentPlanError, "retired schema-10 lineage"
+            ):
+                controller.command_revise_approved(
+                    self.args(
+                        reason="unsafe linked revision",
+                        reopened_by="development-plan-director-2",
+                        analyst_id="planning-analyst-2",
+                    )
+                )
+
+        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
+        self.assertEqual(plan_before, self.plan.read_bytes())
+
+    def test_v2_binding_rejects_a_plan_sha_mismatch_before_reopen(self) -> None:
+        self.initialize()
+        self.write_plan()
+        controller.command_submit(self.args())
+        controller.command_approve(
+            self.args(approved_by="user", approval_note="exact SHA approval")
+        )
+        state_before = controller.load_state(self.root)
+        plan_before = self.plan.read_bytes()
+        self.write_v2_runtime_binding(plan_sha256="0" * 64)
+
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "v2 runtime.*plan SHA"):
+            controller.command_revise_approved(
+                self.args(
+                    reason="unsafe mismatched repair",
+                    reopened_by="director",
+                    analyst_id="planning-analyst-2",
+                )
+            )
+
+        self.assertEqual(plan_before, self.plan.read_bytes())
+        self.assertEqual(state_before, controller.load_state(self.root))
+
+    def test_v2_binding_rejects_an_alternate_same_sha_plan_path_before_reopen(self) -> None:
+        self.initialize()
+        self.write_plan()
+        controller.command_submit(self.args())
+        controller.command_approve(
+            self.args(approved_by="user", approval_note="exact SHA approval")
+        )
+        state_before = controller.load_state(self.root)
+        plan_before = self.plan.read_bytes()
+        alternate = self.plan.with_name("alternate-development-plan.md")
+        alternate.write_bytes(plan_before)
+        self.write_v2_runtime_binding(
+            plan_path=alternate.relative_to(self.root).as_posix(),
+            plan_sha256=controller.sha256(alternate),
+        )
+
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "v2 runtime.*plan path"):
+            controller.command_revise_approved(self.args(
+                reason="unsafe alternate-path repair",
+                reopened_by="director",
+                analyst_id="planning-analyst-2",
+            ))
+
+        self.assertEqual(plan_before, self.plan.read_bytes())
+        self.assertEqual(state_before, controller.load_state(self.root))
+
+    def test_custom_v2_state_path_cannot_bypass_alternate_same_sha_plan_binding(self) -> None:
+        self.initialize()
+        self.write_plan()
+        controller.command_submit(self.args())
+        controller.command_approve(
+            self.args(approved_by="user", approval_note="exact SHA approval")
+        )
+        state_before = controller.load_state(self.root)
+        plan_before = self.plan.read_bytes()
+        alternate = self.plan.with_name("alternate-development-plan.md")
+        alternate.write_bytes(plan_before)
+        self.write_v2_runtime_binding(
+            plan_path=alternate.relative_to(self.root).as_posix(),
+            plan_sha256=controller.sha256(alternate),
+            filename="custom-state.json",
+        )
+
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "v2 runtime.*plan path"):
+            controller.command_revise_approved(self.args(
+                reason="custom state must remain bound",
+                reopened_by="director", analyst_id="planning-analyst-2",
+            ))
+
+        self.assertEqual(plan_before, self.plan.read_bytes())
+        self.assertEqual(state_before, controller.load_state(self.root))
+
+    def test_multiple_v2_runtime_state_candidates_fail_closed_as_ambiguous(self) -> None:
+        self.initialize()
+        self.write_plan()
+        controller.command_submit(self.args())
+        controller.command_approve(
+            self.args(approved_by="user", approval_note="exact SHA approval")
+        )
+        state_before = controller.load_state(self.root)
+        plan_before = self.plan.read_bytes()
+        authority_items = {
+            "requirements": {
+                "path": self.prd.relative_to(self.root).as_posix(),
+                "sha256": controller.sha256(self.prd),
+            },
+            "specification": {
+                "path": self.spec.relative_to(self.root).as_posix(),
+                "sha256": controller.sha256(self.spec),
+            },
+            "plan": {
+                "path": self.plan.relative_to(self.root).as_posix(),
+                "sha256": controller.sha256(self.plan),
+            },
+        }
+        runtime = {
+            "schema": 2, "project_root": str(self.root),
+            "authority": {
+                "items": authority_items,
+                "digest": hashlib.sha256(
+                    __import__("json").dumps(
+                        authority_items, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            },
+        }
+        runtime_dir = self.root / ".agentic-pipeline-v2"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("state.json", "custom-state.json"):
+            (runtime_dir / name).write_text(
+                __import__("json").dumps(runtime), encoding="utf-8",
+            )
+
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "multiple v2 runtime"):
+            controller.command_revise_approved(self.args(
+                reason="ambiguous runtime discovery must fail",
+                reopened_by="director", analyst_id="planning-analyst-2",
+            ))
+
+        self.assertEqual(plan_before, self.plan.read_bytes())
+        self.assertEqual(state_before, controller.load_state(self.root))
+
+    def test_revise_approved_help_distinguishes_v2_status_init_from_legacy_token(self) -> None:
+        parser = controller.build_parser()
+        subparsers = next(
+            action for action in parser._actions
+            if isinstance(action, __import__("argparse")._SubParsersAction)
+        )
+        text = subparsers.choices["revise-approved"].format_help()
+        self.assertIn("v2", text)
+        self.assertIn("status", text)
+        self.assertIn("init", text)
+        self.assertIn("legacy-only", text)
+
+    def test_v2_binding_uses_public_reconfiguration_without_a_legacy_hold(self) -> None:
+        self.initialize()
+        self.write_plan()
+        controller.command_submit(self.args())
+        controller.command_approve(
+            self.args(approved_by="user", approval_note="exact SHA approval")
+        )
+        runtime_path = self.write_v2_runtime_binding()
+        runtime_before = runtime_path.read_bytes()
+
+        reopened = controller.command_revise_approved(
+            self.args(
+                reason="repair authority through v2 init",
+                reopened_by="director",
+                analyst_id="planning-analyst-2",
+            )
+        )
+
+        self.assertEqual("analyzing", reopened["status"])
+        self.assertNotIn("recovery_authorization", reopened)
+        self.assertEqual(runtime_before, runtime_path.read_bytes())
+
     def test_bound_approved_plan_revision_requires_exact_authority_recovery_hold(self) -> None:
         self.initialize()
         self.write_plan()
@@ -1183,7 +2362,7 @@ Only the approved feature and named shared symbol are in scope.
             encoding="utf-8",
         )
         submitted = controller.command_submit(self.args())
-        self.assertEqual("awaiting_user_approval", submitted["status"])
+        self.assertEqual("awaiting_approval", submitted["status"])
         self.assertEqual(0, self.cli("submit").returncode)
 
     def test_duplicate_acceptance_rows_within_one_requirements_surface_fail(self) -> None:
@@ -1555,6 +2734,22 @@ Only the approved feature and named shared symbol are in scope.
         self.write_plan(mode="sequential_slices", slice_count=2)
         result = controller.command_validate(self.args())
         self.assertEqual(result["slice_ids"], ["SLICE-001", "SLICE-002"])
+
+    def test_v2_plan_does_not_require_removed_coverage_manifest_outputs(self) -> None:
+        self.initialize()
+        self.write_plan()
+        lines = [
+            line
+            for line in self.plan.read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith(
+                ("- manifest_path:", "- planned_manifest:", "- finalized_manifest:")
+            )
+        ]
+        self.plan.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        result = controller.command_validate(self.args())
+
+        self.assertEqual(["SLICE-001"], result["slice_ids"])
 
     def test_scope_contract_omits_technical_baseline_and_ignores_legacy_field(self) -> None:
         self.initialize()

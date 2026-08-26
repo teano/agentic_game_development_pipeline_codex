@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Development Plan"
   short_description: "Plan bounded sequential game feature work"
-  default_prompt: "Use $gamedev-development-plan to turn PRD_READY and SPEC_READY into exact user-approved PLAN_READY plus NEXT_ACTION, then stop without starting runtime work."
+  default_prompt: "Use $gamedev-development-plan to produce approved PLAN_READY authority and bounded slice records for v2; keep decision/finding custody controller-internal and stop before runtime."
 policy:
   allow_implicit_invocation: false

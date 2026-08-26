@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Final Review"
   short_description: "Explicit-only GameDev pipeline Review mode"
-  default_prompt: "Use $gamedev-review for one immutable capsule-bounded review assignment with exact component credit, then return NEXT_ACTION and stop."
+  default_prompt: "Use $gamedev-review for one fresh read-only candidate review; return only outcome and findings with text/severity/kind, then stop without remediation."
 policy:
   allow_implicit_invocation: false

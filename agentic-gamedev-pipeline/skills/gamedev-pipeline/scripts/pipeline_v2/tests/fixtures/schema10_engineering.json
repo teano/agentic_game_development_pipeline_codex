@@ -1,0 +1,49 @@
+{
+  "schema_version": 10,
+  "contract_version": "10.0",
+  "project_root": "C:/copied/project",
+  "feature": "copied-feature",
+  "generation": 53,
+  "requirements_path": "C:/copied/project/docs/requirements.md",
+  "requirements_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "spec_path": "C:/copied/project/docs/specification.md",
+  "spec_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "development_plan_path": "C:/copied/project/docs/plan.md",
+  "development_plan_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+  "ordered_slices": ["CUT-ALPHA", "CUT-BETA"],
+  "active_slice": "CUT-ALPHA",
+  "phase": "engineering",
+  "active_write_lease": {
+    "lease_id": "WRITE-42",
+    "write_scope": "CUT-ALPHA",
+    "role": "engineer",
+    "worker_id": "worker-copied",
+    "base_revision": "4444444444444444444444444444444444444444444444444444444444444444",
+    "allowed_paths": ["game.js", "tests/**"],
+    "capsule_id": "PACKET-77",
+    "capsule_path": "evidence/packet.json",
+    "capsule_sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+  },
+  "lease_snapshots": {
+    "WRITE-42": {
+      "snapshot_schema": 4,
+      "snapshot_format": "digest-line-proof-v1",
+      "checkout": {
+        "game.js": "6666666666666666666666666666666666666666666666666666666666666666",
+        "tests/game.test.js": "7777777777777777777777777777777777777777777777777777777777777777"
+      },
+      "source_projection_rules": ["docs/**", "game.js", "tests/**"]
+    }
+  },
+  "scope_guard": {
+    "status": "pending",
+    "rebaseline_candidate": {
+      "candidate_checkout": {
+        "game.js": "8888888888888888888888888888888888888888888888888888888888888888",
+        "tests/game.test.js": "9999999999999999999999999999999999999999999999999999999999999999"
+      },
+      "changes": [{"path": "game.js", "change_kind": "modify"}],
+      "fresh_owner_required": true
+    }
+  }
+}

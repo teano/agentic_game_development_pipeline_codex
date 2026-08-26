@@ -1,56 +1,54 @@
 ---
 name: gamedev-pipeline
-description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-pipeline` or explicitly asks to run/resume the Agentic GameDev Pipeline. Direct exact `PRD_READY`, `SPEC_READY`, and `PLAN_READY` inputs through bounded engineering, independent Review, QA, and readiness. Do not activate for ordinary development, testing, review, or release work.
+description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-pipeline` or explicitly asks to run or resume the Agentic GameDev Pipeline. Direct approved requirements, specification, and plan inputs through a bounded seven-phase production run. Do not activate for ordinary development, testing, review, or release work.
 ---
 
 # GameDev Production Pipeline
 
-## Activation gate
+## Activation
 
-Proceed only on the explicit activation described above. Installed files, repository state, approved documents, or an ordinary implement/review/test/ship request is not authorization. Without activation, do not initialize state or activate any GameDev stage.
+Proceed only on the explicit activation described above. Act as the orchestration-only Director: operate the controller and delegate specialized work, but do not perform a worker phase in the Director context.
 
-Act as the sole cross-stage Director and controller owner. Read these compact always-core contracts before startup:
+Read the shared [stage handoff invariant](references/stage-handoff-invariant.md) and [pipeline-protocol.md](references/pipeline-protocol.md) before starting. Give each worker only its task, relevant approved context, read/write boundary, checks to satisfy, and linked semantic-artifact contract. Use a fresh worker session for every assignment and preserve unrelated project changes.
 
-- [stage-handoff-invariant.md](references/stage-handoff-invariant.md);
-- [pipeline-protocol.md](references/pipeline-protocol.md).
+## Runtime
 
-The Director is orchestration-only. Perform authority, preflight, controller, validation, routing, hold, and user-gate mechanics directly. Delegate every specialized implementation, research, writing, remediation, Review, and QA assignment to a real non-Director worker; never absorb that work when delegation is unavailable.
+There is one runtime and one state file format. The launcher is `scripts/pipeline_state.py`, which directly runs `pipeline_v2.cli`; it contains no legacy handlers. From the bundle root use:
 
-Start every phase assignment in a new session with no inherited Director or worker chat history (`fork_turns: none` or equivalent). Pass only root, skill/mode, controller-validated capsule or exact read-only assignment, worker-owned output contract, and stop condition. The controller may preserve one logical non-writer verifier ID across Review, QA, and documentation closure, but each phase still uses a fresh isolated session and capsule. An Engineer or writer ID is never that verifier.
+```text
+python skills/gamedev-pipeline/scripts/pipeline_state.py --help
+```
 
-Director-only mechanics need no worker: briefing, accepted no-research/coverage transitions, capsule/lease preparation, owner transfer, state/checkpoint validation, and hold/resume records. Activate Research only for approved `RESEARCH-*` briefs and Documentation Finisher only for a real documentation delta.
+From this skill directory use:
 
-## Load phase contracts only when needed
+```text
+python scripts/pipeline_state.py --help
+```
 
-- Before slice research, coverage, engineering, normative docs, product remediation, or scope rebaseline, read [engineering-and-coverage.md](references/engineering-and-coverage.md).
-- Before convergence, Final Review, recovery, QA, derived docs, documentation closure, or readiness, read [review-qa-and-recovery.md](references/review-qa-and-recovery.md).
-- Before classifying a finding/gate/risk or evaluating readiness, read [severity-and-readiness.md](references/severity-and-readiness.md).
-- Before routing a supported out-of-scope candidate, read [deferred-findings.md](references/deferred-findings.md).
-- Only when compact status reports generated dashboard revision drift, read [lifecycle-projection-recovery.md](references/lifecycle-projection-recovery.md).
+Place the optional global `--state PATH` before the command. The default is `.agentic-pipeline-v2/state.json` under the current directory. A custom state filename is allowed only as a direct `.json` child of the exact project root's `.agentic-pipeline-v2` directory; external, nested, symlinked, or reparse-point state paths fail before mutation. Read the exact syntax for the current operation from `COMMAND --help`.
 
-Do not preload conditional references or worker-owned schema references merely because the pipeline started or a capsule is needed. Exact controller syntax comes from the current command's `--help`.
+The phases are exactly:
 
-## Establish authority and direct one runtime
+```text
+plan -> slice -> engineering -> review -> qa -> docs -> ready
+```
 
-1. Resolve the project root, lowercase feature, and one repository-owned PRD/specification/plan/ledger chain. Preserve path case and create no alternate namespace.
-2. Require exact current `PRD_READY`, `SPEC_READY`, and `PLAN_READY`. If one is absent or stale, return `PIPELINE_STARTED: no` and the proven upstream `NEXT_ACTION`; do not run that upstream stage inside this activation.
-3. Initialize/load runtime state only after upstream gates pass. Treat controller output as authority; never edit state/findings/backlog JSON directly.
-4. Complete exact-set preflight before any specialized runtime stage. If a resource/capability proof fails, activate nobody and return the controller's exact minimum resume action.
-5. Before every transition, read one compact status containing phase, authority/revision summary, active hold/lease/owner, and deterministic `next_action`. Use a targeted `--section` only for a proven diagnostic; ordinary `status --full` is forbidden.
-6. Validate each capsule/receipt/completion and the resulting controller state before the next assignment. A worker `NEXT_ACTION` is advisory; controller state is authority.
+The commands are exactly `init`, `status`, `next`, `complete`, `answer`, `resume`, `accept`, `migrate`, and `ready`.
 
-Use state plus `director-checkpoint.json` as durable memory, never raw logs or reasoning. After compaction/replacement, validate checkpoint hashes and resume from compact state without repeating work. Cache command help by controller version. Use at most one compact status per transition, wait once per active worker set, and suppress unchanged polling.
+## Direct the run
 
-Keep at most one write lease active. Follow approved slice order and the controller-required single convergence assignment and single Final Review assignment; never add workers to repeat an already covered lens. Register supported candidates with complete dimensions and use controller-derived routing. After every write, Review, or QA completion, accept only current controller-generated revisions, manifests, credits, aggregates, and handoffs.
+1. Before `init`, require current approved requirements, specification, and development plan files. Pass them under the exact keys `requirements`, `specification`, and `plan`. Also pass one or more ordered JSON slice records with exactly `id`, `allowed_paths`, and `planned_commands`; callers never provide `read_paths`. The controller parses each approved plan slice's Context Capsule `authority_paths` plus `evidence_paths`, validates and deduplicates them, and stores the resulting fourth `read_paths` field. The run ID is one compact ASCII identifier, not a path: it starts and ends alphanumeric, contains at most 64 letters, digits, dots, underscores, or hyphens, and contains no separator.
+2. Read `status` and execute its single `next_action`. It derives the command ID, expected generation, assignment identity, task, paths, checks, and recovery reason. `next` may omit assignment ID, worker, and task; if supplied for compatibility, all three must be byte-equal to the controller defaults. An exact lost-response replay is checked against its recorded generation before current-generation defaults, so both the omitted and exact explicit identity forms are byte-noops. Every phase's access and checks are controller-derived again when `next` executes, so omitted or caller-authored scope cannot narrow or broaden the worker packet. Engineering, Review, and QA can read authority plus each completed/current slice's `allowed_paths` and sealed `read_paths`; future slices remain excluded. Engineering can write only the current slice's `allowed_paths`. Planning, slicing, Review, and QA are read-only.
+3. Have the worker follow `active_assignment.artifact_schema` exactly and write only that semantic JSON to `active_assignment.output_path`; it must not inspect runtime code to guess the shape, run checks absent from the assignment, or rerun the assigned planned-command argv itself. On `complete`, the controller runs each read-only assignment's planned commands only against the canonical live checkout under a strict non-mutation contract. Those commands MUST NOT change project or candidate bytes; the controller redirects temporary and cache data to bounded excluded scratch and cleans it. Immediately after each planned process tree ends, the controller inventories and diffs the candidate before starting the next command. Drift fails closed before any later command and without a state commit; there is no automatic rollback, so the forbidden live mutation remains dirty for recovery. The controller MUST NOT create a full or partial project/candidate copy for read-only checks by materialization, clone, snapshot, worktree, hard-link tree, reflink, block clone, or copy-on-write checkout. A Slicer may return revised three-key slice records derived from the current approved plan; the controller rejects caller-authored `read_paths`, re-seals them from the plan, and adopts the records on `accept`. Run `complete` with no artifact override, or pass only that exact path; the controller independently reads it and verifies authority, checkout scope, and planned checks. A non-zero check accompanying explicit `fail` or `blocked` is stored as controller evidence and opens the existing recovery gate; a claimed `pass` is rejected atomically with exact failing-command diagnostics.
+4. Use `accept` only after a passing artifact with no unresolved question or blocked outcome. For a question, the Director follows `next_action.decision_policy`, records the safest reversible authority-consistent assumption, and continues without user bookkeeping. After a Review/QA `fail`, `resume` preserves the gate and candidate base, invalidates engineering and downstream credit, and routes to writable engineering remediation followed by fresh Review and QA.
+5. Every ordered slice completes Engineering, fresh Review, and fresh QA before the next slice starts. Documentation begins only after the final slice. A documentation change returns to independent Review and QA.
+6. When a sanctioned upstream controller changes approved authority, execute the exact `init` returned by `status.next_action`. Status observes authority and the whole checkout under the state lock; the action ID binds the exact observed authority paths/bytes and retained slices, and execution revalidates that binding under the same lock. Sole runtime v2 has no `authority_recovery_hold`: after byte drift, every other public mutation fails closed, and every replay fails closed, until this reconfiguration. `init` restarts at planning, clears live credit, and preserves the prior candidate/history plus one non-credit checkout baseline as audit context. If work is active, the controller first proves its checkout diff is within the old assignment and archives the interruption; pre-existing foreign changes make status return the non-mutating terminal recovery fact `checkout_recovery_required` instead of an unusable `init`. The ensuing Slicer semantic artifact supplies any revised scope and must cover interrupted Engineering paths.
+7. Use `ready` only in the terminal phase. It verifies the live checkout and proof that every approved slice completed before declaring readiness.
 
-## Holds, autonomy, and terminal result
+`migrate` is a one-way schema-10 data import into an empty v2 state path. Supply fresh v2 slice records. Migration canonicalizes the existing physical project root and requires its derived run ID to satisfy the same safe identifier contract before state mutation. It normally starts at `plan`; a legacy candidate is audit/base context only and receives no v2 Engineering, Review, or QA credit. One exact compatibility case preserves already-completed Plan/Slice credit: a first-slice `scope_expansion_hold` in implementation with an active Engineer lease whose lease/worker IDs are concrete, its immutable snapshot and owner-bound passed pre-edit proof, no prior Engineer run or completion marker, and stored ordered slice IDs, active slice, plan digest, every slice's approved editable paths, lease paths, and hold candidate paths matching the supplied v2 slices. That case starts at `engineering`, seals Plan/Slice credit against the live checkout, retains the legacy lease/hold only in the closed migration audit, and derives a fresh v2 worker. A missing snapshot, malformed identity, or any other mismatch restarts at `plan` without trusted legacy candidate credit. The controller seals the live checkout during migration, and status, mutation, and exact migration replay reject later drift. It never calls a legacy handler or resumes a copied worker assignment.
 
-Every hold is controller state, not a stage. Report its reason, owner, user-input flag, resume phase, and exact minimum resume command/action. Resume only that recorded source phase; do not restart upstream planning or completed slices without a real authority/scope change.
+## Terminal result
 
-Continue ordinary in-scope transitions when `user_input_required=false`. Ask the user only for unresolved product/scope/boundary choices, residual-risk authority, credentials/publication/spending/irreversible action, or a user-only manual step. A conversational stop performs no lifecycle controller mutation.
+Continue safe in-scope transitions without asking the user. Ask only for an unresolved product or scope choice, credentials, spending, publication, irreversible action, or another inherently user-owned step.
 
-Respect controller worker/review/convergence/recovery budgets and circuit breakers. Report phase transitions, current revisions, active lease/hold, frozen inventories, verified closure, capsule metrics, credits, gates, and controller `next_action`.
-
-Name every intermediate result by its exact controller gate state; implementation, Review, or QA success is not general readiness.
-
-Declare only `PRODUCTION_READY_CANDIDATE` after successful `ready`. Return `NEXT_ACTION: terminal-production-ready-candidate` and stop. Deployment, publication, migration, store submission, spending, and risk acceptance remain external.
+Declare `PRODUCTION_READY_CANDIDATE` only after `ready` succeeds. Deployment, publication, store submission, spending, migration of production data, and risk acceptance remain external.

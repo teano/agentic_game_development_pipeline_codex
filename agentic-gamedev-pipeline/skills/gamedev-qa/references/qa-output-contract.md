@@ -1,9 +1,13 @@
-# QA output contract
+# QA semantic artifact
 
-Return the schema-2 manual execution envelope on the exact current revisions. It has exactly integer `schema: 2`, `revision`, `product_revision`, `support_revision`, `evidence_revision`, and `manual_execution`.
+Follow `assignment.artifact_schema` exactly; it is authoritative. Do not inspect runtime code or guess the output shape.
 
-Every registered manual identity appears exactly once. Each row has exactly string `identity_id`; booleans `executed` and `deferred`; boolean-or-null `passed`; string-or-null `blocked_by_finding`; object-or-null `qa_evidence`, exactly `{path,sha256}`; enum-or-null `gate: blocked_user|blocked_environment|error_test`; and string-or-null `minimum_resume_action`.
+Return one JSON object containing only:
 
-Every row is exactly one exhaustive outcome. Executed rows require boolean pass and immutable evidence. Deferred rows are unexecuted/null-pass, require gate and resume action, and forbid evidence/finding. Product-finding-blocked rows are unexecuted/non-deferred and otherwise null. A non-deferred row forbids both gate and resume action; an unexecuted row with neither deferral nor finding is invalid.
+```json
+{"outcome":"pass","checks":["acceptance scenario: pass"],"questions":[]}
+```
 
-The worker returns this envelope and evidence artifacts. The controller validates the supplied status, records the immutable run, and generates the `qa_updated` aggregate; QA never persists controller state itself.
+`outcome` is `pass`, `fail`, or `blocked`. `checks` is required and lists the QA scenarios and their observed results; pass/fail requires at least one check. Do not execute controller-owned planned-command argv in the live candidate merely to populate this list. `blocker` is required only with `blocked`. `questions` is an optional array of concise strings.
+
+Do not include SHA values, checkout inventory, command digests, or controller state. The controller runs assigned machine checks independently.

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib
 import importlib.util
 import json
 import os
@@ -13,7 +14,7 @@ import re
 import sys
 import unicodedata
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 try:
@@ -68,6 +69,36 @@ if _plan_contract_spec is None or _plan_contract_spec.loader is None:
 _plan_contract = importlib.util.module_from_spec(_plan_contract_spec)
 _plan_contract_spec.loader.exec_module(_plan_contract)
 
+_pipeline_v2_model_path = (
+    Path(__file__).resolve().parents[2]
+    / "gamedev-pipeline"
+    / "scripts"
+    / "pipeline_v2"
+    / "model.py"
+)
+_pipeline_v2_model_spec = importlib.util.spec_from_file_location(
+    "gamedev_pipeline_v2_model_for_planning", _pipeline_v2_model_path
+)
+if _pipeline_v2_model_spec is None or _pipeline_v2_model_spec.loader is None:
+    raise RuntimeError("Cannot load the canonical pipeline-v2 state model")
+_pipeline_v2_model = importlib.util.module_from_spec(_pipeline_v2_model_spec)
+_pipeline_v2_model_spec.loader.exec_module(_pipeline_v2_model)
+
+_pipeline_v2_package_root = _pipeline_v2_model_path.parent.parent
+_pipeline_v2_package_root_text = str(_pipeline_v2_package_root)
+_pipeline_v2_path_added = _pipeline_v2_package_root_text not in sys.path
+if _pipeline_v2_path_added:
+    sys.path.insert(0, _pipeline_v2_package_root_text)
+try:
+    _pipeline_v2_legacy = importlib.import_module("pipeline_v2.legacy_gen53")
+finally:
+    if _pipeline_v2_path_added:
+        sys.path.remove(_pipeline_v2_package_root_text)
+if Path(_pipeline_v2_legacy.__file__).resolve() != (
+    _pipeline_v2_model_path.parent / "legacy_gen53.py"
+).resolve():
+    raise RuntimeError("Cannot load the canonical pipeline-v2 schema-10 importer")
+
 
 SCHEMA_VERSION = 1
 SPECIFICATION_STATE_SCHEMA_VERSION = 2
@@ -75,6 +106,7 @@ STATE_RELATIVE_PATH = Path(".agentic-pipeline/development-plan-state.json")
 SPEC_STATE_RELATIVE_PATH = Path(".agentic-pipeline/specification-state.json")
 RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline/state.json")
 RUNTIME_FINDINGS_RELATIVE_PATH = Path(".agentic-pipeline/findings.json")
+V2_RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline-v2/state.json")
 MODES = {"single_owner", "sequential_slices"}
 REQUIRED_GLOBAL_SECTIONS = {
     "Decision",
@@ -122,6 +154,8 @@ CONTEXT_LIMITS = {
     "max_estimated_tokens",
 }
 CONTEXT_METRIC_SCOPE = "capsule_plus_referenced_files"
+APPROVAL_WAITING_STATES = {"awaiting_approval", "awaiting_user_approval"}
+APPROVAL_ACTOR_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 class DevelopmentPlanError(RuntimeError):
@@ -197,6 +231,14 @@ def normalized_actor_id(value: str) -> str:
     return unicodedata.normalize("NFKC", value).strip().casefold()
 
 
+def require_approval_actor(value: Any) -> str:
+    if not isinstance(value, str) or APPROVAL_ACTOR_PATTERN.fullmatch(value) is None:
+        raise DevelopmentPlanError(
+            "approval actor must be one safe 1-64 character identity"
+        )
+    return value
+
+
 def normalized_planning_analyst_identities(value: Any) -> set[str]:
     """Collect every stored Planning Analyst identity across current/history shapes."""
     result: set[str] = set()
@@ -256,6 +298,20 @@ def load_json(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise DevelopmentPlanError(f"{label} must contain a JSON object")
     return data
+
+
+def load_valid_v2_runtime(path: Path) -> dict[str, Any]:
+    try:
+        runtime = load_json(path, "v2 runtime state")
+        _pipeline_v2_model.validate_state(runtime)
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        _pipeline_v2_model.PipelineError,
+    ) as error:
+        raise DevelopmentPlanError(f"v2 runtime state is invalid: {error}") from error
+    return runtime
 
 
 def load_state(root: Path) -> dict[str, Any]:
@@ -476,8 +532,16 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
     if required_status == "draft" and ("approved_by" in meta or "approved_at" in meta):
         errors.append("draft frontmatter cannot contain approval metadata")
     if required_status == "approved":
-        if meta.get("approved_by") != "user":
-            errors.append("approved frontmatter must record approved_by: user")
+        approval_record = state.get("approval_transition") or state.get("approval") or {}
+        expected_actor = approval_record.get("approved_by")
+        try:
+            require_approval_actor(expected_actor)
+        except DevelopmentPlanError as exc:
+            errors.append(str(exc))
+        if meta.get("approved_by") != expected_actor:
+            errors.append(
+                "approved frontmatter must record the controller-bound approval actor"
+            )
         if not re.fullmatch(
             r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00", meta.get("approved_at", "")
         ):
@@ -508,8 +572,8 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         errors.append("Decision Ledger must name the exact resolved ledger path")
     if not re.search(r"\bDEC-[A-Za-z0-9-]+\b|\bnone\b", ledger_section, re.I):
         errors.append("Decision Ledger must list active DEC-* IDs or none")
-    if "Decision Recorder" not in ledger_section:
-        errors.append("Decision Ledger must state the Decision Recorder route")
+    if "planning controller internal" not in ledger_section.lower():
+        errors.append("Decision Ledger must state the planning controller internal route")
 
     def validate_context_budget(section: str, label: str) -> dict[str, int]:
         found: dict[str, int] = {}
@@ -966,7 +1030,9 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
         }
         if (
             set(pending_transition) != required_transition_fields
-            or pending_transition.get("approved_by") != "user"
+            or not isinstance(pending_transition.get("approved_by"), str)
+            or APPROVAL_ACTOR_PATTERN.fullmatch(pending_transition["approved_by"])
+            is None
             or not isinstance(pending_transition.get("approval_note"), str)
             or not pending_transition["approval_note"].strip()
             or not isinstance(pending_transition.get("approved_at"), str)
@@ -1031,6 +1097,7 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
         recovery_token=getattr(args, "recovery_token", None),
         reason=getattr(args, "reason", None),
         prior_plan_sha256=prior_plan_sha256,
+        prior_plan_path=state["plan_path"],
     )
     sources = require_sources(
         root,
@@ -1134,7 +1201,7 @@ def command_validate(args: argparse.Namespace) -> dict[str, Any]:
     if state["status"] == "approved":
         approval = state.get("approval") or {}
         if result["sha256"] != approval.get("approved_sha256"):
-            raise DevelopmentPlanError("approved plan changed after user approval")
+            raise DevelopmentPlanError("approved plan changed after recorded approval")
     return result
 
 
@@ -1142,18 +1209,31 @@ def command_submit(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
     require_bound_recovery_continuation(root, state)
-    if state["status"] not in {"drafting", "awaiting_user_approval"}:
+    if state["status"] != "drafting" and state["status"] not in APPROVAL_WAITING_STATES:
         raise DevelopmentPlanError(f"cannot submit plan in {state['status']}")
     result = validate_plan(root, state, "draft")
+    recorded_submission = state.get("submission")
+    if (
+        state["status"] in APPROVAL_WAITING_STATES
+        and isinstance(recorded_submission, dict)
+        and set(recorded_submission) == set(result) | {"submitted_at"}
+        and isinstance(recorded_submission.get("submitted_at"), str)
+        and bool(recorded_submission["submitted_at"])
+        and all(recorded_submission.get(key) == value for key, value in result.items())
+        and state.get("approval") is None
+        and "approval_transition" not in state
+    ):
+        return state
     state["submission"] = {**result, "submitted_at": utc_now()}
     state["approval"] = None
-    state["status"] = "awaiting_user_approval"
+    state["status"] = "awaiting_approval"
     state["updated_at"] = utc_now()
     save_state(root, state)
     return state
 
 
 def promoted_plan_bytes(plan: Path, approved_by: str, approved_at: str) -> bytes:
+    approved_by = require_approval_actor(approved_by)
     text = plan.read_text(encoding="utf-8")
     parts = text.split("---", 2)
     lines = parts[1].splitlines()
@@ -1234,29 +1314,521 @@ def write_bytes_atomically(path: Path, value: bytes) -> None:
     os.replace(temporary, path)
 
 
+def canonical_json_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and set(value) <= set("0123456789abcdef")
+    )
+
+
+def runtime_path_exists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def require_canonical_runtime_file(root: Path, relative: Path, label: str) -> Path:
+    directory = root / relative.parent
+    path = root / relative
+    try:
+        directory_stat = directory.lstat()
+        path_stat = path.lstat()
+    except OSError as error:
+        raise DevelopmentPlanError(
+            f"retired schema-10 lineage requires the complete canonical legacy pair: {error}"
+        ) from error
+    if (
+        not directory.is_dir()
+        or directory.is_symlink()
+        or bool(getattr(directory_stat, "st_file_attributes", 0) & 0x400)
+        or not path.is_file()
+        or path.is_symlink()
+        or bool(getattr(path_stat, "st_file_attributes", 0) & 0x400)
+    ):
+        raise DevelopmentPlanError(
+            f"retired schema-10 lineage requires a canonical regular {label} file"
+        )
+    return path
+
+
+def legacy_relative_path(legacy_root: str, supplied: Any, label: str) -> str:
+    if not isinstance(supplied, str) or not supplied:
+        raise DevelopmentPlanError(
+            f"retired schema-10 lineage has an invalid {label} path"
+        )
+    windows = bool(re.match(r"^[A-Za-z]:[\\/]", legacy_root))
+    path_type = PureWindowsPath if windows else PurePosixPath
+    base = path_type(legacy_root)
+    path = path_type(supplied)
+    if not base.is_absolute():
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage project root must be absolute"
+        )
+    if not path.is_absolute():
+        path = base / path
+    try:
+        relative = path.relative_to(base)
+    except ValueError as error:
+        raise DevelopmentPlanError(
+            f"retired schema-10 lineage {label} path escapes the project root"
+        ) from error
+    value = relative.as_posix()
+    if (
+        not value
+        or value == "."
+        or ".." in relative.parts
+        or any(character in value for character in "*?[")
+    ):
+        raise DevelopmentPlanError(
+            f"retired schema-10 lineage has an invalid {label} path"
+        )
+    return value
+
+
+def derived_schema10_authority(root: Path, legacy: dict[str, Any]) -> dict[str, Any]:
+    legacy_root = legacy.get("project_root")
+    if (
+        not isinstance(legacy_root, str)
+        or not legacy_root
+        or Path(legacy_root).resolve() != root
+    ):
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage belongs to a different project root"
+        )
+    candidates = {
+        "requirements": (
+            legacy.get("requirements_path"), legacy.get("requirements_sha256")
+        ),
+        "specification": (legacy.get("spec_path"), legacy.get("spec_sha256")),
+        "plan": (
+            legacy.get("development_plan_path"),
+            legacy.get("development_plan_sha256"),
+        ),
+    }
+    items: dict[str, dict[str, str]] = {}
+    for name, (path, digest) in candidates.items():
+        if not is_sha256(digest):
+            raise DevelopmentPlanError(
+                f"retired schema-10 lineage has an invalid {name} authority digest"
+            )
+        items[name] = {
+            "path": legacy_relative_path(legacy_root, path, name),
+            "sha256": digest,
+        }
+    return {"items": items, "digest": canonical_json_digest(items)}
+
+
+def require_retired_schema10_history(
+    runtime: dict[str, Any], legacy_generation: int,
+) -> list[dict[str, Any]]:
+    runtime_generation = runtime.get("generation")
+    history = runtime.get("history")
+    if (
+        type(runtime_generation) is not int
+        or runtime_generation < legacy_generation
+        or not isinstance(history, list)
+        or len(history) < 2
+    ):
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage has an invalid runtime generation or history"
+        )
+    seen_ids: set[str] = set()
+    for index, item in enumerate(history):
+        expected_generation = (
+            legacy_generation if index < 2 else legacy_generation + index - 1
+        )
+        record_id = item.get("id") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or type(item.get("generation")) is not int
+            or item["generation"] < 0
+            or item["generation"] != expected_generation
+            or not isinstance(record_id, str)
+            or not record_id.strip()
+            or record_id in seen_ids
+            or any(
+                not isinstance(item.get(field), str) or not item[field].strip()
+                for field in ("command", "result")
+            )
+        ):
+            raise DevelopmentPlanError(
+                "retired schema-10 lineage has invalid public history sequencing"
+            )
+        seen_ids.add(record_id)
+    if history[-1]["generation"] != runtime_generation:
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage history does not reach the runtime generation"
+        )
+    return history
+
+
+def reconstruct_retired_schema10_import(
+    legacy: dict[str, Any], runtime: dict[str, Any],
+    first: dict[str, Any], migrate: dict[str, Any], *, evolved: bool,
+) -> dict[str, Any]:
+    runtime_slices = runtime.get("slices")
+    legacy_slice_fields = ("id", "allowed_paths", "planned_commands")
+    if not isinstance(runtime_slices, list):
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage has invalid imported slice records"
+        )
+    if evolved:
+        slices = [
+            {field: copy.deepcopy(item[field]) for field in legacy_slice_fields}
+            for item in runtime_slices
+            if isinstance(item, dict)
+            and all(field in item for field in legacy_slice_fields)
+        ]
+        if len(slices) != len(runtime_slices):
+            raise DevelopmentPlanError(
+                "retired schema-10 lineage has invalid imported slice records"
+            )
+    else:
+        slices = runtime_slices
+    try:
+        slices = _pipeline_v2_model.slice_records(slices, sealed=False)
+        imported = _pipeline_v2_legacy.import_schema10(legacy, slices)
+    except (
+        _pipeline_v2_model.PipelineError,
+        _pipeline_v2_legacy.PipelineError,
+        KeyError,
+    ) as error:
+        raise DevelopmentPlanError(
+            f"retired schema-10 lineage import snapshot is invalid: {error}"
+        ) from error
+    if imported.get("history") != [first]:
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage import snapshot does not match its public record"
+        )
+    expected_migrate_digest = canonical_json_digest(
+        {"name": "migrate", "id": migrate["id"], "imported": imported}
+    )
+    if migrate.get("command_digest") != expected_migrate_digest:
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage public migrate digest is invalid"
+        )
+    return imported
+
+
+def require_retired_schema10_lineage(
+    root: Path, runtime: dict[str, Any]
+) -> None:
+    legacy_state_path = require_canonical_runtime_file(
+        root, RUNTIME_STATE_RELATIVE_PATH, "legacy state"
+    )
+    legacy_findings_path = require_canonical_runtime_file(
+        root, RUNTIME_FINDINGS_RELATIVE_PATH, "legacy findings"
+    )
+    try:
+        legacy = json.loads(legacy_state_path.read_text(encoding="utf-8"))
+        findings = json.loads(legacy_findings_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise DevelopmentPlanError(
+            f"retired schema-10 lineage evidence is unreadable: {error}"
+        ) from error
+    if not isinstance(legacy, dict) or legacy.get("schema_version") != 10:
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage requires an exact schema-10 legacy state"
+        )
+    generation = legacy.get("generation")
+    if type(generation) is not int or generation < 0:
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage has an invalid legacy generation"
+        )
+    if (
+        not isinstance(findings, dict)
+        or set(findings) != {"schema_version", "items", "generation"}
+        or findings.get("schema_version") != 10
+        or type(findings.get("generation")) is not int
+        or findings.get("generation") != generation
+        or findings.get("items") != []
+    ):
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage requires empty same-generation schema-10 findings"
+        )
+
+    authority = derived_schema10_authority(root, legacy)
+    source_digest = canonical_json_digest(legacy)
+    feature = legacy.get("feature")
+    if not isinstance(feature, str) or not feature:
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage requires a non-empty legacy feature"
+        )
+    expected_run_id = f"migrated-{feature}-{source_digest[:12]}"
+    if runtime.get("run_id") != expected_run_id:
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage has a mismatched deterministic v2 run ID"
+        )
+    history = require_retired_schema10_history(runtime, generation)
+    first, migrate = history[0], history[1]
+    first_result_phases = {
+        "resumed_at_first_slice_engineering": "engineering",
+        "audit_preserved": "plan",
+        "projected_to_plan": "plan",
+    }
+    if (
+        not isinstance(first, dict)
+        or set(first) != {"id", "command", "command_digest", "generation", "result"}
+        or first.get("id") != f"legacy-{source_digest[:16]}"
+        or first.get("command") != "schema10_import"
+        or first.get("command_digest") != source_digest
+        or first.get("generation") != generation
+        or first.get("result") not in first_result_phases
+        or sum(
+            isinstance(item, dict) and item.get("command") == "schema10_import"
+            for item in history
+        )
+        != 1
+    ):
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage does not match the immutable import record"
+        )
+    if (
+        not isinstance(migrate, dict)
+        or set(migrate) != {"id", "command", "command_digest", "generation", "result"}
+        or not isinstance(migrate.get("id"), str)
+        or not migrate["id"].strip()
+        or migrate.get("command") != "migrate"
+        or not is_sha256(migrate.get("command_digest"))
+        or migrate.get("generation") != generation
+        or migrate.get("result") != "migrated"
+        or sum(
+            isinstance(item, dict) and item.get("command") == "migrate"
+            for item in history
+        )
+        != 1
+    ):
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage is missing the following public migrate record"
+        )
+
+    bridge_candidates = [
+        (index, item)
+        for index, item in enumerate(history[2:], 2)
+        if isinstance(item, dict)
+        and item.get("result") == "authority_scope_reconfigured"
+    ]
+    imported = reconstruct_retired_schema10_import(
+        legacy, runtime, first, migrate, evolved=bool(bridge_candidates)
+    )
+    if bridge_candidates:
+        bridge_index, bridge = bridge_candidates[0]
+        bridge_generation = bridge.get("generation")
+        prior = bridge.get("prior")
+        prior_fields = {
+            "phase", "authority_digest", "slices_digest", "candidate",
+            "artifact_phases", "question_ids", "gate_ids",
+        }
+        prior_lists = (
+            prior.get("artifact_phases"), prior.get("question_ids"),
+            prior.get("gate_ids"),
+        ) if isinstance(prior, dict) else (None, None, None)
+        valid_prior_lists = all(
+            isinstance(value, list)
+            and all(isinstance(item, str) and item for item in value)
+            and value == sorted(set(value))
+            for value in prior_lists
+        )
+        migration_audit_required = first["result"] != "projected_to_plan"
+        duplicate_legacy_bridge = sum(
+            isinstance(item.get("prior"), dict)
+            and item["prior"].get("authority_digest") == authority["digest"]
+            for _, item in bridge_candidates
+        ) > 1
+        if (
+            set(bridge) != {
+                "id", "command", "command_digest", "generation", "result", "prior",
+            }
+            or not isinstance(bridge.get("id"), str)
+            or not bridge["id"].strip()
+            or bridge.get("command") != "init"
+            or not is_sha256(bridge.get("command_digest"))
+            or bridge.get("result") != "authority_scope_reconfigured"
+            or type(bridge_generation) is not int
+            or bridge_generation <= generation
+            or not isinstance(prior, dict)
+            or not prior_fields <= set(prior)
+            or prior.get("authority_digest") != authority["digest"]
+            or prior.get("slices_digest") != canonical_json_digest(imported["slices"])
+            or prior.get("phase") not in _pipeline_v2_model.PHASES
+            or not valid_prior_lists
+            or (
+                migration_audit_required
+                and "migration-audit" not in prior["gate_ids"]
+            )
+            or duplicate_legacy_bridge
+        ):
+            raise DevelopmentPlanError(
+                "retired schema-10 lineage has an invalid public reconfiguration bridge"
+            )
+        return
+
+    if runtime.get("authority") != authority:
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage authority does not match the v2 authority"
+        )
+    expected_audit = imported["gates"].get("migration-audit")
+    runtime_gates = runtime.get("gates")
+    if expected_audit is not None and (
+        not isinstance(runtime_gates, dict)
+        or runtime_gates.get("migration-audit") != expected_audit
+    ):
+        raise DevelopmentPlanError(
+            "retired schema-10 lineage has invalid migration audit evidence"
+        )
+
+
+def discover_v2_runtime_states(root: Path) -> list[Path]:
+    """Find direct schema-2 runtime states without treating other JSON as state."""
+    directory = root / V2_RUNTIME_STATE_RELATIVE_PATH.parent
+    if not directory.exists():
+        return []
+    try:
+        stat = directory.lstat()
+    except OSError as error:
+        raise DevelopmentPlanError(f"cannot inspect v2 runtime directory: {error}") from error
+    if (
+        not directory.is_dir() or directory.is_symlink()
+        or bool(getattr(stat, "st_file_attributes", 0) & 0x400)
+    ):
+        raise DevelopmentPlanError("v2 runtime directory must be a canonical confined directory")
+    candidates = []
+    for path in sorted(directory.glob("*.json"), key=lambda item: item.name):
+        try:
+            child_stat = path.lstat()
+        except OSError as error:
+            raise DevelopmentPlanError(f"cannot inspect v2 runtime JSON: {error}") from error
+        if (
+            not path.is_file() or path.is_symlink()
+            or bool(getattr(child_stat, "st_file_attributes", 0) & 0x400)
+        ):
+            raise DevelopmentPlanError("v2 runtime JSON must be a canonical confined file")
+        if path.name == V2_RUNTIME_STATE_RELATIVE_PATH.name:
+            candidates.append(path)
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(value, dict) and value.get("schema") == 2
+            and "project_root" in value and "authority" in value
+        ):
+            candidates.append(path)
+    return candidates
+
+
+def require_v2_runtime_binding(
+    root: Path,
+    v2_path: Path,
+    *,
+    prior_plan_sha256: str | None,
+    prior_plan_path: str | None,
+) -> dict[str, Any]:
+    runtime = load_valid_v2_runtime(v2_path)
+    authority = runtime.get("authority")
+    items = authority.get("items") if isinstance(authority, dict) else None
+    expected_digest = canonical_json_digest(items) if isinstance(items, dict) else None
+    if (
+        runtime.get("schema") != 2
+        or Path(str(runtime.get("project_root", ""))).resolve() != root
+        or not isinstance(authority, dict)
+        or set(authority) != {"items", "digest"}
+        or set(items or {}) != {"requirements", "specification", "plan"}
+        or authority.get("digest") != expected_digest
+    ):
+        raise DevelopmentPlanError("v2 runtime binding is malformed and fails closed")
+    plan_binding = items.get("plan")
+    if not isinstance(plan_binding, dict) or set(plan_binding) != {"path", "sha256"}:
+        raise DevelopmentPlanError("v2 runtime plan binding is malformed")
+    if plan_binding.get("path") != prior_plan_path:
+        raise DevelopmentPlanError(
+            "v2 runtime bound plan path does not match the canonical plan being reopened"
+        )
+    if plan_binding.get("sha256") != prior_plan_sha256:
+        raise DevelopmentPlanError(
+            "v2 runtime bound plan SHA does not match the approved plan being reopened"
+        )
+    return runtime
+
+
 def runtime_recovery_authorization(
     root: Path,
     *,
     recovery_token: str | None,
     reason: str | None,
     prior_plan_sha256: str | None,
+    prior_plan_path: str | None,
 ) -> dict[str, Any] | None:
-    bound = [
-        path.as_posix()
+    v2_paths = discover_v2_runtime_states(root)
+    legacy_presence = [
+        runtime_path_exists(root / path)
         for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
-        if (root / path).exists()
     ]
-    if not bound:
+    if v2_paths:
+        if len(v2_paths) != 1:
+            raise DevelopmentPlanError(
+                "multiple v2 runtime state candidates exist; retired schema-10 lineage "
+                "cannot be proven and the ambiguous binding fails closed"
+            )
+        try:
+            runtime = require_v2_runtime_binding(
+                root,
+                v2_paths[0],
+                prior_plan_sha256=prior_plan_sha256,
+                prior_plan_path=prior_plan_path,
+            )
+        except DevelopmentPlanError as error:
+            if any(legacy_presence):
+                raise DevelopmentPlanError(
+                    "retired schema-10 lineage cannot use an invalid v2 binding: "
+                    f"{error}"
+                ) from error
+            raise
+        if recovery_token:
+            raise DevelopmentPlanError(
+                "v2 runtime reconfiguration uses public status -> init, not a recovery token"
+            )
+        if any(legacy_presence):
+            if not all(legacy_presence):
+                raise DevelopmentPlanError(
+                    "retired schema-10 lineage requires the complete legacy state/findings pair"
+                )
+            require_retired_schema10_lineage(root, runtime)
+        return None
+    legacy_bound = [
+        path
+        for path, present in zip(
+            (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH),
+            legacy_presence,
+            strict=True,
+        )
+        if present
+    ]
+    if not legacy_bound:
         if recovery_token:
             raise DevelopmentPlanError(
                 "--recovery-token is valid only for an open bound runtime recovery hold"
             )
         return None
-    if len(bound) != 2:
+    if len(legacy_bound) != 2:
         raise DevelopmentPlanError(
             "runtime pipeline state binding is incomplete and cannot authorize plan recovery"
         )
-    runtime = load_json(root / RUNTIME_STATE_RELATIVE_PATH, "runtime state")
+    legacy_state_path = require_canonical_runtime_file(
+        root, RUNTIME_STATE_RELATIVE_PATH, "legacy state"
+    )
+    require_canonical_runtime_file(
+        root, RUNTIME_FINDINGS_RELATIVE_PATH, "legacy findings"
+    )
+    runtime = load_json(legacy_state_path, "runtime state")
     hold = runtime.get("authority_recovery_hold") or {}
     token_payload = {
         "feature": hold.get("feature"),
@@ -1302,28 +1874,55 @@ def require_runtime_unbound(
     recovery_token: str | None = None,
     reason: str | None = None,
     prior_plan_sha256: str | None = None,
+    prior_plan_path: str | None = None,
 ) -> dict[str, Any] | None:
     return runtime_recovery_authorization(
         root,
         recovery_token=recovery_token,
         reason=reason,
         prior_plan_sha256=prior_plan_sha256,
+        prior_plan_path=prior_plan_path,
     )
 
 
 def require_bound_recovery_continuation(root: Path, state: dict[str, Any]) -> None:
-    bound = any(
-        (root / path).exists()
-        for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
-    )
-    if not bound:
-        return
     authorization = state.get("recovery_authorization") or {}
+    prior_plan_sha256 = authorization.get("prior_plan_sha256")
+    if not is_sha256(prior_plan_sha256):
+        for item in reversed(state.get("history", [])):
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") == "stale":
+                archived_approval = item.get("approval")
+                if (
+                    item.get("plan_path") != state.get("plan_path")
+                    or not isinstance(archived_approval, dict)
+                    or not is_sha256(archived_approval.get("approved_sha256"))
+                ):
+                    raise DevelopmentPlanError(
+                        "reinitialized plan authority history is malformed"
+                    )
+                prior_plan_sha256 = archived_approval["approved_sha256"]
+                break
+            if (
+                item.get("event") == "approved_plan_revision_opened"
+                and item.get("plan_path") == state.get("plan_path")
+                and item.get("new_analyst_id") == state.get("analyst_id")
+                and is_sha256(item.get("prior_approved_sha256"))
+            ):
+                prior_plan_sha256 = item["prior_approved_sha256"]
+                break
+    if not is_sha256(prior_plan_sha256) and state.get("status") == "approved":
+        approval = state.get("approval") or {}
+        approved_sha256 = approval.get("approved_sha256")
+        if is_sha256(approved_sha256):
+            prior_plan_sha256 = approved_sha256
     runtime_recovery_authorization(
         root,
         recovery_token=authorization.get("token"),
         reason=authorization.get("reason"),
-        prior_plan_sha256=authorization.get("prior_plan_sha256"),
+        prior_plan_sha256=prior_plan_sha256,
+        prior_plan_path=state.get("plan_path"),
     )
 
 
@@ -1346,6 +1945,7 @@ def finalize_approved_revision_reopen(
         recovery_token=getattr(args, "recovery_token", None),
         reason=args.reason,
         prior_plan_sha256=transition["prior_approved_sha256"],
+        prior_plan_path=transition["plan_path"],
     )
     drift = source_drift(root, state)
     if drift:
@@ -1425,13 +2025,15 @@ def command_revise_approved(args: argparse.Namespace) -> dict[str, Any]:
         recovery_token=getattr(args, "recovery_token", None),
         reason=args.reason,
         prior_plan_sha256=prior_sha256,
+        prior_plan_path=state["plan_path"],
     )
     meta, _ = parse_frontmatter(plan, "approved development plan")
+    approval_actor = approval.get("approved_by")
     if (
         meta.get("document_type") != "development-plan"
         or meta.get("status") != "approved"
         or meta.get("feature") != state["feature"]
-        or meta.get("approved_by") != "user"
+        or require_approval_actor(approval_actor) != meta.get("approved_by")
     ):
         raise DevelopmentPlanError(
             "approved plan frontmatter does not match the recorded approved authority"
@@ -1470,8 +2072,9 @@ def finalize_plan_approval(
     root: Path, state: dict[str, Any], args: argparse.Namespace
 ) -> dict[str, Any]:
     transition = state.get("approval_transition") or {}
+    transition_actor = require_approval_actor(transition.get("approved_by"))
     if (
-        transition.get("approved_by") != args.approved_by
+        transition_actor != args.approved_by
         or transition.get("approval_note") != args.approval_note
     ):
         raise DevelopmentPlanError(
@@ -1529,6 +2132,7 @@ def finalize_plan_approval(
 def command_approve(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
+    approval_actor = require_approval_actor(args.approved_by)
     if state["status"] == "approved":
         approval = state.get("approval") or {}
         if (
@@ -1542,20 +2146,18 @@ def command_approve(args: argparse.Namespace) -> dict[str, Any]:
     require_bound_recovery_continuation(root, state)
     if state["status"] == "approval_pending":
         return finalize_plan_approval(root, state, args)
-    if state["status"] != "awaiting_user_approval" or not state.get("submission"):
+    if state["status"] not in APPROVAL_WAITING_STATES or not state.get("submission"):
         raise DevelopmentPlanError("approval requires a submitted draft")
     require_current_sources(root, state)
-    if args.approved_by != "user":
-        raise DevelopmentPlanError("only explicit user approval may promote the plan")
     if not args.approval_note.strip():
         raise DevelopmentPlanError("approval note is required")
     plan = root / state["plan_path"]
     if sha256(plan) != state["submission"]["sha256"]:
         raise DevelopmentPlanError("draft changed after submission; resubmit before approval")
     approved_at = utc_now()
-    approved_bytes = promoted_plan_bytes(plan, args.approved_by, approved_at)
+    approved_bytes = promoted_plan_bytes(plan, approval_actor, approved_at)
     state["approval_transition"] = {
-        "approved_by": args.approved_by,
+        "approved_by": approval_actor,
         "approval_note": args.approval_note,
         "submitted_sha256": state["submission"]["sha256"],
         "approved_sha256": hashlib.sha256(approved_bytes).hexdigest(),
@@ -1611,7 +2213,11 @@ def build_parser() -> argparse.ArgumentParser:
         "revise-approved",
         help=(
             "revoke exact approved bytes and open a resumable new draft revision; "
-            "after runtime binding requires an exact authority_recovery_hold token"
+            "v2 continues through public status -> init; legacy binding requires its token"
+        ),
+        description=(
+            "Reopen approved plan bytes. A bound v2 runtime fails closed until its public "
+            "status -> init reconfiguration; --recovery-token is legacy-only."
         ),
     )
     revise.add_argument("--reason", required=True, help="exact audited revision reason")
@@ -1625,7 +2231,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     revise.add_argument(
         "--recovery-token",
-        help="exact token from a controller-owned authority_recovery_hold",
+        help="legacy-only exact token from a controller-owned authority_recovery_hold",
     )
     revise.set_defaults(handler=command_revise_approved)
 

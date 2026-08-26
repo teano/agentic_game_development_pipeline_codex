@@ -73,9 +73,18 @@ contain only non-blocking open questions.
 
 Record what the product must achieve and what observable behavior proves it. Exclude implementation plans, class structures, speculative architecture, agent activity, raw interview transcripts, and discarded ideas unless they become an explicit constraint or non-goal.
 
+Every semantic statement must be explicitly confirmed by the user through a direct statement, selection of one bounded option, an unambiguous `yes` to one immediately preceding proposal, or explicit approval of the exact PRD revision. Repository facts and inspected code may ground options and expose feasibility constraints, but they do not authorize product requirements. Existing draft text is not proof of confirmation.
+
+Do not write agent-originated proposals, assumptions, open questions, risks, exclusions, examples, inferred consequences, or candidate acceptance criteria anywhere in the PRD before the user confirms that exact content. Required sections may remain empty. A label does not make unconfirmed content admissible.
+
+Faithful paraphrase, stable IDs, and a mechanically equivalent observable check are allowed only when they add no independently choosable semantics. New defaults, owners, APIs, supported-type lists, lifecycle/failure behavior, validation, edge cases, limits, platform mappings, or technical consequences require separate confirmation.
+
+If a short confirmation follows a bundled proposal, treat it as ambiguous and make no semantic edit. Ask separate questions with two or three mutually exclusive options and tradeoffs, one independently choosable decision per question.
+
 ## Approval and changes
 
 - Keep the file in `draft` until the user explicitly approves it.
+- Before every semantic edit and before approval, audit each added or changed statement against the exact confirming user statement or selected option. Unsupported content keeps the PRD not ready.
 - Validate before and after approval.
 - Record the exact-byte SHA-256 at handoff time; do not embed a self-referential hash inside the PRD.
 - Reopen an approved PRD before any semantic edit by incrementing `revision`, setting `status: draft`, and clearing `approved_at`.
