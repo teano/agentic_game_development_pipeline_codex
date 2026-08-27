@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from copy import deepcopy
 from typing import Any
 
@@ -41,7 +40,8 @@ COMMANDS = {"init", "status", "next", "complete", "answer", "resume", "accept", 
 WORKER_FORBIDDEN_KEYS = {
     "authority_digest", "base_checkout_sha256", "current_checkout_sha256", "checkout",
     "controller", "diff", "diff_sha256", "inventory", "commands", "tests", "receipts",
-    "returncode", "stdout_sha256", "stderr_sha256",
+    "returncode", "stdout_sha256", "stderr_sha256", "stderr_excerpt",
+    "stderr_excerpt_truncated", "stderr_excerpt_redacted",
 }
 
 
@@ -152,8 +152,8 @@ def _worker_artifact(value: Any, phase: str, role: str) -> dict[str, Any]:
 
 
 def _validate_controller(
-    state: dict[str, Any], active: dict[str, Any], evidence: Any, worker_outcome: str,
-) -> None:
+    state: dict[str, Any], active: dict[str, Any], evidence: Any,
+) -> dict[str, Any] | None:
     required = {
         "authority_digest", "base_checkout_sha256", "current_checkout_sha256",
         "inventory", "diff", "diff_sha256", "violations", "commands",
@@ -177,29 +177,45 @@ def _validate_controller(
     results = evidence["commands"]
     if (
         not isinstance(results, list) or any(not isinstance(item, dict) for item in results)
-        or [item.get("argv") for item in results] != active["commands"]
+        or len(results) > len(active["commands"])
+        or [item.get("argv") for item in results]
+        != active["commands"][:len(results)]
     ):
-        raise PipelineError("controller did not run the exact planned commands")
-    if any(set(item) != {"argv", "returncode", "stdout_sha256", "stderr_sha256"} for item in results):
-        raise PipelineError("malformed controller command result")
-    if any(type(item["returncode"]) is not int or not is_digest(item["stdout_sha256"]) or not is_digest(item["stderr_sha256"]) for item in results):
-        raise PipelineError("malformed controller command result")
+        raise PipelineError("controller command evidence is not an exact planned prefix")
+    base_result = {"argv", "returncode", "stdout_sha256", "stderr_sha256"}
+    excerpt_result = base_result | {
+        "stderr_excerpt", "stderr_excerpt_truncated", "stderr_excerpt_redacted",
+    }
+    for item in results:
+        if (
+            type(item.get("returncode")) is not int
+            or not is_digest(item.get("stdout_sha256"))
+            or not is_digest(item.get("stderr_sha256"))
+        ):
+            raise PipelineError("malformed controller command result")
+        keys = set(item)
+        if item["returncode"] == 0:
+            if keys != base_result:
+                raise PipelineError("successful controller command persisted failure-only evidence")
+        elif keys != base_result and keys != excerpt_result:
+            raise PipelineError("malformed controller command result")
+        elif keys == excerpt_result and (
+            not isinstance(item["stderr_excerpt"], str)
+            or len(item["stderr_excerpt"].encode("utf-8")) > 4096
+            or type(item["stderr_excerpt_truncated"]) is not bool
+            or type(item["stderr_excerpt_redacted"]) is not bool
+        ):
+            raise PipelineError("malformed controller stderr excerpt")
     failures = [
         (index, item)
         for index, item in enumerate(results, 1)
         if item["returncode"] != 0
     ]
-    if failures and worker_outcome not in {"fail", "blocked"}:
-        index, failed = failures[0]
-        argv = json.dumps(
-            failed["argv"], ensure_ascii=False, separators=(",", ":")
-        )
-        raise PipelineError(
-            "controller-run command failed: "
-            f"index={index} argv={argv} returncode={failed['returncode']} "
-            f"stdout_sha256={failed['stdout_sha256']} "
-            f"stderr_sha256={failed['stderr_sha256']}"
-        )
+    if failures:
+        if len(failures) != 1 or failures[0][0] != len(results):
+            raise PipelineError("controller command evidence continued after the first failure")
+    elif len(results) != len(active["commands"]):
+        raise PipelineError("controller command evidence truncated a successful plan")
     if active["phase"] in {"engineering", "qa"} and not results:
         raise PipelineError(f"{active['phase']} requires controller-run checks")
     if not active["access"]["write"] and expected_diff:
@@ -208,6 +224,10 @@ def _validate_controller(
     if active["phase"] in {"review", "qa"}:
         if not isinstance(bound, dict) or bound != current_candidate(state) or bound.get("checkout_sha256") != evidence["current_checkout_sha256"]:
             raise PipelineError("Review/QA is not bound to the current candidate")
+    if not failures:
+        return None
+    index, failed = failures[0]
+    return {"index": index, **deepcopy(failed)}
 
 
 def _record(
@@ -317,7 +337,7 @@ def _latest_remediation_candidate(state: dict[str, Any]) -> dict[str, Any] | Non
             and candidate["generation"]
             > max(last_completed_slice_generation, retained_generation)
             and item.get("status") == "closed"
-            and item.get("kind") == "worker_result"
+            and item.get("kind") in {"worker_result", "controller_result"}
             and item.get("reason") == "fail"
             and item.get("phase") in {"review", "qa"}
         ):
@@ -337,8 +357,33 @@ def _newer_nonpassing_engineering_inventory(
     controller = record.get("controller") if isinstance(record, dict) else None
     assignment_id = record.get("assignment_id") if isinstance(record, dict) else None
     checkout = controller.get("inventory") if isinstance(controller, dict) else None
+    commands = controller.get("commands") if isinstance(controller, dict) else None
+    failures = [
+        (index, item)
+        for index, item in enumerate(commands, 1)
+        if isinstance(item, dict) and type(item.get("returncode")) is int
+        and item["returncode"] != 0
+    ] if isinstance(commands, list) else []
+    controller_gate = (
+        state["gates"].get(f"{assignment_id}-controller-result")
+        if isinstance(assignment_id, str) else None
+    )
+    controller_nonpassing = (
+        isinstance(worker, dict) and worker.get("outcome") == "pass"
+        and len(failures) == 1 and failures[0][0] == len(commands)
+        and isinstance(controller_gate, dict)
+        and controller_gate.get("kind") == "controller_result"
+        and controller_gate.get("phase") == "engineering"
+        and controller_gate.get("reason") == "fail"
+        and controller_gate.get("command_index") == failures[0][0]
+        and controller_gate.get("returncode") == failures[0][1]["returncode"]
+    )
     if (
-        not isinstance(worker, dict) or worker.get("outcome") not in {"blocked", "fail"}
+        not isinstance(worker, dict)
+        or (
+            worker.get("outcome") not in {"blocked", "fail"}
+            and not controller_nonpassing
+        )
         or record.get("candidate_binding") != candidate
         or not isinstance(assignment_id, str)
         or not isinstance(controller, dict)
@@ -696,7 +741,8 @@ def _reduce_command(
         context["remediation"] = [
             {"gate_id": key, **deepcopy(item)}
             for key, item in sorted(work["gates"].items())
-            if item.get("status") == "closed" and item.get("kind") == "worker_result"
+            if item.get("status") == "closed"
+            and item.get("kind") in {"worker_result", "controller_result"}
         ]
         context["migration_audit"] = [
             {"gate_id": key, **deepcopy(item)} for key, item in sorted(work["gates"].items())
@@ -733,15 +779,34 @@ def _reduce_command(
         forbidden = _contains_forbidden(artifact)
         if forbidden:
             raise PipelineError(f"worker artifact contains controller-owned field {forbidden!r}")
-        _validate_controller(work, active, command.get("controller"), artifact["outcome"])
+        controller_failure = _validate_controller(
+            work, active, command.get("controller"),
+        )
+        failure_capsule = None
+        if controller_failure is not None:
+            failure_capsule = {
+                "command_index": controller_failure["index"],
+                "returncode": controller_failure["returncode"],
+                "stdout_sha256": controller_failure["stdout_sha256"],
+                "stderr_sha256": controller_failure["stderr_sha256"],
+                "unexecuted_count": len(active["commands"]) - controller_failure["index"],
+            }
+            for key in (
+                "stderr_excerpt", "stderr_excerpt_truncated", "stderr_excerpt_redacted",
+            ):
+                if key in controller_failure:
+                    failure_capsule[key] = deepcopy(controller_failure[key])
         evidence = deepcopy(command["controller"])
         questions = artifact.get("questions", [])
         record = {"assignment_id": active["id"], "worker": deepcopy(artifact), "controller": evidence}
         record["candidate_binding"] = deepcopy(active["capsule"].get("candidate"))
         if (
-            active["phase"] == "engineering" and artifact["outcome"] == "pass"
-            or active["phase"] == "docs" and evidence["diff"]
-        ):
+            (
+                active["phase"] == "engineering"
+                and artifact["outcome"] == "pass"
+            )
+            or (active["phase"] == "docs" and evidence["diff"])
+        ) and controller_failure is None:
             record["candidate"] = {
                 "checkout_sha256": evidence["current_checkout_sha256"],
                 "diff_sha256": evidence["diff_sha256"],
@@ -758,9 +823,23 @@ def _reduce_command(
             }
         if artifact["outcome"] != "pass":
             gate_id = f"{active['id']}-result"
-            work["gates"][gate_id] = {
+            gate = {
                 "status": "open", "phase": active["phase"], "kind": "worker_result",
                 "reason": artifact["outcome"], "worker_artifact": deepcopy(artifact),
+                "candidate_base": deepcopy(active["capsule"].get("candidate")),
+                "slice_id": current_slice(work)["id"],
+            }
+            if failure_capsule is not None:
+                gate["controller_failure"] = failure_capsule
+            work["gates"][gate_id] = gate
+        elif controller_failure is not None:
+            gate_id = f"{active['id']}-controller-result"
+            work["gates"][gate_id] = {
+                "status": "open", "phase": active["phase"],
+                "kind": "controller_result", "reason": "fail",
+                "command_index": controller_failure["index"],
+                "returncode": controller_failure["returncode"],
+                "controller_failure": failure_capsule,
                 "candidate_base": deepcopy(active["capsule"].get("candidate")),
                 "slice_id": current_slice(work)["id"],
             }
@@ -802,7 +881,11 @@ def _reduce_command(
                 raise PipelineError("migration resume requires controller commands")
         else:
             source_phase = item["phase"]
-            if item.get("reason") == "fail" and source_phase in {"review", "qa"}:
+            if (
+                item.get("reason") == "fail"
+                and source_phase in {"review", "qa"}
+                and item.get("kind") in {"worker_result", "controller_result"}
+            ):
                 candidate = item.get("candidate_base")
                 if not isinstance(candidate, dict):
                     raise PipelineError("failed verification gate lost its candidate base")

@@ -598,8 +598,8 @@ documentation_state, and open_assumptions.
 - max_payload_bytes: 160000
 - max_estimated_tokens: 40000
 - metric_scope: capsule_plus_referenced_files
-- authority_paths: approved feature documents and exact edit files
-- evidence_paths: bounded research and verification artifacts
+- authority_paths: docs/Features/template/{self.feature}/product-requirements.md, docs/Features/template/{self.feature}/technical-specification.md
+- evidence_paths: docs/Features/template/{self.feature}/technical-specification.md, tests/sample-feature/verification/SLICE-{number:03d}-planned.json
 
 ### Verification and Exit Criteria
 
@@ -760,6 +760,82 @@ Only the approved feature and named shared symbol are in scope.
         self.assertEqual(
             approved["approval"]["submitted_sha256"], submitted["submission"]["sha256"]
         )
+
+    def test_public_plan_lifecycle_seals_comma_space_paths_in_pipeline_init(self) -> None:
+        self.initialize()
+        self.write_plan()
+        for command in (
+            ("validate-plan",),
+            ("submit",),
+            (
+                "approve", "--approved-by", "delegated-technical-approver",
+                "--approval-note", "Approve exact comma-space read scope",
+            ),
+        ):
+            result = self.cli(*command)
+            self.assertEqual(0, result.returncode, msg=result.stdout or result.stderr)
+
+        pipeline_launcher = (
+            Path(controller.__file__).resolve().parents[2]
+            / "gamedev-pipeline" / "scripts" / "pipeline_state.py"
+        )
+        runtime_state = self.root / ".agentic-pipeline-v2" / "state.json"
+        slice_record = json.dumps({
+            "id": "SLICE-001",
+            "allowed_paths": ["src/feature-1.lua"],
+            "planned_commands": [[sys.executable, "-B", "-c", "pass"]],
+        })
+        init = subprocess.run(
+            [
+                sys.executable,
+                str(pipeline_launcher),
+                "--state", str(runtime_state),
+                "init",
+                "--id", "INIT-COMMA-SPACE-READS",
+                "--root", str(self.root),
+                "--run-id", "sample-feature-comma-space",
+                "--authority", f"requirements={self.prd.relative_to(self.root).as_posix()}",
+                "--authority", f"specification={self.spec.relative_to(self.root).as_posix()}",
+                "--authority", f"plan={self.plan.relative_to(self.root).as_posix()}",
+                "--slice", slice_record,
+            ],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, init.returncode, msg=init.stdout or init.stderr)
+        runtime = json.loads(runtime_state.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [
+                f"docs/Features/template/{self.feature}/product-requirements.md",
+                f"docs/Features/template/{self.feature}/technical-specification.md",
+                "tests/sample-feature/verification/SLICE-001-planned.json",
+            ],
+            runtime["slices"][0]["read_paths"],
+        )
+
+    def test_validate_plan_rejects_runtime_invalid_read_path_grammar(self) -> None:
+        invalid_paths = ("../outside", "src/**/nested.lua", "[docs/context.md]")
+        for invalid in invalid_paths:
+            with self.subTest(invalid=invalid):
+                self.initialize()
+                self.write_plan()
+                plan_text = self.plan.read_text(encoding="utf-8")
+                self.plan.write_text(
+                    plan_text.replace(
+                        "- authority_paths: "
+                        f"docs/Features/template/{self.feature}/product-requirements.md",
+                        f"- authority_paths: {invalid}",
+                        1,
+                    ),
+                    encoding="utf-8",
+                )
+                result = self.cli("validate-plan")
+                self.assertEqual(2, result.returncode, msg=result.stdout or result.stderr)
+                self.assertIn("Context Capsule Budget authority_paths", result.stderr)
+                self.temp.cleanup()
+                self.setUp()
 
     def test_delegated_technical_approval_records_the_true_actor_and_revises(self) -> None:
         self.initialize()

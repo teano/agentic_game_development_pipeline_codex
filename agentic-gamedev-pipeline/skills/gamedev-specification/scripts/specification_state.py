@@ -19,11 +19,54 @@ from typing import Any
 
 
 SCHEMA_VERSION = 2
+V2_RECOVERY_AUTHORIZATION_SCHEMA = 2
 STATE_RELATIVE_PATH = Path(".agentic-pipeline/specification-state.json")
 RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline/state.json")
 RUNTIME_FINDINGS_RELATIVE_PATH = Path(".agentic-pipeline/findings.json")
 V2_RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline-v2/state.json")
 MAX_CYCLES_PER_ARCHITECT = 5
+
+V2_RECOVERY_AUTHORIZATION_V1_KEYS = {
+    "schema",
+    "token",
+    "reason",
+    "runtime_state_path",
+    "runtime_state_sha256",
+    "prior_spec_sha256",
+}
+V2_RECOVERY_AUTHORIZATION_V2_KEYS = {
+    "schema",
+    "token",
+    "reason",
+    "revision_kind",
+    "prior_requirements",
+    "prior_specification",
+    "runtime_state_path",
+    "runtime_state_sha256",
+}
+READY_REVISION_RECEIPT_KEYS = {
+    "opened_at",
+    "reason",
+    "new_architect_id",
+    "recovery_token",
+    "specification_only",
+    "revision_kind",
+    "recovery_authorization",
+    "specification_path",
+    "prior_revision",
+    "next_revision",
+    "prior_ready_sha256",
+    "draft_sha256",
+    "prior_prd",
+    "new_prd",
+    "prior_specification",
+    "prior_ready",
+    "prior_architects",
+    "prior_waves",
+    "prior_hold_history",
+    "prior_total_cycles_completed",
+    "spec_ready_disposition",
+}
 
 
 _DEVELOPMENT_PLAN_CONTROLLER_PATH = (
@@ -425,7 +468,7 @@ def runtime_recovery_authorization(
     requirements_path: str | None = None,
     requirements_sha256: str | None = None,
     specification_path: str | None = None,
-    specification_only: bool = False,
+    revision_kind: str = "prd_revision",
     expected_authorization: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     try:
@@ -448,9 +491,9 @@ def runtime_recovery_authorization(
             raise SpecificationStateError(
                 "v2 specification revision uses the public tokenless reopen route"
             )
-        if not specification_only:
+        if revision_kind not in {"specification_only", "prd_revision"}:
             raise SpecificationStateError(
-                "bound v2 runtime permits only a specification-only revision"
+                "bound v2 runtime revision kind is invalid"
             )
         v2_path = v2_paths[0]
         try:
@@ -494,10 +537,6 @@ def runtime_recovery_authorization(
                 "bound v2 runtime does not match the exact project, requirements, "
                 "and prior specification authority"
             )
-        if runtime.get("active_assignment") is not None:
-            raise SpecificationStateError(
-                "bound v2 runtime is not at the quiescent specification-reopen boundary"
-            )
         try:
             view = _pipeline_v2_runner.Controller(
                 _pipeline_v2_transaction.StateStore(v2_path)
@@ -508,27 +547,47 @@ def runtime_recovery_authorization(
                 f"bound v2 public status cannot prove a safe checkout: {error}"
             ) from error
         next_action = view.get("next_action") if isinstance(view, dict) else None
-        if (
+        public_status_invalid = (
             before != after
             or not isinstance(view, dict)
-            or view.get("active_assignment") is not None
-            or view.get("open_gates") != []
-            or view.get("open_questions") != []
             or not isinstance(next_action, dict)
             or next_action.get("kind") != "command"
-        ):
+        )
+        if revision_kind == "specification_only":
+            public_status_invalid = public_status_invalid or (
+                runtime.get("active_assignment") is not None
+                or view.get("active_assignment") is not None
+                or view.get("open_gates") != []
+                or view.get("open_questions") != []
+            )
+        else:
+            public_status_invalid = public_status_invalid or (
+                next_action.get("command") != "init"
+                or next_action.get("user_input_required") is not False
+            )
+        if public_status_invalid:
             raise SpecificationStateError(
-                "bound v2 public status is not a safe quiescent boundary: it is "
-                "terminal, requires checkout recovery, has an open gate/question, "
-                "exposes an unknown effect, or changed during authorization"
+                "bound v2 public status is not a safe specification-reopen boundary: "
+                "the specification-only route is not quiescent, the PRD-change route "
+                "does not expose tokenless init with user_input_required=false, status "
+                "is terminal or requires checkout recovery, an effect is unknown, or "
+                "the runtime changed during authorization"
             )
         authorization = {
-            "schema": 1,
+            "schema": V2_RECOVERY_AUTHORIZATION_SCHEMA,
             "token": None,
             "reason": reason,
+            "revision_kind": revision_kind,
+            "prior_requirements": {
+                "path": requirements_path,
+                "sha256": requirements_sha256,
+            },
+            "prior_specification": {
+                "path": specification_path,
+                "sha256": prior_spec_sha256,
+            },
             "runtime_state_path": v2_path.relative_to(root).as_posix(),
             "runtime_state_sha256": hashlib.sha256(before).hexdigest(),
-            "prior_spec_sha256": prior_spec_sha256,
         }
         if (
             expected_authorization is not None
@@ -598,7 +657,12 @@ def runtime_recovery_authorization(
 
 
 def require_bound_recovery_continuation(root: Path, state: dict[str, Any]) -> None:
-    authorization = state.get("recovery_authorization") or {}
+    raw_authorization = state.get("recovery_authorization") or {}
+    authorization = (
+        normalized_recovery_authorization_for_state(root, state, raw_authorization)
+        if raw_authorization
+        else raw_authorization
+    )
     if not authorization:
         try:
             v2_paths = _development_plan_controller.discover_v2_runtime_states(root)
@@ -622,15 +686,44 @@ def require_bound_recovery_continuation(root: Path, state: dict[str, Any]) -> No
         == V2_RUNTIME_STATE_RELATIVE_PATH.parent
         and Path(runtime_state_path).suffix == ".json"
     )
+    revision_kind = authorization.get("revision_kind")
+    prior_requirements = authorization.get("prior_requirements")
+    prior_specification = authorization.get("prior_specification")
+    if authorized_v2_path and (
+        revision_kind not in {"specification_only", "prd_revision"}
+        or not isinstance(prior_requirements, dict)
+        or set(prior_requirements) != {"path", "sha256"}
+        or not isinstance(prior_specification, dict)
+        or set(prior_specification) != {"path", "sha256"}
+    ):
+        raise SpecificationStateError(
+            "bound v2 runtime authorization lacks the exact prior authority binding"
+        )
     runtime_recovery_authorization(
         root,
         recovery_token=authorization.get("token"),
         reason=authorization.get("reason"),
-        prior_spec_sha256=authorization.get("prior_spec_sha256"),
-        requirements_path=(state.get("prd") or {}).get("path"),
-        requirements_sha256=(state.get("prd") or {}).get("sha256"),
-        specification_path=(state.get("specification") or {}).get("path"),
-        specification_only=authorized_v2_path,
+        prior_spec_sha256=(
+            prior_specification.get("sha256")
+            if authorized_v2_path
+            else authorization.get("prior_spec_sha256")
+        ),
+        requirements_path=(
+            prior_requirements.get("path")
+            if authorized_v2_path
+            else (state.get("prd") or {}).get("path")
+        ),
+        requirements_sha256=(
+            prior_requirements.get("sha256")
+            if authorized_v2_path
+            else (state.get("prd") or {}).get("sha256")
+        ),
+        specification_path=(
+            prior_specification.get("path")
+            if authorized_v2_path
+            else (state.get("specification") or {}).get("path")
+        ),
+        revision_kind=(revision_kind if authorized_v2_path else "prd_revision"),
         expected_authorization=authorization,
     )
 
@@ -899,6 +992,15 @@ def finalize_ready_revision(
         raise SpecificationStateError(
             "pending ready-specification revision must resume with exact original inputs"
         )
+    if (
+        set(transition) != READY_REVISION_RECEIPT_KEYS
+        or not _canonical_ready_archive(transition)
+    ):
+        raise SpecificationStateError("pending ready revision receipt is not canonical")
+    _validated_ready_revision_prd(root, transition, label="pending ready revision PRD")
+    expected_authorization = normalized_recovery_authorization_for_state(
+        root, state, transition.get("recovery_authorization")
+    )
     runtime_recovery_authorization(
         root,
         recovery_token=getattr(args, "recovery_token", None),
@@ -907,21 +1009,16 @@ def finalize_ready_revision(
         requirements_path=transition["prior_prd"]["path"],
         requirements_sha256=transition["prior_prd"]["sha256"],
         specification_path=transition["specification_path"],
-        specification_only=bool(transition.get("specification_only")),
-        expected_authorization=transition.get("recovery_authorization"),
+        revision_kind=transition.get("revision_kind"),
+        expected_authorization=expected_authorization,
     )
-    prd = root / transition["new_prd"]["path"]
-    if sha256(prd) != transition["new_prd"]["sha256"]:
-        raise SpecificationStateError("pending ready revision found changed PRD bytes")
-    validate_approved_prd_contract(
-        prd,
-        label=(
-            "unchanged specification-only PRD"
-            if transition.get("specification_only")
-            else "new PRD"
-        ),
+    spec = resolve_project_path(
+        root, transition["specification_path"], "pending ready revision specification"
     )
-    spec = root / transition["specification_path"]
+    if spec.relative_to(root).as_posix() != transition["specification_path"]:
+        raise SpecificationStateError(
+            "pending ready revision specification path is not canonical"
+        )
     current_sha = sha256(spec)
     if current_sha == transition["prior_ready_sha256"]:
         draft_bytes, prior_revision, next_revision = reopened_specification_bytes(
@@ -1051,8 +1148,20 @@ def _canonical_ready_archive(event: dict[str, Any]) -> bool:
     holds = event.get("prior_hold_history")
     total = event.get("prior_total_cycles_completed")
     specification_only = event.get("specification_only")
+    prior_revision = event.get("prior_revision")
+    next_revision = event.get("next_revision")
     if (
         type(specification_only) is not bool
+        or not _is_receipt_timestamp(event.get("opened_at"))
+        or not isinstance(event.get("reason"), str)
+        or not event["reason"].strip()
+        or _normalized_receipt_id(event.get("new_architect_id")) is None
+        or type(prior_revision) is not int
+        or prior_revision < 1
+        or type(next_revision) is not int
+        or next_revision != prior_revision + 1
+        or not _is_receipt_digest(event.get("prior_ready_sha256"))
+        or not _is_receipt_digest(event.get("draft_sha256"))
         or not _is_canonical_prd_receipt(prior_prd)
         or not _is_canonical_prd_receipt(new_prd)
         or not isinstance(prior_ready, dict)
@@ -1073,7 +1182,8 @@ def _canonical_ready_archive(event: dict[str, Any]) -> bool:
             "trace_errors": [],
         }
         or specification_only
-        and new_prd != prior_prd
+        and new_prd
+        != {key: prior_prd.get(key) for key in ("path", "revision", "sha256")}
         or not isinstance(architects, list)
         or not architects
         or not isinstance(waves, list)
@@ -1290,6 +1400,231 @@ def _canonical_ready_archive(event: dict[str, Any]) -> bool:
     return True
 
 
+def _validated_ready_revision_prd(
+    root: Path, event: dict[str, Any], *, label: str
+) -> Path:
+    """Bind a ready-revision receipt to the freshly validated canonical live PRD."""
+    new_prd = event.get("new_prd")
+    prior_prd = event.get("prior_prd")
+    specification_only = event.get("specification_only")
+    if (
+        type(specification_only) is not bool
+        or not isinstance(new_prd, dict)
+        or not isinstance(prior_prd, dict)
+    ):
+        raise SpecificationStateError(f"{label} receipt is malformed")
+    try:
+        prd = resolve_project_path(root, new_prd.get("path"), label)
+    except (TypeError, SpecificationStateError) as error:
+        raise SpecificationStateError(f"{label} path is not canonical") from error
+    relative_path = prd.relative_to(root).as_posix()
+    if relative_path != new_prd.get("path") or relative_path != prior_prd.get("path"):
+        raise SpecificationStateError(f"{label} path changed")
+
+    validation = validate_approved_prd_contract(prd, label=label)
+    metadata = require_approved_prd(prd)
+    live_digest = sha256(prd)
+    if validation.get("sha256") != live_digest:
+        raise SpecificationStateError(f"{label} changed during validation")
+    expected = {
+        "path": relative_path,
+        "revision": metadata["revision"],
+        "sha256": live_digest,
+    }
+    if not specification_only:
+        expected.update(
+            {
+                "approved_at": metadata["approved_at"],
+                "validation_sha256": validation["sha256"],
+            }
+        )
+    if new_prd.get("sha256") != live_digest:
+        raise SpecificationStateError(f"{label} found changed PRD bytes")
+    if new_prd != expected:
+        raise SpecificationStateError(f"{label} receipt does not match the live approved PRD")
+    return prd
+
+
+def _recovery_authorization_archive(
+    state: dict[str, Any], authorization: dict[str, Any]
+) -> dict[str, Any]:
+    if state.get("status") == "ready_revision_pending":
+        archive = state.get("ready_revision")
+        if (
+            not isinstance(archive, dict)
+            or archive.get("recovery_authorization") != authorization
+        ):
+            raise SpecificationStateError(
+                "legacy v2 recovery authorization has no exact live pending receipt"
+            )
+        return archive
+
+    history = state.get("history")
+    if not isinstance(history, list):
+        raise SpecificationStateError(
+            "legacy v2 recovery authorization has no canonical committed history"
+        )
+    archive = next(
+        (
+            event
+            for event in reversed(history)
+            if isinstance(event, dict)
+            and event.get("event") == "ready_specification_revision_opened"
+        ),
+        None,
+    )
+    if (
+        not isinstance(archive, dict)
+        or archive.get("recovery_authorization") != authorization
+        or state.get("recovery_authorization") != authorization
+    ):
+        raise SpecificationStateError(
+            "legacy v2 recovery authorization does not match live committed history"
+        )
+    return archive
+
+
+def normalized_recovery_authorization_for_state(
+    root: Path,
+    state: dict[str, Any],
+    authorization: Any,
+) -> dict[str, Any] | None:
+    """Return semantic v2 authorization without rewriting its persisted receipt."""
+    if authorization is None:
+        return None
+    if not isinstance(authorization, dict):
+        raise SpecificationStateError("bound runtime authorization is malformed")
+    schema = authorization.get("schema")
+    if type(schema) is not int or schema not in {1, V2_RECOVERY_AUTHORIZATION_SCHEMA}:
+        raise SpecificationStateError(
+            "v2 recovery authorization schema must be exact integer 1 or 2"
+        )
+
+    archive = _recovery_authorization_archive(state, authorization)
+    archived_authorization = archive.get("recovery_authorization")
+    archived_schema = (
+        archived_authorization.get("schema")
+        if isinstance(archived_authorization, dict)
+        else None
+    )
+    if (
+        type(archived_schema) is not int
+        or archived_schema not in {1, V2_RECOVERY_AUTHORIZATION_SCHEMA}
+    ):
+        raise SpecificationStateError(
+            "archived v2 recovery authorization schema must be exact integer 1 or 2"
+        )
+    live_authorization = (
+        archived_authorization
+        if state.get("status") == "ready_revision_pending"
+        else state.get("recovery_authorization")
+    )
+    live_schema = (
+        live_authorization.get("schema")
+        if isinstance(live_authorization, dict)
+        else None
+    )
+    if type(live_schema) is not int or live_schema not in {
+        1,
+        V2_RECOVERY_AUTHORIZATION_SCHEMA,
+    }:
+        raise SpecificationStateError(
+            "live recovery authorization schema must be exact integer 1 or 2"
+        )
+    if authorization.get("token") is not None:
+        return copy.deepcopy(authorization)
+    expected_archive_keys = READY_REVISION_RECEIPT_KEYS | (
+        set() if state.get("status") == "ready_revision_pending" else {"event"}
+    )
+    if (
+        set(archive) != expected_archive_keys
+        or not _canonical_ready_archive(archive)
+        or (
+            archive.get("specification_only") is not True
+            and authorization.get("schema") == 1
+        )
+        or archive.get("revision_kind")
+        != ("specification_only" if archive.get("specification_only") else "prd_revision")
+        or archive.get("recovery_token") is not None
+        or archive.get("reason") != authorization.get("reason")
+    ):
+        raise SpecificationStateError(
+            "v2 recovery authorization archive is not canonical for its revision mode"
+        )
+
+    prior_prd = archive.get("prior_prd")
+    prior_specification = archive.get("prior_specification")
+    prior_ready = archive.get("prior_ready")
+    if (
+        not isinstance(prior_prd, dict)
+        or not isinstance(prior_specification, dict)
+        or not isinstance(prior_ready, dict)
+    ):
+        raise SpecificationStateError(
+            "v2 recovery authorization lacks canonical prior authority"
+        )
+    try:
+        prior_prd_path = resolve_project_path(
+            root, prior_prd.get("path"), "prior runtime requirements"
+        )
+        prior_specification_path = resolve_project_path(
+            root, prior_specification.get("path"), "prior runtime specification"
+        )
+    except (TypeError, SpecificationStateError) as error:
+        raise SpecificationStateError(
+            "v2 recovery authorization prior authority paths are not canonical"
+        ) from error
+    if (
+        prior_prd_path.relative_to(root).as_posix() != prior_prd.get("path")
+        or prior_specification_path.relative_to(root).as_posix()
+        != prior_specification.get("path")
+    ):
+        raise SpecificationStateError(
+            "v2 recovery authorization prior authority paths are not canonical"
+        )
+
+    derived = {
+        "schema": V2_RECOVERY_AUTHORIZATION_SCHEMA,
+        "token": None,
+        "reason": archive.get("reason"),
+        "revision_kind": archive.get("revision_kind"),
+        "prior_requirements": {
+            "path": prior_prd.get("path"),
+            "sha256": prior_prd.get("sha256"),
+        },
+        "prior_specification": {
+            "path": prior_specification.get("path"),
+            "sha256": prior_ready.get("spec_sha256"),
+        },
+        "runtime_state_path": authorization.get("runtime_state_path"),
+        "runtime_state_sha256": authorization.get("runtime_state_sha256"),
+    }
+    if schema == 1:
+        if (
+            set(authorization) != V2_RECOVERY_AUTHORIZATION_V1_KEYS
+            or archive.get("specification_only") is not True
+            or archive.get("revision_kind") != "specification_only"
+            or authorization.get("prior_spec_sha256")
+            != prior_ready.get("spec_sha256")
+        ):
+            raise SpecificationStateError(
+                "legacy v2 recovery authorization is not the exact released "
+                "specification-only schema-1 form"
+            )
+        return derived
+    if schema == V2_RECOVERY_AUTHORIZATION_SCHEMA:
+        if set(authorization) != V2_RECOVERY_AUTHORIZATION_V2_KEYS:
+            raise SpecificationStateError(
+                "v2 recovery authorization schema-2 keyset is invalid"
+            )
+        if authorization != derived:
+            raise SpecificationStateError(
+                "v2 recovery authorization does not match its canonical authority archive"
+            )
+        return copy.deepcopy(authorization)
+    raise SpecificationStateError("unsupported v2 recovery authorization schema")
+
+
 def replay_committed_ready_revision(
     root: Path,
     state: dict[str, Any],
@@ -1326,30 +1661,7 @@ def replay_committed_ready_revision(
             "committed ready-specification replay requires exact original inputs"
         )
 
-    expected_event_keys = {
-        "opened_at",
-        "reason",
-        "new_architect_id",
-        "recovery_token",
-        "specification_only",
-        "revision_kind",
-        "recovery_authorization",
-        "specification_path",
-        "prior_revision",
-        "next_revision",
-        "prior_ready_sha256",
-        "draft_sha256",
-        "prior_prd",
-        "new_prd",
-        "prior_specification",
-        "prior_ready",
-        "prior_architects",
-        "prior_waves",
-        "prior_hold_history",
-        "prior_total_cycles_completed",
-        "spec_ready_disposition",
-        "event",
-    }
+    expected_event_keys = READY_REVISION_RECEIPT_KEYS | {"event"}
     prior_ready = event.get("prior_ready")
     prior_specification = event.get("prior_specification")
     prior_prd = event.get("prior_prd")
@@ -1380,10 +1692,9 @@ def replay_committed_ready_revision(
         )
     ):
         raise SpecificationStateError("committed replay receipt changed after commit")
-    for digest in (event.get("prior_ready_sha256"), event.get("draft_sha256")):
-        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-            raise SpecificationStateError("committed replay receipt changed after commit")
-
+    expected_authorization = normalized_recovery_authorization_for_state(
+        root, state, event.get("recovery_authorization")
+    )
     runtime_recovery_authorization(
         root,
         recovery_token=getattr(args, "recovery_token", None),
@@ -1392,16 +1703,10 @@ def replay_committed_ready_revision(
         requirements_path=prior_prd.get("path"),
         requirements_sha256=prior_prd.get("sha256"),
         specification_path=event["specification_path"],
-        specification_only=specification_only,
-        expected_authorization=event.get("recovery_authorization"),
+        revision_kind=event.get("revision_kind"),
+        expected_authorization=expected_authorization,
     )
-
-    prd = resolve_project_path(root, new_prd.get("path"), "committed replay PRD")
-    if prd.relative_to(root).as_posix() != new_prd.get("path"):
-        raise SpecificationStateError("committed replay PRD path changed")
-    if sha256(prd) != new_prd.get("sha256"):
-        raise SpecificationStateError("committed replay found changed PRD bytes")
-    validate_approved_prd_contract(prd, label="committed replay PRD")
+    _validated_ready_revision_prd(root, event, label="committed replay PRD")
 
     spec = resolve_project_path(
         root, event.get("specification_path"), "committed replay specification"
@@ -1558,11 +1863,12 @@ def command_revise_ready(args: argparse.Namespace) -> dict[str, Any]:
         requirements_path=state["prd"]["path"],
         requirements_sha256=state["prd"]["sha256"],
         specification_path=state["specification"]["path"],
-        specification_only=specification_only,
+        revision_kind=("specification_only" if specification_only else "prd_revision"),
     )
     if (
         authorization
         and prd_approved_at is not None
+        and authorization.get("hold_opened_at") is not None
         and prd_approved_at
         <= utc_timestamp(
             authorization["hold_opened_at"], "authority recovery hold opened_at"
@@ -1592,7 +1898,11 @@ def command_revise_ready(args: argparse.Namespace) -> dict[str, Any]:
         "draft_sha256": hashlib.sha256(draft_bytes).hexdigest(),
         "prior_prd": copy.deepcopy(state["prd"]),
         "new_prd": (
-            copy.deepcopy(state["prd"])
+            {
+                "path": state["prd"]["path"],
+                "revision": new_prd_meta["revision"],
+                "sha256": new_prd_sha,
+            }
             if specification_only
             else {
                 "path": state["prd"]["path"],
@@ -2025,15 +2335,18 @@ def build_parser() -> argparse.ArgumentParser:
     revise_in_progress.add_argument("--architect-id", required=True)
     revise_in_progress.set_defaults(handler=command_revise_in_progress)
 
+    revise_ready_help = (
+        "revoke exact SPEC_READY bytes for a sanctioned specification revision or "
+        "a newly approved PRD revision; a legacy bound runtime requires an exact "
+        "authority_recovery_hold token, while proven v2 revisions are tokenless and "
+        "a PRD change requires public status to expose init with "
+        "user_input_required=false"
+    )
     revise_ready = commands.add_parser(
         "revise-ready",
         aliases=["reopen-ready"],
-        help=(
-            "revoke exact SPEC_READY bytes for a sanctioned specification revision or "
-            "a newly approved PRD revision; "
-            "a legacy bound runtime requires an exact authority_recovery_hold token, "
-            "while a proven v2 specification-only revision is tokenless"
-        ),
+        help=revise_ready_help,
+        description=revise_ready_help,
     )
     revise_ready.add_argument("--reason", required=True)
     revise_ready.add_argument("--architect-id", required=True)
@@ -2041,7 +2354,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--recovery-token",
         help=(
             "required only for an exact legacy authority_recovery_hold; "
-            "v2 specification-only revisions are tokenless"
+            "all v2 specification and PRD revisions are tokenless"
         ),
     )
     revise_ready.add_argument(

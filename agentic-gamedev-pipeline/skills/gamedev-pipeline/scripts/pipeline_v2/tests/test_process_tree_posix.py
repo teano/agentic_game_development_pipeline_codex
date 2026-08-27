@@ -35,6 +35,18 @@ class _FakePosixProcess:
 
 
 class PosixContainmentStructureTests(unittest.TestCase):
+    def test_stderr_reader_keeps_a_bounded_tail_without_changing_full_digest(self) -> None:
+        payload = b"prefix-" + (b"x" * 4096) + b"-semantic-tail"
+        reader = process_tree._DigestReader(io.BytesIO(payload), tail_limit=128)
+        reader.start()
+        reader.join(2.0)
+
+        tail, truncated = reader.tail()
+        self.assertEqual(128, len(tail))
+        self.assertTrue(truncated)
+        self.assertTrue(tail.endswith(b"-semantic-tail"))
+        self.assertEqual(process_tree.hashlib.sha256(payload).hexdigest(), reader.hexdigest())
+
     def test_posix_implementation_has_no_pid_scan_or_group_kill_fallback(self) -> None:
         source = Path(process_tree.__file__).read_text(encoding="utf-8")
         self.assertNotIn("_TREE_TOKEN_ENV", source)

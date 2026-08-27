@@ -6,7 +6,9 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
+import stat
 import tempfile
 import time
 from copy import deepcopy
@@ -41,6 +43,21 @@ from .transaction import StateStore
 
 
 TECHNICAL_FAILURE_RETURN_CODE = 125
+STDERR_EXCERPT_BYTES = 4096
+
+_SENSITIVE_ENV_NAME = re.compile(
+    r"(?:api_?key|apikey|token|secret|password|passwd|credential|authorization|bearer|private_?key|access_?key|(?:^|_)pat(?:_|$)|database_?url|dsn)",
+    re.IGNORECASE,
+)
+_SECRET_PATTERNS = (
+    re.compile(r"\b([a-z][a-z0-9+.-]*://)([^/\s@]+)@", re.IGNORECASE),
+    re.compile(r"\b(bearer)(\s+)([^\s,;]+)", re.IGNORECASE),
+    re.compile(
+        r"\b(api[-_ ]?key|password|passwd|access[-_ ]?token|refresh[-_ ]?token|token|secret)"
+        r"(\s*[:=]\s*)([^\s,;]+)",
+        re.IGNORECASE,
+    ),
+)
 
 _PLAN_CONTRACT_PATH = Path(__file__).resolve().parents[4] / "scripts" / "development_plan_contract.py"
 _PLAN_CONTRACT_SPEC = importlib.util.spec_from_file_location(
@@ -108,10 +125,36 @@ def _process_environment() -> dict[str, str]:
     return environment
 
 
+def _lexically_contained(root: Path, candidate: str | Path) -> bool:
+    root_value = os.path.normcase(os.path.abspath(root))
+    candidate_value = os.path.normcase(os.path.abspath(candidate))
+    try:
+        return os.path.commonpath((root_value, candidate_value)) == root_value
+    except (OSError, ValueError):
+        return False
+
+
 def _remove_read_only_temp(path: Path, label: str) -> None:
+    verified_scratch = Path(os.path.abspath(path))
+
+    def retry_read_only(function, failed_path, exc_info) -> None:
+        failed = Path(os.path.abspath(failed_path))
+        if not _lexically_contained(verified_scratch, failed):
+            raise exc_info[1]
+        try:
+            failed_stat = failed.lstat()
+        except OSError:
+            raise exc_info[1]
+        if failed.is_symlink() or bool(
+            getattr(failed_stat, "st_file_attributes", 0) & 0x400
+        ):
+            raise exc_info[1]
+        os.chmod(failed, stat.S_IREAD | stat.S_IWRITE)
+        function(failed_path)
+
     for attempt in range(6):
         try:
-            shutil.rmtree(path)
+            shutil.rmtree(path, onerror=retry_read_only if os.name == "nt" else None)
             return
         except FileNotFoundError:
             return
@@ -119,6 +162,62 @@ def _remove_read_only_temp(path: Path, label: str) -> None:
             if attempt == 5:
                 raise PipelineError(f"cannot clean {label}: {exc}") from exc
             time.sleep(0.05 * (attempt + 1))
+
+
+def _replace_literal(value: str, literal: str, replacement: str) -> tuple[str, bool]:
+    if not literal:
+        return value, False
+    updated, count = re.subn(
+        re.escape(literal), lambda _match: replacement, value, flags=re.IGNORECASE,
+    )
+    return updated, count > 0
+
+
+def _stderr_excerpt(
+    raw: bytes, *, raw_truncated: bool, environment: dict[str, str],
+    project_root: Path, scratch_root: Path | None,
+) -> dict[str, Any]:
+    """Return one redacted, path-normalized, byte-bounded failure tail."""
+    text = raw.decode("utf-8", errors="replace")
+    redacted = False
+    sensitive_values = sorted(
+        {
+            value for name, value in environment.items()
+            if value and _SENSITIVE_ENV_NAME.search(name)
+        },
+        key=len,
+        reverse=True,
+    )
+    for secret in sensitive_values:
+        text, replaced = _replace_literal(text, secret, "[REDACTED]")
+        redacted = redacted or replaced
+    for pattern in _SECRET_PATTERNS:
+        text, count = pattern.subn(
+            lambda match: (
+                f"{match.group(1)}[REDACTED]@"
+                if "://" in match.group(1)
+                else f"{match.group(1)}{match.group(2)}[REDACTED]"
+            ),
+            text,
+        )
+        redacted = redacted or count > 0
+    roots = []
+    if scratch_root is not None:
+        roots.append((str(Path(os.path.abspath(scratch_root))), "[SCRATCH_ROOT]"))
+    roots.append((str(Path(os.path.abspath(project_root))), "[PROJECT_ROOT]"))
+    for root_value, replacement in roots:
+        for spelling in dict.fromkeys((root_value, root_value.replace("\\", "/"))):
+            text, _ = _replace_literal(text, spelling, replacement)
+    encoded = text.encode("utf-8")
+    truncated = raw_truncated or len(encoded) > STDERR_EXCERPT_BYTES
+    if len(encoded) > STDERR_EXCERPT_BYTES:
+        encoded = encoded[-STDERR_EXCERPT_BYTES:]
+        text = encoded.decode("utf-8", errors="ignore")
+    return {
+        "stderr_excerpt": text,
+        "stderr_excerpt_truncated": truncated,
+        "stderr_excerpt_redacted": redacted,
+    }
 
 
 @contextmanager
@@ -210,7 +309,8 @@ class Controller:
             (item["candidate_base"]["generation"], key, item["candidate_base"])
             for key, item in state["gates"].items()
             if isinstance(item, dict) and item.get("status") == "closed"
-            and item.get("kind") == "worker_result" and item.get("reason") == "fail"
+            and item.get("kind") in {"worker_result", "controller_result"}
+            and item.get("reason") == "fail"
             and item.get("phase") in {"review", "qa"}
             and candidate_record_valid(
                 item.get("candidate_base"), state["authority"]["digest"],
@@ -595,7 +695,7 @@ class Controller:
             results = []
 
             def run_checks(
-                checkout: Path, environment: dict[str, str], *, enforce_read_only: bool,
+                checkout: Path, environment: dict[str, str],
             ) -> None:
                 for argv in active["commands"]:
                     try:
@@ -610,28 +710,44 @@ class Controller:
                             "stdout_sha256": result.stdout_sha256,
                             "stderr_sha256": result.stderr_sha256,
                         }
+                        if result.returncode != 0:
+                            command_result.update(_stderr_excerpt(
+                                result.stderr_tail,
+                                raw_truncated=result.stderr_tail_truncated,
+                                environment=environment,
+                                project_root=root,
+                                scratch_root=Path(environment["TEMP"]),
+                            ))
                     except OSError as exc:
+                        raw_error = str(exc).encode("utf-8", errors="replace")
                         command_result = {
                             "argv": argv, "returncode": TECHNICAL_FAILURE_RETURN_CODE,
                             "stdout_sha256": _stream_digest(b""),
-                            "stderr_sha256": _stream_digest(str(exc).encode()),
+                            "stderr_sha256": _stream_digest(raw_error),
                         }
+                        command_result.update(_stderr_excerpt(
+                            raw_error,
+                            raw_truncated=False,
+                            environment=environment,
+                            project_root=root,
+                            scratch_root=Path(environment["TEMP"]),
+                        ))
                     results.append(command_result)
-                    if enforce_read_only:
-                        command_inventory = inventory(checkout)
-                        command_changes = diff(active["base"]["inventory"], command_inventory)
-                        forbidden = violations(command_changes, active["access"]["write"])
-                        if forbidden:
-                            raise PipelineError(f"candidate changed forbidden paths: {forbidden}")
+                    command_inventory = inventory(checkout)
+                    command_changes = diff(active["base"]["inventory"], command_inventory)
+                    forbidden = violations(command_changes, active["access"]["write"])
+                    if forbidden:
+                        raise PipelineError(f"candidate changed forbidden paths: {forbidden}")
+                    if command_result["returncode"] != 0:
+                        break
 
             if active["commands"]:
                 with _read_only_process_environment(root) as environment:
                     run_checks(
                         root, environment,
-                        enforce_read_only=not active["access"]["write"],
                     )
             else:
-                run_checks(root, _process_environment(), enforce_read_only=False)
+                run_checks(root, _process_environment())
             verify_authority(root, state["authority"])
             current = inventory(root)
             changes = diff(active["base"]["inventory"], current)

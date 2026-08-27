@@ -527,6 +527,38 @@ approved_at: 2026-08-10T00:00:00Z
             self.args(architect_id="architect-2", confirmation="exact SHA confirmed")
         )
 
+    def released_v2_schema1_authorization(self, authorization: dict) -> dict:
+        self.assertEqual(2, authorization["schema"])
+        self.assertIsNone(authorization["token"])
+        return {
+            "schema": 1,
+            "token": None,
+            "reason": authorization["reason"],
+            "runtime_state_path": authorization["runtime_state_path"],
+            "runtime_state_sha256": authorization["runtime_state_sha256"],
+            "prior_spec_sha256": authorization["prior_specification"]["sha256"],
+        }
+
+    def persist_released_v2_schema1_authorization(self) -> dict:
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state = controller.load_state(self.root)
+        if state["status"] == "ready_revision_pending":
+            receipt = state["ready_revision"]
+            legacy = self.released_v2_schema1_authorization(
+                receipt["recovery_authorization"]
+            )
+            receipt["recovery_authorization"] = legacy
+        else:
+            receipt = state["history"][-1]
+            self.assertEqual("ready_specification_revision_opened", receipt["event"])
+            legacy = self.released_v2_schema1_authorization(
+                receipt["recovery_authorization"]
+            )
+            receipt["recovery_authorization"] = legacy
+            state["recovery_authorization"] = dict(legacy)
+        controller.write_state_file(state_path, state)
+        return legacy
+
     def assert_committed_ready_replay_byte_noop(
         self, arguments: Namespace, *bound_paths: Path
     ) -> None:
@@ -1430,6 +1462,7 @@ approved_at: 2026-08-10T00:00:00Z
 
         self.assertEqual("awaiting_accept", reopened["status"])
         authorization = reopened["recovery_authorization"]
+        self.assertEqual(2, authorization["schema"])
         self.assertEqual(
             ".agentic-pipeline-v2/state.json",
             authorization["runtime_state_path"],
@@ -1437,6 +1470,18 @@ approved_at: 2026-08-10T00:00:00Z
         self.assertEqual(
             hashlib.sha256(runtime_before).hexdigest(),
             authorization["runtime_state_sha256"],
+        )
+        self.assertEqual("specification_only", authorization["revision_kind"])
+        self.assertEqual(
+            {"path": ready["prd"]["path"], "sha256": ready["prd"]["sha256"]},
+            authorization["prior_requirements"],
+        )
+        self.assertEqual(
+            {
+                "path": ready["specification"]["path"],
+                "sha256": ready["ready"]["spec_sha256"],
+            },
+            authorization["prior_specification"],
         )
         self.assertEqual(runtime_before, runtime.read_bytes())
         final = self.complete_fresh_v2_reopen("direct-v2-proofread.md")
@@ -1500,11 +1545,15 @@ approved_at: 2026-08-10T00:00:00Z
         )
         self.assertEqual("awaiting_accept", reopened["status"])
         authorization = reopened["recovery_authorization"]
+        self.assertEqual(2, authorization["schema"])
         self.assertEqual(
             ".agentic-pipeline-v2/state.json",
             authorization["runtime_state_path"],
         )
-        self.assertEqual(ready["ready"]["spec_sha256"], authorization["prior_spec_sha256"])
+        self.assertEqual(
+            ready["ready"]["spec_sha256"],
+            authorization["prior_specification"]["sha256"],
+        )
 
         self.spec.write_text(
             self.spec.read_text(encoding="utf-8").replace(
@@ -1732,6 +1781,13 @@ approved_at: 2026-08-10T00:00:00Z
         poison_labels = (
             "specification_only_integer",
             "top_level_extra",
+            "opened_at_invalid",
+            "reason_blank",
+            "new_architect_blank",
+            "prior_revision_bool",
+            "next_revision_float",
+            "prior_ready_sha_uppercase",
+            "draft_sha_uppercase",
             "prior_specification_extra",
             "prior_specification_changed",
             "prior_ready_extra",
@@ -1752,6 +1808,22 @@ approved_at: 2026-08-10T00:00:00Z
                     receipt["specification_only"] = 1
                 elif label == "top_level_extra":
                     receipt["unexpected"] = True
+                elif label == "opened_at_invalid":
+                    receipt["opened_at"] = "not-a-timestamp"
+                elif label == "reason_blank":
+                    receipt["reason"] = "  "
+                elif label == "new_architect_blank":
+                    receipt["new_architect_id"] = "  "
+                elif label == "prior_revision_bool":
+                    receipt["prior_revision"] = True
+                elif label == "next_revision_float":
+                    receipt["next_revision"] = 2.0
+                elif label == "prior_ready_sha_uppercase":
+                    receipt["prior_ready_sha256"] = receipt[
+                        "prior_ready_sha256"
+                    ].upper()
+                elif label == "draft_sha_uppercase":
+                    receipt["draft_sha256"] = receipt["draft_sha256"].upper()
                 elif label == "prior_specification_extra":
                     receipt["prior_specification"]["unexpected"] = True
                 elif label == "prior_specification_changed":
@@ -1779,6 +1851,120 @@ approved_at: 2026-08-10T00:00:00Z
                     arguments, "committed replay receipt changed", runtime
                 )
                 state_path.write_bytes(original_state)
+
+    def test_recovery_authorization_rejects_noninteger_schema_live_and_archive(
+        self,
+    ) -> None:
+        ready = self.make_ready()
+        runtime = self.bind_direct_v2(ready)
+        arguments = self.args(
+            reason="strict authorization schema",
+            architect_id="architect-2",
+            recovery_token=None,
+            specification_only=True,
+        )
+        controller.command_revise_ready(arguments)
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        schema2 = controller.load_state(self.root)
+        schema1 = json.loads(json.dumps(schema2))
+        legacy = self.released_v2_schema1_authorization(
+            schema1["recovery_authorization"]
+        )
+        schema1["recovery_authorization"] = dict(legacy)
+        schema1["history"][-1]["recovery_authorization"] = dict(legacy)
+
+        cases = (
+            ("schema1-bool", schema1, True),
+            ("schema1-float", schema1, 1.0),
+            ("schema2-float", schema2, 2.0),
+        )
+        for label, baseline, schema in cases:
+            for location in ("live", "archive"):
+                with self.subTest(label=label, location=location):
+                    poisoned = json.loads(json.dumps(baseline))
+                    target = (
+                        poisoned["recovery_authorization"]
+                        if location == "live"
+                        else poisoned["history"][-1]["recovery_authorization"]
+                    )
+                    target["schema"] = schema
+                    controller.write_state_file(state_path, poisoned)
+                    self.assert_committed_ready_replay_rejected_without_mutation(
+                        arguments, "schema", runtime
+                    )
+
+    def test_pending_prd_revision_rejects_coordinated_revision_and_draft_tamper(
+        self,
+    ) -> None:
+        ready = self.make_ready()
+        runtime = self.bind_direct_v2(ready)
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        arguments = self.args(
+            reason="reject coordinated pending PRD receipt tamper",
+            architect_id="architect-2",
+            recovery_token=None,
+            specification_only=False,
+        )
+        with mock.patch.object(
+            controller, "write_bytes_atomically", side_effect=OSError("lost response")
+        ):
+            with self.assertRaisesRegex(OSError, "lost response"):
+                controller.command_revise_ready(arguments)
+
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        poisoned = controller.load_state(self.root)
+        transition = poisoned["ready_revision"]
+        transition["new_prd"]["revision"] = "999"
+        draft, _, _ = controller.reopened_specification_bytes(
+            self.spec,
+            transition["new_prd"]["path"],
+            transition["new_prd"]["revision"],
+            transition["new_prd"]["sha256"],
+        )
+        transition["draft_sha256"] = hashlib.sha256(draft).hexdigest()
+        controller.write_state_file(state_path, poisoned)
+        tracked = (state_path, self.prd, self.spec, runtime)
+        before = {path: path.read_bytes() for path in tracked}
+
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "live approved PRD"
+        ):
+            controller.command_revise_ready(arguments)
+        self.assertEqual(before, {path: path.read_bytes() for path in tracked})
+
+    def test_committed_prd_revision_rejects_coordinated_revision_projection(
+        self,
+    ) -> None:
+        ready = self.make_ready()
+        runtime = self.bind_direct_v2(ready)
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        arguments = self.args(
+            reason="reject coordinated committed PRD receipt tamper",
+            architect_id="architect-2",
+            recovery_token=None,
+            specification_only=False,
+        )
+        controller.command_revise_ready(arguments)
+
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        poisoned = controller.load_state(self.root)
+        receipt = poisoned["history"][-1]
+        receipt["new_prd"]["revision"] = "999"
+        poisoned["prd"]["revision"] = "999"
+        self.spec.write_text(
+            self.spec.read_text(encoding="utf-8").replace(
+                "  revision: 4", "  revision: 999", 1
+            ),
+            encoding="utf-8",
+        )
+        poisoned_draft_sha = controller.sha256(self.spec)
+        receipt["draft_sha256"] = poisoned_draft_sha
+        poisoned["specification"]["sha256"] = poisoned_draft_sha
+        controller.write_state_file(state_path, poisoned)
+
+        self.assert_committed_ready_replay_rejected_without_mutation(
+            arguments, "live approved PRD", runtime
+        )
 
     def test_committed_ready_replay_rejects_bool_numbers_and_blank_receipt_ids(
         self,
@@ -2089,7 +2275,7 @@ approved_at: 2026-08-10T00:00:00Z
                         prior_root, prior_temp, prior_feature, prior_prd, prior_spec
                     )
 
-    def test_v2_reopen_rejects_active_terminal_drift_token_and_prd_mode(self) -> None:
+    def test_v2_specification_only_reopen_rejects_active_terminal_drift_and_token(self) -> None:
         ready = self.make_ready()
         runtime = self.bind_retired_schema10_v2(ready)
         runtime_controller = controller._pipeline_v2_runner.Controller(
@@ -2131,19 +2317,202 @@ approved_at: 2026-08-10T00:00:00Z
         self.assertEqual(state_before, (self.root / controller.STATE_RELATIVE_PATH).read_bytes())
         self.assertEqual(spec_before, self.spec.read_bytes())
 
+    def test_prd_revision_rewinds_active_v2_plan_and_reconverges(self) -> None:
+        ready = self.make_ready()
+        runtime = self.bind_direct_v2(ready)
+        runtime_controller = controller._pipeline_v2_runner.Controller(
+            controller._pipeline_v2_transaction.StateStore(runtime)
+        )
+        action = runtime_controller.status()["next_action"]
+        runtime_controller.next(
+            command_id=action["command_id"],
+            assignment=action["assignment"],
+            expected_generation=action["expected_generation"],
+        )
+        self.assertIsNotNone(runtime_controller.status()["active_assignment"])
+        runtime_before = runtime.read_bytes()
+        prior_prd = dict(ready["prd"])
+        prior_specification = {
+            "path": ready["specification"]["path"],
+            "sha256": ready["ready"]["spec_sha256"],
+        }
+
         self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
-        state_before = (self.root / controller.STATE_RELATIVE_PATH).read_bytes()
-        spec_before = self.spec.read_bytes()
-        with self.assertRaisesRegex(controller.SpecificationStateError, "specification-only"):
-            controller.command_revise_ready(
+        rewind_action = runtime_controller.status()["next_action"]
+        self.assertEqual("command", rewind_action["kind"])
+        self.assertEqual("init", rewind_action["command"])
+        self.assertFalse(rewind_action["user_input_required"])
+        arguments = self.args(
+            reason="approved product authority changed during active planning",
+            architect_id="architect-2",
+            recovery_token=None,
+            specification_only=False,
+        )
+        reopened = controller.command_revise_ready(arguments)
+
+        self.assertEqual("awaiting_accept", reopened["status"])
+        self.assertEqual("prd_revision", reopened["history"][-1]["revision_kind"])
+        self.assertEqual("4", reopened["prd"]["revision"])
+        authorization = reopened["recovery_authorization"]
+        self.assertEqual(2, authorization["schema"])
+        self.assertEqual("prd_revision", authorization["revision_kind"])
+        self.assertEqual(
+            {"path": prior_prd["path"], "sha256": prior_prd["sha256"]},
+            authorization["prior_requirements"],
+        )
+        self.assertEqual(prior_specification, authorization["prior_specification"])
+        self.assertEqual(
+            hashlib.sha256(runtime_before).hexdigest(),
+            authorization["runtime_state_sha256"],
+        )
+        self.assertEqual(runtime_before, runtime.read_bytes())
+
+        self.assert_committed_ready_replay_byte_noop(arguments, runtime)
+        final = self.complete_fresh_v2_reopen("prd-rewind-proofread.md")
+        self.assertEqual("spec_ready", final["status"])
+        self.assertEqual("4", final["prd"]["revision"])
+        self.assertEqual(runtime_before, runtime.read_bytes())
+
+    def test_prd_revision_allows_stale_open_v2_lifecycle_evidence_at_init_boundary(self) -> None:
+        ready = self.make_ready()
+        runtime = self.bind_direct_v2(ready)
+        runtime_before = runtime.read_bytes()
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        with mock.patch.object(
+            controller._pipeline_v2_runner.Controller,
+            "status",
+            return_value={
+                "active_assignment": {"id": "stale-plan-assignment"},
+                "open_gates": ["stale-gate"],
+                "open_questions": ["stale-question"],
+                "next_action": {
+                    "kind": "command",
+                    "command": "init",
+                    "user_input_required": False,
+                },
+            },
+        ):
+            reopened = controller.command_revise_ready(
                 self.args(
-                    reason="must not revise product authority through v2",
+                    reason="approved PRD supersedes stale runtime lifecycle evidence",
                     architect_id="architect-2",
                     recovery_token=None,
                     specification_only=False,
                 )
             )
-        self.assertEqual(state_before, (self.root / controller.STATE_RELATIVE_PATH).read_bytes())
+        self.assertEqual("awaiting_accept", reopened["status"])
+        self.assertEqual("prd_revision", reopened["recovery_authorization"]["revision_kind"])
+        self.assertEqual(runtime_before, runtime.read_bytes())
+
+    def test_prd_revision_rejects_non_init_recovery_unknown_and_token_without_mutation(self) -> None:
+        self.make_ready()
+        runtime = self.bind_direct_v2(controller.load_state(self.root))
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        cases = {
+            "non-init": {
+                "active_assignment": None,
+                "open_gates": [],
+                "open_questions": [],
+                "next_action": {
+                    "kind": "command",
+                    "command": "next",
+                    "user_input_required": False,
+                },
+            },
+            "user-input": {
+                "active_assignment": None,
+                "open_gates": [],
+                "open_questions": [],
+                "next_action": {
+                    "kind": "command",
+                    "command": "init",
+                    "user_input_required": True,
+                },
+            },
+            "recovery": {
+                "active_assignment": None,
+                "open_gates": [],
+                "open_questions": [],
+                "next_action": {
+                    "kind": "terminal",
+                    "result": "checkout_recovery_required",
+                },
+            },
+            "unknown": {
+                "active_assignment": None,
+                "open_gates": [],
+                "open_questions": [],
+                "next_action": {"kind": "unknown-effect"},
+            },
+        }
+        for label, public_status in cases.items():
+            with self.subTest(label=label), mock.patch.object(
+                controller._pipeline_v2_runner.Controller,
+                "status",
+                return_value=public_status,
+            ):
+                state_before = state_path.read_bytes()
+                spec_before = self.spec.read_bytes()
+                runtime_before = runtime.read_bytes()
+                with self.assertRaisesRegex(
+                    controller.SpecificationStateError,
+                    "init|terminal|checkout recovery|unknown|safe",
+                ):
+                    controller.command_revise_ready(
+                        self.args(
+                            reason="reject unsafe PRD rewind boundary",
+                            architect_id="architect-2",
+                            recovery_token=None,
+                            specification_only=False,
+                        )
+                    )
+                self.assertEqual(state_before, state_path.read_bytes())
+                self.assertEqual(spec_before, self.spec.read_bytes())
+                self.assertEqual(runtime_before, runtime.read_bytes())
+
+        state_before = state_path.read_bytes()
+        spec_before = self.spec.read_bytes()
+        runtime_before = runtime.read_bytes()
+        with self.assertRaisesRegex(controller.SpecificationStateError, "tokenless"):
+            controller.command_revise_ready(
+                self.args(
+                    reason="reject token on PRD rewind",
+                    architect_id="architect-2",
+                    recovery_token="ARH-FOREIGN",
+                    specification_only=False,
+                )
+            )
+        self.assertEqual(state_before, state_path.read_bytes())
+        self.assertEqual(spec_before, self.spec.read_bytes())
+        self.assertEqual(runtime_before, runtime.read_bytes())
+
+    def test_prd_revision_revalidates_prior_v2_runtime_cas_on_continuation(self) -> None:
+        ready = self.make_ready()
+        runtime = self.bind_direct_v2(ready)
+        runtime_before = runtime.read_bytes()
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        controller.command_revise_ready(
+            self.args(
+                reason="CAS-bound PRD rewind",
+                architect_id="architect-2",
+                recovery_token=None,
+                specification_only=False,
+            )
+        )
+        self.spec.write_text(
+            self.spec.read_text(encoding="utf-8").replace(
+                "status: draft", "status: approved", 1
+            ),
+            encoding="utf-8",
+        )
+        runtime.write_text(json.dumps(json.loads(runtime_before), indent=2), encoding="utf-8")
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_before = state_path.read_bytes()
+        spec_before = self.spec.read_bytes()
+        with self.assertRaisesRegex(controller.SpecificationStateError, "authorization changed"):
+            controller.command_accept_spec(self.args())
+        self.assertEqual(state_before, state_path.read_bytes())
         self.assertEqual(spec_before, self.spec.read_bytes())
 
     def test_v2_reopen_rejects_unknown_public_status_effect(self) -> None:
@@ -2303,6 +2672,174 @@ approved_at: 2026-08-10T00:00:00Z
         reopened = controller.command_revise_ready(args)
         self.assertEqual("awaiting_accept", reopened["status"])
         self.assertIn("revision: 2", self.spec.read_text(encoding="utf-8"))
+
+    def test_released_v2_schema1_pending_before_spec_write_resumes_without_rewrite(self) -> None:
+        ready = self.make_ready()
+        runtime = self.bind_direct_v2(ready)
+        arguments = self.args(
+            reason="released schema-1 pending before specification write",
+            architect_id="architect-2",
+            recovery_token=None,
+            specification_only=True,
+        )
+        with mock.patch.object(
+            controller, "write_bytes_atomically", side_effect=OSError("lost response")
+        ):
+            with self.assertRaisesRegex(OSError, "lost response"):
+                controller.command_revise_ready(arguments)
+        self.assertIn("status: approved", self.spec.read_text(encoding="utf-8"))
+        legacy = self.persist_released_v2_schema1_authorization()
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        stored_before_load = state_path.read_bytes()
+        controller.load_state(self.root)
+        self.assertEqual(stored_before_load, state_path.read_bytes())
+
+        reopened = controller.command_revise_ready(arguments)
+
+        self.assertEqual("awaiting_accept", reopened["status"])
+        self.assertEqual(legacy, reopened["recovery_authorization"])
+        self.assertEqual(legacy, reopened["history"][-1]["recovery_authorization"])
+        self.assertIn("status: draft", self.spec.read_text(encoding="utf-8"))
+        self.assertEqual(2, reopened["schema_version"])
+        self.assertEqual(
+            hashlib.sha256(runtime.read_bytes()).hexdigest(),
+            legacy["runtime_state_sha256"],
+        )
+
+    def test_released_v2_schema1_pending_after_spec_write_resumes_without_rewrite(self) -> None:
+        ready = self.make_ready()
+        self.bind_direct_v2(ready)
+        arguments = self.args(
+            reason="released schema-1 pending after specification write",
+            architect_id="architect-2",
+            recovery_token=None,
+            specification_only=True,
+        )
+        real_write = controller.write_bytes_atomically
+
+        def write_then_lose_response(path: Path, value: bytes) -> None:
+            real_write(path, value)
+            raise OSError("lost response after specification write")
+
+        with mock.patch.object(
+            controller, "write_bytes_atomically", side_effect=write_then_lose_response
+        ):
+            with self.assertRaisesRegex(OSError, "after specification write"):
+                controller.command_revise_ready(arguments)
+        self.assertIn("status: draft", self.spec.read_text(encoding="utf-8"))
+        legacy = self.persist_released_v2_schema1_authorization()
+
+        reopened = controller.command_revise_ready(arguments)
+
+        self.assertEqual("awaiting_accept", reopened["status"])
+        self.assertEqual(legacy, reopened["recovery_authorization"])
+        self.assertEqual(legacy, reopened["history"][-1]["recovery_authorization"])
+
+    def test_released_v2_schema1_committed_replay_and_full_convergence(self) -> None:
+        ready = self.make_ready()
+        runtime = self.bind_direct_v2(ready)
+        arguments = self.args(
+            reason="continue released schema-1 committed specification reopen",
+            architect_id="architect-2",
+            recovery_token=None,
+            specification_only=True,
+        )
+        controller.command_revise_ready(arguments)
+        legacy = self.persist_released_v2_schema1_authorization()
+
+        self.assert_committed_ready_replay_byte_noop(arguments, runtime)
+        final = self.complete_fresh_v2_reopen("released-schema1-proofread.md")
+
+        self.assertEqual("spec_ready", final["status"])
+        self.assertEqual(legacy, final["recovery_authorization"])
+        receipt = next(
+            event
+            for event in reversed(final["history"])
+            if event.get("event") == "ready_specification_revision_opened"
+        )
+        self.assertEqual(legacy, receipt["recovery_authorization"])
+        self.assertNotIn("revision_kind", legacy)
+        self.assertEqual(2, final["schema_version"])
+
+    def test_released_v2_schema1_rejects_malformed_history_runtime_and_source_byte_noop(self) -> None:
+        ready = self.make_ready()
+        runtime = self.bind_direct_v2(ready)
+        arguments = self.args(
+            reason="reject tampered released schema-1 authorization",
+            architect_id="architect-2",
+            recovery_token=None,
+            specification_only=True,
+        )
+        controller.command_revise_ready(arguments)
+        self.persist_released_v2_schema1_authorization()
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        original_state = state_path.read_bytes()
+
+        for label in ("extra", "missing", "mixed", "history-mismatch", "archive"):
+            with self.subTest(label=label):
+                poisoned = json.loads(original_state)
+                receipt = poisoned["history"][-1]
+                receipt_authorization = receipt["recovery_authorization"]
+                state_authorization = poisoned["recovery_authorization"]
+                if label == "extra":
+                    receipt_authorization["extra"] = "forbidden"
+                    state_authorization["extra"] = "forbidden"
+                elif label == "missing":
+                    receipt_authorization.pop("prior_spec_sha256")
+                    state_authorization.pop("prior_spec_sha256")
+                elif label == "mixed":
+                    receipt_authorization["revision_kind"] = "specification_only"
+                    state_authorization["revision_kind"] = "specification_only"
+                elif label == "history-mismatch":
+                    state_authorization["reason"] = "different live authorization"
+                else:
+                    receipt["prior_ready"]["spec_sha256"] = "b" * 64
+                    receipt["prior_ready_sha256"] = "b" * 64
+                    receipt["prior_specification"]["sha256"] = "b" * 64
+                    receipt_authorization["prior_spec_sha256"] = "b" * 64
+                    poisoned["recovery_authorization"]["prior_spec_sha256"] = "b" * 64
+                controller.write_state_file(state_path, poisoned)
+                self.assert_committed_ready_replay_rejected_without_mutation(
+                    arguments, "authorization|archive|history|released|receipt", runtime
+                )
+                state_path.write_bytes(original_state)
+
+        poisoned = json.loads(original_state)
+        receipt = poisoned["history"][-1]
+        receipt["specification_only"] = False
+        receipt["revision_kind"] = "prd_revision"
+        receipt["spec_ready_disposition"] = "revoked_by_prd_revision"
+        controller.write_state_file(state_path, poisoned)
+        self.assert_committed_ready_replay_rejected_without_mutation(
+            self.args(
+                reason=arguments.reason,
+                architect_id="architect-2",
+                recovery_token=None,
+                specification_only=False,
+            ),
+            "schema-1|archive|specification-only",
+            runtime,
+        )
+        state_path.write_bytes(original_state)
+
+        ambiguous_runtime = runtime.with_name("ambiguous-released-schema1.json")
+        ambiguous_runtime.write_bytes(runtime.read_bytes())
+        self.assert_committed_ready_replay_rejected_without_mutation(
+            arguments, "multiple v2|ambiguous", runtime, ambiguous_runtime
+        )
+        ambiguous_runtime.unlink()
+
+        runtime_before = runtime.read_bytes()
+        runtime.write_text(json.dumps(json.loads(runtime_before), indent=2), encoding="utf-8")
+        self.assert_committed_ready_replay_rejected_without_mutation(
+            arguments, "authorization changed", runtime
+        )
+        runtime.write_bytes(runtime_before)
+
+        self.spec.write_bytes(self.spec.read_bytes() + b"tampered source\n")
+        self.assert_committed_ready_replay_rejected_without_mutation(
+            arguments, "draft bytes changed", runtime
+        )
 
     def test_specification_only_reopen_cli(self) -> None:
         self.make_ready()
@@ -2482,7 +3019,8 @@ approved_at: 2026-08-10T00:00:00Z
         self.assertEqual(0, help_result.returncode)
         self.assertIn("--recovery-token", help_result.stdout)
         self.assertIn("--specification-only", help_result.stdout)
-        self.assertIn("v2 specification-only", help_result.stdout)
+        self.assertIn("v2 revisions", help_result.stdout)
+        self.assertIn("user_input_required=false", help_result.stdout)
         self.assertIn("tokenless", help_result.stdout)
         alias_result = self.cli("reopen-ready", "--help")
         self.assertEqual(0, alias_result.returncode)
@@ -2573,8 +3111,14 @@ approved_at: 2026-08-10T00:00:00Z
             self.assertIn("--specification-only", text)
             self.assertIn("token", text)
             self.assertIn("checkout recovery", text)
+            self.assertIn("user_input_required: false", text)
+            self.assertIn("prior runtime requirements", text)
+            self.assertIn("active assignment", text)
         self.assertIn("exact v2 state SHA", skill_text)
+        self.assertIn("normalized in memory and never rewritten", skill_text)
         self.assertIn("Multiple, malformed, foreign, mixed, or unproven", contract_text)
+        self.assertIn("New tokenless v2 `recovery_authorization` receipts use nested schema 2", contract_text)
+        self.assertIn("mixed, missing, extra, PRD-mode, ambiguous, or tampered", contract_text)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import ctypes
 import gc
 import hashlib
 import os
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -16,6 +17,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import pipeline_v2.process_tree as process_tree
+import pipeline_v2.runner as runner
 
 
 if os.name == "nt":
@@ -103,6 +105,9 @@ class WindowsProcessTreeTests(unittest.TestCase):
         self.assertEqual(0, result.returncode)
         self.assertEqual(expected_stdout.hexdigest(), result.stdout_sha256)
         self.assertEqual(expected_stderr.hexdigest(), result.stderr_sha256)
+        self.assertEqual(process_tree._STDERR_TAIL_BYTES, len(result.stderr_tail))
+        self.assertEqual(b"E" * process_tree._STDERR_TAIL_BYTES, result.stderr_tail)
+        self.assertTrue(result.stderr_tail_truncated)
 
     def test_successful_parent_cannot_escape_twenty_five_ready_children(self) -> None:
         child_count = 25
@@ -242,6 +247,38 @@ class WindowsProcessTreeTests(unittest.TestCase):
             self.assertEqual(23, exit_23().returncode)
         gc.collect()
         self.assertEqual(before, _handle_count())
+
+    def test_direct_and_contained_commands_match_on_actual_temp_scratch_semantics(self) -> None:
+        code = (
+            "import os,sys;from pathlib import Path;"
+            "Path(os.environ['TEMP'],'semantic-marker.txt').write_text('stable-marker',encoding='utf-8');"
+            "sys.stderr.write('stable-semantic-stderr\\n');raise SystemExit(31)"
+        )
+        scratch_root = self.root / ".agentic-pipeline-v2" / "read-only-temp"
+        with runner._read_only_process_environment(self.root) as environment:
+            marker = Path(environment["TEMP"]) / "semantic-marker.txt"
+            direct = subprocess.run(
+                [sys.executable, "-c", code], cwd=self.root, env=environment,
+                capture_output=True, check=False,
+            )
+            direct_marker = marker.read_text(encoding="utf-8")
+            marker.unlink()
+
+            contained = process_tree.run_process_tree(
+                [sys.executable, "-c", code], cwd=self.root, env=environment,
+                timeout=5.0,
+            )
+            contained_marker = marker.read_text(encoding="utf-8")
+
+        self.assertEqual(31, direct.returncode)
+        self.assertEqual(31, contained.returncode)
+        self.assertEqual("stable-marker", direct_marker)
+        self.assertEqual(direct_marker, contained_marker)
+        self.assertEqual(
+            hashlib.sha256(direct.stderr).hexdigest(), contained.stderr_sha256,
+        )
+        self.assertIn(b"stable-semantic-stderr", contained.stderr_tail)
+        self.assertFalse(scratch_root.exists())
 
 
 if __name__ == "__main__":

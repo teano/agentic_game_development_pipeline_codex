@@ -893,6 +893,13 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         slice_context_budget = validate_context_budget(
             capsule_budget, f"{slice_id} Context Capsule Budget"
         )
+        try:
+            _plan_contract.parse_context_capsule_read_paths(
+                capsule_budget,
+                label=f"{slice_id} Context Capsule Budget",
+            )
+        except _plan_contract.PlanContractError as exc:
+            errors.append(str(exc))
         exceeded = sorted(
             key
             for key, value in slice_context_budget.items()
@@ -902,10 +909,6 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
             errors.append(
                 f"{slice_id} Context Capsule Budget exceeds global limits: "
                 + ", ".join(exceeded)
-            )
-        if "authority_paths" not in capsule_budget or "evidence_paths" not in capsule_budget:
-            errors.append(
-                f"{slice_id} Context Capsule Budget must bound authority_paths and evidence_paths"
             )
         handoff = sections.get("Handoff Contract", "")
         for required_text in (

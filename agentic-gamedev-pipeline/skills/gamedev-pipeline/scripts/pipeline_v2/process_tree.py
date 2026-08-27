@@ -18,6 +18,7 @@ from typing import BinaryIO
 _PIPE_JOIN_SECONDS = 2.0
 _PROCESS_JOIN_SECONDS = 2.0
 _TECHNICAL_LAUNCH_RETURN_CODE = 125
+_STDERR_TAIL_BYTES = 64 * 1024
 _LINUX_EXEC = (
     "import os,sys;"
     "ready_fd=int(sys.argv[1]);argv=sys.argv[2:];"
@@ -46,22 +47,32 @@ class ProcessEvidence:
     returncode: int
     stdout_sha256: str
     stderr_sha256: str
+    stderr_tail: bytes = b""
+    stderr_tail_truncated: bool = False
 
 
 class _DigestReader(threading.Thread):
-    """Drain a pipe without retaining attacker-controlled output in memory."""
+    """Drain a pipe while retaining at most one explicitly bounded tail."""
 
-    def __init__(self, stream: BinaryIO):
+    def __init__(self, stream: BinaryIO, *, tail_limit: int = 0):
         super().__init__(daemon=True)
         self.stream = stream
         self.hasher = hashlib.sha256()
         self.lock = threading.Lock()
+        self.tail_limit = tail_limit
+        self.tail_bytes = bytearray()
+        self.tail_truncated = False
 
     def run(self) -> None:
         try:
             while chunk := self.stream.read(64 * 1024):
                 with self.lock:
                     self.hasher.update(chunk)
+                    if self.tail_limit:
+                        self.tail_bytes.extend(chunk)
+                        if len(self.tail_bytes) > self.tail_limit:
+                            del self.tail_bytes[:-self.tail_limit]
+                            self.tail_truncated = True
         except (OSError, ValueError):
             # Tree termination can close a pipe concurrently with the reader.
             pass
@@ -76,6 +87,17 @@ class _DigestReader(threading.Thread):
             value = self.hasher.copy()
         value.update(suffix)
         return value.hexdigest()
+
+    def tail(self, suffix: bytes = b"") -> tuple[bytes, bool]:
+        with self.lock:
+            value = bytes(self.tail_bytes)
+            truncated = self.tail_truncated
+        if suffix:
+            value += suffix
+            if len(value) > self.tail_limit:
+                value = value[-self.tail_limit:]
+                truncated = True
+        return value, truncated
 
 
 class _ReadyReader(threading.Thread):
@@ -101,7 +123,10 @@ class _ReadyReader(threading.Thread):
 def _start_readers(process: subprocess.Popen[bytes]) -> tuple[_DigestReader, _DigestReader]:
     if process.stdout is None or process.stderr is None:  # pragma: no cover - internal invariant
         raise RuntimeError("planned command pipes were not created")
-    readers = (_DigestReader(process.stdout), _DigestReader(process.stderr))
+    readers = (
+        _DigestReader(process.stdout),
+        _DigestReader(process.stderr, tail_limit=_STDERR_TAIL_BYTES),
+    )
     for reader in readers:
         reader.start()
     return readers
@@ -109,7 +134,7 @@ def _start_readers(process: subprocess.Popen[bytes]) -> tuple[_DigestReader, _Di
 
 def _finish_readers(
     readers: tuple[_DigestReader, _DigestReader], *, stderr_suffix: bytes = b"",
-) -> tuple[str, str]:
+) -> tuple[str, str, bytes, bool]:
     for reader in readers:
         reader.join(_PIPE_JOIN_SECONDS)
         if reader.is_alive():
@@ -118,7 +143,11 @@ def _finish_readers(
             except OSError:
                 pass
             reader.join(0.1)
-    return readers[0].hexdigest(), readers[1].hexdigest(stderr_suffix)
+    stderr_tail, stderr_tail_truncated = readers[1].tail(stderr_suffix)
+    return (
+        readers[0].hexdigest(), readers[1].hexdigest(stderr_suffix),
+        stderr_tail, stderr_tail_truncated,
+    )
 
 
 def _timeout_message(timeout: float) -> bytes:
@@ -131,6 +160,7 @@ def _technical_launch_failure(reason: str) -> ProcessEvidence:
         _TECHNICAL_LAUNCH_RETURN_CODE,
         hashlib.sha256(b"").hexdigest(),
         hashlib.sha256(message).hexdigest(),
+        message,
     )
 
 
@@ -218,7 +248,7 @@ def _run_posix(
             process.kill()
             process.wait(timeout=_PROCESS_JOIN_SECONDS)
         ready_reader.join(_PROCESS_JOIN_SECONDS)
-    stdout_digest, stderr_digest = _finish_readers(
+    stdout_digest, stderr_digest, stderr_tail, stderr_tail_truncated = _finish_readers(
         readers,
         stderr_suffix=(
             _timeout_message(timeout) if timed_out
@@ -230,6 +260,8 @@ def _run_posix(
         125 if not setup_ready else 124 if timed_out else int(process.returncode),
         stdout_digest,
         stderr_digest,
+        stderr_tail,
+        stderr_tail_truncated,
     )
 
 
@@ -466,12 +498,13 @@ if os.name == "nt":
                 raise cleanup_error
         if process is None or readers is None:  # pragma: no cover - launch errors propagate
             raise RuntimeError("planned command did not start")
-        stdout_digest, stderr_digest = _finish_readers(
+        stdout_digest, stderr_digest, stderr_tail, stderr_tail_truncated = _finish_readers(
             readers,
             stderr_suffix=_timeout_message(timeout) if timed_out else b"",
         )
         return ProcessEvidence(
             124 if timed_out else int(process.returncode), stdout_digest, stderr_digest,
+            stderr_tail, stderr_tail_truncated,
         )
 
 

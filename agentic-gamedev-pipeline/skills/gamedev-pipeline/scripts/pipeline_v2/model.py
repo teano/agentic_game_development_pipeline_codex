@@ -253,7 +253,10 @@ def compact_assignment_context(source: dict[str, Any], bound_candidate: Any) -> 
         remediation_source = [
             {
                 key: deepcopy(item[key])
-                for key in ("gate_id", "phase", "reason", "slice_id", "worker_artifact", "resolution")
+                for key in (
+                    "gate_id", "phase", "reason", "slice_id", "worker_artifact",
+                    "controller_failure", "resolution",
+                )
                 if key in item
             }
             for item in remediation_source
@@ -563,6 +566,10 @@ def passing_artifact(state: dict[str, Any], phase: str) -> dict[str, Any] | None
         assignment_generation <= epoch_generation
         or not isinstance(controller, dict)
         or controller.get("authority_digest") != state.get("authority", {}).get("digest")
+        or any(
+            isinstance(item, dict) and item.get("returncode") != 0
+            for item in controller.get("commands", [])
+        )
     ):
         return None
     if phase == "engineering":
@@ -582,7 +589,7 @@ def passing_artifact(state: dict[str, Any], phase: str) -> dict[str, Any] | None
             or candidate["generation"] <= accepted_generation
             or any(
                 gate.get("status") == "closed"
-                and gate.get("kind") == "worker_result"
+                and gate.get("kind") in {"worker_result", "controller_result"}
                 and gate.get("reason") == "fail"
                 and gate.get("phase") in {"review", "qa"}
                 and gate.get("candidate_base") == candidate
@@ -770,13 +777,20 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
         gate_id = open_gates[0]
         gate = state["gates"][gate_id]
         reason = gate.get("reason", "blocked")
-        return {
+        action = {
             "kind": "command", "command": "resume",
             "command_id": _action_id(state, "resume"),
             "expected_generation": generation, "gate_id": gate_id,
             "resume_reason": f"Controller revalidated {gate['phase']} gate: {reason}.",
             "user_input_required": False,
         }
+        public_gate = {
+            key: deepcopy(value)
+            for key, value in gate.items()
+            if key in {"phase", "kind", "reason", "slice_id", "controller_failure"}
+        }
+        action["gate"] = {"id": gate_id, **public_gate}
+        return action
     if production_ready(state):
         return {"kind": "terminal", "result": "production_ready_candidate"}
     phase = state["phase"]
@@ -861,6 +875,56 @@ def validate_state(state: dict[str, Any]) -> None:
             candidate_base, authority["digest"],
         ):
             raise PipelineError("gate candidate_base is malformed")
+        if item.get("kind") == "controller_result" and (
+            item.get("reason") != "fail"
+            or not is_strict_integer(item.get("command_index"))
+            or item["command_index"] < 1
+            or type(item.get("returncode")) is not int
+            or item["returncode"] == 0
+            or "worker_artifact" in item
+        ):
+            raise PipelineError("controller-result gate is malformed")
+        failure = item.get("controller_failure")
+        if item.get("kind") == "controller_result" or failure is not None:
+            core_fields = {
+                "command_index", "returncode", "stdout_sha256", "stderr_sha256",
+                "unexecuted_count",
+            }
+            excerpt_fields = {
+                "stderr_excerpt", "stderr_excerpt_truncated", "stderr_excerpt_redacted",
+            }
+            if (
+                not isinstance(failure, dict)
+                or item.get("kind") not in {"worker_result", "controller_result"}
+                or frozenset(failure) not in {
+                    frozenset(core_fields), frozenset(core_fields | excerpt_fields),
+                }
+                or not is_strict_integer(failure.get("command_index"))
+                or failure["command_index"] < 1
+                or type(failure.get("returncode")) is not int
+                or failure["returncode"] == 0
+                or (
+                    item.get("kind") == "controller_result"
+                    and (
+                        failure["command_index"] != item["command_index"]
+                        or failure["returncode"] != item["returncode"]
+                    )
+                )
+                or not is_digest(failure.get("stdout_sha256"))
+                or not is_digest(failure.get("stderr_sha256"))
+                or not is_strict_integer(failure.get("unexecuted_count"))
+                or failure["unexecuted_count"] < 0
+                or (
+                    excerpt_fields <= set(failure)
+                    and (
+                        not isinstance(failure["stderr_excerpt"], str)
+                        or len(failure["stderr_excerpt"].encode("utf-8")) > 4096
+                        or type(failure["stderr_excerpt_truncated"]) is not bool
+                        or type(failure["stderr_excerpt_redacted"]) is not bool
+                    )
+                )
+            ):
+                raise PipelineError("controller failure capsule is malformed")
     for item in state["history"]:
         if (
             not isinstance(item, dict) or not isinstance(item.get("id"), str)

@@ -4,6 +4,7 @@ import json
 import ast
 import inspect
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -140,7 +141,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                 "- max_estimated_tokens: 25000\n"
                 "- metric_scope: capsule_plus_referenced_files\n"
                 f"- authority_paths: {paths[0]}\n"
-                f"- evidence_paths: {','.join(paths)}\n"
+                f"- evidence_paths: {', '.join(paths)}\n"
             )
         text = (
             "---\n"
@@ -1109,7 +1110,11 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual([failing_check], [item["argv"] for item in command_evidence])
         self.assertEqual([17], [item["returncode"] for item in command_evidence])
         self.assertEqual(
-            {"argv", "returncode", "stdout_sha256", "stderr_sha256"},
+            {
+                "argv", "returncode", "stdout_sha256", "stderr_sha256",
+                "stderr_excerpt", "stderr_excerpt_truncated",
+                "stderr_excerpt_redacted",
+            },
             set(command_evidence[0]),
         )
         gate_id = next(key for key, item in blocked["gates"].items() if item["status"] == "open")
@@ -1138,7 +1143,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual(["src/config.js"], fresh["access"]["write"])
         self.assertEqual([failing_check], fresh["checks"])
 
-    def test_nonzero_planned_check_with_pass_is_atomic_and_reports_exact_evidence(self) -> None:
+    def test_nonzero_planned_check_with_pass_persists_controller_gate_without_credit(self) -> None:
         failing_check = [sys.executable, "-c", "raise SystemExit(19)"]
         self.slices = [{
             "id": "SLICE-FAILING-PASS",
@@ -1162,17 +1167,41 @@ class PipelineV2CoreTests(unittest.TestCase):
             },
         )
         self._write_artifact({"outcome": "pass", "summary": "Implementation claimed complete"})
-        before = self.store.path.read_bytes()
+        before_generation = self.store.load()["generation"]
+        completed = self.controller.complete(command_id="COMPLETE-FAILING-PASS")
 
-        with self.assertRaisesRegex(
-            PipelineError,
-            r"controller-run command failed: index=1 .*returncode=19 "
-            r"stdout_sha256=[0-9a-f]{64} stderr_sha256=[0-9a-f]{64}",
-        ) as raised:
-            self.controller.complete(command_id="COMPLETE-FAILING-PASS")
+        self.assertEqual(before_generation + 1, completed["generation"])
+        self.assertIsNone(completed["active_assignment"])
+        record = completed["artifacts"]["engineering"]
+        self.assertEqual(
+            {"outcome": "pass", "summary": "Implementation claimed complete"},
+            record["worker"],
+        )
+        self.assertNotIn("candidate", record)
+        self.assertEqual(19, record["controller"]["commands"][0]["returncode"])
+        gate_id = next(
+            key for key, item in completed["gates"].items()
+            if item["status"] == "open"
+        )
+        self.assertEqual("controller_result", completed["gates"][gate_id]["kind"])
+        self.assertEqual("fail", completed["gates"][gate_id]["reason"])
+        self.assertEqual("resume", status_view(completed)["next_action"]["command"])
+        persisted = self.store.path.read_bytes()
+        with mock.patch("pipeline_v2.runner.run_process_tree") as rerun:
+            self.assertEqual(
+                completed,
+                self.controller.complete(command_id="COMPLETE-FAILING-PASS"),
+            )
+        rerun.assert_not_called()
+        self.assertEqual(persisted, self.store.path.read_bytes())
 
-        self.assertIn(json.dumps(failing_check, separators=(",", ":")), str(raised.exception))
-        self.assertEqual(before, self.store.path.read_bytes())
+        resumed = self.controller.transition({
+            "name": "resume", "id": "RESUME-FAILING-PASS",
+            "expected_generation": completed["generation"], "gate_id": gate_id,
+            "resolution": "Repair the controller-owned check failure",
+        })
+        self.assertEqual("engineering", resumed["phase"])
+        self.assertEqual("next", status_view(resumed)["next_action"]["command"])
 
     def test_nonzero_planned_check_with_fail_persists_gate_and_resumes(self) -> None:
         failing_check = [sys.executable, "-c", "raise SystemExit(19)"]
@@ -1251,6 +1280,217 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual("engineering", resumed["phase"])
         self.assertNotIn("review", resumed["artifacts"])
         self.assertNotIn("qa", resumed["artifacts"])
+
+    def test_nonzero_qa_check_with_worker_pass_routes_to_engineering_rework(self) -> None:
+        failing_check = [sys.executable, "-c", "raise SystemExit(37)"]
+        self.slices = [{
+            "id": "SLICE-QA-CONTROLLER-FAIL",
+            "allowed_paths": ["game.txt"],
+            "planned_commands": [failing_check],
+        }]
+        state = self.store.load()
+        self.store.dispatch({
+            "name": "init", "id": "CONFIGURE-QA-CONTROLLER-FAIL",
+            "expected_generation": state["generation"], "run_id": state["run_id"],
+            "project_root": state["project_root"], "authority": state["authority"],
+            "slices": self._sealed(self.slices),
+        })
+        with mock.patch(
+            "pipeline_v2.runner.run_process_tree",
+            side_effect=(
+                ProcessEvidence(0, digest("engineering-out"), digest("engineering-err")),
+                ProcessEvidence(37, digest("qa-out"), digest("qa-err"), b"qa failed"),
+            ),
+        ):
+            self._reach_candidate()
+            self._review_pass("reviewer-before-controller-qa-fail")
+            failed = self._complete_readonly(
+                "qa", "qa-controller-fail",
+                {"outcome": "pass", "checks": ["worker inspection passed"]},
+            )
+        gate_id = next(
+            key for key, item in failed["gates"].items()
+            if item["status"] == "open"
+        )
+        self.assertEqual("controller_result", failed["gates"][gate_id]["kind"])
+        self.assertEqual("pass", failed["artifacts"]["qa"]["worker"]["outcome"])
+        resumed = self.controller.transition({
+            "name": "resume", "id": "RESUME-QA-CONTROLLER-FAIL",
+            "expected_generation": failed["generation"], "gate_id": gate_id,
+            "resolution": "Repair the failing QA command",
+        })
+        self.assertEqual("engineering", resumed["phase"])
+        self.assertIn("engineering", resumed["artifacts"])
+        self.assertNotIn("review", resumed["artifacts"])
+        self.assertNotIn("qa", resumed["artifacts"])
+
+        engineering_action = status_view(resumed)["next_action"]
+        self.assertEqual("next", engineering_action.get("command"), engineering_action)
+        self.controller.next(
+            command_id=engineering_action["command_id"],
+            assignment=engineering_action["assignment"],
+        )
+        (self.root / "game.txt").write_text(
+            "allowed remediation before controller failure\n", encoding="utf-8",
+        )
+        remediation_artifact = self._write_artifact({
+            "outcome": "pass", "summary": "Remediation implemented",
+        })
+        with mock.patch(
+            "pipeline_v2.runner.run_process_tree",
+            return_value=ProcessEvidence(
+                41, digest("remediation-out"), digest("remediation-err"),
+                b"remediation check failed",
+            ),
+        ):
+            remediation_failed = self.controller.complete(
+                command_id="COMPLETE-CONTROLLER-FAILED-REMEDIATION",
+                artifact_path=remediation_artifact,
+            )
+        remediation_gate = self.controller.status()["next_action"]["gate_id"]
+        retried = self.controller.transition({
+            "name": "resume", "id": "RESUME-CONTROLLER-FAILED-REMEDIATION",
+            "expected_generation": remediation_failed["generation"],
+            "gate_id": remediation_gate,
+            "resolution": "Retry from the newest non-passing Engineering inventory",
+        })
+        retry_action = status_view(retried)["next_action"]
+        retried = self.controller.next(
+            command_id=retry_action["command_id"], assignment=retry_action["assignment"],
+        )
+        self.assertEqual(
+            inventory_digest(inventory(self.root)),
+            retried["active_assignment"]["base"]["checkout_sha256"],
+        )
+
+    def test_fail_fast_runs_only_through_first_failure_or_the_full_success_plan(self) -> None:
+        cases = (
+            ("first", [31, 0, 0], [31]),
+            ("second", [0, 23, 0], [0, 23]),
+            ("all-pass", [0, 0, 0], [0, 0, 0]),
+        )
+        for label, available_codes, expected_codes in cases:
+            with self.subTest(label=label):
+                harness = PipelineV2CoreTests("runTest")
+                harness.setUp()
+                try:
+                    commands = [
+                        [sys.executable, "-c", f"raise SystemExit({index})"]
+                        for index in range(len(available_codes))
+                    ]
+                    harness.slices = [{
+                        "id": f"SLICE-FAIL-FAST-{label.upper()}",
+                        "allowed_paths": ["game.txt"],
+                        "planned_commands": commands,
+                    }]
+                    current = harness.store.load()
+                    harness.store.dispatch({
+                        "name": "init", "id": f"CONFIGURE-FAIL-FAST-{label.upper()}",
+                        "expected_generation": current["generation"],
+                        "run_id": current["run_id"],
+                        "project_root": current["project_root"],
+                        "authority": current["authority"],
+                        "slices": harness._sealed(harness.slices),
+                    })
+                    harness._reach_engineering(f"-fail-fast-{label}")
+                    harness.controller.next(
+                        command_id=f"NEXT-FAIL-FAST-{label.upper()}",
+                        assignment={
+                            "id": f"ASSIGN-FAIL-FAST-{label.upper()}",
+                            "worker_id": f"engineer-fail-fast-{label}",
+                            "task": "Exercise fail-fast command execution",
+                        },
+                    )
+                    artifact = harness._write_artifact({
+                        "outcome": "pass", "summary": "Worker completed",
+                    })
+                    effects = [
+                        ProcessEvidence(
+                            code, digest(f"stdout-{index}"), digest(f"stderr-{index}"),
+                            f"failure-{code}".encode() if code else b"",
+                        )
+                        for index, code in enumerate(available_codes)
+                    ]
+                    with mock.patch(
+                        "pipeline_v2.runner.run_process_tree", side_effect=effects,
+                    ) as invoked:
+                        completed = harness.controller.complete(
+                            command_id=f"COMPLETE-FAIL-FAST-{label.upper()}",
+                            artifact_path=artifact,
+                        )
+                    evidence = completed["artifacts"]["engineering"]["controller"]["commands"]
+                    self.assertEqual(expected_codes, [item["returncode"] for item in evidence])
+                    self.assertEqual(len(expected_codes), invoked.call_count)
+                    self.assertEqual(
+                        bool(expected_codes[-1]),
+                        any(item["status"] == "open" for item in completed["gates"].values()),
+                    )
+                finally:
+                    harness.tearDown()
+
+    def test_reducer_rejects_forged_command_prefixes_and_accepts_legacy_failure_shape(self) -> None:
+        self.slices = [{
+            "id": "SLICE-FORGED-PREFIX",
+            "allowed_paths": ["game.txt"],
+            "planned_commands": [
+                [sys.executable, "-c", "raise SystemExit(0)"],
+                [sys.executable, "-c", "raise SystemExit(2)"],
+            ],
+        }]
+        current = self.store.load()
+        self.store.dispatch({
+            "name": "init", "id": "CONFIGURE-FORGED-PREFIX",
+            "expected_generation": current["generation"], "run_id": current["run_id"],
+            "project_root": current["project_root"], "authority": current["authority"],
+            "slices": self._sealed(self.slices),
+        })
+        self._reach_engineering("-forged-prefix")
+        issued = self.controller.next(
+            command_id="NEXT-FORGED-PREFIX",
+            assignment={
+                "id": "ASSIGN-FORGED-PREFIX", "worker_id": "engineer-forged-prefix",
+                "task": "Reject forged controller evidence",
+            },
+        )
+        active = issued["active_assignment"]
+        empty_digest = digest("")
+        base_result = {
+            "returncode": 0, "stdout_sha256": empty_digest,
+            "stderr_sha256": empty_digest,
+        }
+        evidence = {
+            "authority_digest": issued["authority"]["digest"],
+            "base_checkout_sha256": active["base"]["checkout_sha256"],
+            "current_checkout_sha256": active["base"]["checkout_sha256"],
+            "inventory": deepcopy(active["base"]["inventory"]),
+            "diff": [], "diff_sha256": digest([]), "violations": [],
+        }
+
+        def completion(results: list[dict], command_id: str) -> dict:
+            return {
+                "name": "complete", "id": command_id,
+                "expected_generation": issued["generation"],
+                "artifact": {"outcome": "pass", "summary": "Worker completed"},
+                "controller": {**deepcopy(evidence), "commands": results},
+            }
+
+        first = {"argv": active["commands"][0], **base_result}
+        second = {"argv": active["commands"][1], **base_result}
+        failed_first = {**first, "returncode": 31}
+        with self.assertRaisesRegex(PipelineError, "exact planned prefix"):
+            reduce(issued, completion([second], "FORGED-NON-PREFIX"))
+        with self.assertRaisesRegex(PipelineError, "truncated a successful plan"):
+            reduce(issued, completion([first], "FORGED-TRUNCATED-SUCCESS"))
+        with self.assertRaisesRegex(PipelineError, "continued after the first failure"):
+            reduce(issued, completion([failed_first, second], "FORGED-AFTER-FAILURE"))
+
+        legacy = reduce(issued, completion([failed_first], "LEGACY-FOUR-FIELD-FAILURE"))
+        self.assertEqual(2, legacy["schema"])
+        validate_state(legacy)
+        legacy_path = self.root / ".agentic-pipeline-v2" / "legacy-state.json"
+        legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+        legacy_controller = Controller(StateStore(legacy_path))
+        self.assertEqual("resume", legacy_controller.status()["next_action"]["command"])
 
     def test_newer_blocked_engineering_inventory_recovers_old_remediation_candidate(self) -> None:
         self._reach_candidate()
@@ -1935,6 +2175,365 @@ class PipelineV2CoreTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(1, invoked.call_count)
+
+    def test_public_failure_capsule_is_bounded_redacted_and_reaches_remediation(self) -> None:
+        secret = "PIPELINE_SECRET_SENTINEL_7F42"
+        bearer = "BEARER_SENTINEL_28A1"
+        password = "PASSWORD_SENTINEL_19C3"
+        github_pat = "GITHUB_PAT_SENTINEL_91F2"
+        database_password = "DB_PASSWORD_SENTINEL_6A31"
+        dsn_secret = "SENTRY_DSN_SENTINEL_4C77"
+        uri_secret = "URI_USERINFO_SENTINEL_5D88"
+        database_env = "DATABASE_URL_ENV_SENTINEL_3B55"
+        dsn_env = "SENTRY_DSN_ENV_SENTINEL_8E29"
+        database_url = f"postgres://user:{database_password}@db.example/game"
+        sentry_dsn = f"https://public:{dsn_secret}@o0.ingest.sentry.io/0"
+        failing_check = [sys.executable, "-c", "raise SystemExit(31)"]
+        skipped_checks = [
+            [sys.executable, "-c", "raise SystemExit(0)"],
+            [sys.executable, "-c", "raise SystemExit(0)"],
+        ]
+        self.slices = [{
+            "id": "SLICE-REDACTED-STDERR",
+            "allowed_paths": ["game.txt"],
+            "planned_commands": [failing_check, *skipped_checks],
+        }]
+        current = self.store.load()
+        self.store.dispatch({
+            "name": "init", "id": "CONFIGURE-REDACTED-STDERR",
+            "expected_generation": current["generation"], "run_id": current["run_id"],
+            "project_root": current["project_root"], "authority": current["authority"],
+            "slices": self._sealed(self.slices),
+        })
+        self._reach_engineering("-redacted-stderr")
+        self.controller.next(
+            command_id="NEXT-REDACTED-STDERR",
+            assignment={
+                "id": "ASSIGN-REDACTED-STDERR",
+                "worker_id": "engineer-redacted-stderr",
+                "task": "Persist safe failure diagnostics",
+            },
+        )
+        artifact = self._write_artifact({
+            "outcome": "pass", "summary": "Worker completed",
+        })
+        observed_raw: list[bytes] = []
+
+        def failure(*_args, cwd: Path, env: dict[str, str], **_kwargs) -> ProcessEvidence:
+            raw = (
+                "x" * 5000
+                + f"\nenv={secret}\nAuthorization: Bearer {bearer}\n"
+                + f"password={password}\npat={github_pat}\ndatabase_env={database_env}\n"
+                + f"dsn_env={dsn_env}\ndatabase={database_url}\ndsn={sentry_dsn}\n"
+                + f"uri=redis://user:{uri_secret}@cache.example/0\n"
+                + f"project={cwd}\nscratch={env['TEMP']}\n"
+            ).encode("utf-8")
+            observed_raw.append(raw)
+            return ProcessEvidence(
+                31, digest("stdout"), runner_module._stream_digest(raw), raw, False,
+            )
+
+        with (
+            mock.patch.dict(os.environ, {
+                "PIPELINE_API_TOKEN": secret,
+                "GITHUB_PAT": github_pat,
+                "DATABASE_URL": database_env,
+                "SENTRY_DSN": dsn_env,
+            }),
+            mock.patch("pipeline_v2.runner.run_process_tree", side_effect=failure),
+        ):
+            completed = self.controller.complete(
+                command_id="COMPLETE-REDACTED-STDERR", artifact_path=artifact,
+            )
+        command = completed["artifacts"]["engineering"]["controller"]["commands"][0]
+        self.assertEqual(runner_module._stream_digest(observed_raw[0]), command["stderr_sha256"])
+        self.assertLessEqual(len(command["stderr_excerpt"].encode("utf-8")), 4096)
+        self.assertTrue(command["stderr_excerpt_truncated"])
+        self.assertTrue(command["stderr_excerpt_redacted"])
+        self.assertIn("[REDACTED]", command["stderr_excerpt"])
+        self.assertIn("redis://[REDACTED]@cache.example/0", command["stderr_excerpt"])
+        self.assertIn("[PROJECT_ROOT]", command["stderr_excerpt"])
+        self.assertIn("[SCRATCH_ROOT]", command["stderr_excerpt"])
+        self.assertNotIn("stdout", command)
+        self.assertNotIn("env", command)
+        self.assertNotIn("cwd", command)
+        view = status_view(completed)
+        gate_id = view["next_action"]["gate_id"]
+        gate = completed["gates"][gate_id]
+        public_gate = view["next_action"]["gate"]
+        expected_failure_keys = {
+            "command_index", "returncode", "stdout_sha256", "stderr_sha256",
+            "stderr_excerpt", "stderr_excerpt_truncated", "stderr_excerpt_redacted",
+            "unexecuted_count",
+        }
+        for capsule in (gate["controller_failure"], public_gate["controller_failure"]):
+            self.assertEqual(expected_failure_keys, set(capsule))
+            self.assertEqual(1, capsule["command_index"])
+            self.assertEqual(31, capsule["returncode"])
+            self.assertEqual(command["stdout_sha256"], capsule["stdout_sha256"])
+            self.assertEqual(command["stderr_sha256"], capsule["stderr_sha256"])
+            self.assertEqual(2, capsule["unexecuted_count"])
+            self.assertNotIn("argv", capsule)
+            self.assertNotIn("env", capsule)
+            self.assertNotIn("cwd", capsule)
+            self.assertNotIn("stdout", capsule)
+
+        before_replay = self.store.path.read_bytes()
+        with mock.patch("pipeline_v2.runner.run_process_tree") as rerun:
+            complete_view = cli_run(cli_parser().parse_args([
+                "--state", str(self.store.path), "complete",
+                "--id", "COMPLETE-REDACTED-STDERR", "--artifact", str(artifact),
+            ]))
+        rerun.assert_not_called()
+        self.assertEqual(before_replay, self.store.path.read_bytes())
+        status = cli_run(cli_parser().parse_args([
+            "--state", str(self.store.path), "status",
+        ]))
+        self.assertEqual(view, complete_view)
+        self.assertEqual(view, status)
+        sentinels = (
+            secret, bearer, password, github_pat, database_password, dsn_secret,
+            uri_secret, database_env, dsn_env,
+        )
+        public_payloads = (completed, complete_view, status, gate, public_gate)
+        for sentinel in sentinels:
+            for payload in public_payloads:
+                self.assertNotIn(sentinel, json.dumps(payload, ensure_ascii=False))
+
+        resumed = self.controller.transition({
+            "name": "resume", "id": "RESUME-REDACTED-STDERR",
+            "expected_generation": completed["generation"], "gate_id": gate_id,
+            "resolution": "Retry after the controller failure",
+        })
+        next_action = status_view(resumed)["next_action"]
+        fresh = self.controller.next(
+            command_id=next_action["command_id"], assignment=next_action["assignment"],
+        )
+        assignment_context = status_view(fresh)["active_assignment"]["context"]
+        remediation_failure = assignment_context["remediation"][0]["controller_failure"]
+        self.assertEqual(expected_failure_keys, set(remediation_failure))
+        for key in expected_failure_keys - {"stderr_excerpt"}:
+            self.assertEqual(public_gate["controller_failure"][key], remediation_failure[key])
+        self.assertIn("[REDACTED]", remediation_failure["stderr_excerpt"])
+        self.assertLess(
+            len(remediation_failure["stderr_excerpt"].encode("utf-8")),
+            len(public_gate["controller_failure"]["stderr_excerpt"].encode("utf-8")),
+        )
+        for sentinel in sentinels:
+            self.assertNotIn(
+                sentinel, json.dumps(assignment_context, ensure_ascii=False),
+            )
+
+    def test_nonpassing_worker_keeps_one_worker_gate_with_safe_controller_failure(self) -> None:
+        for outcome in ("fail", "blocked"):
+            with self.subTest(outcome=outcome):
+                harness = PipelineV2CoreTests("runTest")
+                harness.setUp()
+                try:
+                    failing_check = [sys.executable, "-c", "raise SystemExit(47)"]
+                    skipped_check = [sys.executable, "-c", "raise SystemExit(0)"]
+                    harness.slices = [{
+                        "id": f"SLICE-WORKER-{outcome.upper()}-CONTROLLER-FAIL",
+                        "allowed_paths": ["game.txt"],
+                        "planned_commands": [failing_check, skipped_check],
+                    }]
+                    harness._write_approved_plan(harness.slices)
+                    current = harness.store.load()
+                    harness.store.dispatch({
+                        "name": "init", "id": f"CONFIGURE-WORKER-{outcome.upper()}-FAILURE",
+                        "expected_generation": current["generation"],
+                        "run_id": current["run_id"],
+                        "project_root": current["project_root"],
+                        "authority": {
+                            "items": authority_items(harness.root, {
+                                "requirements": "requirements.md",
+                                "specification": "specification.md",
+                                "plan": "plan.md",
+                            }),
+                        },
+                        "slices": harness._sealed(harness.slices),
+                    })
+                    harness._reach_engineering(f"-worker-{outcome}-controller-fail")
+                    harness.controller.next(
+                        command_id=f"NEXT-WORKER-{outcome.upper()}-CONTROLLER-FAIL",
+                        assignment={
+                            "id": f"ASSIGN-WORKER-{outcome.upper()}-CONTROLLER-FAIL",
+                            "worker_id": f"engineer-worker-{outcome}-controller-fail",
+                            "task": "Preserve both worker and controller failure evidence",
+                        },
+                    )
+                    worker_artifact = {
+                        "outcome": outcome,
+                        "summary": f"Worker reported {outcome}",
+                    }
+                    artifact_path = harness._write_artifact(worker_artifact)
+                    sentinel = f"WORKER_{outcome.upper()}_SECRET_SENTINEL_4F19"
+                    raw_stderr = f"token={sentinel}\ncontroller check failed\n".encode()
+                    with (
+                        mock.patch.dict(os.environ, {"PIPELINE_API_TOKEN": sentinel}),
+                        mock.patch(
+                            "pipeline_v2.runner.run_process_tree",
+                            return_value=ProcessEvidence(
+                                47, digest("worker-nonpass-out"),
+                                runner_module._stream_digest(raw_stderr), raw_stderr, False,
+                            ),
+                        ),
+                    ):
+                        completed = harness.controller.complete(
+                            command_id=f"COMPLETE-WORKER-{outcome.upper()}-CONTROLLER-FAIL",
+                            artifact_path=artifact_path,
+                        )
+
+                    open_gates = [
+                        (key, item) for key, item in completed["gates"].items()
+                        if item["status"] == "open"
+                    ]
+                    self.assertEqual(1, len(open_gates))
+                    gate_id, gate = open_gates[0]
+                    self.assertEqual("worker_result", gate["kind"])
+                    self.assertEqual(outcome, gate["reason"])
+                    self.assertEqual(worker_artifact, gate["worker_artifact"])
+                    self.assertNotIn(
+                        f"{completed['artifacts']['engineering']['assignment_id']}-controller-result",
+                        completed["gates"],
+                    )
+                    self.assertNotIn("candidate", completed["artifacts"]["engineering"])
+                    capsule = gate["controller_failure"]
+                    self.assertEqual(1, capsule["command_index"])
+                    self.assertEqual(47, capsule["returncode"])
+                    self.assertEqual(1, capsule["unexecuted_count"])
+                    self.assertIn("[REDACTED]", capsule["stderr_excerpt"])
+                    for forbidden in ("argv", "env", "cwd", "stdout"):
+                        self.assertNotIn(forbidden, capsule)
+
+                    view = status_view(completed)
+                    public_gate = view["next_action"]["gate"]
+                    self.assertEqual(gate_id, public_gate["id"])
+                    self.assertEqual("worker_result", public_gate["kind"])
+                    self.assertEqual(capsule, public_gate["controller_failure"])
+
+                    before_replay = harness.store.path.read_bytes()
+                    with mock.patch("pipeline_v2.runner.run_process_tree") as rerun:
+                        complete_view = cli_run(cli_parser().parse_args([
+                            "--state", str(harness.store.path), "complete",
+                            "--id", f"COMPLETE-WORKER-{outcome.upper()}-CONTROLLER-FAIL",
+                            "--artifact", str(artifact_path),
+                        ]))
+                    rerun.assert_not_called()
+                    self.assertEqual(before_replay, harness.store.path.read_bytes())
+                    status = cli_run(cli_parser().parse_args([
+                        "--state", str(harness.store.path), "status",
+                    ]))
+                    self.assertEqual(view, complete_view)
+                    self.assertEqual(view, status)
+                    for payload in (completed, complete_view, status, public_gate):
+                        self.assertNotIn(
+                            sentinel, json.dumps(payload, ensure_ascii=False),
+                        )
+
+                    resumed = harness.controller.transition({
+                        "name": "resume",
+                        "id": f"RESUME-WORKER-{outcome.upper()}-CONTROLLER-FAIL",
+                        "expected_generation": completed["generation"],
+                        "gate_id": gate_id,
+                        "resolution": "Retry with the controller failure evidence",
+                    })
+                    action = status_view(resumed)["next_action"]
+                    fresh = harness.controller.next(
+                        command_id=action["command_id"], assignment=action["assignment"],
+                    )
+                    context = status_view(fresh)["active_assignment"]["context"]
+                    remediation = context["remediation"][0]
+                    self.assertEqual(worker_artifact, remediation["worker_artifact"])
+                    self.assertEqual(capsule, remediation["controller_failure"])
+                    self.assertNotIn(
+                        sentinel, json.dumps(context, ensure_ascii=False),
+                    )
+                finally:
+                    harness.tearDown()
+
+    def test_worker_result_without_controller_failure_keeps_legacy_gate_shape(self) -> None:
+        for case in ("no-checks", "all-pass"):
+            with self.subTest(case=case):
+                harness = PipelineV2CoreTests("runTest")
+                harness.setUp()
+                try:
+                    worker_artifact = {
+                        "outcome": "fail", "summary": f"Worker failed with {case}",
+                    }
+                    if case == "no-checks":
+                        completed = harness._complete_readonly(
+                            "plan", "planner-worker-fail-no-checks", worker_artifact,
+                        )
+                    else:
+                        harness._reach_engineering("-worker-fail-all-pass")
+                        harness.controller.next(
+                            command_id="NEXT-WORKER-FAIL-ALL-PASS",
+                            assignment={
+                                "id": "ASSIGN-WORKER-FAIL-ALL-PASS",
+                                "worker_id": "engineer-worker-fail-all-pass",
+                                "task": "Keep the ordinary worker-result gate",
+                            },
+                        )
+                        completed = harness._complete(
+                            "COMPLETE-WORKER-FAIL-ALL-PASS", worker_artifact,
+                        )
+                    gate = next(
+                        item for item in completed["gates"].values()
+                        if item["status"] == "open"
+                    )
+                    self.assertEqual({
+                        "status", "phase", "kind", "reason", "worker_artifact",
+                        "candidate_base", "slice_id",
+                    }, set(gate))
+                    self.assertEqual("worker_result", gate["kind"])
+                    self.assertEqual(worker_artifact, gate["worker_artifact"])
+                    self.assertNotIn(
+                        "controller_failure",
+                        status_view(completed)["next_action"]["gate"],
+                    )
+                finally:
+                    harness.tearDown()
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only cleanup behavior")
+    def test_windows_scratch_cleanup_handles_stale_and_fresh_readonly_git_objects(self) -> None:
+        scratch_root = self.root / ".agentic-pipeline-v2" / "read-only-temp"
+        stale = scratch_root / "stale-command" / ".git" / "objects" / "stale-object"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("stale", encoding="utf-8")
+        os.chmod(stale, stat.S_IREAD)
+
+        with runner_module._read_only_process_environment(self.root) as environment:
+            self.assertFalse(stale.exists())
+            fresh = Path(environment["TEMP"]) / ".git" / "objects" / "fresh-object"
+            fresh.parent.mkdir(parents=True)
+            fresh.write_text("fresh", encoding="utf-8")
+            os.chmod(fresh, stat.S_IREAD)
+
+        self.assertFalse(scratch_root.exists())
+        runner_module._remove_read_only_temp(scratch_root, "absent scratch")
+        self.assertFalse(scratch_root.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behavior")
+    def test_windows_scratch_cleanup_does_not_touch_external_junction_target(self) -> None:
+        scratch_root = self.root / ".agentic-pipeline-v2" / "read-only-temp"
+        scratch_root.mkdir(parents=True)
+        with tempfile.TemporaryDirectory() as external_temporary:
+            external = Path(external_temporary).resolve()
+            sentinel = external / "external-sentinel.txt"
+            sentinel.write_text("untouched", encoding="utf-8")
+            junction = scratch_root / "external-link"
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(external)],
+                capture_output=True, text=True, check=False,
+            )
+            if created.returncode != 0:
+                self.skipTest("junction creation is unavailable")
+
+            runner_module._remove_read_only_temp(scratch_root, "junction scratch")
+
+            self.assertFalse(scratch_root.exists())
+            self.assertEqual("untouched", sentinel.read_text(encoding="utf-8"))
 
     def test_runner_has_no_candidate_tree_materialization_path(self) -> None:
         source = inspect.getsource(runner_module)

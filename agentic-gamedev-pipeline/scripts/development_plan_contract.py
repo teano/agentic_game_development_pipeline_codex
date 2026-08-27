@@ -243,6 +243,29 @@ def _controller_read_path(value: str, label: str) -> str:
     return value
 
 
+def parse_context_capsule_read_paths(
+    section: str, *, label: str
+) -> list[str]:
+    """Parse one scalar Context Capsule and return its sealed read scope."""
+    rows = parse_exact_contract_rows(
+        section,
+        label=label,
+        scalar_keys=CONTEXT_CAPSULE_KEYS,
+    )
+    combined: list[str] = []
+    for key in ("authority_paths", "evidence_paths"):
+        items = [item.strip() for item in rows[key].split(",")]
+        if not items or any(not item for item in items):
+            raise PlanContractError(
+                f"{label} {key} must be a non-empty comma-separated list"
+            )
+        for path in items:
+            canonical = _controller_read_path(path, f"{label} {key}")
+            if canonical not in combined:
+                combined.append(canonical)
+    return combined
+
+
 def parse_slice_read_paths(
     text: str, *, label: str = "approved development plan"
 ) -> dict[str, list[str]]:
@@ -268,25 +291,10 @@ def parse_slice_read_paths(
         start = headings[0].end()
         following = re.search(r"(?m)^#{2,3} ", block[start:])
         section = block[start:start + following.start()] if following else block[start:]
-        rows = parse_exact_contract_rows(
+        result[slice_id] = parse_context_capsule_read_paths(
             section,
             label=f"{label} {slice_id} Context Capsule Budget",
-            scalar_keys=CONTEXT_CAPSULE_KEYS,
         )
-        combined: list[str] = []
-        for key in ("authority_paths", "evidence_paths"):
-            items = rows[key].split(",")
-            if not items or any(not item for item in items):
-                raise PlanContractError(
-                    f"{label} {slice_id} {key} must be a non-empty comma-separated list"
-                )
-            for path in items:
-                canonical = _controller_read_path(
-                    path, f"{label} {slice_id} {key}"
-                )
-                if canonical not in combined:
-                    combined.append(canonical)
-        result[slice_id] = combined
     return result
 
 
