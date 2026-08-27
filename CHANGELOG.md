@@ -7,15 +7,28 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-27
+
+### Добавлено
+
+- Bound-v2 Specification теперь поддерживает tokenless rewind после утверждённой PRD revision только при точном public `status -> init`, с nested schema-2 привязкой prior authority и повторной CAS-проверкой runtime state; точный released schema-1 specification-only receipt читается через неперсистирующий compatibility adapter.
+- Public `complete`/`status` и свежий remediation assignment теперь показывают безопасный controller-failure capsule для `worker_result` и `controller_result` gates с индексом/return code/digests/excerpt/flags и числом невыполненных команд, не публикуя argv/env/cwd/stdout.
+
+### Изменено
+
+- Planned commands выполняются fail-fast до первого non-zero с inventory/drift-проверкой после каждой реально выполненной команды; reducer принимает только полный all-pass или точный failure-prefix.
+- Failure-only evidence получила redacted/path-normalized `stderr_excerpt` не более 4096 UTF-8 bytes с flags, сохранив full stderr digest и совместимость schema 2 с legacy four-field evidence; PAT, database URL, DSN и URI userinfo дополнительно редактируются.
+- Plan validator и runtime используют общий строгий parser Context Capsule read paths, включая comma-space lists, и одинаково отклоняют недопустимую грамматику путей.
+
 ### Исправлено
 
 - Windows cleanup controller scratch теперь ограниченно снимает read-only только с точного отказавшего пути внутри проверенного scratch, не делает prewalk и не затрагивает цели junction/symlink; отсутствующий scratch удаляется идемпотентно.
-- Planned commands выполняются fail-fast до первого non-zero с inventory/drift-проверкой после каждой реально выполненной команды; reducer принимает только полный all-pass или точный failure-prefix.
 - Non-zero controller result атомарно сохраняет неизменённый worker artifact и controller evidence. Для worker `pass` открывается отдельный `controller_result` gate без candidate/phase credit; replay не перезапускает команды, а QA возвращается в Engineering.
-- Failure-only evidence получила redacted/path-normalized `stderr_excerpt` не более 4096 UTF-8 bytes с flags, сохранив full stderr digest и совместимость schema 2 с legacy four-field evidence.
-- Public `complete`/`status` и свежий remediation assignment теперь показывают только безопасный controller-failure capsule для `worker_result` и `controller_result` gates с индексом/return code/digests/excerpt/flags и числом невыполненных команд; PAT, database URL, DSN и URI userinfo дополнительно редактируются без публикации argv/env/cwd/stdout.
-- Bound-v2 Specification теперь поддерживает tokenless rewind после утверждённой PRD revision только при точном public `status -> init`, с nested schema-2 привязкой prior authority и повторной CAS-проверкой runtime state; точный released schema-1 specification-only receipt читается через неперсистирующий compatibility adapter.
-- Plan validator и runtime используют общий строгий parser Context Capsule read paths, включая comma-space lists, и одинаково отклоняют недопустимую грамматику путей.
+
+### Проверено
+
+- Полный canonical regression suite: 333/333 PASS; три Linux PID namespace runtime-теста ожидаемо пропущены на Windows.
+- Два изолированных `TEST FIXTURE ONLY` E2E завершились terminal `production_ready_candidate`: полный PRD r2 -> Specification -> Plan rewind/reconvergence достиг generation 21, а controller-result remediation после worker `pass` и non-zero check — generation 22; без изменений игровых путей и без утверждений пользовательского approval или `$feature-finish`.
 
 ## [0.8.0] - 2026-08-26
 
@@ -223,7 +236,8 @@
 - Полный набор из 97 тестов контроллеров, активации и межрежимных контрактов.
 - Валидация manifest плагина и всех восьми skill-пакетов.
 
-[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.5.0...v0.6.0
