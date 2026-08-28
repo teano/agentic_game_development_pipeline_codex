@@ -245,6 +245,8 @@ def compact_assignment_context(source: dict[str, Any], bound_candidate: Any) -> 
     context: dict[str, Any] = {}
     if isinstance(source.get("current_slice"), dict):
         context["current_slice"] = deepcopy(source["current_slice"])
+    if isinstance(source.get("review_target"), dict):
+        context["review_target"] = deepcopy(source["review_target"])
 
     remediation_source = source.get("remediation", [])
     if not isinstance(remediation_source, list):
@@ -458,6 +460,50 @@ def _integrated_slice_paths(state: dict[str, Any]) -> list[str]:
         for item in state["slices"][:last_index + 1]
         for path in item["allowed_paths"] + item.get("read_paths", [])
     ))
+
+
+def review_target(
+    state: dict[str, Any], *,
+    selected: dict[str, Any] | None = None,
+    candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the small controller-derived target for one Review assignment."""
+    def changed_paths(record: Any) -> list[str]:
+        controller = record.get("controller") if isinstance(record, dict) else None
+        changes = controller.get("diff") if isinstance(controller, dict) else None
+        if not isinstance(changes, list):
+            return []
+        return list(dict.fromkeys(
+            item["path"] for item in changes
+            if isinstance(item, dict) and isinstance(item.get("path"), str)
+        ))
+
+    selected = current_slice(state) if selected is None else deepcopy(selected)
+    candidate = current_candidate(state) if candidate is None else deepcopy(candidate)
+    docs = state.get("artifacts", {}).get("docs")
+    if (
+        state.get("phase") == "review"
+        and isinstance(docs, dict)
+        and docs.get("candidate") == candidate
+    ):
+        paths = changed_paths(docs)
+        if paths:
+            return {
+                "kind": "documentation_changes",
+                "required_scope": "candidate_changes",
+                "candidate_changes": paths,
+            }
+    engineering = state.get("artifacts", {}).get("engineering")
+    return {
+        "kind": "current_slice_implementation",
+        "slice_id": selected["id"],
+        "required_scope": deepcopy(selected["allowed_paths"]),
+        "candidate_changes": (
+            changed_paths(engineering)
+            if isinstance(engineering, dict) and engineering.get("candidate") == candidate
+            else []
+        ),
+    }
 
 
 def all_slices_completed(state: dict[str, Any]) -> bool:
@@ -722,6 +768,9 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
         else selected["allowed_paths"]
     )
     read = list(dict.fromkeys(authority_paths + slice_read))
+    target = review_target(state) if phase == "review" else None
+    if target is not None and target["kind"] == "documentation_changes":
+        read = list(dict.fromkeys(read + target["candidate_changes"]))
     write: list[str] = []
     checks: list[list[str]] = []
     if phase == "engineering":
@@ -739,7 +788,7 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
         if not write:
             write = [f"docs/{state['run_id']}-verification.md"]
         read = list(dict.fromkeys(read + write))
-    return {
+    assignment = {
         "id": assignment_id,
         "worker_id": identity["worker_id"],
         "task": identity["task"],
@@ -747,6 +796,9 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
         "checks": checks,
         "output_path": assignment_output_path(assignment_id),
     }
+    if target is not None:
+        assignment["context"] = {"review_target": target}
+    return assignment
 
 
 def next_action(state: dict[str, Any]) -> dict[str, Any]:
@@ -989,11 +1041,23 @@ def validate_state(state: dict[str, Any]) -> None:
             raise PipelineError("assignment commands are malformed")
 
 
-def _active_assignment_view(active: dict[str, Any]) -> dict[str, Any]:
+def _active_assignment_view(
+    state: dict[str, Any], active: dict[str, Any],
+) -> dict[str, Any]:
     """Project the recoverable worker packet without controller bookkeeping."""
     source = active["capsule"]["context"]
     bound_candidate = active["capsule"].get("candidate")
     context = compact_assignment_context(source, bound_candidate)
+    selected = context.get("current_slice")
+    if (
+        active["phase"] == "review"
+        and "review_target" not in context
+        and isinstance(selected, dict)
+        and isinstance(bound_candidate, dict)
+    ):
+        context["review_target"] = review_target(
+            state, selected=selected, candidate=bound_candidate,
+        )
 
     return {
         "id": active["id"],
@@ -1015,7 +1079,7 @@ def status_view(state: dict[str, Any]) -> dict[str, Any]:
         "run_id": state["run_id"],
         "generation": state["generation"],
         "phase": state["phase"],
-        "active_assignment": _active_assignment_view(active) if active else None,
+        "active_assignment": _active_assignment_view(state, active) if active else None,
         "candidate": current_candidate(state),
         "open_questions": pending(state["questions"]),
         "open_gates": pending(state["gates"]),

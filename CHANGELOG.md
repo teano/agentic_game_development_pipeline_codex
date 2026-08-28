@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+### Изменено
+
+- Review получает controller-derived `review_target`, ограниченный текущим implementation slice и точными путями принятого candidate diff; остальные доступные для чтения пути используются только как evidence context.
+- Reviewer сообщает только конкретные материальные дефекты и внесённую текущим target избыточность по KISS/YAGNI; теоретические, крайне маловероятные и необязательные улучшения исключены, а доказанный bounded target завершается `pass` без findings.
+
+### Исправлено
+
+- Сохранены exact replay и recovery для активных Review assignments, созданных до появления `review_target`: совместимый target проецируется без изменения controller state, а подмена caller-ом отклоняется.
+
 ## [0.9.0] - 2026-08-27
 
 ### Добавлено

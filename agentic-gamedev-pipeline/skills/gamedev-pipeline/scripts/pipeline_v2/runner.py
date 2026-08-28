@@ -482,7 +482,7 @@ class Controller:
                             f"assignment {field} is controller-derived and must match the recorded next command"
                         )
                 historical_spec = deepcopy(historical)
-                if "context" in supplied:
+                if "context" in supplied and phase != "review":
                     historical_spec["context"] = supplied["context"]
                 replay = self.store._replay_locked({
                     "name": "next", "id": command_id,
@@ -507,7 +507,14 @@ class Controller:
             canonical_spec = {
                 field: canonical[field] for field in ("id", "worker_id", "task")
             }
-            if "context" in supplied:
+            if (
+                state["phase"] == "review" and "context" in supplied
+                and supplied["context"] != canonical["context"]
+            ):
+                raise PipelineError(
+                    "review target is controller-derived and must match status.next_action"
+                )
+            if "context" in supplied and state["phase"] != "review":
                 canonical_spec["context"] = supplied["context"]
             intent = {"name": "next", "id": command_id, "assignment": canonical_spec}
             command = {

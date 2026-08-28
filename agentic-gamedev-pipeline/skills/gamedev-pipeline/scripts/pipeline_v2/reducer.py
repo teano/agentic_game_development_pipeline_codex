@@ -736,8 +736,14 @@ def _reduce_command(
         context = spec.get("context", {})
         if not isinstance(context, dict):
             raise PipelineError("assignment context must be an object")
+        if phase == "review" and context not in ({}, canonical["context"]):
+            raise PipelineError(
+                "review target is controller-derived and must match status.next_action"
+            )
         context = deepcopy(context)
         context["current_slice"] = current_slice(work)
+        if phase == "review":
+            context["review_target"] = deepcopy(canonical["context"]["review_target"])
         context["remediation"] = [
             {"gate_id": key, **deepcopy(item)}
             for key, item in sorted(work["gates"].items())

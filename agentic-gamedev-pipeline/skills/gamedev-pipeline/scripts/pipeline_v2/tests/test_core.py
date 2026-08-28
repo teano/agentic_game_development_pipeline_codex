@@ -614,6 +614,49 @@ class PipelineV2CoreTests(unittest.TestCase):
                 finally:
                     harness.tearDown()
 
+    def test_pre_patch_review_next_replays_with_omitted_or_exact_identity(self) -> None:
+        legacy_task = "Independently review the current candidate and report actionable findings."
+        for include_identity in (False, True):
+            with self.subTest(include_identity=include_identity):
+                harness = PipelineV2CoreTests("runTest")
+                harness.setUp()
+                try:
+                    harness._reach_candidate()
+                    controller = Controller(harness.store)
+                    action = controller.status()["next_action"]
+                    identity = {
+                        field: action["assignment"][field]
+                        for field in ("id", "worker_id", "task")
+                    }
+                    self.assertEqual(legacy_task, identity["task"])
+                    self.assertEqual(
+                        ["game.txt"],
+                        action["assignment"]["context"]["review_target"]["candidate_changes"],
+                    )
+
+                    issued = controller.next(
+                        command_id=action["command_id"], assignment=identity,
+                        expected_generation=action["expected_generation"],
+                    )
+                    history = issued["history"][-1]
+                    self.assertEqual(
+                        command_intent_digest({
+                            "name": "next", "id": action["command_id"],
+                            "assignment": identity,
+                        }),
+                        history["command_digest"],
+                    )
+                    before = harness.store.path.read_bytes()
+                    replay = controller.next(
+                        command_id=action["command_id"],
+                        assignment=identity if include_identity else None,
+                        expected_generation=-1,
+                    )
+                    self.assertEqual(issued, replay)
+                    self.assertEqual(before, harness.store.path.read_bytes())
+                finally:
+                    harness.tearDown()
+
     def test_init_rejects_unsafe_run_ids_before_state_or_lock_mutation(self) -> None:
         for index, run_id in enumerate((".", "..", "../escape", "nested/run", r"nested\run")):
             with self.subTest(run_id=run_id):
@@ -934,12 +977,68 @@ class PipelineV2CoreTests(unittest.TestCase):
 
         review = issue_and_assert("review", "reviewer-integration")
         self.assertEqual([], review["access"]["write"])
+        review_target = review["capsule"]["context"]["review_target"]
+        self.assertEqual(
+            {
+                "kind": "current_slice_implementation",
+                "slice_id": "SLICE-INTEGRATION",
+                "required_scope": ["src/config.js"],
+                "candidate_changes": ["src/config.js"],
+            },
+            review_target,
+        )
+        self.assertLess(
+            len(json.dumps(review_target, separators=(",", ":")).encode("utf-8")),
+            192,
+        )
+        self.assertEqual(["src/config.js"], review["capsule"]["context"]["current_slice"]["allowed_paths"])
+        self.assertIn("src/levels.js", review["access"]["read"])
+        self.assertIn("src/integration-reference.js", review["access"]["read"])
+        self.assertNotIn("src/future.js", review["access"]["read"])
         self._complete("COMPLETE-reviewer-integration", {"outcome": "pass", "findings": []})
         self._accept("reviewer-integration")
 
         qa = issue_and_assert("qa", "qa-integration")
         self.assertEqual([], qa["access"]["write"])
         self.assertEqual([integrated_check], qa["commands"])
+
+    def test_broad_required_scope_keeps_untouched_paths_out_of_candidate_changes(self) -> None:
+        (self.root / "src").mkdir()
+        (self.root / "src" / "changed.luau").write_text("return 1\n", encoding="utf-8")
+        (self.root / "src" / "untouched.luau").write_text("return 2\n", encoding="utf-8")
+        self.slices = [{
+            "id": "SLICE-BROAD",
+            "allowed_paths": ["src/**"],
+            "planned_commands": [self.command],
+        }]
+        state = self.store.load()
+        self.store.dispatch({
+            "name": "init", "id": "CONFIGURE-BROAD-REVIEW-TARGET",
+            "expected_generation": state["generation"], "run_id": state["run_id"],
+            "project_root": state["project_root"], "authority": state["authority"],
+            "slices": self._sealed(self.slices),
+        })
+        self._reach_engineering("-broad-review-target")
+        self._engineer_slice(
+            "engineer-broad-review-target", "return 3\n",
+            slice_index=0, target="src/changed.luau",
+        )
+        self._accept("engineering-broad-review-target")
+
+        assignment = self.controller.status()["next_action"]["assignment"]
+        self.assertEqual(
+            {
+                "kind": "current_slice_implementation",
+                "slice_id": "SLICE-BROAD",
+                "required_scope": ["src/**"],
+                "candidate_changes": ["src/changed.luau"],
+            },
+            assignment["context"]["review_target"],
+        )
+        self.assertNotIn(
+            "src/untouched.luau",
+            assignment["context"]["review_target"]["candidate_changes"],
+        )
 
     def test_old_scope_status_projects_exact_init_and_replay_seals_plan_reads(self) -> None:
         legacy = self.store.load()
@@ -2816,11 +2915,27 @@ class PipelineV2CoreTests(unittest.TestCase):
         legacy = deepcopy(issued)
         legacy["generation"] = 67
         legacy["active_assignment"].pop("artifact_schema")
+        legacy["active_assignment"]["capsule"]["context"].pop("review_target")
+        self.assertEqual(
+            "Independently review the current candidate and report actionable findings.",
+            legacy["active_assignment"]["task"],
+        )
         validate_state(legacy)
         self.store._write(legacy)
-        view = status_view(legacy)["active_assignment"]
+        before = self.store.path.read_bytes()
+        view = self.controller.status()["active_assignment"]
         self.assertEqual(artifact_schema("review", "reviewer"), view["artifact_schema"])
         self.assertEqual(assignment_output_path(legacy["active_assignment"]), view["output_path"])
+        self.assertEqual(
+            {
+                "kind": "current_slice_implementation",
+                "slice_id": "SLICE-1",
+                "required_scope": ["game.txt", "tests/**"],
+                "candidate_changes": ["game.txt"],
+            },
+            view["context"]["review_target"],
+        )
+        self.assertEqual(before, self.store.path.read_bytes())
         completed = self._complete("GEN67-REVIEW-COMPLETE", {"outcome": "pass", "findings": []})
         self.assertEqual(68, completed["generation"])
 
@@ -2853,6 +2968,17 @@ class PipelineV2CoreTests(unittest.TestCase):
         (self.root / "game.txt").write_text("review-remediated\n", encoding="utf-8")
         self._complete("COMPLETE-engineer-2", {"outcome": "pass", "summary": "Remediated Review finding"})
         self._accept("engineering-2")
+        fresh_review = self.controller.status()["next_action"]["assignment"]
+        self.assertNotEqual("reviewer-1", fresh_review["worker_id"])
+        self.assertEqual(
+            {
+                "kind": "current_slice_implementation",
+                "slice_id": "SLICE-1",
+                "required_scope": ["game.txt", "tests/**"],
+                "candidate_changes": ["game.txt"],
+            },
+            fresh_review["context"]["review_target"],
+        )
         self._finish_ready("reviewer-2", "qa-2", "docs-2")
 
     def test_failed_qa_invalidates_engineering_and_review_then_reaches_ready(self) -> None:
@@ -3294,10 +3420,52 @@ class PipelineV2CoreTests(unittest.TestCase):
         docs_path.write_text("documented\n", encoding="utf-8")
         self._complete("COMPLETE-docs-1", {"outcome": "pass", "summary": "Updated docs"})
         self.assertEqual("review", self._accept("docs-1")["phase"])
-        self._review_pass("reviewer-2"); self._qa_pass("qa-2")
+        action = self.controller.status()["next_action"]
+        review_target = action["assignment"]["context"]["review_target"]
+        self.assertEqual(
+            {
+                "kind": "documentation_changes",
+                "required_scope": "candidate_changes",
+                "candidate_changes": [docs_path.relative_to(self.root).as_posix()],
+            },
+            review_target,
+        )
+        self.assertEqual({"kind", "required_scope", "candidate_changes"}, set(review_target))
+        self.assertIn(docs_path.relative_to(self.root).as_posix(), action["assignment"]["access"]["read"])
+        self.assertLess(
+            len(json.dumps(review_target, separators=(",", ":")).encode("utf-8")),
+            512,
+        )
+        issued_review = self.controller.next(
+            command_id=action["command_id"], assignment=action["assignment"],
+            expected_generation=action["expected_generation"],
+        )
+        self.assertEqual(
+            review_target,
+            issued_review["active_assignment"]["capsule"]["context"]["review_target"],
+        )
+        self._complete("COMPLETE-reviewer-2", {"outcome": "pass", "findings": []})
+        self._accept("reviewer-2"); self._qa_pass("qa-2")
         terminal = self.store.load()
         ready = self.controller.ready(command_id="READY-DOCS", expected_generation=terminal["generation"])
         self.assertTrue(status_view(ready)["ready"])
+
+    def test_review_target_cannot_be_replaced_by_caller_context(self) -> None:
+        self._reach_candidate()
+        action = self.controller.status()["next_action"]
+        forged = deepcopy(action["assignment"])
+        forged["context"]["review_target"] = {
+            "kind": "documentation_changes",
+            "required_scope": "candidate_changes",
+            "candidate_changes": ["future/unassigned.md"],
+        }
+        before = self.store.path.read_bytes()
+        with self.assertRaisesRegex(PipelineError, "review target is controller-derived"):
+            Controller(self.store).next(
+                command_id=action["command_id"], assignment=forged,
+                expected_generation=action["expected_generation"],
+            )
+        self.assertEqual(before, self.store.path.read_bytes())
 
     def test_status_prefers_newer_post_docs_review_failure_candidate_and_rejects_drift(self) -> None:
         resumed, _, docs_candidate, _ = self._resume_after_changed_docs_review_failure()

@@ -71,15 +71,21 @@ class SharedOperationalInvariantTests(unittest.TestCase):
             "fail closed",
             "MUST NOT retry the same unavailable environment",
             "authority or capability evidence changes",
-            "report every issue observed within the assigned read scope",
+            "Pipeline-observation workers report every issue observed",
             "pipeline`, `test`, `product`, or `environment",
             "verify the evidence before concluding",
             "pipeline-maintenance observer ledger",
-            "Review and QA follow their assigned semantic artifact schemas",
+            "Review and QA instead stop at their bounded stage contracts",
+            "only findings eligible under its controller-derived `review_target`",
+            "only assigned acceptance checks",
         )
         for phrase in required:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
+        self.assertNotIn(
+            "Review, QA, and pipeline-observation workers report every issue",
+            text,
+        )
 
         template = (
             SKILLS / "gamedev-development-plan" / "assets" / "development-plan.md"
@@ -101,6 +107,27 @@ class SharedOperationalInvariantTests(unittest.TestCase):
         ):
             with self.subTest(platform_default=platform_default):
                 self.assertNotIn(platform_default, template.lower())
+
+    def test_review_contract_keeps_target_separate_from_evidence_context(self) -> None:
+        reviewer = (SKILLS / "gamedev-review" / "SKILL.md").read_text(encoding="utf-8")
+        contract = (
+            SKILLS / "gamedev-review" / "references" / "review-output-contract.md"
+        ).read_text(encoding="utf-8")
+        protocol = (
+            SKILLS / "gamedev-pipeline" / "references" / "pipeline-protocol.md"
+        ).read_text(encoding="utf-8")
+
+        for text in (reviewer, contract, protocol):
+            self.assertIn("evidence context", text)
+            self.assertIn("documentation_changes", text)
+            self.assertIn("candidate_changes", text)
+            self.assertIn("direct regression", text)
+            self.assertIn("missing mandatory implementation", text)
+            self.assertIn("current-candidate evidence", text)
+            self.assertIn("simpler sufficient implementation", text)
+        self.assertIn("no suggestions or backlog", contract)
+        self.assertIn("direct authority contradiction that changes the verdict", contract)
+        self.assertIn("mandatory assigned input or capability", contract)
 
     def test_v2_authority_reopen_has_one_public_fail_closed_route(self) -> None:
         protocol = (
