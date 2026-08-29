@@ -125,12 +125,48 @@ class PipelineV2CoreTests(unittest.TestCase):
 
     def _write_approved_plan(
         self, slices: list[dict], *, reads: dict[str, list[str]] | None = None,
-        revision: int = 1,
+        revision: int = 1, documentation_policy: str | None = None,
+        normative_documentation_policy: str | None = None,
+        derived_documentation_policy: str | None = None,
+        documentation_path: str | None = "docs/RUN-TEST-verification.md",
+        slice_documentation: dict[str, tuple[str, str]] | None = None,
     ) -> None:
+        if documentation_policy is not None:
+            if (
+                normative_documentation_policy is not None
+                or derived_documentation_policy is not None
+            ):
+                raise ValueError("use one shared policy or category-specific policies")
+            normative_documentation_policy = documentation_policy
+            derived_documentation_policy = documentation_policy
+
+        def documentation_value(policy: str | None) -> str | None:
+            if policy is not None:
+                return f"not_required | policy={policy}"
+            return documentation_path
+
+        normative_documentation = documentation_value(normative_documentation_policy)
+        derived_documentation = documentation_value(derived_documentation_policy)
         reads = reads or {item["id"]: item["allowed_paths"] for item in slices}
         sections = []
         for item in slices:
             paths = reads[item["id"]]
+            documentation = ""
+            slice_normative, slice_derived = (
+                slice_documentation.get(
+                    item["id"], (normative_documentation, derived_documentation),
+                )
+                if slice_documentation is not None
+                else (normative_documentation, derived_documentation)
+            )
+            if slice_normative is not None and slice_derived is not None:
+                documentation = (
+                    "\n### Documentation Contract\n\n"
+                    f"- normative_pre_review_paths: {slice_normative}\n"
+                    f"- derived_post_qa_paths: {slice_derived}\n"
+                    "- decision_ids: none\n"
+                    "- evidence_sources: approved test authority\n"
+                )
             sections.append(
                 f"## Slice {item['id']}\n\n"
                 "### Context Capsule Budget\n\n"
@@ -142,6 +178,15 @@ class PipelineV2CoreTests(unittest.TestCase):
                 "- metric_scope: capsule_plus_referenced_files\n"
                 f"- authority_paths: {paths[0]}\n"
                 f"- evidence_paths: {', '.join(paths)}\n"
+                f"{documentation}"
+            )
+        documentation_strategy = ""
+        if normative_documentation is not None and derived_documentation is not None:
+            documentation_strategy = (
+                "## Documentation Strategy\n\n"
+                f"- normative_pre_review: {normative_documentation}\n"
+                f"- derived_post_qa: {derived_documentation}\n"
+                "- source_rule: approved test authority\n\n"
             )
         text = (
             "---\n"
@@ -164,9 +209,32 @@ class PipelineV2CoreTests(unittest.TestCase):
             "approved_at: 2026-08-24T00:00:00+00:00\n"
             "---\n"
             "# Test plan\n\n"
+            + documentation_strategy
             + "\n".join(sections)
         )
         (self.root / "plan.md").write_text(text, encoding="utf-8")
+
+    def _reconfigure_documentation_contract(
+        self, *, policy: str | None = None,
+        normative_policy: str | None = None,
+        derived_policy: str | None = None,
+        path: str | None = None,
+        slice_documentation: dict[str, tuple[str, str]] | None = None,
+    ) -> None:
+        self._write_approved_plan(
+            self.slices, revision=2, documentation_policy=policy,
+            normative_documentation_policy=normative_policy,
+            derived_documentation_policy=derived_policy,
+            documentation_path=path,
+            slice_documentation=slice_documentation,
+        )
+        action = self.controller.status()["next_action"]
+        self.controller.reconfigure({
+            "name": "init", "id": action["command_id"],
+            "expected_generation": action["expected_generation"],
+            "run_id": action["run_id"], "project_root": action["project_root"],
+            "authority_paths": action["authority"], "slices": action["slices"],
+        })
 
     def _accept(self, suffix: str) -> dict:
         state = self.store.load()
@@ -291,6 +359,19 @@ class PipelineV2CoreTests(unittest.TestCase):
             "run_id": state["run_id"], "project_root": state["project_root"],
             "authority": state["authority"], "slices": self._sealed(self.slices),
         })
+
+    def _reach_docs_after_two_slices(self, suffix: str) -> None:
+        self._reach_engineering(f"-{suffix}")
+        for index, target in enumerate(("slice-one.txt", "slice-two.txt"), start=1):
+            worker = f"{suffix}-s{index}"
+            self._engineer_slice(
+                f"engineer-{worker}", f"candidate {worker}\n",
+                slice_index=index - 1, target=target,
+            )
+            self._accept(f"engineering-{worker}")
+            self._review_pass(f"reviewer-{worker}")
+            self._qa_pass(f"qa-{worker}")
+        self.assertEqual("docs", self.store.load()["phase"])
 
     def _review_pass(self, worker: str) -> None:
         self._complete_readonly("review", worker, {"outcome": "pass", "findings": []})
@@ -3449,6 +3530,188 @@ class PipelineV2CoreTests(unittest.TestCase):
         terminal = self.store.load()
         ready = self.controller.ready(command_id="READY-DOCS", expected_generation=terminal["generation"])
         self.assertTrue(status_view(ready)["ready"])
+
+    def test_docs_not_required_contract_grants_no_project_writes_and_allows_noop(self) -> None:
+        self._reconfigure_documentation_contract(policy="TS-SCOPE-001")
+        self._reach_candidate(); self._review_pass("reviewer-no-docs"); self._qa_pass("qa-no-docs")
+        action = self.controller.status()["next_action"]
+        self.assertEqual([], action["assignment"]["access"]["write"])
+        self.assertEqual(
+            [item["path"] for item in self.store.load()["authority"]["items"].values()],
+            action["assignment"]["access"]["read"],
+        )
+        self.assertEqual(
+            ".agentic-pipeline/outputs/" + action["assignment"]["id"] + ".json",
+            action["assignment"]["output_path"],
+        )
+        issued = self.controller.next(
+            command_id=action["command_id"], assignment=action["assignment"],
+            expected_generation=action["expected_generation"],
+        )
+        self.assertEqual([], issued["active_assignment"]["access"]["write"])
+        self._complete("COMPLETE-docs-noop", {
+            "outcome": "pass", "summary": "No documentation change required",
+        })
+        self.assertEqual("ready", self._accept("docs-noop")["phase"])
+
+    def test_docs_distinct_category_policies_allow_noop(self) -> None:
+        self._reconfigure_documentation_contract(
+            normative_policy="POLICY-NORM", derived_policy="POLICY-DERIVED",
+        )
+        self._reach_candidate(); self._review_pass("reviewer-distinct-policy"); self._qa_pass("qa-distinct-policy")
+
+        action = self.controller.status()["next_action"]
+
+        self.assertEqual([], action["assignment"]["access"]["write"])
+        self.controller.next(
+            command_id=action["command_id"], assignment=action["assignment"],
+            expected_generation=action["expected_generation"],
+        )
+        self._complete("COMPLETE-docs-distinct-policy", {
+            "outcome": "pass", "summary": "No documentation change required",
+        })
+        self.assertEqual("ready", self._accept("docs-distinct-policy")["phase"])
+
+    def test_docs_slice_policy_must_match_its_plan_wide_category_policy(self) -> None:
+        self._write_approved_plan(
+            self.slices,
+            normative_documentation_policy="POLICY-NORM",
+            derived_documentation_policy="POLICY-DERIVED",
+        )
+        self.root.joinpath("plan.md").write_text(
+            self.root.joinpath("plan.md").read_text(encoding="utf-8").replace(
+                "- derived_post_qa_paths: not_required | policy=POLICY-DERIVED",
+                "- derived_post_qa_paths: not_required | policy=POLICY-WRONG",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        self.store = StateStore(
+            self.root / ".agentic-pipeline-v2" / "docs-policy-mismatch-state.json"
+        )
+        self._initialize()
+        self._reach_candidate(); self._review_pass("reviewer-policy-mismatch"); self._qa_pass("qa-policy-mismatch")
+
+        with self.assertRaisesRegex(
+            PipelineError, "derived slice declarations must repeat the plan-wide policy",
+        ):
+            self.controller.status()
+
+    def test_docs_required_plan_allows_a_noop_slice_and_grants_only_plan_paths(self) -> None:
+        expected = "docs/multi-slice.md"
+        self._configure_two_slices()
+        self._reconfigure_documentation_contract(
+            path=expected,
+            slice_documentation={
+                "SLICE-2": (
+                    "not_required | policy=POLICY-NORM",
+                    "not_required | policy=POLICY-DERIVED",
+                ),
+            },
+        )
+        self._reach_docs_after_two_slices("docs-partial-noop")
+
+        action = self.controller.status()["next_action"]
+
+        self.assertEqual([expected], action["assignment"]["access"]["write"])
+
+    def test_docs_slice_cannot_invent_a_path_absent_from_plan_wide_authority(self) -> None:
+        expected = "docs/multi-slice.md"
+        self._configure_two_slices()
+        self._reconfigure_documentation_contract(
+            path=expected,
+            slice_documentation={
+                "SLICE-1": ("docs/invented.md", expected),
+                "SLICE-2": (
+                    "not_required | policy=POLICY-NORM",
+                    "not_required | policy=POLICY-DERIVED",
+                ),
+            },
+        )
+        self._reach_docs_after_two_slices("docs-invented-path")
+
+        with self.assertRaisesRegex(
+            PipelineError, "normative slice paths are absent from the plan-wide declaration",
+        ):
+            self.controller.status()
+
+    def test_docs_required_plan_rejects_all_slices_as_noop(self) -> None:
+        expected = "docs/multi-slice.md"
+        noop = (
+            "not_required | policy=POLICY-NORM",
+            "not_required | policy=POLICY-DERIVED",
+        )
+        self._configure_two_slices()
+        self._reconfigure_documentation_contract(
+            path=expected,
+            slice_documentation={"SLICE-1": noop, "SLICE-2": noop},
+        )
+        self._reach_docs_after_two_slices("docs-all-noop")
+
+        with self.assertRaisesRegex(
+            PipelineError, "normative plan-wide paths require at least one slice path declaration",
+        ):
+            self.controller.status()
+
+    def test_docs_slice_rejects_not_required_policy_mixed_with_a_path(self) -> None:
+        expected = "docs/multi-slice.md"
+        self._configure_two_slices()
+        self._reconfigure_documentation_contract(
+            path=expected,
+            slice_documentation={
+                "SLICE-2": (
+                    "not_required | policy=POLICY-NORM, docs/extra.md",
+                    "not_required | policy=POLICY-DERIVED",
+                ),
+            },
+        )
+        self._reach_docs_after_two_slices("docs-malformed-mix")
+
+        with self.assertRaisesRegex(
+            PipelineError, "normative declaration must use exact not_required policy syntax",
+        ):
+            self.controller.status()
+
+    def test_docs_required_category_writes_exact_path_while_other_is_not_required(self) -> None:
+        expected = "docs/derived-only.md"
+        self._reconfigure_documentation_contract(
+            normative_policy="POLICY-NORM", path=expected,
+        )
+        self._reach_candidate(); self._review_pass("reviewer-derived-only"); self._qa_pass("qa-derived-only")
+
+        action = self.controller.status()["next_action"]
+
+        self.assertEqual([expected], action["assignment"]["access"]["write"])
+
+    def test_docs_required_contract_writes_only_exact_declared_path(self) -> None:
+        expected = "docs/declared-release-notes.md"
+        unrelated = self.root / "docs" / "unrelated.md"
+        unrelated.parent.mkdir(parents=True, exist_ok=True)
+        unrelated.write_text("unrelated baseline documentation\n", encoding="utf-8")
+        self.store = StateStore(
+            self.root / ".agentic-pipeline-v2" / "docs-authority-state.json"
+        )
+        self._initialize()
+        self._reconfigure_documentation_contract(path=expected)
+        self._reach_candidate(); self._review_pass("reviewer-docs-required"); self._qa_pass("qa-docs-required")
+        action = self.controller.status()["next_action"]
+        self.assertEqual([expected], action["assignment"]["access"]["write"])
+        self.assertNotIn("docs/unrelated.md", action["assignment"]["access"]["write"])
+
+    def test_docs_missing_plan_declaration_fails_closed(self) -> None:
+        self._write_approved_plan(
+            self.slices, revision=2, documentation_path=None,
+        )
+        self.store = StateStore(
+            self.root / ".agentic-pipeline-v2" / "missing-docs-state.json"
+        )
+        self._initialize()
+        self._reach_candidate(); self._review_pass("reviewer-docs-missing"); self._qa_pass("qa-docs-missing")
+
+        with self.assertRaisesRegex(
+            PipelineError, "exactly one Documentation Strategy",
+        ):
+            self.controller.status()
 
     def test_review_target_cannot_be_replaced_by_caller_context(self) -> None:
         self._reach_candidate()

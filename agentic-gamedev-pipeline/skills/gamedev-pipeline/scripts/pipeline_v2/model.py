@@ -7,7 +7,7 @@ import json
 import math
 import re
 from copy import deepcopy
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 SCHEMA = 2
@@ -755,6 +755,153 @@ def assignment_identity(run_id: str, generation: int, phase: str) -> dict[str, s
     }
 
 
+def _documentation_authority(state: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Derive Docs write authority from exact approved-plan declarations."""
+    plan_item = state.get("authority", {}).get("items", {}).get("plan")
+    if not isinstance(plan_item, dict) or not isinstance(plan_item.get("path"), str):
+        raise PipelineError("Docs requires an approved plan authority path")
+    try:
+        text = (Path(state["project_root"]) / plan_item["path"]).read_text(encoding="utf-8")
+    except (KeyError, OSError, UnicodeError):
+        raise PipelineError("Docs cannot read its approved plan authority")
+
+    frontmatter = re.match(r"\A---\n(.*?)\n---(?:\n|\Z)", text, re.S)
+    statuses = (
+        re.findall(r"(?m)^status:\s*(\S+)\s*$", frontmatter.group(1))
+        if frontmatter is not None
+        else []
+    )
+    if statuses != ["approved"]:
+        raise PipelineError("Docs requires an exact approved development plan")
+
+    global_matches = list(re.finditer(
+        r"(?ms)^## Documentation Strategy\s*$\n(.*?)(?=^## |\Z)", text,
+    ))
+    slice_matches = list(re.finditer(
+        r"(?ms)^## Slice ([A-Za-z0-9][A-Za-z0-9._-]*)\s*$\n(.*?)(?=^## |\Z)",
+        text,
+    ))
+    if len(global_matches) != 1 or not slice_matches:
+        raise PipelineError(
+            "Docs requires exactly one Documentation Strategy and at least one slice"
+        )
+
+    def rows(
+        section: str, *, required: set[str], optional: set[str], label: str,
+    ) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for raw in section.splitlines():
+            if not raw.strip():
+                continue
+            match = re.fullmatch(r"\s*-\s*([a-z_]+):\s*(\S(?:.*\S)?)\s*", raw)
+            if match is None:
+                raise PipelineError(f"{label} contains a non-schema row")
+            key, value = match.groups()
+            if key not in required | optional or key in result:
+                raise PipelineError(f"{label} contains an unsupported or repeated field")
+            result[key] = value
+        if set(result) - optional != required:
+            raise PipelineError(f"{label} is missing or malformed")
+        return result
+
+    strategy = rows(
+        global_matches[0].group(1),
+        required={"normative_pre_review", "derived_post_qa"},
+        optional={"source_rule"},
+        label="Documentation Strategy",
+    )
+    declarations: dict[str, list[str]] = {
+        "normative": [strategy["normative_pre_review"]],
+        "derived": [strategy["derived_post_qa"]],
+    }
+    for match in slice_matches:
+        contracts = list(re.finditer(
+            r"(?ms)^### Documentation Contract\s*$\n(.*?)(?=^#{2,3} |\Z)",
+            match.group(2),
+        ))
+        if len(contracts) != 1:
+            raise PipelineError(
+                f"Docs requires exactly one Documentation Contract for {match.group(1)}"
+            )
+        contract = rows(
+            contracts[0].group(1),
+            required={
+                "normative_pre_review_paths", "derived_post_qa_paths",
+                "decision_ids", "evidence_sources",
+            },
+            optional=set(),
+            label=f"{match.group(1)} Documentation Contract",
+        )
+        declarations["normative"].append(contract["normative_pre_review_paths"])
+        declarations["derived"].append(contract["derived_post_qa_paths"])
+
+    paths: list[str] = []
+    all_not_required = True
+    for kind, values in declarations.items():
+        parsed: list[tuple[str, str | list[str]]] = []
+        for value in values:
+            policy = re.fullmatch(
+                r"not_required \| policy=([A-Za-z0-9][A-Za-z0-9._:/-]*)", value,
+            )
+            if policy is not None:
+                parsed.append(("policy", policy.group(1)))
+                continue
+            if value.startswith("not_required"):
+                raise PipelineError(
+                    f"Docs {kind} declaration must use exact not_required policy syntax"
+                )
+            items = [item.strip() for item in value.split(",")]
+            if any(not item for item in items) or len(items) != len(set(items)):
+                raise PipelineError(
+                    f"Docs {kind} paths must be a duplicate-free comma-separated list"
+                )
+            normalized = [normalize_rule(item.replace("\\", "/")) for item in items]
+            if "**" in normalized:
+                raise PipelineError("Docs declarations cannot grant whole-project write access")
+            parsed.append(("paths", normalized))
+
+        global_kind, global_value = parsed[0]
+        if global_kind == "policy":
+            if any(
+                item_kind != "policy" or item_value != global_value
+                for item_kind, item_value in parsed[1:]
+            ):
+                raise PipelineError(
+                    f"Docs {kind} slice declarations must repeat the plan-wide policy"
+                )
+            continue
+
+        all_not_required = False
+        required_slices = [
+            item_value
+            for item_kind, item_value in parsed[1:]
+            if item_kind == "paths"
+        ]
+        if not required_slices:
+            raise PipelineError(
+                f"Docs {kind} plan-wide paths require at least one slice path declaration"
+            )
+        global_paths = set(global_value)
+        invented = sorted({
+            path
+            for slice_paths in required_slices
+            for path in slice_paths
+            if path not in global_paths
+        })
+        if invented:
+            raise PipelineError(
+                f"Docs {kind} slice paths are absent from the plan-wide declaration: "
+                + ", ".join(invented)
+            )
+        for path in global_value:
+            if path not in paths:
+                paths.append(path)
+
+    if all_not_required:
+        return True, []
+    return False, paths
+
+
 def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
     """Derive the complete technical assignment; callers supply no IDs or path rules."""
     phase = state["phase"]
@@ -779,15 +926,12 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
     elif phase == "qa":
         checks = deepcopy(selected["planned_commands"])
     elif phase == "docs":
-        authority_set = set(authority_paths)
-        write = [
-            path for path in sorted(_latest_inventory(state))
-            if path.startswith("docs/") and path not in authority_set
-            and path.lower().endswith((".md", ".json", ".jsonl"))
-        ]
-        if not write:
-            write = [f"docs/{state['run_id']}-verification.md"]
-        read = list(dict.fromkeys(read + write))
+        no_documentation, write = _documentation_authority(state)
+        read = (
+            list(authority_paths)
+            if no_documentation
+            else list(dict.fromkeys(read + write))
+        )
     assignment = {
         "id": assignment_id,
         "worker_id": identity["worker_id"],

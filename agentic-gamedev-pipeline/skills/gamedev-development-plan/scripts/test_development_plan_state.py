@@ -559,7 +559,7 @@ documentation_state, and open_assumptions.
 
 - acceptance_ids: PRD-AC-{number:03d}
 - editable_paths: src/feature-{number}.lua
-- shared_touchpoints: see structured rows below
+- shared_touchpoints: TP-{number:03d}
 - shared_touchpoint: TP-{number:03d} | path=src/contracts.lua | symbols=FeatureContract | allowed_change=additive type only | forbidden_change=lifecycle, ownership, removals
 - excluded_components: save-system, commerce
 - excluded_paths: src/save/**, src/commerce/**
@@ -2840,6 +2840,106 @@ Only the approved feature and named shared symbol are in scope.
         )
         self.plan.write_text(text, encoding="utf-8")
         self.assertEqual(["SLICE-001"], controller.command_validate(self.args())["slice_ids"])
+
+    def test_accepts_exact_no_shared_touchpoints_sentinel(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = self.plan.read_text(encoding="utf-8").replace(
+            "- shared_touchpoints: TP-001\n"
+            "- shared_touchpoint: TP-001 | path=src/contracts.lua | symbols=FeatureContract | allowed_change=additive type only | forbidden_change=lifecycle, ownership, removals",
+            "- shared_touchpoints: none",
+        )
+        self.plan.write_text(text, encoding="utf-8")
+
+        self.assertEqual(
+            ["SLICE-001"], controller.command_validate(self.args())["slice_ids"]
+        )
+
+    def test_rejects_none_sentinel_mixed_with_structured_touchpoint(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = self.plan.read_text(encoding="utf-8").replace(
+            "- shared_touchpoints: TP-001",
+            "- shared_touchpoints: none",
+        )
+        self.plan.write_text(text, encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            controller.DevelopmentPlanError,
+            "shared_touchpoints: none must not be combined",
+        ):
+            controller.command_validate(self.args())
+
+    def test_rejects_fake_no_shared_touchpoints_sentinel(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = self.plan.read_text(encoding="utf-8").replace(
+            "- shared_touchpoints: TP-001\n"
+            "- shared_touchpoint: TP-001 | path=src/contracts.lua | symbols=FeatureContract | allowed_change=additive type only | forbidden_change=lifecycle, ownership, removals",
+            "- shared_touchpoints: none | reason=isolated",
+        )
+        self.plan.write_text(text, encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            controller.DevelopmentPlanError,
+            "exact none sentinel",
+        ):
+            controller.command_validate(self.args())
+
+    def test_rejects_non_id_shared_touchpoints_declaration(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- shared_touchpoints: TP-001",
+                "- shared_touchpoints: banana",
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            controller.DevelopmentPlanError,
+            "duplicate-free comma-separated list of TP-NNN IDs",
+        ):
+            controller.command_validate(self.args())
+
+    def test_rejects_shared_touchpoints_declaration_unknown_to_rows(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- shared_touchpoints: TP-001",
+                "- shared_touchpoints: TP-999",
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            controller.DevelopmentPlanError,
+            "shared_touchpoints must exactly match structured shared_touchpoint IDs",
+        ):
+            controller.command_validate(self.args())
+
+    def test_rejects_none_when_slice_editable_paths_overlap(self) -> None:
+        self.initialize(mode="sequential_slices")
+        self.write_plan(mode="sequential_slices", slice_count=2)
+        text = self.plan.read_text(encoding="utf-8").replace(
+            "- editable_paths: src/feature-2.lua",
+            "- editable_paths: src/feature-1.lua",
+        )
+        for number in (1, 2):
+            text = text.replace(
+                f"- shared_touchpoints: TP-{number:03d}\n"
+                f"- shared_touchpoint: TP-{number:03d} | path=src/contracts.lua | symbols=FeatureContract | allowed_change=additive type only | forbidden_change=lifecycle, ownership, removals",
+                "- shared_touchpoints: none",
+            )
+        self.plan.write_text(text, encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            controller.DevelopmentPlanError,
+            "shared_touchpoints: none requires editable_paths isolated",
+        ):
+            controller.command_validate(self.args())
 
     def test_rejects_duplicate_shared_touchpoint_path(self) -> None:
         self.initialize()

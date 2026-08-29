@@ -104,6 +104,10 @@ class SpecificationStateTests(unittest.TestCase):
         self.feature_dir.mkdir(parents=True)
         self.prd = self.feature_dir / "product-requirements.md"
         self.spec = self.feature_dir / "technical-specification.md"
+        self.preaccept_receipt = (
+            self.root / ".agentic-pipeline" / "evidence" / "architect-preaccept.json"
+        )
+        self.helper_receipt_counter = 0
         self.prd.write_text(PRD, encoding="utf-8")
 
     def tearDown(self) -> None:
@@ -139,9 +143,148 @@ language: English
 {authority}
 ---
 # Technical Specification
+
+## Goal
+
+Implement the exact approved behavior.
 {suffix}
 """,
             encoding="utf-8",
+        )
+
+    def write_preaccept_receipt(self, **overrides: object) -> Path:
+        self.preaccept_receipt = (
+            self.root / ".agentic-pipeline" / "evidence" / "architect-preaccept.json"
+        )
+        self.preaccept_receipt.parent.mkdir(parents=True, exist_ok=True)
+        inventory = [
+            {
+                "locator": locator,
+                "disposition": "retain",
+                "authority_or_rationale": "PRD-REQ-001 requires this authored structure.",
+            }
+            for locator in controller.specification_inventory_locators(self.spec)
+        ]
+        payload: dict[str, object] = {
+            "schema": controller.PREACCEPT_RECEIPT_SCHEMA,
+            "architect_id": controller.load_state(self.root)["active_architect_id"],
+            "prd_sha256": controller.sha256(self.prd),
+            "assessed_spec_sha256": controller.sha256(self.spec),
+            "semantic_assessment": "accept",
+            "section_applicability_inventory": inventory,
+        }
+        payload.update(overrides)
+        self.preaccept_receipt.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return self.preaccept_receipt
+
+    def prepare_helper(
+        self,
+        operation: str,
+        correction_ids: list[str] | None = None,
+    ) -> dict:
+        return controller.command_prepare_helper(
+            self.args(
+                operation=operation,
+                correction_id=(
+                    correction_ids
+                    if correction_ids is not None
+                    else (["CORR-001"] if operation == "correction" else [])
+                ),
+            )
+        )
+
+    def write_fake_helper_result(self, **overrides: object) -> Path:
+        state = controller.load_state(self.root)
+        request_record = state["active_helper_request"]
+        self.assertIsNotNone(request_record)
+        request = request_record["summary"]
+        artifacts = request["artifacts"]
+        report = self.root / artifacts["helper_report_path"]
+        coverage = self.root / artifacts["coverage_path"]
+        result = self.root / artifacts["result_path"]
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(
+            "Fake external adapter report for controller unit tests.\n",
+            encoding="utf-8",
+        )
+        coverage.write_text(
+            json.dumps(
+                {
+                    "owned_by": "$skill-specification-pipeline",
+                    "request_id": request["request_id"],
+                    "coverage": "complete",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload: dict[str, object] = {
+            "schema": controller.HELPER_RESULT_SCHEMA,
+            "request": {
+                "id": request["request_id"],
+                "sha256": request_record["sha256"],
+            },
+            "operation": request["operation"],
+            "route": request["route"],
+            "output_specification": {
+                "path": request["specification"]["path"],
+                "sha256": controller.sha256(self.spec),
+            },
+            "outcome": "PASS",
+            "write_paths": request["allowed_write_paths"],
+            "artifacts": [
+                {
+                    "kind": "helper_report",
+                    "path": artifacts["helper_report_path"],
+                    "sha256": controller.sha256(report),
+                },
+                {
+                    "kind": "coverage",
+                    "path": artifacts["coverage_path"],
+                    "sha256": controller.sha256(coverage),
+                },
+            ],
+            "helper_identity": request["helper_identity"],
+        }
+        payload.update(overrides)
+        result.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return result
+
+    def consume_fake_helper_result(self, **overrides: object) -> dict:
+        self.write_fake_helper_result(**overrides)
+        return controller.command_record_helper_result(self.args())
+
+    def write_actual_helper_artifacts(self) -> tuple[Path, Path]:
+        state = controller.load_state(self.root)
+        request = state["active_helper_request"]["summary"]
+        report = self.root / request["artifacts"]["helper_report_path"]
+        coverage = self.root / request["artifacts"]["coverage_path"]
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("Actual emitter integration report.\n", encoding="utf-8")
+        coverage.write_text(
+            json.dumps({"coverage": "complete"}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return report, coverage
+
+    def accept_spec(
+        self,
+        receipt: Path | None = None,
+    ) -> dict:
+        state = controller.load_state(self.root)
+        if state.get("active_helper_request") is not None:
+            self.consume_fake_helper_result()
+        receipt = receipt or self.write_preaccept_receipt()
+        return controller.command_accept_spec(
+            self.args(
+                preaccept_receipt=receipt.relative_to(self.root).as_posix(),
+            )
         )
 
     def cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -159,9 +302,9 @@ language: English
         )
 
     def make_ready(self) -> dict:
-        self.initialize()
+        self.initialize(with_spec=False)
         self.write_spec(status="approved")
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         self.start_and_record(1, major=0, coverage_complete=True)
         return controller.command_confirm_ready(
             self.args(architect_id="architect-1", confirmation="same SHA confirmed")
@@ -495,13 +638,14 @@ approved_at: 2026-08-10T00:00:00Z
         return runtime_path
 
     def complete_fresh_v2_reopen(self, report_path: str) -> dict:
+        self.prepare_helper("correction")
         self.spec.write_text(
             self.spec.read_text(encoding="utf-8").replace(
                 "status: draft", "status: approved", 1
             ),
             encoding="utf-8",
         )
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         controller.command_start_cycle(
             self.args(architect_id="architect-2", proofreader_id="proofreader-2")
         )
@@ -676,8 +820,10 @@ approved_at: 2026-08-10T00:00:00Z
                 architect_id="architect-1",
             )
         )
+        if state["status"] == "needs_generation":
+            state = self.prepare_helper("generation")
         if with_spec:
-            state = controller.command_accept_spec(self.args())
+            state = self.accept_spec()
         return state
 
     def start_and_record(self, number: int, **overrides: object) -> None:
@@ -787,10 +933,12 @@ approved_at: 2026-08-10T00:00:00Z
             controller.SpecificationStateError,
             "legacy state approved PRD.*full approved requirements contract",
         ):
-            controller.command_accept_spec(self.args())
+            self.accept_spec()
         self.assertEqual(before, state_path.read_bytes())
 
-        cli = self.cli("accept-spec")
+        cli = self.cli(
+            "accept-spec", "--preaccept-receipt", "missing-preaccept.json"
+        )
         self.assertEqual(2, cli.returncode)
         self.assertIn("full approved requirements contract", cli.stderr)
         self.assertEqual(before, state_path.read_bytes())
@@ -798,9 +946,705 @@ approved_at: 2026-08-10T00:00:00Z
     def test_accept_spec_requires_exact_current_prd_trace(self) -> None:
         self.initialize(with_spec=False)
         self.write_spec()
-        state = controller.command_accept_spec(self.args())
+        state = self.accept_spec()
         self.assertEqual(state["status"], "reviewing")
         self.assertEqual(state["specification"]["sha256"], controller.sha256(self.spec))
+
+    def test_needs_generation_rejects_local_draft_preaccept_only_as_byte_noop(
+        self,
+    ) -> None:
+        controller.command_init(
+            self.args(
+                feature="sample-feature",
+                prd=self.prd.relative_to(self.root).as_posix(),
+                spec=self.spec.relative_to(self.root).as_posix(),
+                architect_id="architect-1",
+            )
+        )
+        self.write_spec()
+        preaccept = self.write_preaccept_receipt()
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_before = state_path.read_bytes()
+        spec_before = self.spec.read_bytes()
+
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError,
+            "helper evidence does not end at the exact current specification SHA",
+        ):
+            controller.command_accept_spec(
+                self.args(
+                    preaccept_receipt=preaccept.relative_to(self.root).as_posix(),
+                )
+            )
+
+        self.assertEqual(state_before, state_path.read_bytes())
+        self.assertEqual(spec_before, self.spec.read_bytes())
+        self.assertIsNone(controller.load_state(self.root)["acceptance"])
+
+    def test_valid_generation_result_is_consumed_and_revalidated(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec()
+        consumed = self.consume_fake_helper_result()
+        accepted = self.accept_spec()
+
+        evidence = accepted["acceptance"]["helper_evidence"]
+        self.assertEqual(
+            controller.sha256(self.spec),
+            evidence["results"][0]["result"]["summary"]
+            ["output_specification"]["sha256"],
+        )
+        self.assertIsNone(evidence["source_spec_sha256"])
+        self.assertIsNone(consumed["active_helper_request"])
+        self.assertEqual(1, len(consumed["helper_history"]))
+        report_path = self.root / (
+            evidence["results"][0]["result"]["summary"]["artifacts"][0]["path"]
+        )
+        report_before = report_path.read_bytes()
+        report_path.write_bytes(report_before + b"drift")
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "artifact SHA is stale or invalid"
+        ):
+            controller.command_start_cycle(
+                self.args(
+                    architect_id="architect-1",
+                    proofreader_id="proofreader-helper-drift",
+                )
+            )
+        self.assertEqual(state_before, state_path.read_bytes())
+        report_path.write_bytes(report_before)
+        started = controller.command_start_cycle(
+            self.args(architect_id="architect-1", proofreader_id="proofreader-helper")
+        )
+        self.assertEqual(
+            controller.sha256(self.spec), started["active_wave"]["spec_sha256"]
+        )
+
+    def test_helper_request_and_result_binding_failures_are_byte_noops(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec()
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state = controller.load_state(self.root)
+        request_path = self.root / state["active_helper_request"]["path"]
+        request_before = request_path.read_bytes()
+        spec_before = self.spec.read_bytes()
+
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "helper request is active"
+        ):
+            self.prepare_helper("generation")
+        self.assertEqual(state_before, state_path.read_bytes())
+        self.assertEqual(request_before, request_path.read_bytes())
+
+        request = json.loads(request_before)
+        request["expected_user_language"] = "Russian"
+        request_path.write_text(
+            json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "request.*changed|language binding"
+        ):
+            controller.command_record_helper_result(self.args())
+        self.assertEqual(state_before, state_path.read_bytes())
+        self.assertEqual(spec_before, self.spec.read_bytes())
+        request_path.write_bytes(request_before)
+
+        result_path = self.write_fake_helper_result()
+        base = json.loads(result_path.read_text(encoding="utf-8"))
+        mutations = {
+            "missing field": lambda value: value.pop("operation"),
+            "request SHA": lambda value: value["request"].update(
+                {"sha256": "0" * 64}
+            ),
+            "operation": lambda value: value.update({"operation": "correction"}),
+            "mode": lambda value: value["route"].update(
+                {"mode": "spec-assistant"}
+            ),
+            "output SHA": lambda value: value["output_specification"].update(
+                {"sha256": "0" * 64}
+            ),
+            "outcome": lambda value: value.update({"outcome": "FAIL"}),
+            "write set": lambda value: value["write_paths"].append("docs/another.md"),
+            "identity": lambda value: value["helper_identity"].update(
+                {"entrypoint_sha256": "0" * 64}
+            ),
+            "artifact SHA": lambda value: value["artifacts"][0].update(
+                {"sha256": "0" * 64}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                candidate = json.loads(json.dumps(base))
+                mutate(candidate)
+                result_path.write_text(
+                    json.dumps(candidate, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                state_before = state_path.read_bytes()
+                with self.assertRaises(controller.SpecificationStateError):
+                    controller.command_record_helper_result(self.args())
+                self.assertEqual(state_before, state_path.read_bytes())
+                self.assertEqual(spec_before, self.spec.read_bytes())
+
+        result_path.write_text(
+            json.dumps(base, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        controller.command_record_helper_result(self.args())
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "no active.*request"
+        ):
+            controller.command_record_helper_result(self.args())
+        self.assertEqual(state_before, state_path.read_bytes())
+
+    def test_actual_external_emitter_creates_one_immutable_result(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec()
+        self.write_actual_helper_artifacts()
+        state = controller.load_state(self.root)
+        request = self.root / state["active_helper_request"]["path"]
+        emitter = Path(
+            state["active_helper_request"]["summary"]["helper_identity"]
+            ["result_emitter_path"]
+        )
+
+        emitted = subprocess.run(
+            [sys.executable, "-B", str(emitter), "--request", str(request)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, emitted.returncode, emitted.stderr)
+        result_path = self.root / (
+            state["active_helper_request"]["summary"]["artifacts"]["result_path"]
+        )
+        result_before = result_path.read_bytes()
+
+        consumed = controller.command_record_helper_result(self.args())
+        self.assertIsNone(consumed["active_helper_request"])
+        accepted = self.accept_spec()
+        self.assertEqual("reviewing", accepted["status"])
+
+        replay = subprocess.run(
+            [sys.executable, "-B", str(emitter), "--request", str(request)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(2, replay.returncode)
+        self.assertIn("already exists", replay.stderr)
+        self.assertEqual(result_before, result_path.read_bytes())
+
+    def test_accept_spec_preaccept_receipt_failures_are_byte_noops(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec()
+        self.consume_fake_helper_result()
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        spec_before = self.spec.read_bytes()
+
+        def assert_rejected(receipt: Path | None, pattern: str = "pre-accept") -> None:
+            state_before = state_path.read_bytes()
+            arguments = self.args(
+                **(
+                    {"preaccept_receipt": receipt.relative_to(self.root).as_posix()}
+                    if receipt is not None
+                    else {}
+                )
+            )
+            with self.assertRaisesRegex(controller.SpecificationStateError, pattern):
+                controller.command_accept_spec(arguments)
+            self.assertEqual(state_before, state_path.read_bytes())
+            self.assertEqual(spec_before, self.spec.read_bytes())
+
+        assert_rejected(None, "requires --preaccept-receipt")
+
+        self.preaccept_receipt.parent.mkdir(parents=True, exist_ok=True)
+        self.preaccept_receipt.write_text("{", encoding="utf-8")
+        assert_rejected(self.preaccept_receipt, "valid UTF-8 JSON")
+
+        base_path = self.write_preaccept_receipt()
+        base = json.loads(base_path.read_text(encoding="utf-8"))
+        mutations = {
+            "malformed schema": lambda value: value.update({"schema": 2}),
+            "stale SHA": lambda value: value.update(
+                {"assessed_spec_sha256": "0" * 64}
+            ),
+            "blank rationale": lambda value: value[
+                "section_applicability_inventory"
+            ][0].update({"authority_or_rationale": " "}),
+            "duplicate locator": lambda value: value[
+                "section_applicability_inventory"
+            ].append(dict(value["section_applicability_inventory"][0])),
+            "reject assessment": lambda value: value.update(
+                {"semantic_assessment": "reject"}
+            ),
+            "remove disposition": lambda value: value[
+                "section_applicability_inventory"
+            ][0].update({"disposition": "remove"}),
+            "merge disposition": lambda value: value[
+                "section_applicability_inventory"
+            ][0].update({"disposition": "merge"}),
+            "defer disposition": lambda value: value[
+                "section_applicability_inventory"
+            ][0].update({"disposition": "defer"}),
+            "identity mismatch": lambda value: value.update(
+                {"architect_id": "different-architect"}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                candidate = json.loads(json.dumps(base))
+                mutate(candidate)
+                base_path.write_text(
+                    json.dumps(candidate, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                assert_rejected(base_path)
+
+    def test_formatter_counterexample_requires_correction_helper_result(self) -> None:
+        self.initialize(with_spec=False)
+        trace = controller.sha256(self.prd)
+        self.spec.write_text(
+            f"""---
+document_type: technical-specification
+status: draft
+revision: 1
+language: English
+source_prd_path: docs/Features/template/sample-feature/product-requirements.md
+source_prd_revision: 3
+source_prd_sha256: {trace}
+---
+# RoundTimeFormatter Technical Specification
+
+## Goal
+
+Format supported seconds as M:SS for PRD-REQ-001.
+
+## Data Models
+
+No structured model is introduced.
+
+| Contract value | Type |
+|---|---|
+| totalSeconds | number |
+
+## System Diagram
+
+```text
+seconds -> formatter -> M:SS
+```
+
+## Behavior
+
+The pure formatter returns the exact PRD-AC-001 output.
+
+## Open Questions
+
+None.
+
+## Source Coverage Manifest
+
+| Source ID | Address |
+|---|---|
+| PRD-REQ-001 | Goal and Behavior |
+
+No assumptions or risks are introduced.
+""",
+            encoding="utf-8",
+        )
+        old_sha = controller.sha256(self.spec)
+        self.consume_fake_helper_result()
+        inventory = []
+        for locator in controller.specification_inventory_locators(self.spec):
+            remove = any(
+                token in locator
+                for token in (
+                    "Data Models",
+                    "System Diagram",
+                    "Open Questions",
+                    "diagram:",
+                    "footer:",
+                )
+            )
+            if locator.startswith("table:") and not any(
+                row["locator"].startswith("table:") for row in inventory
+            ):
+                remove = True
+            inventory.append(
+                {
+                    "locator": locator,
+                    "disposition": "remove" if remove else "retain",
+                    "authority_or_rationale": (
+                        "CORR-001 removes formatter boilerplate."
+                        if remove
+                        else "PRD-REQ-001 requires this distinct content."
+                    ),
+                }
+            )
+        rejected_receipt = self.write_preaccept_receipt(
+            semantic_assessment="reject",
+            section_applicability_inventory=inventory,
+        )
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "semantic assessment must be accept"
+        ):
+            controller.command_accept_spec(
+                self.args(
+                    preaccept_receipt=rejected_receipt.relative_to(self.root).as_posix()
+                )
+            )
+        self.assertEqual(state_before, state_path.read_bytes())
+        self.assertEqual(old_sha, controller.sha256(self.spec))
+
+        self.prepare_helper("correction", ["CORR-001"])
+        corrected = self.spec.read_text(encoding="utf-8")
+        corrected = corrected.replace(
+            """## Data Models
+
+No structured model is introduced.
+
+| Contract value | Type |
+|---|---|
+| totalSeconds | number |
+
+""",
+            "",
+        ).replace(
+            """## System Diagram
+
+```text
+seconds -> formatter -> M:SS
+```
+
+""",
+            "",
+        ).replace(
+            """## Open Questions
+
+None.
+
+""",
+            "",
+        ).replace("\nNo assumptions or risks are introduced.\n", "\n")
+        self.spec.write_text(corrected, encoding="utf-8")
+        new_sha = controller.sha256(self.spec)
+        self.assertNotEqual(old_sha, new_sha)
+
+        accepted = self.accept_spec()
+        summary = accepted["acceptance"]["preaccept_receipt"]["summary"]
+        self.assertEqual("reviewing", accepted["status"])
+        self.assertEqual(new_sha, summary["assessed_spec_sha256"])
+        self.assertTrue(summary["required_locators"])
+        self.assertFalse(
+            any(
+                token in locator
+                for locator in summary["required_locators"]
+                for token in ("Data Models", "System Diagram", "Open Questions", "footer:")
+            )
+        )
+
+    def test_active_wave_rejects_late_accept_spec_as_byte_noop(self) -> None:
+        self.initialize()
+        controller.command_start_cycle(
+            self.args(architect_id="architect-1", proofreader_id="proofreader-late")
+        )
+        receipt = self.write_preaccept_receipt()
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_before = state_path.read_bytes()
+        spec_before = self.spec.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "forbidden while a Proofreader wave is active"
+        ):
+            controller.command_accept_spec(
+                self.args(preaccept_receipt=receipt.relative_to(self.root).as_posix())
+            )
+        self.assertEqual(state_before, state_path.read_bytes())
+        self.assertEqual(spec_before, self.spec.read_bytes())
+
+    def test_active_wave_legacy_acceptance_cannot_create_review_credit(self) -> None:
+        self.initialize()
+        controller.command_start_cycle(
+            self.args(architect_id="architect-1", proofreader_id="proofreader-legacy")
+        )
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        legacy = controller.load_state(self.root)
+        legacy["acceptance"].pop("preaccept_receipt")
+        controller.save_state(self.root, legacy)
+        spec_before = self.spec.read_bytes()
+
+        record_args = self.args(
+            proofreader_id="proofreader-legacy",
+            critical=0,
+            major=0,
+            minor=0,
+            product_questions=0,
+            scope_questions=0,
+            boundary_questions=0,
+            ownership_questions=0,
+            public_contract_questions=0,
+            minors_engineer_resolvable=True,
+            coverage_complete=True,
+            report_path="legacy-proofread.json",
+            finding_id=[],
+            question_id=[],
+        )
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "exact Architect pre-accept receipt"
+        ):
+            controller.command_record_proofread(record_args)
+        self.assertEqual(state_before, state_path.read_bytes())
+        self.assertEqual(spec_before, self.spec.read_bytes())
+
+        legacy = controller.load_state(self.root)
+        legacy["active_wave"]["proofread"] = {
+            "critical": 0,
+            "major": 0,
+            "minor": 0,
+            "questions": {
+                "product": 0,
+                "scope": 0,
+                "boundary": 0,
+                "ownership": 0,
+                "public_contract": 0,
+            },
+            "minors_engineer_resolvable": True,
+            "coverage_complete": True,
+            "report_path": "legacy-proofread.json",
+            "finding_ids": [],
+            "question_ids": [],
+            "recorded_at": "2026-08-29T00:00:00+00:00",
+        }
+        controller.save_state(self.root, legacy)
+        for label, action in (
+            (
+                "complete",
+                lambda: controller.command_complete_cycle(
+                    self.args(
+                        architect_id="architect-1",
+                        resolution_note="must not create legacy credit",
+                        user_decision_note=None,
+                    )
+                ),
+            ),
+            (
+                "confirm",
+                lambda: controller.command_confirm_ready(
+                    self.args(
+                        architect_id="architect-1",
+                        confirmation="must not create legacy readiness",
+                    )
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                state_before = state_path.read_bytes()
+                with self.assertRaisesRegex(
+                    controller.SpecificationStateError,
+                    "exact Architect pre-accept receipt",
+                ):
+                    action()
+                self.assertEqual(state_before, state_path.read_bytes())
+                self.assertEqual(spec_before, self.spec.read_bytes())
+
+    def test_active_wave_requires_acceptance_not_later_than_wave_start(self) -> None:
+        self.initialize()
+        controller.command_start_cycle(
+            self.args(architect_id="architect-1", proofreader_id="proofreader-time")
+        )
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state = controller.load_state(self.root)
+        state["acceptance"]["accepted_at"] = "2099-08-29T00:00:00+00:00"
+        controller.save_state(self.root, state)
+        before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "predates the current specification acceptance"
+        ):
+            controller.command_record_proofread(
+                self.args(
+                    proofreader_id="proofreader-time",
+                    critical=0,
+                    major=0,
+                    minor=0,
+                    product_questions=0,
+                    scope_questions=0,
+                    boundary_questions=0,
+                    ownership_questions=0,
+                    public_contract_questions=0,
+                    minors_engineer_resolvable=True,
+                    coverage_complete=True,
+                    report_path="time-proofread.json",
+                    finding_id=[],
+                    question_id=[],
+                )
+            )
+        self.assertEqual(before, state_path.read_bytes())
+
+    def test_nested_hierarchy_and_standalone_footer_can_be_retained(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec(
+            suffix="""
+
+## Component Ownership
+
+- Formatter feature
+  - Shared formatter module
+  - Focused verification runner
+
+## Flat Constraints
+
+- Keep the utility pure.
+- Keep the runner focused.
+
+## Coverage
+
+PRD-REQ-001 is covered by the formatter and runner.
+
+No assumptions, source conflicts, unresolved risks, or additional product obligations are introduced.
+"""
+        )
+        locators = controller.specification_inventory_locators(self.spec)
+        hierarchy = [item for item in locators if item.startswith("hierarchy:")]
+        footer = [item for item in locators if item.startswith("footer:")]
+        self.assertEqual(1, len(hierarchy))
+        self.assertEqual(1, len(footer))
+        self.assertFalse(any("Flat Constraints" in item and item.startswith("hierarchy:") for item in locators))
+        accepted = self.accept_spec()
+        summary = accepted["acceptance"]["preaccept_receipt"]["summary"]
+        self.assertIn(hierarchy[0], summary["required_locators"])
+        self.assertIn(footer[0], summary["required_locators"])
+
+    def test_nested_hierarchy_and_footer_remove_require_corrected_new_sha(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec(
+            suffix="""
+
+## Duplicate Hierarchy
+
+- Formatter feature
+  - Formatter module
+  - Formatter runner
+
+## Coverage
+
+PRD-REQ-001 is already covered here.
+
+No additional assumptions or risks exist.
+"""
+        )
+        old_sha = controller.sha256(self.spec)
+        self.consume_fake_helper_result()
+        inventory = []
+        for locator in controller.specification_inventory_locators(self.spec):
+            remove = locator.startswith(("hierarchy:", "footer:")) or "Duplicate Hierarchy" in locator
+            inventory.append(
+                {
+                    "locator": locator,
+                    "disposition": "remove" if remove else "retain",
+                    "authority_or_rationale": (
+                        "CORR-HIER-001 removes duplicate structure."
+                        if remove
+                        else "PRD-REQ-001 requires this distinct content."
+                    ),
+                }
+            )
+        receipt = self.write_preaccept_receipt(
+            section_applicability_inventory=inventory
+        )
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "disposition must be retain"
+        ):
+            controller.command_accept_spec(
+                self.args(preaccept_receipt=receipt.relative_to(self.root).as_posix())
+            )
+        self.assertEqual(before, state_path.read_bytes())
+
+        self.prepare_helper("correction", ["CORR-HIER-001"])
+        corrected = self.spec.read_text(encoding="utf-8").replace(
+            """## Duplicate Hierarchy
+
+- Formatter feature
+  - Formatter module
+  - Formatter runner
+
+""",
+            "",
+        ).replace("\nNo additional assumptions or risks exist.\n", "\n")
+        self.spec.write_text(corrected, encoding="utf-8")
+        new_sha = controller.sha256(self.spec)
+        self.assertNotEqual(old_sha, new_sha)
+        accepted = self.accept_spec()
+        summary = accepted["acceptance"]["preaccept_receipt"]["summary"]
+        self.assertEqual(new_sha, summary["assessed_spec_sha256"])
+        self.assertFalse(
+            any(
+                locator.startswith(("hierarchy:", "footer:"))
+                for locator in summary["required_locators"]
+            )
+        )
+
+    def test_final_section_ordinary_paragraphs_are_not_footer_structure(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec(
+            suffix="""
+
+## Verification
+
+The focused runner validates PRD-AC-001 across the supported input boundary.
+
+The integration runner validates the same output at the current call site.
+"""
+        )
+        locators = controller.specification_inventory_locators(self.spec)
+        self.assertFalse(any(item.startswith("footer:") for item in locators))
+
+    def test_exact_and_normalized_no_content_registers_are_footer_structure(self) -> None:
+        self.initialize(with_spec=False)
+        exact_footer = (
+            "No assumptions, source conflicts, unresolved risks, or additional "
+            "product obligations are introduced."
+        )
+        self.write_spec(
+            suffix=f"""
+
+## Coverage
+
+PRD-REQ-001 is covered by the formatter and runner.
+
+{exact_footer}
+"""
+        )
+        exact_locators = controller.specification_inventory_locators(self.spec)
+        self.assertEqual(
+            1, len([item for item in exact_locators if item.startswith("footer:")])
+        )
+
+        normalized_footer = """NO   ASSUMPTIONS, source conflicts,
+unresolved risks, OR additional product obligations are introduced !"""
+        self.write_spec(
+            suffix=f"""
+
+## Coverage
+
+PRD-REQ-001 is covered by the formatter and runner.
+
+{normalized_footer}
+"""
+        )
+        normalized_locators = controller.specification_inventory_locators(self.spec)
+        self.assertEqual(
+            1,
+            len(
+                [item for item in normalized_locators if item.startswith("footer:")]
+            ),
+        )
 
     def test_init_is_idempotent_and_cannot_reset_cycle_history(self) -> None:
         self.initialize()
@@ -972,9 +1816,9 @@ approved_at: 2026-08-10T00:00:00Z
             )
 
     def test_ready_requires_clean_complete_same_sha_pass(self) -> None:
-        self.initialize()
+        self.initialize(with_spec=False)
         self.write_spec(status="approved")
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         self.start_and_record(
             1,
             major=0,
@@ -989,20 +1833,166 @@ approved_at: 2026-08-10T00:00:00Z
         self.assertEqual(state["ready"]["spec_sha256"], controller.sha256(self.spec))
 
     def test_ready_rejects_spec_changed_after_proofread(self) -> None:
-        self.initialize()
+        self.initialize(with_spec=False)
         self.write_spec(status="approved")
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         self.start_and_record(1, major=0, coverage_complete=True)
         self.spec.write_text(self.spec.read_text(encoding="utf-8") + "changed\n", encoding="utf-8")
-        with self.assertRaisesRegex(controller.SpecificationStateError, "same specification SHA"):
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError,
+            "pre-accept receipt specification SHA|same specification SHA",
+        ):
             controller.command_confirm_ready(
                 self.args(architect_id="architect-1", confirmation="confirm")
             )
 
-    def test_ready_rejects_unresolved_product_question(self) -> None:
+    def test_edit_before_record_proofread_remains_rejected(self) -> None:
         self.initialize()
+        controller.command_start_cycle(
+            self.args(architect_id="architect-1", proofreader_id="proofreader-early-edit")
+        )
+        self.spec.write_text(
+            self.spec.read_text(encoding="utf-8") + "\nUnreviewed edit.\n",
+            encoding="utf-8",
+        )
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError,
+            "changed during read-only proofreading",
+        ):
+            controller.command_record_proofread(
+                self.args(
+                    proofreader_id="proofreader-early-edit",
+                    critical=0,
+                    major=0,
+                    minor=0,
+                    product_questions=0,
+                    scope_questions=0,
+                    boundary_questions=0,
+                    ownership_questions=0,
+                    public_contract_questions=0,
+                    minors_engineer_resolvable=True,
+                    coverage_complete=True,
+                    report_path="early-edit.md",
+                    finding_id=[],
+                    question_id=[],
+                )
+            )
+        self.assertEqual(state_before, state_path.read_bytes())
+
+    def test_no_edit_complete_cycle_preserves_acceptance_and_reviewing(self) -> None:
+        self.initialize()
+        self.start_and_record(1, major=1, coverage_complete=True)
+        before = controller.load_state(self.root)
+        completed = controller.command_complete_cycle(
+            self.args(
+                architect_id="architect-1",
+                resolution_note="No admissible specification edit is required.",
+                user_decision_note=None,
+            )
+        )
+        self.assertEqual("reviewing", completed["status"])
+        self.assertEqual(before["acceptance"], completed["acceptance"])
+        self.assertEqual(
+            completed["waves"][-1]["spec_sha256"],
+            completed["waves"][-1]["result_spec_sha256"],
+        )
+
+    def test_major_helper_correction_closes_wave_then_reaccepts_to_spec_ready(
+        self,
+    ) -> None:
+        self.initialize()
+        self.start_and_record(1, major=1, coverage_complete=True)
+        wave_input_sha256 = controller.sha256(self.spec)
+        self.prepare_helper("correction", ["SPEC-FINDING-1"])
+        self.spec.write_text(
+            self.spec.read_text(encoding="utf-8")
+            .replace("status: draft", "status: approved", 1)
+            + "\nPRD-REQ-001 correction applied.\n",
+            encoding="utf-8",
+        )
+        corrected_sha256 = controller.sha256(self.spec)
+        result_path = self.write_fake_helper_result()
+        base = json.loads(result_path.read_text(encoding="utf-8"))
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        spec_before = self.spec.read_bytes()
+        mutations = {
+            "request": lambda value: value["request"].update(
+                {"sha256": "0" * 64}
+            ),
+            "route": lambda value: value["route"].update(
+                {"submode": "review-light"}
+            ),
+            "output": lambda value: value["output_specification"].update(
+                {"sha256": "0" * 64}
+            ),
+            "outcome": lambda value: value.update({"outcome": "FAIL"}),
+            "write set": lambda value: value["write_paths"].append("docs/another.md"),
+            "artifact": lambda value: value["artifacts"][0].update(
+                {"sha256": "0" * 64}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                candidate = json.loads(json.dumps(base))
+                mutate(candidate)
+                result_path.write_text(
+                    json.dumps(candidate, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                state_before = state_path.read_bytes()
+                with self.assertRaises(controller.SpecificationStateError):
+                    controller.command_record_helper_result(self.args())
+                self.assertEqual(state_before, state_path.read_bytes())
+                self.assertEqual(spec_before, self.spec.read_bytes())
+        result_path.write_text(
+            json.dumps(base, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        recorded = controller.command_record_helper_result(self.args())
+        self.assertIsNone(recorded["active_helper_request"])
+
+        completed = controller.command_complete_cycle(
+            self.args(
+                architect_id="architect-1",
+                resolution_note="Apply the recorded Major correction.",
+                user_decision_note=None,
+            )
+        )
+        self.assertEqual("awaiting_accept", completed["status"])
+        self.assertIsNone(completed["acceptance"])
+        self.assertEqual(
+            corrected_sha256, completed["waves"][-1]["result_spec_sha256"]
+        )
+        self.assertEqual(
+            corrected_sha256,
+            completed["waves"][-1]["helper_correction_results"][-1]
+            ["result"]["summary"]["output_specification"]["sha256"],
+        )
+        with self.assertRaisesRegex(controller.SpecificationStateError, "awaiting_accept"):
+            controller.command_start_cycle(
+                self.args(architect_id="architect-1", proofreader_id="proofreader-2")
+            )
+
+        accepted = self.accept_spec()
+        self.assertEqual("reviewing", accepted["status"])
+        self.assertEqual(
+            corrected_sha256, accepted["acceptance"]["specification_sha256"]
+        )
+        self.start_and_record(2, major=0, coverage_complete=True)
+        ready = controller.command_confirm_ready(
+            self.args(
+                architect_id="architect-1",
+                confirmation="Fresh Proofreader confirms the corrected exact SHA.",
+            )
+        )
+        self.assertEqual("spec_ready", ready["status"])
+        self.assertEqual(corrected_sha256, ready["ready"]["spec_sha256"])
+
+    def test_ready_rejects_unresolved_product_question(self) -> None:
+        self.initialize(with_spec=False)
         self.write_spec(status="approved")
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         self.start_and_record(
             1, major=0, product_questions=1, coverage_complete=True
         )
@@ -1061,11 +2051,12 @@ approved_at: 2026-08-10T00:00:00Z
                 self.args(architect_id="architect-2", proofreader_id="proofreader-2")
             )
 
+        self.prepare_helper("correction")
         self.spec.write_text(
             spec_text.replace("status: draft", "status: approved", 1),
             encoding="utf-8",
         )
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         with self.assertRaisesRegex(controller.SpecificationStateError, "fresh"):
             controller.command_start_cycle(
                 self.args(architect_id="architect-2", proofreader_id="proofreader-1")
@@ -1370,11 +2361,12 @@ approved_at: 2026-08-10T00:00:00Z
                 self.args(architect_id="architect-2", proofreader_id="proofreader-2")
             )
         draft_text = self.spec.read_text(encoding="utf-8")
+        self.prepare_helper("correction")
         self.spec.write_text(
             draft_text.replace("status: draft", "status: approved", 1),
             encoding="utf-8",
         )
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         controller.command_start_cycle(
             self.args(architect_id="architect-2", proofreader_id="proofreader-2")
         )
@@ -1555,13 +2547,14 @@ approved_at: 2026-08-10T00:00:00Z
             authorization["prior_specification"]["sha256"],
         )
 
+        self.prepare_helper("correction")
         self.spec.write_text(
             self.spec.read_text(encoding="utf-8").replace(
                 "status: draft", "status: approved", 1
             ),
             encoding="utf-8",
         )
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         controller.command_start_cycle(
             self.args(architect_id="architect-2", proofreader_id="proofreader-2")
         )
@@ -1969,9 +2962,9 @@ approved_at: 2026-08-10T00:00:00Z
     def test_committed_ready_replay_rejects_bool_numbers_and_blank_receipt_ids(
         self,
     ) -> None:
-        self.initialize()
+        self.initialize(with_spec=False)
         self.write_spec(status="approved")
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         self.start_and_record(
             1,
             major=0,
@@ -2057,13 +3050,14 @@ approved_at: 2026-08-10T00:00:00Z
         )
 
         self.spec.write_bytes(original_draft)
+        self.prepare_helper("correction")
         self.spec.write_text(
             self.spec.read_text(encoding="utf-8").replace(
                 "status: draft", "status: approved", 1
             ),
             encoding="utf-8",
         )
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         self.assert_committed_ready_replay_rejected_without_mutation(
             arguments, "requires exact spec_ready state", runtime
         )
@@ -2086,13 +3080,14 @@ approved_at: 2026-08-10T00:00:00Z
             ".agentic-pipeline-v2/custom-run.json",
             reopened["recovery_authorization"]["runtime_state_path"],
         )
+        self.prepare_helper("correction")
         self.spec.write_text(
             self.spec.read_text(encoding="utf-8").replace(
                 "status: draft", "status: approved", 1
             ),
             encoding="utf-8",
         )
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         controller.command_start_cycle(
             self.args(architect_id="architect-2", proofreader_id="proofreader-2")
         )
@@ -2511,7 +3506,7 @@ approved_at: 2026-08-10T00:00:00Z
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, "authorization changed"):
-            controller.command_accept_spec(self.args())
+            self.accept_spec()
         self.assertEqual(state_before, state_path.read_bytes())
         self.assertEqual(spec_before, self.spec.read_bytes())
 
@@ -2543,6 +3538,7 @@ approved_at: 2026-08-10T00:00:00Z
             )
         )
         self.assertEqual("awaiting_accept", reopened["status"])
+        self.prepare_helper("correction")
         self.spec.write_text(
             self.spec.read_text(encoding="utf-8").replace(
                 "status: draft", "status: approved", 1
@@ -2558,10 +3554,10 @@ approved_at: 2026-08-10T00:00:00Z
         change_runtime_bytes()
         state_before = (self.root / controller.STATE_RELATIVE_PATH).read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, "authorization changed"):
-            controller.command_accept_spec(self.args())
+            self.accept_spec()
         self.assertEqual(state_before, (self.root / controller.STATE_RELATIVE_PATH).read_bytes())
         runtime.write_bytes(original_runtime)
-        controller.command_accept_spec(self.args())
+        self.accept_spec()
         controller.command_start_cycle(
             self.args(architect_id="architect-2", proofreader_id="proofreader-2")
         )
@@ -3039,6 +4035,14 @@ approved_at: 2026-08-10T00:00:00Z
             token,
         )
         self.assertEqual(0, reopened.returncode, reopened.stderr)
+        prepared = self.cli(
+            "prepare-helper",
+            "--operation",
+            "correction",
+            "--correction-id",
+            "CORR-CLI-001",
+        )
+        self.assertEqual(0, prepared.returncode, prepared.stderr)
         draft = self.spec.read_text(encoding="utf-8")
         self.spec.write_text(
             draft.replace("status: draft", "status: approved", 1), encoding="utf-8"
@@ -3051,8 +4055,16 @@ approved_at: 2026-08-10T00:00:00Z
             "proofreader-2",
         )
         self.assertEqual(2, blocked.returncode)
-        self.assertIn("awaiting_accept", blocked.stderr)
-        accepted = self.cli("accept-spec")
+        self.assertIn("external helper request is active", blocked.stderr)
+        self.write_fake_helper_result()
+        recorded = self.cli("record-helper-result")
+        self.assertEqual(0, recorded.returncode, recorded.stderr)
+        receipt = self.write_preaccept_receipt()
+        accepted = self.cli(
+            "accept-spec",
+            "--preaccept-receipt",
+            receipt.relative_to(self.root).as_posix(),
+        )
         self.assertEqual(0, accepted.returncode, accepted.stderr)
         started = self.cli(
             "start-cycle",
@@ -3119,6 +4131,469 @@ approved_at: 2026-08-10T00:00:00Z
         self.assertIn("Multiple, malformed, foreign, mixed, or unproven", contract_text)
         self.assertIn("New tokenless v2 `recovery_authorization` receipts use nested schema 2", contract_text)
         self.assertIn("mixed, missing, extra, PRD-mode, ambiguous, or tampered", contract_text)
+
+    def test_skill_contract_enforces_one_bounded_scope_and_sufficiency_invariant(self) -> None:
+        skill_root = Path(__file__).resolve().parents[1]
+        skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        contract_text = (
+            skill_root / "references" / "specification-contract.md"
+        ).read_text(encoding="utf-8")
+        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(1, contract_text.count("## Scope and sufficiency invariant"))
+        for role in ("Director", "Generator", "Technical Spec Architect", "Proofreader"):
+            self.assertIn(role, contract_text)
+        for required_rule in (
+            "exact approved PRD is the complete product scope",
+            "concrete current-project evidence",
+            "smallest required resolution",
+            "Theoretical, unlikely, low-probability, or rare risks",
+            "current supported path",
+            "Apply KISS and YAGNI in both directions",
+            "Stop and pass as soon as every mandatory PRD behavior",
+            "no blocking admissible finding remains",
+            "Return no optional suggestions or backlog",
+            "Any missing mandatory behavior or design text is Major",
+        ):
+            self.assertIn(required_rule, contract_text)
+
+        self.assertIn("scope and sufficiency invariant", skill_text)
+        self.assertIn("includes this invariant in every internal worker packet", skill_text)
+        self.assertIn("does not judge its semantic satisfaction", skill_text)
+        self.assertIn("route it without judging semantic sufficiency", contract_text)
+        self.assertNotIn("reject worker output that violates it", contract_text)
+        self.assertIn("Apply KISS/YAGNI", openai_yaml)
+        self.assertIn("stop when mandatory coverage", openai_yaml)
+        self.assertIn("minimal sufficient design", openai_yaml)
+        self.assertIn("theoretical or optional improvements", openai_yaml)
+
+    def test_generator_requires_specification_pipeline_with_exact_bindings(self) -> None:
+        skill_root = Path(__file__).resolve().parents[1]
+        skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        contract_text = (
+            skill_root / "references" / "specification-contract.md"
+        ).read_text(encoding="utf-8")
+        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        for text in (skill_text, contract_text):
+            self.assertIn("$skill-specification-pipeline", text)
+            self.assertIn("prepare-helper --operation generation", text)
+            self.assertIn("GAMEDEV_HELPER_REQUEST_PATH", text)
+            for binding in (
+                "`TARGET_OPERATION`",
+                "`SPECIFICATION_PATH`",
+            ):
+                self.assertIn(binding, text)
+            self.assertIn("approved PRD", text)
+            self.assertIn("PRD-language", text)
+            self.assertIn("external", text)
+            self.assertIn("local", text)
+            self.assertIn("fallback", text)
+
+        for required_prompt_fragment in (
+            "actual external $skill-specification-pipeline",
+            "prepare-helper --operation generation",
+            "GAMEDEV_HELPER_REQUEST_PATH",
+            "TARGET_OPERATION, SPECIFICATION_PATH",
+            "approved PRD path/revision/SHA",
+            "PRD-language USER_REQUEST",
+            "MUST NOT bypass or locally replace it",
+        ):
+            self.assertIn(required_prompt_fragment, openai_yaml)
+
+        banned_wording = (
+            "Do not invoke " + "`$skill-specification-pipeline`",
+            "Never invoke " + "$skill-specification-pipeline",
+            "bounded local Generator as the only generation path",
+            "mandatory generic passes cannot be constrained",
+            "may optionally use " + "`$skill-specification-pipeline`",
+        )
+        for text in (skill_text, contract_text, openai_yaml):
+            for banned in banned_wording:
+                self.assertNotIn(banned, text)
+
+    def test_generator_integration_contract_rejects_weakening_mutations(self) -> None:
+        skill_root = Path(__file__).resolve().parents[1]
+        contract_text = (
+            skill_root / "references" / "specification-contract.md"
+        ).read_text(encoding="utf-8")
+
+        strict_clauses = (
+            "The Generator MUST invoke `$skill-specification-pipeline` in `spec-generator` mode as the mandatory and only generation engine and MUST NOT bypass it.",
+            "prepare-helper --operation generation",
+            "`GAMEDEV_HELPER_REQUEST_PATH`",
+            "The external helper retains sole ownership of its mandatory stages, passes, mode routing, and global not-applicable policy",
+            "MUST NOT skip, duplicate, parse, normalize, or locally reimplement that topology",
+            "`USER_REQUEST`: a complete generation request that must be authored entirely in the approved PRD language",
+            "the helper-derived `USER_LANGUAGE` must exactly match the approved PRD language",
+            "Director runs `record-helper-result`",
+            "The Director does not author the result, parse detailed stage/pass topology or coverage content",
+            "The same persistent Technical Spec Architect then performs the read-only pre-accept semantic assessment",
+            "prepare-helper --operation correction",
+            "same external `$skill-specification-pipeline`",
+            "`TARGET_OPERATION=continue`",
+            "PRD-language explicit write/apply request authorizing only those corrections",
+            "`spec-assistant -> fragment-capture`",
+            "runs `record-helper-result` before returning the new SHA to the same persistent Architect",
+            "Any SHA drift fails closed: do not apply the packet, rebind the current SHA, and require the same Architect to reassess before issuing a replacement packet.",
+            "No Proofreader credit exists before acceptance.",
+            "no local fallback or Director-authored helper result is allowed",
+        )
+
+        def is_strict(text: str) -> bool:
+            return all(clause in text for clause in strict_clauses)
+
+        for clause in strict_clauses:
+            self.assertIn(clause, contract_text, clause)
+        weakening_mutations = {
+            "must-to-may": contract_text.replace(
+                "The Generator MUST invoke", "The Generator may invoke", 1
+            ),
+            "mandatory-to-optional": contract_text.replace(
+                "the mandatory and only generation engine",
+                "an optional generation helper",
+                1,
+            ),
+            "request-bypass": contract_text.replace(
+                "prepare-helper --operation generation",
+                "generate without controller request",
+                1,
+            ),
+            "wrapper-owns-topology": contract_text.replace(
+                "MUST NOT skip, duplicate, parse, normalize, or locally reimplement that topology",
+                "may locally normalize helper passes",
+                1,
+            ),
+            "director-authors-result": contract_text.replace(
+                "The Director does not author the result, parse detailed stage/pass topology or coverage content",
+                "The Director authors and parses the result",
+                1,
+            ),
+            "language-is-optional": contract_text.replace(
+                "must be authored entirely in the approved PRD language",
+                "may be authored in any language",
+                1,
+            ),
+            "architect-is-bypassed": contract_text.replace(
+                "The same persistent Technical Spec Architect then performs the read-only pre-accept semantic assessment",
+                "A temporary reviewer may perform the semantic assessment",
+                1,
+            ),
+            "correction-regenerates": contract_text.replace(
+                "`TARGET_OPERATION=continue`",
+                "`TARGET_OPERATION=new`",
+                1,
+            ),
+            "correction-route-bypass": contract_text.replace(
+                "`spec-assistant -> fragment-capture`",
+                "The helper may repeat `spec-generator`.",
+            ),
+            "correction-without-write-verb": contract_text.replace(
+                "PRD-language explicit write/apply request authorizing only those corrections",
+                "contain a review-only request",
+                1,
+            ),
+            "correction-without-sha-evidence": contract_text.replace(
+                "runs `record-helper-result` before returning the new SHA to the same persistent Architect",
+                "It returns a completion summary.",
+                1,
+            ),
+            "sha-drift-is-ignored": contract_text.replace(
+                "Any SHA drift fails closed: do not apply the packet, rebind the current SHA, and require the same Architect to reassess before issuing a replacement packet.",
+                "SHA drift may be ignored for a small correction.",
+                1,
+            ),
+            "local-fallback": contract_text.replace(
+                "no local fallback or Director-authored helper result is allowed",
+                "The Generator may use a local generation fallback.",
+                1,
+            ),
+        }
+        for mutation_name, mutated_text in weakening_mutations.items():
+            self.assertFalse(is_strict(mutated_text), mutation_name)
+
+    def test_external_helper_solely_owns_pass_topology_and_na_policy(self) -> None:
+        skill_root = Path(__file__).resolve().parents[1]
+        skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        contract_text = (
+            skill_root / "references" / "specification-contract.md"
+        ).read_text(encoding="utf-8")
+        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        for text in (skill_text, contract_text, openai_yaml):
+            self.assertIn("external", text.casefold())
+            self.assertIn("stage", text.casefold())
+            self.assertIn("pass", text.casefold())
+            self.assertIn("not-applicable", text.casefold())
+        self.assertIn("sole ownership", skill_text)
+        self.assertIn("sole ownership", contract_text)
+        self.assertIn("MUST NOT skip, duplicate, parse, normalize", skill_text)
+        self.assertIn("MUST NOT skip, duplicate, parse, normalize", contract_text)
+        self.assertIn("MUST NOT author the helper result", openai_yaml)
+        self.assertIn("MUST NOT author the helper result", openai_yaml)
+        for forbidden in (
+            "GENERATOR_STAGES",
+            "GENERATOR_PASSES",
+            "FRAGMENT_PASSES",
+            "PASS-003",
+            "PASS-011",
+            "PASS-006",
+        ):
+            self.assertNotIn(forbidden, skill_text)
+            self.assertNotIn(forbidden, contract_text)
+            self.assertNotIn(forbidden, openai_yaml)
+
+    def test_director_architect_preaccept_ownership_and_output_validation(self) -> None:
+        skill_root = Path(__file__).resolve().parents[1]
+        skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        contract_text = (
+            skill_root / "references" / "specification-contract.md"
+        ).read_text(encoding="utf-8")
+        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        for text in (skill_text, contract_text):
+            for mechanical_check in (
+                "prepare-helper --operation generation",
+                "GAMEDEV_HELPER_REQUEST_PATH",
+                "record-helper-result",
+                "output SHA",
+                "helper fingerprints",
+                "--preaccept-receipt",
+                "controller",
+            ):
+                self.assertIn(mechanical_check, text)
+            self.assertIn("Director", text)
+            self.assertIn("author the result", text)
+            self.assertIn("same persistent", text)
+            self.assertIn("pre-accept semantic assessment", text)
+            for rejection in (
+                "exact enumerated correction packet",
+                "external `$skill-specification-pipeline`",
+                "specification-helper integration error",
+            ):
+                self.assertIn(rejection, text)
+            self.assertIn("local", text)
+            self.assertIn("fallback", text)
+            self.assertIn("Proofreader credit", text)
+            self.assertIn("Proofreader credit exists", text)
+        for rejection in (
+            "unsupported obligation/system",
+            "output scaffolding",
+            "boilerplate",
+            "speculative OQ/risk",
+            "missing semantic coverage",
+            "non-minimal design",
+        ):
+            self.assertIn(rejection, contract_text)
+        self.assertIn(
+            "request/result/output SHAs",
+            openai_yaml,
+        )
+        self.assertIn("persistent Architect performs pre-accept semantic assessment", openai_yaml)
+        self.assertIn("No Proofreader credit exists before acceptance", openai_yaml)
+
+    def test_preaccept_section_inventory_gate_rejects_weakening_mutations(self) -> None:
+        skill_root = Path(__file__).resolve().parents[1]
+        skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        contract_text = (
+            skill_root / "references" / "specification-contract.md"
+        ).read_text(encoding="utf-8")
+        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        strict_clauses = (
+            "`accept-spec --preaccept-receipt <in-project-json>`",
+            "exact UTF-8 JSON object with `schema: 1`",
+            "Architect identity must equal the controller's persistent Architect",
+            "PRD/spec hashes must match current immutable bytes",
+            "`semantic_assessment` must be exact `accept`",
+            "controller mechanically derives locators",
+            "inventory must cover that exact locator set once",
+            "Every row has exactly non-blank `locator`, exact `disposition: retain`, and non-blank `authority_or_rationale`",
+            "`reject`, `remove`, `merge`, `defer`",
+            "fails closed without controller-state mutation",
+            "stores Architect receipt path, exact-byte SHA, and normalized inventory summary",
+            "revalidates them with the helper chain before later transitions",
+            "new Architect receipt bound to the resulting SHA",
+        )
+
+        def is_strict(text: str) -> bool:
+            return all(clause in text for clause in strict_clauses)
+
+        self.assertTrue(is_strict(contract_text))
+        weakening_mutations = {
+            "must-to-may": contract_text.replace(
+                "`semantic_assessment` must be exact `accept`",
+                "`semantic_assessment` may be `accept`",
+                1,
+            ),
+            "inventory-omitted": contract_text.replace(
+                "inventory must cover that exact locator set once",
+                "inventory may cover some locators",
+                1,
+            ),
+            "stale-sha-allowed": contract_text.replace(
+                "PRD/spec hashes must match current immutable bytes",
+                "PRD/spec hashes may be stale",
+                1,
+            ),
+            "blank-inventory-allowed": contract_text.replace(
+                "`reject`, `remove`, `merge`, `defer`",
+                "Only `reject` blocks",
+                1,
+            ),
+            "blank-row-allowed": contract_text.replace(
+                "Every row has exactly non-blank `locator`, exact `disposition: retain`, and non-blank `authority_or_rationale`",
+                "Every row may omit `authority_or_rationale`",
+                1,
+            ),
+            "rejection-can-accept": contract_text.replace(
+                "new Architect receipt bound to the resulting SHA",
+                "old Architect receipt may be reused",
+                1,
+            ),
+        }
+        for mutation_name, mutated_text in weakening_mutations.items():
+            self.assertFalse(is_strict(mutated_text), mutation_name)
+
+        for prompt_rule in (
+            "exact-SHA non-empty section-applicability/minimality inventory",
+            "covering every top-level section plus standalone diagram, table, hierarchy description, and footer block",
+            "accept-spec takes only --preaccept-receipt",
+            "requires the consumed helper chain to end at the current SHA",
+        ):
+            self.assertIn(prompt_rule, openai_yaml)
+        self.assertIn("section-applicability/minimality inventory", skill_text)
+        self.assertIn("mechanically rejects a missing, stale-SHA, or blank inventory", skill_text)
+
+    def test_preaccept_minimality_inventory_covers_formatter_counterexample_and_valid_sections(
+        self,
+    ) -> None:
+        skill_root = Path(__file__).resolve().parents[1]
+        contract_text = (
+            skill_root / "references" / "specification-contract.md"
+        ).read_text(encoding="utf-8")
+
+        formatter_style_counterexample = {
+            "Data Models": (
+                "No structured model, configuration, persisted state, or runtime state "
+                "is introduced; table lists scalar totalSeconds and return value."
+            ),
+            "System Diagram": (
+                "supported totalSeconds -> RoundTimeFormatter.format -> M:SS repeats "
+                "the decomposition and formatting flow."
+            ),
+            "Open Questions": "None.",
+            "Footer": "No assumptions, source conflicts, unresolved risks, or additional obligations.",
+        }
+        expected_disposition = {name: "reject" for name in formatter_style_counterexample}
+        self.assertEqual(
+            {
+                "Data Models": "reject",
+                "System Diagram": "reject",
+                "Open Questions": "reject",
+                "Footer": "reject",
+            },
+            expected_disposition,
+        )
+        for required_counterexample_rule in (
+            "Formatter-style counterexamples",
+            "an absent-topic section whose only substance is `none`, `not applicable`, `no data`, or equivalent",
+            "component hierarchy or diagram that duplicates another prose or diagram description without conveying distinct PRD-backed behavior",
+            "an empty Open Questions, Assumptions, or Risks section, including a footer carrying only the empty declaration",
+            'a generic scalar "data model" table when the approved PRD requires no data, configuration, or persistence model',
+            "MUST use `reject` and an enumerated remove-or-merge correction",
+        ):
+            self.assertIn(required_counterexample_rule, contract_text)
+
+        valid_prd_backed_sections = {
+            "Data Models": "defines a PRD-required persisted schema",
+            "Open Questions or Risks": "concrete unresolved blocker on a named PRD path",
+            "Hierarchy or Diagram": (
+                "exposes distinct PRD-required interaction or ownership behavior"
+            ),
+        }
+        for distinct_authority in valid_prd_backed_sections.values():
+            self.assertIn(distinct_authority, contract_text)
+        self.assertIn(
+            "These section kinds are not categorically forbidden.", contract_text
+        )
+        self.assertIn(
+            "completion of a pass never requires the assembled specification to retain an empty or generic section",
+            contract_text,
+        )
+
+    def test_architect_correction_loop_uses_fragment_capture_with_sha_guard(self) -> None:
+        skill_root = Path(__file__).resolve().parents[1]
+        skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        contract_text = (
+            skill_root / "references" / "specification-contract.md"
+        ).read_text(encoding="utf-8")
+        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        for text in (skill_text, contract_text):
+            for correction_rule in (
+                "exact enumerated correction packet",
+                "through the Director",
+                "$skill-specification-pipeline",
+                "prepare-helper --operation correction",
+                "GAMEDEV_HELPER_REQUEST_PATH",
+                "`TARGET_OPERATION=continue`",
+                "same exact `SPECIFICATION_PATH`",
+                "SHA",
+                "PRD-language",
+                "explicit write/apply",
+                "`spec-assistant -> fragment-capture`",
+                "record-helper-result",
+                "same persistent Architect",
+                "SHA drift",
+                "fail closed",
+            ):
+                self.assertIn(correction_rule, text)
+
+        for prompt_rule in (
+            "prepare-helper --operation correction",
+            "every correction ID",
+            "same external skill through spec-assistant -> fragment-capture",
+            "exact current/prewrite SHA",
+            "record-helper-result",
+            "Any drift",
+        ):
+            self.assertIn(prompt_rule, openai_yaml)
+
+    def test_engineer_resolvable_minor_contract_matches_controller_readiness(self) -> None:
+        skill_root = Path(__file__).resolve().parents[1]
+        skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        contract_text = (
+            skill_root / "references" / "specification-contract.md"
+        ).read_text(encoding="utf-8")
+        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        for required_rule in (
+            "concrete, non-blocking local implementation detail",
+            "already inside the approved design",
+            "without changing specification bytes",
+            "product meaning, system or public boundaries, or design complexity",
+            "not a specification omission, improvement, suggestion, or backlog item",
+            "requires Architect revision before readiness",
+        ):
+            self.assertIn(required_rule, contract_text)
+        self.assertIn("no blocking admissible finding remains", skill_text)
+        self.assertIn("Engineer-resolvable Minor", skill_text)
+        self.assertIn("No Proofreader credit exists before acceptance", openai_yaml)
 
 
 if __name__ == "__main__":

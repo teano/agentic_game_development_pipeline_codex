@@ -648,6 +648,33 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         if not re.search(r"(?m)^\s*-\s*MILESTONE-\d{3}\b", milestones):
             errors.append("single_owner requires at least one Integration Milestones entry")
 
+    editable_paths_by_slice: dict[str, list[str]] = {}
+    for slice_id, content in slices:
+        scope = section_map(content, 3).get("Scope Contract", "")
+        values = re.findall(r"(?m)^\s*-\s*editable_paths:\s*(.+?)\s*$", scope)
+        editable_paths_by_slice[slice_id] = (
+            [item.strip().replace("\\", "/") for item in values[0].split(",")]
+            if len(values) == 1
+            else []
+        )
+
+    def editable_paths_overlap(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        left_root = left[:-3].rstrip("/") if left.endswith("/**") else None
+        right_root = right[:-3].rstrip("/") if right.endswith("/**") else None
+        if left_root is not None and right_root is not None:
+            return (
+                left_root == right_root
+                or left_root.startswith(right_root + "/")
+                or right_root.startswith(left_root + "/")
+            )
+        if left_root is not None:
+            return right == left_root or right.startswith(left_root + "/")
+        if right_root is not None:
+            return left == right_root or left.startswith(right_root + "/")
+        return False
+
     slice_acceptance_by_id: dict[str, set[str]] = {}
     for index, (slice_id, content) in enumerate(slices):
         sections = section_map(content, 3)
@@ -734,11 +761,77 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
             errors.append(str(exc))
         if not scope_acceptance.issubset(requirement_acceptance_ids):
             errors.append(f"{slice_id} scope acceptance_ids must appear in Requirements")
-        touchpoints = re.findall(
-            r"(?m)^\s*-\s*shared_touchpoint:\s*(TP-\d{3})\s*\|\s*(.+)$", scope
+        touchpoint_declarations = re.findall(
+            r"(?m)^\s*-\s*shared_touchpoints:\s*(.*?)\s*$", scope
         )
-        if not touchpoints:
-            errors.append(f"{slice_id} requires at least one structured shared_touchpoint")
+        if len(touchpoint_declarations) != 1:
+            errors.append(
+                f"{slice_id} Scope Contract requires exactly one shared_touchpoints field"
+            )
+        no_shared_touchpoints = (
+            len(touchpoint_declarations) == 1
+            and touchpoint_declarations[0] == "none"
+        )
+        declared_touchpoint_ids: list[str] = []
+        if len(touchpoint_declarations) == 1 and not no_shared_touchpoints:
+            declared_touchpoint_ids = [
+                item.strip() for item in touchpoint_declarations[0].split(",")
+            ]
+            if (
+                any(
+                    re.fullmatch(r"TP-\d{3}", item) is None
+                    for item in declared_touchpoint_ids
+                )
+                or len(declared_touchpoint_ids) != len(set(declared_touchpoint_ids))
+            ):
+                errors.append(
+                    f"{slice_id} shared_touchpoints must be the exact none sentinel or "
+                    "a duplicate-free comma-separated list of TP-NNN IDs"
+                )
+                declared_touchpoint_ids = []
+        touchpoint_candidates = [
+            line
+            for line in scope.splitlines()
+            if re.match(r"\s*-\s*shared_touchpoint:\s*", line)
+        ]
+        touchpoints: list[tuple[str, str]] = []
+        for candidate in touchpoint_candidates:
+            match = re.fullmatch(
+                r"\s*-\s*shared_touchpoint:\s*(TP-\d{3})\s*\|\s*(\S(?:.*\S)?)\s*",
+                candidate,
+            )
+            if match is None:
+                errors.append(f"{slice_id} contains malformed shared_touchpoint")
+            else:
+                touchpoints.append((match.group(1), match.group(2)))
+        if no_shared_touchpoints and touchpoint_candidates:
+            errors.append(
+                f"{slice_id} shared_touchpoints: none must not be combined with "
+                "shared_touchpoint rows"
+            )
+        elif no_shared_touchpoints:
+            overlaps = sorted({
+                other_slice_id
+                for other_slice_id, other_paths in editable_paths_by_slice.items()
+                if other_slice_id != slice_id
+                and any(
+                    editable_paths_overlap(path, other_path)
+                    for path in editable_paths_by_slice[slice_id]
+                    for other_path in other_paths
+                )
+            })
+            if overlaps:
+                errors.append(
+                    f"{slice_id} shared_touchpoints: none requires editable_paths "
+                    "isolated from other slices; overlaps " + ", ".join(overlaps)
+                )
+        elif set(declared_touchpoint_ids) != {
+            touchpoint_id for touchpoint_id, _ in touchpoints
+        }:
+            errors.append(
+                f"{slice_id} shared_touchpoints must exactly match structured "
+                "shared_touchpoint IDs"
+            )
         seen_touchpoint_ids: set[str] = set()
         seen_touchpoint_paths: set[str] = set()
         for touchpoint_id, fields_text in touchpoints:
@@ -765,14 +858,7 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
             if touchpoint_path:
                 seen_touchpoint_paths.add(touchpoint_path)
         try:
-            editable_values = re.findall(
-                r"(?m)^\s*-\s*editable_paths:\s*(.+?)\s*$", scope
-            )
-            editable_paths = (
-                [item.strip().replace("\\", "/") for item in editable_values[0].split(",")]
-                if len(editable_values) == 1
-                else []
-            )
+            editable_paths = editable_paths_by_slice[slice_id]
             parsed_touchpoints = [
                 {
                     "id": touchpoint_id,

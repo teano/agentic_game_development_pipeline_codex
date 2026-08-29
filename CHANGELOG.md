@@ -7,6 +7,28 @@
 
 ## [Unreleased]
 
+### Добавлено
+
+- Specification controller получил одноразовый challenge/result handshake с внешним `skill-specification-pipeline`: controller фиксирует точные PRD/spec SHA, язык, route, fingerprints и write boundary, а внешний canonical emitter связывает результат с report/coverage и защищает его от replay.
+- Persistent Technical Spec Architect теперь выпускает exact-SHA pre-accept receipt с полным inventory самостоятельных разделов, таблиц, диаграмм и иерархий, чтобы обязательная полнота не сохраняла пустой boilerplate или необоснованную сложность.
+- Изолированные Development Plan slices могут явно использовать `shared_touchpoints: none`; controller принимает это только при отсутствии structured touchpoints и пересекающихся editable paths.
+
+### Изменено
+
+- Внешний `skill-specification-pipeline` стал единственным generation/correction engine для GameDev Specification; локальный fallback удалён, а его generic stages, passes и N/A policy не дублируются в GameDev controller.
+- Общий scope-and-sufficiency contract ограничивает Generator, Architect и Proofreader подтверждённым PRD scope и материальными текущими дефектами, исключая theoretical risks, future-scale design, optional hardening и поиск необязательных улучшений.
+- Docs write authority теперь выводится только из утверждённого Development Plan: exact `not_required` честно завершает фазу без project-file writes, а требуемая документация ограничивается объявленными canonical paths.
+
+### Исправлено
+
+- Major-коррекция Specification больше не наследует acceptance и review credit старых байтов: внешний `fragment-capture` исправляет exact reviewed SHA, после чего обязательны fresh Architect acceptance и новый Proofreader.
+- Устранены искусственные shared-boundary и documentation artifacts для минимальных изолированных features без ослабления overlap и plan-authority проверок.
+
+### Проверено
+
+- Canonical regression suite: 375/375 PASS; три Linux PID namespace проверки ожидаемо пропущены на Windows. Specification — 103/103, Development Plan — 103/103, Pipeline v2 core — 120/120.
+- Два изолированных E2E достигли `production_ready_candidate`; финальный correction path доказал external generation, Major -> `fragment-capture` correction, fresh acceptance/review, `shared_touchpoints: none` и Docs no-op с независимым аудитом P0/P1/P2 = 0.
+
 ## [0.9.1] - 2026-08-28
 
 ### Изменено

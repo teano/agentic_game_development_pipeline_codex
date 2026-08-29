@@ -25,6 +25,81 @@ RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline/state.json")
 RUNTIME_FINDINGS_RELATIVE_PATH = Path(".agentic-pipeline/findings.json")
 V2_RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline-v2/state.json")
 MAX_CYCLES_PER_ARCHITECT = 5
+PREACCEPT_RECEIPT_SCHEMA = 1
+PREACCEPT_RECEIPT_KEYS = {
+    "schema",
+    "architect_id",
+    "prd_sha256",
+    "assessed_spec_sha256",
+    "semantic_assessment",
+    "section_applicability_inventory",
+}
+PREACCEPT_INVENTORY_ROW_KEYS = {
+    "locator",
+    "disposition",
+    "authority_or_rationale",
+}
+HELPER_REQUEST_SCHEMA = 1
+HELPER_RESULT_SCHEMA = 1
+HELPER_REQUEST_KEYS = {
+    "schema",
+    "request_id",
+    "operation",
+    "project_root",
+    "route",
+    "approved_prd",
+    "specification",
+    "expected_user_language",
+    "allowed_write_paths",
+    "artifacts",
+    "helper_identity",
+    "correction_ids",
+}
+HELPER_ROUTE_KEYS = {"mode", "submode", "target_operation"}
+HELPER_AUTHORITY_KEYS = {"path", "revision", "sha256"}
+HELPER_SPECIFICATION_KEYS = {"path", "input"}
+HELPER_INPUT_ABSENT_KEYS = {"kind"}
+HELPER_INPUT_SHA_KEYS = {"kind", "sha256"}
+HELPER_ARTIFACT_PATH_KEYS = {
+    "helper_report_path",
+    "coverage_path",
+    "result_path",
+}
+HELPER_IDENTITY_KEYS = {
+    "entrypoint_path",
+    "entrypoint_sha256",
+    "result_emitter_path",
+    "result_emitter_sha256",
+}
+HELPER_RESULT_KEYS = {
+    "schema",
+    "request",
+    "operation",
+    "route",
+    "output_specification",
+    "outcome",
+    "write_paths",
+    "artifacts",
+    "helper_identity",
+}
+HELPER_RESULT_REQUEST_KEYS = {"id", "sha256"}
+HELPER_RESULT_SPECIFICATION_KEYS = {"path", "sha256"}
+HELPER_RESULT_ARTIFACT_KEYS = {"kind", "path", "sha256"}
+HELPER_EVIDENCE_KEYS = {"source_spec_sha256", "results"}
+_NO_CONTENT_FOOTER_ITEM = (
+    r"(?:additional\s+)?assumptions?"
+    r"|source\s+conflicts?"
+    r"|(?:unresolved\s+)?risks?"
+    r"|open\s+questions?"
+    r"|additional\s+product\s+obligations?"
+)
+_NO_CONTENT_FOOTER_PATTERN = re.compile(
+    rf"^no\s+(?:{_NO_CONTENT_FOOTER_ITEM})"
+    rf"(?:(?:\s*,\s*(?:(?:and|or)\s+)?|\s+(?:and|or)\s+)"
+    rf"(?:{_NO_CONTENT_FOOTER_ITEM}))*"
+    r"\s+(?:exist|exists|are\s+introduced|is\s+introduced)\s*[.!]?$",
+    re.IGNORECASE,
+)
 
 V2_RECOVERY_AUTHORIZATION_V1_KEYS = {
     "schema",
@@ -130,6 +205,23 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def external_helper_identity() -> dict[str, str]:
+    codex_root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    skill_root = (codex_root / "skills" / "skill-specification-pipeline").resolve()
+    entrypoint = skill_root / "SKILL.md"
+    emitter = skill_root / "scripts" / "emit_helper_result.py"
+    if not entrypoint.is_file() or not emitter.is_file():
+        raise SpecificationStateError(
+            "external $skill-specification-pipeline entrypoint/result emitter is unavailable"
+        )
+    return {
+        "entrypoint_path": str(entrypoint),
+        "entrypoint_sha256": sha256(entrypoint),
+        "result_emitter_path": str(emitter),
+        "result_emitter_sha256": sha256(emitter),
+    }
+
+
 def parse_frontmatter(path: Path, label: str) -> dict[str, str]:
     text = path.read_text(encoding="utf-8")
     if not text.startswith("---"):
@@ -152,6 +244,765 @@ def parse_frontmatter(path: Path, label: str) -> dict[str, str]:
         elif parent and value:
             fields[f"{parent}.{key}"] = value
     return fields
+
+
+def specification_inventory_locators(path: Path) -> list[str]:
+    """Return bounded mechanical locators for authored specification structure."""
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise SpecificationStateError(
+            f"Specification must start with YAML frontmatter: {path}"
+        )
+    try:
+        body_start = next(
+            index for index in range(1, len(lines)) if lines[index].strip() == "---"
+        ) + 1
+    except StopIteration as error:
+        raise SpecificationStateError(
+            f"Specification has unterminated frontmatter: {path}"
+        ) from error
+
+    locators: list[str] = []
+    structural_blocks: list[tuple[int, int]] = []
+    section_starts: list[int] = []
+    current_section = ""
+    index = body_start
+    while index < len(lines):
+        line = lines[index]
+        heading = re.fullmatch(r"##(?!#)\s+(.+?)\s*", line)
+        if heading:
+            current_section = heading.group(1).strip()
+            line_number = index + 1
+            section_starts.append(index)
+            locators.append(f"section:L{line_number}:{current_section}")
+            index += 1
+            continue
+
+        fence = re.match(r"^\s*(```+|~~~+)(.*)$", line)
+        if fence:
+            marker = fence.group(1)
+            end = index + 1
+            while end < len(lines) and re.match(
+                rf"^\s*{re.escape(marker[0])}{{{len(marker)},}}\s*$", lines[end]
+            ) is None:
+                end += 1
+            if end >= len(lines):
+                raise SpecificationStateError(
+                    f"Specification has an unterminated fenced block at line {index + 1}"
+                )
+            content = "\n".join(lines[index + 1 : end])
+            fence_info = fence.group(2).strip().casefold()
+            section_name = current_section.casefold()
+            if any(token in content for token in ("├", "└", "│", "┬", "┼")):
+                kind = "hierarchy"
+            elif (
+                "diagram" in section_name
+                or fence_info == "mermaid"
+                or re.search(r"(?:-->|->|=>|\bv\b\s*$)", content, re.MULTILINE)
+            ):
+                kind = "diagram"
+            else:
+                kind = "fenced-block"
+            locators.append(f"{kind}:L{index + 1}-L{end + 1}")
+            structural_blocks.append((index, end))
+            index = end + 1
+            continue
+
+        if (
+            line.strip().startswith("|")
+            and index + 1 < len(lines)
+            and re.fullmatch(
+                r"\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*",
+                lines[index + 1],
+            )
+        ):
+            end = index + 2
+            while end < len(lines) and lines[end].strip().startswith("|"):
+                end += 1
+            locators.append(f"table:L{index + 1}-L{end}")
+            structural_blocks.append((index, end - 1))
+            index = end
+            continue
+
+        list_item = re.match(r"^(\s*)(?:[-*+]|\d+[.)])\s+\S", line)
+        if list_item:
+            end = index
+            indentation_levels: list[int] = []
+            while end < len(lines):
+                nested_item = re.match(
+                    r"^(\s*)(?:[-*+]|\d+[.)])\s+\S", lines[end]
+                )
+                if nested_item is None:
+                    break
+                indentation_levels.append(
+                    len(nested_item.group(1).expandtabs(4))
+                )
+                end += 1
+            if (
+                len(indentation_levels) >= 2
+                and max(indentation_levels) > min(indentation_levels)
+            ):
+                locators.append(f"hierarchy:L{index + 1}-L{end}")
+                structural_blocks.append((index, end - 1))
+            index = end
+            continue
+
+        if re.search(r"!\[[^\]]*\]\([^\)]+\)", line):
+            locators.append(f"diagram:L{index + 1}-L{index + 1}")
+            structural_blocks.append((index, index))
+        index += 1
+
+    if section_starts:
+        final_section_start = section_starts[-1]
+        last_nonblank = len(lines) - 1
+        while last_nonblank >= body_start and not lines[last_nonblank].strip():
+            last_nonblank -= 1
+        if last_nonblank > final_section_start:
+            paragraph_start = last_nonblank
+            while (
+                paragraph_start - 1 > final_section_start
+                and lines[paragraph_start - 1].strip()
+            ):
+                paragraph_start -= 1
+            paragraph = lines[paragraph_start : last_nonblank + 1]
+            normalized_paragraph = re.sub(
+                r"\s+", " ", " ".join(item.strip() for item in paragraph)
+            ).strip()
+            prior_nonblank = paragraph_start - 1
+            while (
+                prior_nonblank > final_section_start
+                and not lines[prior_nonblank].strip()
+            ):
+                prior_nonblank -= 1
+            if (
+                paragraph_start > final_section_start + 1
+                and not lines[paragraph_start - 1].strip()
+                and prior_nonblank > final_section_start
+                and _NO_CONTENT_FOOTER_PATTERN.fullmatch(normalized_paragraph)
+            ):
+                locators.append(
+                    f"footer:L{paragraph_start + 1}-L{last_nonblank + 1}"
+                )
+
+    if not locators:
+        raise SpecificationStateError(
+            "Specification has no inventory-addressable top-level section"
+        )
+    if len(locators) != len(set(locators)):
+        raise SpecificationStateError("Specification inventory locators are not unique")
+    return locators
+
+
+def _is_exact_sha256(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _read_helper_json(
+    root: Path, supplied_path: str | None, label: str
+) -> tuple[Path, bytes, dict[str, Any]]:
+    if not isinstance(supplied_path, str) or not supplied_path.strip():
+        raise SpecificationStateError(f"{label} path is required")
+    artifact_path = resolve_project_path(root, supplied_path.strip(), label)
+    if artifact_path.suffix.casefold() != ".json" or not artifact_path.is_file():
+        raise SpecificationStateError(
+            f"{label} must be one readable in-project JSON file"
+        )
+    artifact_bytes = artifact_path.read_bytes()
+    try:
+        artifact = json.loads(artifact_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SpecificationStateError(
+            f"{label} must contain valid UTF-8 JSON"
+        ) from error
+    if not isinstance(artifact, dict):
+        raise SpecificationStateError(f"{label} must contain one JSON object")
+    return artifact_path, artifact_bytes, artifact
+
+
+def _helper_input_sha(request: dict[str, Any]) -> str | None:
+    binding = (request.get("specification") or {}).get("input")
+    if not isinstance(binding, dict):
+        raise SpecificationStateError("helper request specification input is malformed")
+    if set(binding) == HELPER_INPUT_ABSENT_KEYS and binding.get("kind") == "absent":
+        return None
+    if (
+        set(binding) == HELPER_INPUT_SHA_KEYS
+        and binding.get("kind") == "sha256"
+        and _is_exact_sha256(binding.get("sha256"))
+    ):
+        return binding["sha256"]
+    raise SpecificationStateError("helper request specification input is malformed")
+
+
+def _helper_evidence_output(evidence: dict[str, Any]) -> str | None:
+    results = evidence.get("results")
+    if isinstance(results, list) and results:
+        return results[-1]["result"]["summary"]["output_specification"]["sha256"]
+    return evidence.get("source_spec_sha256")
+
+
+def ensure_helper_state(state: dict[str, Any]) -> None:
+    state.setdefault("helper_sequence", 0)
+    state.setdefault("active_helper_request", None)
+    state.setdefault("helper_history", [])
+    if (
+        type(state["helper_sequence"]) is not int
+        or state["helper_sequence"] < 0
+        or not isinstance(state["helper_history"], list)
+    ):
+        raise SpecificationStateError("helper lifecycle state is malformed")
+    if "helper_evidence" not in state:
+        source_sha = (state.get("specification") or {}).get("sha256")
+        if source_sha is not None and not _is_exact_sha256(source_sha):
+            source_sha = (state.get("specification") or {}).get(
+                "generation_input_sha256"
+            )
+        state["helper_evidence"] = {
+            "source_spec_sha256": source_sha if _is_exact_sha256(source_sha) else None,
+            "results": [],
+        }
+
+
+def require_no_active_helper_request(state: dict[str, Any]) -> None:
+    ensure_helper_state(state)
+    if state.get("active_helper_request") is not None:
+        raise SpecificationStateError(
+            "an external helper request is active; record its exact result before "
+            "another specification transition"
+        )
+
+
+def validate_helper_request(
+    root: Path,
+    state: dict[str, Any],
+    supplied_path: str | None,
+    *,
+    require_current_identity: bool,
+) -> dict[str, Any]:
+    label = "controller-issued helper request"
+    path, request_bytes, request = _read_helper_json(root, supplied_path, label)
+    if set(request) != HELPER_REQUEST_KEYS:
+        raise SpecificationStateError("controller-issued helper request schema is invalid")
+    if type(request.get("schema")) is not int or request["schema"] != HELPER_REQUEST_SCHEMA:
+        raise SpecificationStateError("controller-issued helper request version is invalid")
+    request_id = request.get("request_id")
+    if not isinstance(request_id, str) or re.fullmatch(r"HREQ-[0-9]{6}", request_id) is None:
+        raise SpecificationStateError("controller-issued helper request id is invalid")
+    if path.relative_to(root).as_posix() != (
+        f".agentic-pipeline/helper-requests/{request_id}.json"
+    ):
+        raise SpecificationStateError(
+            "controller-issued helper request path is non-canonical"
+        )
+    if request.get("project_root") != str(root):
+        raise SpecificationStateError("controller-issued helper request project is foreign")
+
+    route = request.get("route")
+    correction_ids = request.get("correction_ids")
+    operation = request.get("operation")
+    if not isinstance(route, dict) or set(route) != HELPER_ROUTE_KEYS:
+        raise SpecificationStateError("controller-issued helper request route is invalid")
+    if operation == "generation":
+        route_valid = (
+            route.get("mode") == "spec-generator"
+            and route.get("submode") is None
+            and route.get("target_operation") in {"new", "continue"}
+            and correction_ids == []
+        )
+    elif operation == "correction":
+        route_valid = (
+            route
+            == {
+                "mode": "spec-assistant",
+                "submode": "fragment-capture",
+                "target_operation": "continue",
+            }
+            and isinstance(correction_ids, list)
+            and bool(correction_ids)
+            and all(isinstance(item, str) and item.strip() for item in correction_ids)
+            and len(correction_ids) == len(set(correction_ids))
+        )
+    else:
+        route_valid = False
+    if not route_valid:
+        raise SpecificationStateError(
+            "controller-issued helper request operation/route is invalid"
+        )
+
+    expected_prd = {
+        "path": state["prd"]["path"],
+        "revision": state["prd"]["revision"],
+        "sha256": state["prd"]["sha256"],
+    }
+    approved_prd = request.get("approved_prd")
+    if (
+        not isinstance(approved_prd, dict)
+        or set(approved_prd) != HELPER_AUTHORITY_KEYS
+        or approved_prd != expected_prd
+    ):
+        raise SpecificationStateError(
+            "controller-issued helper request PRD authority is stale or foreign"
+        )
+    prd = resolve_project_path(root, approved_prd["path"], "helper request PRD")
+    if not prd.is_file() or sha256(prd) != approved_prd["sha256"]:
+        raise SpecificationStateError(
+            "controller-issued helper request PRD bytes changed"
+        )
+
+    specification = request.get("specification")
+    if (
+        not isinstance(specification, dict)
+        or set(specification) != HELPER_SPECIFICATION_KEYS
+        or specification.get("path") != state["specification"]["path"]
+    ):
+        raise SpecificationStateError(
+            "controller-issued helper request specification path is invalid"
+        )
+    input_sha = _helper_input_sha(request)
+    if (
+        input_sha is None
+        and route.get("target_operation") != "new"
+        or input_sha is not None
+        and route.get("target_operation") != "continue"
+    ):
+        raise SpecificationStateError(
+            "controller-issued helper request input/target operation is invalid"
+        )
+
+    language = require_approved_prd(prd).get("language")
+    if (
+        not isinstance(language, str)
+        or not language.strip()
+        or request.get("expected_user_language") != language
+    ):
+        raise SpecificationStateError(
+            "controller-issued helper request language binding is invalid"
+        )
+
+    artifacts = request.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != HELPER_ARTIFACT_PATH_KEYS:
+        raise SpecificationStateError(
+            "controller-issued helper request artifact paths are invalid"
+        )
+    base = f".agentic-pipeline/helper-results/{request_id}"
+    expected_artifacts = {
+        "helper_report_path": f"{base}.report.md",
+        "coverage_path": f"{base}.coverage.json",
+        "result_path": f"{base}.result.json",
+    }
+    if artifacts != expected_artifacts:
+        raise SpecificationStateError(
+            "controller-issued helper request artifact paths are non-canonical"
+        )
+    expected_allowed = [
+        state["specification"]["path"],
+        expected_artifacts["helper_report_path"],
+        expected_artifacts["coverage_path"],
+        expected_artifacts["result_path"],
+    ]
+    if request.get("allowed_write_paths") != expected_allowed:
+        raise SpecificationStateError(
+            "controller-issued helper request write boundary is invalid"
+        )
+    for relative in expected_allowed:
+        resolve_project_path(root, relative, "helper allowed write path")
+
+    identity = request.get("helper_identity")
+    if not isinstance(identity, dict) or set(identity) != HELPER_IDENTITY_KEYS:
+        raise SpecificationStateError(
+            "controller-issued helper request external identity is invalid"
+        )
+    if require_current_identity and identity != external_helper_identity():
+        raise SpecificationStateError(
+            "external $skill-specification-pipeline fingerprint changed or is foreign"
+        )
+    return {
+        "path": path.relative_to(root).as_posix(),
+        "sha256": hashlib.sha256(request_bytes).hexdigest(),
+        "summary": copy.deepcopy(request),
+    }
+
+
+def validate_helper_result(
+    root: Path,
+    state: dict[str, Any],
+    request_record: dict[str, Any],
+    *,
+    require_current_identity: bool,
+    require_output_bytes: bool,
+) -> dict[str, Any]:
+    if not isinstance(request_record, dict) or set(request_record) != {
+        "path",
+        "sha256",
+        "summary",
+    }:
+        raise SpecificationStateError("recorded helper request is malformed")
+    current_request = validate_helper_request(
+        root,
+        state,
+        request_record.get("path"),
+        require_current_identity=require_current_identity,
+    )
+    if current_request != request_record:
+        raise SpecificationStateError(
+            "controller-issued helper request changed after preparation"
+        )
+    request = current_request["summary"]
+    result_relative = request["artifacts"]["result_path"]
+    result_path, result_bytes, result = _read_helper_json(
+        root, result_relative, "external helper result"
+    )
+    if set(result) != HELPER_RESULT_KEYS:
+        raise SpecificationStateError("external helper result schema is invalid")
+    if type(result.get("schema")) is not int or result["schema"] != HELPER_RESULT_SCHEMA:
+        raise SpecificationStateError("external helper result version is invalid")
+    if result.get("request") != {
+        "id": request["request_id"],
+        "sha256": current_request["sha256"],
+    }:
+        raise SpecificationStateError(
+            "external helper result does not bind the exact controller request"
+        )
+    if (
+        result.get("operation") != request["operation"]
+        or result.get("route") != request["route"]
+        or result.get("outcome") != "PASS"
+        or result.get("write_paths") != request["allowed_write_paths"]
+        or result.get("helper_identity") != request["helper_identity"]
+    ):
+        raise SpecificationStateError(
+            "external helper result route/outcome/write/identity binding is invalid"
+        )
+
+    output = result.get("output_specification")
+    spec = resolve_project_path(
+        root, request["specification"]["path"], "helper output specification"
+    )
+    if (
+        not isinstance(output, dict)
+        or set(output) != HELPER_RESULT_SPECIFICATION_KEYS
+        or output.get("path") != request["specification"]["path"]
+        or not _is_exact_sha256(output.get("sha256"))
+        or require_output_bytes
+        and (not spec.is_file() or sha256(spec) != output.get("sha256"))
+    ):
+        raise SpecificationStateError(
+            "external helper result output specification SHA is stale or invalid"
+        )
+    input_sha = _helper_input_sha(request)
+    if input_sha is not None and output["sha256"] == input_sha:
+        raise SpecificationStateError(
+            "external helper result did not change the requested specification"
+        )
+
+    expected_artifacts = [
+        ("helper_report", request["artifacts"]["helper_report_path"]),
+        ("coverage", request["artifacts"]["coverage_path"]),
+    ]
+    artifacts = result.get("artifacts")
+    if not isinstance(artifacts, list) or len(artifacts) != len(expected_artifacts):
+        raise SpecificationStateError(
+            "external helper result artifact references are incomplete"
+        )
+    normalized_artifacts: list[dict[str, str]] = []
+    for row, (expected_kind, expected_path) in zip(artifacts, expected_artifacts):
+        artifact_path = resolve_project_path(root, expected_path, "helper result artifact")
+        if (
+            not isinstance(row, dict)
+            or set(row) != HELPER_RESULT_ARTIFACT_KEYS
+            or row.get("kind") != expected_kind
+            or row.get("path") != expected_path
+            or not _is_exact_sha256(row.get("sha256"))
+            or not artifact_path.is_file()
+            or artifact_path.stat().st_size == 0
+            or sha256(artifact_path) != row.get("sha256")
+        ):
+            raise SpecificationStateError(
+                "external helper result artifact SHA is stale or invalid"
+            )
+        normalized_artifacts.append(copy.deepcopy(row))
+    return {
+        "request": current_request,
+        "result": {
+            "path": result_path.relative_to(root).as_posix(),
+            "sha256": hashlib.sha256(result_bytes).hexdigest(),
+            "summary": {
+                "schema": HELPER_RESULT_SCHEMA,
+                "request": copy.deepcopy(result["request"]),
+                "operation": result["operation"],
+                "route": copy.deepcopy(result["route"]),
+                "output_specification": copy.deepcopy(output),
+                "outcome": "PASS",
+                "write_paths": list(result["write_paths"]),
+                "artifacts": normalized_artifacts,
+                "helper_identity": copy.deepcopy(result["helper_identity"]),
+            },
+        },
+    }
+
+
+def revalidate_helper_evidence(
+    root: Path,
+    state: dict[str, Any],
+    prd: Path,
+    evidence: Any,
+    expected_output_sha256: str | None,
+) -> dict[str, Any]:
+    if not isinstance(evidence, dict) or set(evidence) != HELPER_EVIDENCE_KEYS:
+        raise SpecificationStateError(
+            "current workflow requires exact controller-consumed helper evidence"
+        )
+    source_sha = evidence.get("source_spec_sha256")
+    if source_sha is not None and not _is_exact_sha256(source_sha):
+        raise SpecificationStateError(
+            "helper evidence source specification SHA is invalid"
+        )
+    if sha256(prd) != state["prd"]["sha256"]:
+        raise SpecificationStateError("helper evidence PRD authority changed")
+    results = evidence.get("results")
+    if not isinstance(results, list):
+        raise SpecificationStateError("helper result evidence is malformed")
+    chain_sha = source_sha
+    validated: list[dict[str, Any]] = []
+    generation_seen = False
+    for index, record in enumerate(results):
+        if not isinstance(record, dict):
+            raise SpecificationStateError("helper result evidence record is malformed")
+        current = validate_helper_result(
+            root,
+            state,
+            record.get("request") if isinstance(record, dict) else {},
+            require_current_identity=False,
+            require_output_bytes=False,
+        )
+        if current != record:
+            raise SpecificationStateError(
+                "external helper request/result/artifacts changed after consumption"
+            )
+        request = current["request"]["summary"]
+        if _helper_input_sha(request) != chain_sha:
+            raise SpecificationStateError(
+                "external helper result chain does not bind its immediate input SHA"
+            )
+        if request["operation"] == "generation":
+            if index != 0 or generation_seen:
+                raise SpecificationStateError(
+                    "helper evidence contains a replayed generation operation"
+                )
+            generation_seen = True
+        elif chain_sha is None:
+            raise SpecificationStateError(
+                "helper correction has no exact source specification SHA"
+            )
+        chain_sha = current["result"]["summary"]["output_specification"]["sha256"]
+        validated.append(current)
+    if chain_sha != expected_output_sha256:
+        raise SpecificationStateError(
+            "helper evidence does not end at the exact current specification SHA"
+        )
+    return {"source_spec_sha256": source_sha, "results": validated}
+
+
+def validate_preaccept_receipt(
+    root: Path,
+    state: dict[str, Any],
+    prd: Path,
+    spec: Path,
+    supplied_path: str | None,
+    expected_spec_sha256: str | None = None,
+    expected_locators: list[str] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(supplied_path, str) or not supplied_path.strip():
+        raise SpecificationStateError("accept-spec requires --preaccept-receipt")
+    receipt_path = resolve_project_path(
+        root, supplied_path.strip(), "Architect pre-accept receipt"
+    )
+    if receipt_path.suffix.casefold() != ".json" or not receipt_path.is_file():
+        raise SpecificationStateError(
+            "Architect pre-accept receipt must be one readable in-project JSON file"
+        )
+    receipt_bytes = receipt_path.read_bytes()
+    try:
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SpecificationStateError(
+            "Architect pre-accept receipt must contain valid UTF-8 JSON"
+        ) from error
+    if not isinstance(receipt, dict) or set(receipt) != PREACCEPT_RECEIPT_KEYS:
+        raise SpecificationStateError("Architect pre-accept receipt schema is invalid")
+    if type(receipt.get("schema")) is not int or receipt["schema"] != PREACCEPT_RECEIPT_SCHEMA:
+        raise SpecificationStateError("Architect pre-accept receipt version is invalid")
+    architect_id = receipt.get("architect_id")
+    if (
+        not isinstance(architect_id, str)
+        or not architect_id.strip()
+        or not same_actor(architect_id, state.get("active_architect_id", ""))
+    ):
+        raise SpecificationStateError(
+            "Architect pre-accept receipt identity does not match the persistent Architect"
+        )
+    current_prd_sha = sha256(prd)
+    current_spec_sha = expected_spec_sha256 or sha256(spec)
+    if receipt.get("prd_sha256") != current_prd_sha:
+        raise SpecificationStateError(
+            "Architect pre-accept receipt PRD SHA does not match current immutable bytes"
+        )
+    if receipt.get("assessed_spec_sha256") != current_spec_sha:
+        raise SpecificationStateError(
+            "Architect pre-accept receipt specification SHA does not match current immutable bytes"
+        )
+    if receipt.get("semantic_assessment") != "accept":
+        raise SpecificationStateError(
+            "Architect pre-accept receipt semantic assessment must be accept"
+        )
+    inventory = receipt.get("section_applicability_inventory")
+    if not isinstance(inventory, list) or not inventory:
+        raise SpecificationStateError(
+            "Architect pre-accept receipt inventory must be non-empty"
+        )
+    normalized_rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in inventory:
+        if not isinstance(row, dict) or set(row) != PREACCEPT_INVENTORY_ROW_KEYS:
+            raise SpecificationStateError(
+                "Architect pre-accept inventory row schema is invalid"
+            )
+        locator = row.get("locator")
+        disposition = row.get("disposition")
+        rationale = row.get("authority_or_rationale")
+        if not isinstance(locator, str) or not locator.strip():
+            raise SpecificationStateError(
+                "Architect pre-accept inventory locator must be non-blank"
+            )
+        locator = locator.strip()
+        if locator in seen:
+            raise SpecificationStateError(
+                "Architect pre-accept inventory locators must be unique"
+            )
+        seen.add(locator)
+        if disposition != "retain":
+            raise SpecificationStateError(
+                "Architect pre-accept inventory disposition must be retain before acceptance"
+            )
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise SpecificationStateError(
+                "Architect pre-accept inventory rationale/evidence must be non-blank"
+            )
+        normalized_rows.append(
+            {
+                "locator": locator,
+                "disposition": disposition,
+                "authority_or_rationale": rationale.strip(),
+            }
+        )
+    if expected_locators is None:
+        if sha256(spec) != current_spec_sha:
+            raise SpecificationStateError(
+                "Architect pre-accept receipt old structure lacks accepted locator evidence"
+            )
+        required_locators = specification_inventory_locators(spec)
+    else:
+        if (
+            not isinstance(expected_locators, list)
+            or not expected_locators
+            or any(not isinstance(item, str) or not item for item in expected_locators)
+            or len(expected_locators) != len(set(expected_locators))
+        ):
+            raise SpecificationStateError(
+                "Architect pre-accept receipt accepted locator evidence is malformed"
+            )
+        required_locators = expected_locators
+    if seen != set(required_locators):
+        missing = sorted(set(required_locators) - seen)
+        extra = sorted(seen - set(required_locators))
+        raise SpecificationStateError(
+            "Architect pre-accept inventory does not exactly cover the specification "
+            f"structure; missing={missing}; extra={extra}"
+        )
+    normalized_rows.sort(key=lambda row: row["locator"])
+    summary = {
+        "schema": PREACCEPT_RECEIPT_SCHEMA,
+        "architect_id": architect_id.strip(),
+        "prd_sha256": current_prd_sha,
+        "assessed_spec_sha256": current_spec_sha,
+        "semantic_assessment": "accept",
+        "inventory_count": len(normalized_rows),
+        "inventory_sha256": canonical_json_sha256(normalized_rows),
+        "required_locators": required_locators,
+    }
+    return {
+        "path": receipt_path.relative_to(root).as_posix(),
+        "sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+        "summary": summary,
+    }
+
+
+def require_current_preaccept_acceptance(
+    root: Path,
+    state: dict[str, Any],
+    prd: Path,
+    spec: Path,
+    active_wave: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    acceptance = state.get("acceptance") or {}
+    accepted_preaccept = acceptance.get("preaccept_receipt")
+    if not isinstance(accepted_preaccept, dict):
+        raise SpecificationStateError(
+            "current workflow requires the exact Architect pre-accept receipt"
+        )
+    accepted_spec_sha256 = (
+        active_wave.get("spec_sha256") if active_wave is not None else sha256(spec)
+    )
+    accepted_summary = accepted_preaccept.get("summary") or {}
+    current_preaccept = validate_preaccept_receipt(
+        root,
+        state,
+        prd,
+        spec,
+        accepted_preaccept.get("path"),
+        accepted_spec_sha256,
+        accepted_summary.get("required_locators"),
+    )
+    helper_evidence = revalidate_helper_evidence(
+        root,
+        state,
+        prd,
+        acceptance.get("helper_evidence"),
+        accepted_spec_sha256,
+    )
+    expected_acceptance = {
+        "prd_path": state["prd"]["path"],
+        "prd_revision": state["prd"]["revision"],
+        "prd_sha256": sha256(prd),
+        "specification_path": state["specification"]["path"],
+        "specification_revision": exact_positive_revision(
+            spec, "current specification"
+        ),
+        "specification_sha256": accepted_spec_sha256,
+        "accepted_by": state["active_architect_id"],
+        "recovery_token": (state.get("recovery_authorization") or {}).get("token"),
+        "preaccept_receipt": current_preaccept,
+        "helper_evidence": helper_evidence,
+    }
+    if (
+        not acceptance.get("accepted_at")
+        or any(acceptance.get(key) != value for key, value in expected_acceptance.items())
+    ):
+        raise SpecificationStateError(
+            "current workflow requires a fresh accept-spec receipt for the exact current "
+            "PRD/spec/revision/recovery/preaccept authority"
+        )
+    accepted_at = utc_timestamp(acceptance["accepted_at"], "specification acceptance")
+    if active_wave is not None:
+        started_at = utc_timestamp(
+            active_wave.get("started_at"), "active Proofreader wave started_at"
+        )
+        if accepted_at > started_at:
+            raise SpecificationStateError(
+                "active Proofreader wave predates the current specification acceptance"
+            )
+    return acceptance
 
 
 def require_slug(feature: str) -> str:
@@ -286,6 +1137,36 @@ def write_bytes_atomically(path: Path, value: bytes) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_bytes(value)
     os.replace(temporary, path)
+
+
+def write_new_bytes_atomically(path: Path, value: bytes, label: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.is_file() and path.read_bytes() == value:
+            return
+        raise SpecificationStateError(f"{label} already exists with different bytes")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    if temporary.exists():
+        raise SpecificationStateError(f"{label} temporary path already exists")
+    try:
+        temporary.write_bytes(value)
+        if path.exists():
+            raise SpecificationStateError(f"{label} appeared during atomic creation")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def reset_helper_chain(state: dict[str, Any], source_sha256: str | None) -> None:
+    ensure_helper_state(state)
+    if source_sha256 is not None and not _is_exact_sha256(source_sha256):
+        raise SpecificationStateError("helper chain source SHA is invalid")
+    state["active_helper_request"] = None
+    state["helper_evidence"] = {
+        "source_spec_sha256": source_sha256,
+        "results": [],
+    }
 
 
 def specification_trace(root: Path, prd: Path, spec: Path) -> tuple[dict[str, str], list[str]]:
@@ -828,6 +1709,7 @@ def finalize_in_progress_revision(
     state["hold_history"] = []
     state["ready"] = None
     state["acceptance"] = None
+    reset_helper_chain(state, transition["draft_sha256"])
     state.pop("in_progress_revision", None)
     state["updated_at"] = now
     save_state(root, state)
@@ -837,6 +1719,7 @@ def finalize_in_progress_revision(
 def command_revise_in_progress(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
+    require_no_active_helper_request(state)
     if state.get("status") == "in_progress_revision_pending":
         return finalize_in_progress_revision(root, state, args)
     if state.get("status") == "spec_ready":
@@ -1067,6 +1950,7 @@ def finalize_ready_revision(
     state["hold_history"] = []
     state["ready"] = None
     state["acceptance"] = None
+    reset_helper_chain(state, transition["draft_sha256"])
     if transition.get("recovery_authorization"):
         state["recovery_authorization"] = copy.deepcopy(
             transition["recovery_authorization"]
@@ -1769,6 +2653,7 @@ def replay_committed_ready_revision(
 def command_revise_ready(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
+    require_no_active_helper_request(state)
     if state.get("status") == "ready_revision_pending":
         return finalize_ready_revision(root, state, args)
     if state.get("status") == "awaiting_accept":
@@ -1972,6 +2857,7 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         "specification": {
             "path": spec.relative_to(root).as_posix(),
             "sha256": sha256(spec) if spec.is_file() and not drift else None,
+            "generation_input_sha256": sha256(spec) if spec.is_file() else None,
             "trace_errors": drift,
         },
         "active_architect_id": architect_id,
@@ -1991,6 +2877,15 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         "hold_history": [],
         "ready": None,
         "acceptance": None,
+        "helper_sequence": 0,
+        "active_helper_request": None,
+        "helper_history": [],
+        "helper_evidence": {
+            "source_spec_sha256": (
+                sha256(spec) if spec.is_file() else None
+            ),
+            "results": [],
+        },
         "history": [],
         "identity_history": [],
         "created_at": now,
@@ -2002,12 +2897,272 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
     return state
 
 
+def command_prepare_helper(args: argparse.Namespace) -> dict[str, Any]:
+    root = Path(args.project_root).resolve()
+    state = load_state(root)
+    require_bound_recovery_continuation(root, state)
+    require_no_active_helper_request(state)
+    operation = args.operation
+    correction_ids = [item.strip() for item in (args.correction_id or [])]
+    if (
+        any(not item for item in correction_ids)
+        or len(correction_ids) != len(set(correction_ids))
+    ):
+        raise SpecificationStateError("helper correction IDs must be non-blank and distinct")
+
+    prd = resolve_project_path(root, state["prd"]["path"], "canonical PRD")
+    spec = resolve_project_path(
+        root, state["specification"]["path"], "canonical technical specification"
+    )
+    validate_approved_prd_contract(prd)
+    if sha256(prd) != state["prd"]["sha256"]:
+        raise SpecificationStateError("PRD changed after initialization")
+    evidence = state["helper_evidence"]
+    evidence_output = _helper_evidence_output(evidence)
+
+    if operation == "generation":
+        if state["status"] != "needs_generation":
+            raise SpecificationStateError(
+                "generation helper request is allowed only in needs_generation"
+            )
+        if correction_ids:
+            raise SpecificationStateError(
+                "generation helper request cannot carry correction IDs"
+            )
+        if (evidence.get("results") or []):
+            raise SpecificationStateError(
+                "generation helper request was already consumed for this convergence"
+            )
+        revalidate_helper_evidence(root, state, prd, evidence, evidence_output)
+        input_sha = evidence_output
+        if input_sha is None:
+            if spec.exists():
+                raise SpecificationStateError(
+                    "unrequested local specification bytes exist before generation prepare"
+                )
+            target_operation = "new"
+        else:
+            if not spec.is_file() or sha256(spec) != input_sha:
+                raise SpecificationStateError(
+                    "generation input specification bytes drifted before prepare"
+                )
+            target_operation = "continue"
+        route = {
+            "mode": "spec-generator",
+            "submode": None,
+            "target_operation": target_operation,
+        }
+    elif operation == "correction":
+        if state["status"] not in {"needs_generation", "reviewing", "awaiting_accept"}:
+            raise SpecificationStateError(
+                f"correction helper request is forbidden in {state['status']}"
+            )
+        if not correction_ids:
+            raise SpecificationStateError(
+                "correction helper request requires one or more correction IDs"
+            )
+        if not spec.is_file():
+            raise SpecificationStateError(
+                "correction helper request requires an existing specification"
+            )
+        input_sha = sha256(spec)
+        revalidate_helper_evidence(root, state, prd, evidence, input_sha)
+        if state["status"] == "needs_generation" and not evidence["results"]:
+            raise SpecificationStateError(
+                "initial generation must be consumed before a correction request"
+            )
+        wave = state.get("active_wave")
+        if wave is not None:
+            if (
+                state["status"] != "reviewing"
+                or not isinstance(wave, dict)
+                or not isinstance(wave.get("proofread"), dict)
+            ):
+                raise SpecificationStateError(
+                    "active-wave correction requires a recorded Proofreader result"
+                )
+            require_current_preaccept_acceptance(root, state, prd, spec, wave)
+            if wave.get("spec_sha256") != input_sha:
+                raise SpecificationStateError(
+                    "active-wave correction input does not match the reviewed SHA"
+                )
+        elif state["status"] == "reviewing" and state.get("acceptance") is not None:
+            raise SpecificationStateError(
+                "accepted specification corrections require a recorded Proofreader wave"
+            )
+        route = {
+            "mode": "spec-assistant",
+            "submode": "fragment-capture",
+            "target_operation": "continue",
+        }
+    else:
+        raise SpecificationStateError("helper operation must be generation or correction")
+
+    sequence = state["helper_sequence"] + 1
+    request_id = f"HREQ-{sequence:06d}"
+    request_relative = f".agentic-pipeline/helper-requests/{request_id}.json"
+    base = f".agentic-pipeline/helper-results/{request_id}"
+    artifacts = {
+        "helper_report_path": f"{base}.report.md",
+        "coverage_path": f"{base}.coverage.json",
+        "result_path": f"{base}.result.json",
+    }
+    for relative in artifacts.values():
+        if resolve_project_path(root, relative, "helper output artifact").exists():
+            raise SpecificationStateError(
+                "helper output artifact already exists before request preparation"
+            )
+    request = {
+        "schema": HELPER_REQUEST_SCHEMA,
+        "request_id": request_id,
+        "operation": operation,
+        "project_root": str(root),
+        "route": route,
+        "approved_prd": {
+            "path": state["prd"]["path"],
+            "revision": state["prd"]["revision"],
+            "sha256": state["prd"]["sha256"],
+        },
+        "specification": {
+            "path": state["specification"]["path"],
+            "input": (
+                {"kind": "absent"}
+                if input_sha is None
+                else {"kind": "sha256", "sha256": input_sha}
+            ),
+        },
+        "expected_user_language": require_approved_prd(prd)["language"],
+        "allowed_write_paths": [
+            state["specification"]["path"],
+            artifacts["helper_report_path"],
+            artifacts["coverage_path"],
+            artifacts["result_path"],
+        ],
+        "artifacts": artifacts,
+        "helper_identity": external_helper_identity(),
+        "correction_ids": correction_ids,
+    }
+    request_path = resolve_project_path(root, request_relative, "helper request")
+    request_bytes = (
+        json.dumps(request, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    write_new_bytes_atomically(
+        request_path, request_bytes, "controller-issued helper request"
+    )
+    request_record = validate_helper_request(
+        root, state, request_relative, require_current_identity=True
+    )
+    state["helper_sequence"] = sequence
+    state["active_helper_request"] = request_record
+    state["updated_at"] = utc_now()
+    save_state(root, state)
+    return state
+
+
+def command_record_helper_result(args: argparse.Namespace) -> dict[str, Any]:
+    root = Path(args.project_root).resolve()
+    state = load_state(root)
+    require_bound_recovery_continuation(root, state)
+    ensure_helper_state(state)
+    active = state.get("active_helper_request")
+    if not isinstance(active, dict):
+        raise SpecificationStateError(
+            "no active controller-issued helper request is awaiting a result"
+        )
+    request = validate_helper_request(
+        root,
+        state,
+        active.get("path"),
+        require_current_identity=True,
+    )
+    if request != active:
+        raise SpecificationStateError(
+            "active controller-issued helper request changed after preparation"
+        )
+    prd = resolve_project_path(root, state["prd"]["path"], "canonical PRD")
+    validate_approved_prd_contract(prd)
+    if sha256(prd) != state["prd"]["sha256"]:
+        raise SpecificationStateError("PRD changed after helper request preparation")
+    result = validate_helper_result(
+        root,
+        state,
+        request,
+        require_current_identity=True,
+        require_output_bytes=True,
+    )
+    input_sha = _helper_input_sha(request["summary"])
+    evidence = revalidate_helper_evidence(
+        root, state, prd, state["helper_evidence"], input_sha
+    )
+    updated_evidence = copy.deepcopy(evidence)
+    updated_evidence["results"].append(result)
+    output_sha = result["result"]["summary"]["output_specification"]["sha256"]
+    updated_evidence = revalidate_helper_evidence(
+        root, state, prd, updated_evidence, output_sha
+    )
+    if any(
+        item.get("request", {}).get("summary", {}).get("request_id")
+        == request["summary"]["request_id"]
+        for item in state["helper_history"]
+        if isinstance(item, dict)
+    ):
+        raise SpecificationStateError("helper request/result replay is forbidden")
+
+    spec = resolve_project_path(
+        root, state["specification"]["path"], "helper output specification"
+    )
+    meta, drift = specification_trace(root, prd, spec)
+    if drift:
+        raise SpecificationStateError(
+            "external helper output has stale specification authority: "
+            + "; ".join(drift)
+        )
+    state["helper_evidence"] = updated_evidence
+    state["helper_history"].append(copy.deepcopy(result))
+    state["active_helper_request"] = None
+    state["specification"] = {
+        **state["specification"],
+        "path": spec.relative_to(root).as_posix(),
+        "sha256": output_sha,
+        "status": meta.get("status"),
+        "trace_errors": [],
+    }
+    state["updated_at"] = utc_now()
+    save_state(root, state)
+    return state
+
+
+def helper_evidence_for_acceptance(
+    root: Path,
+    state: dict[str, Any],
+    prd: Path,
+    spec: Path,
+) -> dict[str, Any]:
+    require_no_active_helper_request(state)
+    current_sha = sha256(spec)
+    evidence = revalidate_helper_evidence(
+        root, state, prd, state["helper_evidence"], current_sha
+    )
+    if state["status"] == "needs_generation":
+        results = evidence["results"]
+        if not results or results[0]["request"]["summary"]["operation"] != "generation":
+            raise SpecificationStateError(
+                "needs_generation accept-spec requires a consumed external generation result"
+            )
+    return evidence
+
+
 def command_accept_spec(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
     require_bound_recovery_continuation(root, state)
     if state["status"] not in {"needs_generation", "reviewing", "awaiting_accept"}:
         raise SpecificationStateError(f"cannot accept specification in {state['status']}")
+    if state.get("active_wave") is not None:
+        raise SpecificationStateError(
+            "accept-spec is forbidden while a Proofreader wave is active"
+        )
+    require_no_active_helper_request(state)
     prd = root / state["prd"]["path"]
     spec = root / state["specification"]["path"]
     validate_approved_prd_contract(prd)
@@ -2016,6 +3171,14 @@ def command_accept_spec(args: argparse.Namespace) -> dict[str, Any]:
     meta, drift = specification_trace(root, prd, spec)
     if drift:
         raise SpecificationStateError("cannot accept stale specification: " + "; ".join(drift))
+    preaccept_receipt = validate_preaccept_receipt(
+        root,
+        state,
+        prd,
+        spec,
+        getattr(args, "preaccept_receipt", None),
+    )
+    helper_evidence = helper_evidence_for_acceptance(root, state, prd, spec)
     state["specification"] = {
         "path": spec.relative_to(root).as_posix(),
         "sha256": sha256(spec),
@@ -2033,6 +3196,8 @@ def command_accept_spec(args: argparse.Namespace) -> dict[str, Any]:
         "specification_sha256": state["specification"]["sha256"],
         "accepted_by": state["active_architect_id"],
         "recovery_token": (state.get("recovery_authorization") or {}).get("token"),
+        "preaccept_receipt": preaccept_receipt,
+        "helper_evidence": helper_evidence,
         "accepted_at": utc_now(),
     }
     state["status"] = "reviewing"
@@ -2045,33 +3210,13 @@ def command_start_cycle(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
     require_bound_recovery_continuation(root, state)
+    require_no_active_helper_request(state)
     if state["status"] != "reviewing":
         raise SpecificationStateError(f"cannot start cycle in {state['status']}")
     if state["active_wave"] is not None:
         raise SpecificationStateError("a Proofreader wave is already active")
-    prd = root / state["prd"]["path"]
-    spec = root / state["specification"]["path"]
-    acceptance = state.get("acceptance") or {}
-    expected_acceptance = {
-        "prd_path": state["prd"]["path"],
-        "prd_revision": state["prd"]["revision"],
-        "prd_sha256": sha256(prd),
-        "specification_path": state["specification"]["path"],
-        "specification_revision": exact_positive_revision(
-            spec, "current specification"
-        ),
-        "specification_sha256": sha256(spec),
-        "accepted_by": state["active_architect_id"],
-        "recovery_token": (state.get("recovery_authorization") or {}).get("token"),
-    }
-    if (
-        not acceptance.get("accepted_at")
-        or any(acceptance.get(key) != value for key, value in expected_acceptance.items())
-    ):
-        raise SpecificationStateError(
-            "start-cycle requires a fresh accept-spec receipt for the exact current "
-            "PRD/spec/revision/recovery authorization"
-        )
+    prd, spec = require_source_unchanged(root, state)
+    require_current_preaccept_acceptance(root, state, prd, spec)
     architect = active_architect(state)
     if not same_actor(args.architect_id, architect["id"]):
         raise SpecificationStateError("cycle Architect does not own the specification")
@@ -2099,7 +3244,6 @@ def command_start_cycle(args: argparse.Namespace) -> dict[str, Any]:
         raise SpecificationStateError(
             "sixth cycle for this Architect is forbidden; entered spec_convergence_hold"
         )
-    _, spec = require_source_unchanged(root, state)
     wave_number = len(state["waves"]) + 1
     state["active_wave"] = {
         "number": wave_number,
@@ -2124,12 +3268,14 @@ def command_record_proofread(args: argparse.Namespace) -> dict[str, Any]:
     if state["status"] != "reviewing":
         raise SpecificationStateError(f"cannot record Proofreader result in {state['status']}")
     require_bound_recovery_continuation(root, state)
+    require_no_active_helper_request(state)
     wave = state.get("active_wave")
     if not wave or wave["proofread"] is not None:
         raise SpecificationStateError("no wave is awaiting a Proofreader result")
     if not same_actor(wave["proofreader_id"], args.proofreader_id):
         raise SpecificationStateError("unexpected Proofreader identity")
-    _, spec = require_source_unchanged(root, state)
+    prd, spec = require_source_unchanged(root, state)
+    require_current_preaccept_acceptance(root, state, prd, spec, wave)
     current_hash = sha256(spec)
     if current_hash != wave["spec_sha256"]:
         raise SpecificationStateError("specification changed during read-only proofreading")
@@ -2202,13 +3348,61 @@ def command_complete_cycle(args: argparse.Namespace) -> dict[str, Any]:
         raise SpecificationStateError(
             "product/scope/boundary/ownership/contract questions require a recorded user decision"
         )
-    _, spec = require_source_unchanged(root, state)
+    require_no_active_helper_request(state)
+    prd, spec = require_source_unchanged(root, state)
+    require_current_preaccept_acceptance(root, state, prd, spec, wave)
+    current_hash = sha256(spec)
     wave["architect_response"] = args.resolution_note
     wave["user_decision"] = args.user_decision_note
-    close_active_wave(state, "revised", sha256(spec))
-    state["specification"]["sha256"] = sha256(spec)
+    if current_hash != wave["spec_sha256"]:
+        accepted_evidence = revalidate_helper_evidence(
+            root,
+            state,
+            prd,
+            state["acceptance"].get("helper_evidence"),
+            wave["spec_sha256"],
+        )
+        revised_evidence = revalidate_helper_evidence(
+            root,
+            state,
+            prd,
+            state.get("helper_evidence"),
+            current_hash,
+        )
+        accepted_results = accepted_evidence["results"]
+        revised_results = revised_evidence["results"]
+        if revised_results[: len(accepted_results)] != accepted_results:
+            raise SpecificationStateError(
+                "active-wave helper result chain does not preserve accepted provenance"
+            )
+        new_results = revised_results[len(accepted_results) :]
+        if not new_results or any(
+            item["request"]["summary"]["operation"] != "correction"
+            for item in new_results
+        ):
+            raise SpecificationStateError(
+                "changed active-wave specification requires consumed correction results"
+            )
+        wave["helper_correction_results"] = copy.deepcopy(new_results)
+        close_active_wave(state, "revised", current_hash)
+        state["acceptance"] = None
+        state["status"] = "awaiting_accept"
+    else:
+        current_evidence = revalidate_helper_evidence(
+            root,
+            state,
+            prd,
+            state.get("helper_evidence"),
+            current_hash,
+        )
+        if current_evidence != state["acceptance"].get("helper_evidence"):
+            raise SpecificationStateError(
+                "no-edit cycle cannot consume an unrelated helper result"
+            )
+        close_active_wave(state, "revised", current_hash)
+        state["status"] = "reviewing"
+    state["specification"]["sha256"] = current_hash
     state["specification"]["status"] = parse_frontmatter(spec, "Specification").get("status")
-    state["status"] = "reviewing"
     state["updated_at"] = utc_now()
     save_state(root, state)
     return state
@@ -2220,6 +3414,7 @@ def command_confirm_ready(args: argparse.Namespace) -> dict[str, Any]:
     if state["status"] != "reviewing":
         raise SpecificationStateError(f"cannot confirm readiness in {state['status']}")
     require_bound_recovery_continuation(root, state)
+    require_no_active_helper_request(state)
     wave = state.get("active_wave")
     if not wave or wave["proofread"] is None:
         raise SpecificationStateError("readiness requires a fresh Proofreader result")
@@ -2227,7 +3422,8 @@ def command_confirm_ready(args: argparse.Namespace) -> dict[str, Any]:
         raise SpecificationStateError("only the active Architect may confirm readiness")
     if not args.confirmation.strip():
         raise SpecificationStateError("Architect readiness confirmation is required")
-    _, spec = require_source_unchanged(root, state)
+    prd, spec = require_source_unchanged(root, state)
+    require_current_preaccept_acceptance(root, state, prd, spec, wave)
     proofread = wave["proofread"]
     blockers: list[str] = []
     if proofread["critical"] or proofread["major"]:
@@ -2267,6 +3463,7 @@ def command_handoff(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root)
     require_bound_recovery_continuation(root, state)
+    require_no_active_helper_request(state)
     if state["status"] != "spec_convergence_hold":
         raise SpecificationStateError("Architect handoff is allowed only from spec_convergence_hold")
     new_architect_id = args.new_architect_id.strip()
@@ -2321,7 +3518,18 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--architect-id", required=True)
     init.set_defaults(handler=command_init)
 
+    prepare_helper = commands.add_parser("prepare-helper")
+    prepare_helper.add_argument(
+        "--operation", choices=("generation", "correction"), required=True
+    )
+    prepare_helper.add_argument("--correction-id", action="append", default=[])
+    prepare_helper.set_defaults(handler=command_prepare_helper)
+
+    record_helper = commands.add_parser("record-helper-result")
+    record_helper.set_defaults(handler=command_record_helper_result)
+
     accept = commands.add_parser("accept-spec")
+    accept.add_argument("--preaccept-receipt", required=True)
     accept.set_defaults(handler=command_accept_spec)
 
     revise_in_progress = commands.add_parser(

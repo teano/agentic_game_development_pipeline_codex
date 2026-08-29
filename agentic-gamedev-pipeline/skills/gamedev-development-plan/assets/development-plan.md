@@ -107,7 +107,7 @@ Controller-generated schema-2 handoff with exact revisions/change evidence plus 
 
 - acceptance_ids: PRD-AC-001
 - editable_paths: path/to/expected-write
-- shared_touchpoints: see structured rows below
+- shared_touchpoints: TP-001
 - shared_touchpoint: TP-001 | path=path/to/shared-contract | symbols=ExactSymbol | allowed_change=exact permitted change kind | forbidden_change=lifecycle, ownership, removals
 - planned_material_permission: PF-0001 | change_type=lifecycle_change | target_kind=editable_path | target=path/to/exact-file | rationale=accepted lifecycle integration | decision_authority=DEC-001
 - excluded_components: adjacent-system
@@ -115,6 +115,8 @@ Controller-generated schema-2 handoff with exact revisions/change evidence plus 
 - max_product_files: 10
 - max_product_lines_changed: 500
 - verification_scope: exact affected suites and smoke scenarios
+
+For a legitimately isolated slice, replace both touchpoint rows above with the exact sentinel `- shared_touchpoints: none`.
 
 ### Research Briefs
 

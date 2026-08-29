@@ -74,7 +74,7 @@ Define each `## Slice SLICE-NNN` with all of these non-empty sections:
 - `### Base Contract` and `### Handoff Contract`;
 - `### Owned Paths` and `### Expected Paths`;
 - `### Forbidden Scope`;
-- `### Scope Contract` with `acceptance_ids`, `editable_paths`, structured `shared_touchpoint` rows, `excluded_components`, `excluded_paths`, `max_product_files`, `max_product_lines_changed`, and `verification_scope`;
+- `### Scope Contract` with `acceptance_ids`, `editable_paths`, a `shared_touchpoints` declaration and either structured `shared_touchpoint` rows or the exact isolated-slice sentinel, `excluded_components`, `excluded_paths`, `max_product_files`, `max_product_lines_changed`, and `verification_scope`;
 - `### Research Briefs` with either one to three uniquely identified `RESEARCH-*` rows containing the exact runtime-authoritative `question`, `paths`, `exclusions`, `evidence`, and `stop` selectors, or the exact mutually exclusive sentinel `research_not_required | reason=<non-empty source-backed reason>`;
 - `### Coverage Contract` with assigned acceptance IDs, automated/manual identity namespaces, explicitly mandatory identities or mandatory derivation IDs, automation feasibility, capability prerequisites, and amendment authorities;
 - `### Documentation Contract` with normative pre-Review paths, derived post-QA support paths, decision/evidence sources, and explicit `not_required` rows when applicable;
@@ -88,8 +88,11 @@ Keep paths narrow and use symbols when a shared file is broader than the slice. 
 The Scope Contract is machine-readable. Use comma-separated repository-relative paths; a trailing `/**` authorizes a subtree and no other glob syntax is valid. Every shared boundary is a separate row:
 
 ```text
+- shared_touchpoints: TP-001
 - shared_touchpoint: TP-001 | path=src/contracts.lua | symbols=FeatureContract,FeatureConfig | allowed_change=additive fields required by PRD-AC-001 | forbidden_change=ownership, lifecycle, removals
 ```
+
+When a legitimately isolated slice has no shared boundary, use exactly `- shared_touchpoints: none` and omit every `shared_touchpoint` row. The sentinel and structured rows are mutually exclusive; variants, explanations appended to `none`, and mixed forms are invalid.
 
 Every acceptance assignment uses the same small canonical grammar in Requirements, Planning, and Runtime. The approved PRD has exactly one top-level line `## Acceptance Criteria`; every non-empty line in that section is exactly `- PRD-AC-ID: plain-text description`. IDs are literal, descriptions are visible plain text without emphasis markers, entities, escapes, or inline Markdown, and fenced, quoted, indented, commented, or HTML-block examples grant no authority. Raw `<pre>`, `<script>`, `<style>`, and `<textarea>` blocks close only at their matching end tag; comments, processing instructions, declarations, and CDATA use their own terminators; other HTML blocks are blank-terminated. Code-wrapped IDs, inline HTML/links, narrative rows, multiple IDs in one declaration, and single- or multiline range shorthand are invalid instead of being interpreted by a private Markdown renderer. `Requirements`, Scope, and Coverage name literal inventory IDs; duplicate acceptance rows inside one Requirements surface are invalid, while each slice's Scope/Coverage sets are equal. The union of all slice sets must exactly equal the approved PRD inventory. The same ID may intentionally appear in more than one sequential vertical slice when both slices contribute to the same end-to-end criterion; overlap never substitutes for covering every inventory ID. A format migration is a controlled PRD revision, not an in-place compatibility rewrite: reopen/increment/reapprove PRD, reconverge exact SPEC and PLAN authority, and obtain fresh downstream approvals before runtime.
 

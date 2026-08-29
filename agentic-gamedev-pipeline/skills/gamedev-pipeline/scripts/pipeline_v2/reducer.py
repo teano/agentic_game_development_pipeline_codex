@@ -695,8 +695,8 @@ def _reduce_command(
         read = deepcopy(canonical["access"]["read"])
         write = deepcopy(canonical["access"]["write"])
         commands = deepcopy(canonical["checks"])
-        if phase in {"engineering", "docs"} and not write:
-            raise PipelineError(f"{phase} must have write access")
+        if phase == "engineering" and not write:
+            raise PipelineError("engineering must have write access")
         if phase in {"plan", "slice", "review", "qa"} and write:
             raise PipelineError(f"{phase} assignments are read-only")
         authority_paths = [item["path"] for item in work["authority"]["items"].values()]
