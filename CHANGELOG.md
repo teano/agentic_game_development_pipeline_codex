@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-29
+
 ### Добавлено
 
 - Specification controller получил одноразовый challenge/result handshake с внешним `skill-specification-pipeline`: controller фиксирует точные PRD/spec SHA, язык, route, fingerprints и write boundary, а внешний canonical emitter связывает результат с report/coverage и защищает его от replay.
@@ -269,7 +271,8 @@
 - Полный набор из 97 тестов контроллеров, активации и межрежимных контрактов.
 - Валидация manifest плагина и всех восьми skill-пакетов.
 
-[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.7.0...v0.8.0
