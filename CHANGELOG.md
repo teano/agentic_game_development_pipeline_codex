@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-02
+
 ### Добавлено
 
 - Specification helper request теперь привязан к точному пути и SHA-256 текущего GameDev controller; перед публикацией immutable result внешний helper получает controller-issued preflight envelope, который подтверждает request/output/controller chain, authority, язык и разрешённую write boundary.
@@ -284,7 +286,8 @@
 - Полный набор из 97 тестов контроллеров, активации и межрежимных контрактов.
 - Валидация manifest плагина и всех восьми skill-пакетов.
 
-[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.8.0...v0.9.0
