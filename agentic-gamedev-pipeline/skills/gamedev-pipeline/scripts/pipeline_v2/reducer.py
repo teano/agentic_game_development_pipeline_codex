@@ -5,8 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .checkout import diff as checkout_diff
-from .checkout import authority_items_equal, inventory_digest, matches, path_identity, violations as diff_violations
+from .checkout import authority_items_equal, matches, path_identity, violations as diff_violations
+from .legacy_gen53 import SCHEMA10_UNSUPPORTED_MESSAGE
 from .model import (
     ConflictError,
     NEXT_PHASE,
@@ -26,9 +26,10 @@ from .model import (
     digest,
     is_digest,
     is_generation,
+    is_git_oid,
     is_strict_integer,
+    literal_paths_valid,
     new_state,
-    normalize_rule,
     passing_artifact,
     pending,
     slice_records,
@@ -40,6 +41,7 @@ COMMANDS = {"init", "status", "next", "complete", "answer", "resume", "accept", 
 WORKER_FORBIDDEN_KEYS = {
     "authority_digest", "base_checkout_sha256", "current_checkout_sha256", "checkout",
     "controller", "diff", "diff_sha256", "inventory", "commands", "tests", "receipts",
+    "base_tree_oid", "candidate_tree_oid", "changed_paths", "pipeline_runtime_digest",
     "returncode", "stdout_sha256", "stderr_sha256", "stderr_excerpt",
     "stderr_excerpt_truncated", "stderr_excerpt_redacted",
 }
@@ -84,23 +86,6 @@ def _contains_forbidden(value: Any) -> str | None:
     return None
 
 
-def _inventory(value: Any, label: str) -> dict[str, dict[str, Any]]:
-    if not isinstance(value, dict):
-        raise PipelineError(f"{label} inventory is malformed")
-    for path, item in value.items():
-        if (
-            not isinstance(path, str) or not path or not isinstance(item, dict)
-            or set(item) != {"kind", "sha256", "size"}
-            or item["kind"] not in {"file", "legacy"}
-            or not is_digest(item["sha256"])
-            or (item["size"] is not None and (type(item["size"]) is not int or item["size"] < 0))
-        ):
-            raise PipelineError(f"{label} inventory is malformed")
-        if normalize_rule(path) != path:
-            raise PipelineError(f"{label} inventory paths must be canonical")
-    return value
-
-
 def _worker_artifact(value: Any, phase: str, role: str) -> dict[str, Any]:
     schema = artifact_schema(phase, role)
     allowed = set(schema["allowed_keys"])
@@ -139,10 +124,11 @@ def _worker_artifact(value: Any, phase: str, role: str) -> dict[str, Any]:
             raise PipelineError("QA checks are required")
         if value["outcome"] != "blocked" and not checks:
             raise PipelineError("QA pass/fail requires at least one check")
-        if value["outcome"] == "blocked":
-            _require_text(value.get("blocker"), "blocker")
-        elif value.get("blocker") is not None:
-            raise PipelineError("blocker is valid only for blocked QA")
+    if value["outcome"] == "blocked":
+        _require_text(value.get("blocker"), "blocker")
+        _require_text(value.get("required_action"), "required action")
+    elif "blocker" in value or "required_action" in value:
+        raise PipelineError("blocker and required_action are valid only when blocked")
     questions = value.get("questions", [])
     if not isinstance(questions, list) or any(
         not isinstance(item, str) or not item.strip() for item in questions
@@ -152,26 +138,30 @@ def _worker_artifact(value: Any, phase: str, role: str) -> dict[str, Any]:
 
 
 def _validate_controller(
-    state: dict[str, Any], active: dict[str, Any], evidence: Any,
+    state: dict[str, Any], active: dict[str, Any], artifact: dict[str, Any], evidence: Any,
 ) -> dict[str, Any] | None:
     required = {
-        "authority_digest", "base_checkout_sha256", "current_checkout_sha256",
-        "inventory", "diff", "diff_sha256", "violations", "commands",
+        "authority_digest", "pipeline_runtime_digest", "base_tree_oid",
+        "candidate_tree_oid", "changed_paths", "violations", "commands",
     }
     if not isinstance(evidence, dict) or set(evidence) != required:
         raise PipelineError("complete requires the exact controller evidence shape")
     if evidence["authority_digest"] != state["authority"]["digest"]:
         raise PipelineError("controller evidence used stale authority")
+    if evidence["pipeline_runtime_digest"] != state["pipeline_runtime_digest"]:
+        raise PipelineError("controller evidence used a different pipeline runtime")
     base = active["base"]
-    if evidence["base_checkout_sha256"] != base.get("checkout_sha256"):
-        raise PipelineError("controller evidence used the wrong checkout base")
-    _inventory(evidence["inventory"], "controller")
-    if not is_digest(evidence["current_checkout_sha256"]) or evidence["current_checkout_sha256"] != inventory_digest(evidence["inventory"]):
-        raise PipelineError("current checkout digest is invalid")
-    expected_diff = checkout_diff(base["inventory"], evidence["inventory"])
-    if not isinstance(evidence["diff"], list) or evidence["diff"] != expected_diff or not is_digest(evidence["diff_sha256"]) or evidence["diff_sha256"] != digest(expected_diff):
-        raise PipelineError("controller diff is not derived from its inventories")
-    expected_violations = diff_violations(expected_diff, active["access"]["write"])
+    if evidence["base_tree_oid"] != base.get("candidate_tree_oid"):
+        raise PipelineError("controller evidence used the wrong Git candidate base")
+    if not is_git_oid(evidence["candidate_tree_oid"]):
+        raise PipelineError("controller evidence has a malformed Git candidate tree")
+    paths = evidence["changed_paths"]
+    if not literal_paths_valid(paths):
+        raise PipelineError("controller changed_paths are malformed")
+    diff_base = _engineering_candidate_diff_base(state, active)
+    if (diff_base == evidence["candidate_tree_oid"]) != (not paths):
+        raise PipelineError("controller tree identity and changed_paths disagree")
+    expected_violations = diff_violations(paths, active["access"]["write"])
     if not isinstance(evidence["violations"], list) or evidence["violations"] != expected_violations or expected_violations:
         raise PipelineError(f"candidate changed forbidden paths: {expected_violations}")
     results = evidence["commands"]
@@ -214,15 +204,23 @@ def _validate_controller(
     if failures:
         if len(failures) != 1 or failures[0][0] != len(results):
             raise PipelineError("controller command evidence continued after the first failure")
-    elif len(results) != len(active["commands"]):
+    elif artifact["outcome"] != "blocked" and len(results) != len(active["commands"]):
         raise PipelineError("controller command evidence truncated a successful plan")
-    if active["phase"] in {"engineering", "qa"} and not results:
+    if artifact["outcome"] == "blocked" and results:
+        raise PipelineError("blocked worker evidence cannot contain command receipts")
+    if (
+        artifact["outcome"] != "blocked"
+        and active["phase"] in {"engineering", "qa"} and not results
+    ):
         raise PipelineError(f"{active['phase']} requires controller-run checks")
-    if not active["access"]["write"] and expected_diff:
-        raise PipelineError("a read-only assignment changed the checkout")
+    if not active["access"]["write"] and paths:
+        raise PipelineError("a read-only assignment changed the Git candidate")
     bound = active["capsule"].get("candidate")
     if active["phase"] in {"review", "qa"}:
-        if not isinstance(bound, dict) or bound != current_candidate(state) or bound.get("checkout_sha256") != evidence["current_checkout_sha256"]:
+        if (
+            not isinstance(bound, dict) or bound != current_candidate(state)
+            or bound.get("candidate_tree_oid") != evidence["candidate_tree_oid"]
+        ):
             raise PipelineError("Review/QA is not bound to the current candidate")
     if not failures:
         return None
@@ -333,7 +331,10 @@ def _latest_remediation_candidate(state: dict[str, Any]) -> dict[str, Any] | Non
     for gate_id, item in state["gates"].items():
         candidate = item.get("candidate_base") if isinstance(item, dict) else None
         if (
-            candidate_record_valid(candidate, state["authority"]["digest"])
+            candidate_record_valid(
+                candidate, state["authority"]["digest"],
+                state["pipeline_runtime_digest"],
+            )
             and candidate["generation"]
             > max(last_completed_slice_generation, retained_generation)
             and item.get("status") == "closed"
@@ -347,16 +348,56 @@ def _latest_remediation_candidate(state: dict[str, Any]) -> dict[str, Any] | Non
     return deepcopy(max(candidates, key=lambda value: (value[0], value[1]))[2])
 
 
-def _newer_nonpassing_engineering_inventory(
+def _engineering_candidate_diff_base(
+    state: dict[str, Any], active: dict[str, Any],
+) -> str:
+    """Keep accepted Engineering deltas cumulative across nonpassing retries."""
+    execution_base = active["base"]["candidate_tree_oid"]
+    if active.get("phase") != "engineering":
+        return execution_base
+    slice_id = current_slice(state)["id"]
+    binding = active.get("capsule", {}).get("candidate")
+    for gate in state["gates"].values():
+        if (
+            gate.get("status") == "closed"
+            and gate.get("slice_id") == slice_id
+            and gate.get("reason") == "fail"
+            and gate.get("phase") in {"review", "qa"}
+            and gate.get("candidate_base") == binding
+            and candidate_record_valid(
+                binding, state["authority"]["digest"],
+                state["pipeline_runtime_digest"],
+            )
+        ):
+            return binding["base_tree_oid"]
+    engineering_gates = [
+        gate for gate in state["gates"].values()
+        if gate.get("status") == "closed"
+        and gate.get("slice_id") == slice_id
+        and gate.get("phase") == "engineering"
+        and gate.get("reason") in {"blocked", "fail"}
+    ]
+    for gate in engineering_gates:
+        candidate = gate.get("candidate_base")
+        if candidate_record_valid(
+            candidate, state["authority"]["digest"],
+            state["pipeline_runtime_digest"],
+        ):
+            return candidate["candidate_tree_oid"]
+    if engineering_gates:
+        return state["base_tree_oid"]
+    return execution_base
+
+
+def _newer_nonpassing_engineering_tree(
     state: dict[str, Any], candidate: dict[str, Any],
-) -> dict[str, Any] | None:
+) -> str | None:
     if state.get("phase") != "engineering" or state.get("active_assignment") is not None:
         return None
     record = state["artifacts"].get("engineering")
     worker = record.get("worker") if isinstance(record, dict) else None
     controller = record.get("controller") if isinstance(record, dict) else None
     assignment_id = record.get("assignment_id") if isinstance(record, dict) else None
-    checkout = controller.get("inventory") if isinstance(controller, dict) else None
     commands = controller.get("commands") if isinstance(controller, dict) else None
     failures = [
         (index, item)
@@ -378,6 +419,13 @@ def _newer_nonpassing_engineering_inventory(
         and controller_gate.get("command_index") == failures[0][0]
         and controller_gate.get("returncode") == failures[0][1]["returncode"]
     )
+    required_controller = {
+        "authority_digest", "pipeline_runtime_digest", "base_tree_oid",
+        "candidate_tree_oid", "changed_paths", "violations", "commands",
+    }
+    paths = controller.get("changed_paths") if isinstance(controller, dict) else None
+    slice_record = current_slice(state)
+    allowed_paths = slice_record.get("allowed_paths", []) if isinstance(slice_record, dict) else []
     if (
         not isinstance(worker, dict)
         or (
@@ -387,16 +435,18 @@ def _newer_nonpassing_engineering_inventory(
         or record.get("candidate_binding") != candidate
         or not isinstance(assignment_id, str)
         or not isinstance(controller, dict)
+        or set(controller) != required_controller
         or controller.get("authority_digest") != state["authority"]["digest"]
-    ):
-        return None
-    try:
-        _inventory(checkout, "nonpassing engineering")
-    except PipelineError:
-        return None
-    if (
-        not is_digest(controller.get("current_checkout_sha256"))
-        or controller["current_checkout_sha256"] != inventory_digest(checkout)
+        or controller.get("pipeline_runtime_digest") != state["pipeline_runtime_digest"]
+        or controller.get("base_tree_oid") != candidate.get("candidate_tree_oid")
+        or not is_git_oid(controller.get("candidate_tree_oid"))
+        or not literal_paths_valid(paths)
+        or (
+            (candidate.get("base_tree_oid") == controller.get("candidate_tree_oid"))
+            != (not paths)
+        )
+        or controller.get("violations") != diff_violations(paths, allowed_paths)
+        or controller.get("violations") != []
     ):
         return None
     completed_generation = max(
@@ -410,7 +460,9 @@ def _newer_nonpassing_engineering_inventory(
         ),
         default=-1,
     )
-    if not candidate_record_valid(candidate, state["authority"]["digest"]):
+    if not candidate_record_valid(
+        candidate, state["authority"]["digest"], state["pipeline_runtime_digest"],
+    ):
         return None
     candidate_generation = candidate["generation"]
     last_completed_slice_generation = max(
@@ -425,33 +477,30 @@ def _newer_nonpassing_engineering_inventory(
         completed_generation <= max(candidate_generation, last_completed_slice_generation)
     ):
         return None
-    return checkout
+    return controller["candidate_tree_oid"]
 
 
 def _validate_interrupted_assignment(state: dict[str, Any], evidence: Any) -> dict[str, Any]:
     active = state["active_assignment"]
-    required = {"inventory", "checkout_sha256", "diff", "violations"}
+    required = {"base_tree_oid", "candidate_tree_oid", "changed_paths", "violations"}
     if active is None or not isinstance(evidence, dict) or set(evidence) != required:
         raise PipelineError("active reconfiguration requires controller interruption evidence")
-    current = _inventory(evidence["inventory"], "interrupted checkout")
-    if inventory_digest(current) != evidence["checkout_sha256"]:
-        raise PipelineError("interrupted checkout digest is invalid")
-    authority_paths = {item["path"] for item in state["authority"]["items"].values()}
-    expected = [
-        item for item in checkout_diff(active["base"]["inventory"], current)
-        if item["path"] not in authority_paths
-    ]
-    expected_violations = diff_violations(expected, active["access"]["write"])
-    if evidence["diff"] != expected or evidence["violations"] != expected_violations or expected_violations:
+    if (
+        evidence["base_tree_oid"] != active["base"]["candidate_tree_oid"]
+        or not is_git_oid(evidence["candidate_tree_oid"])
+        or not literal_paths_valid(evidence["changed_paths"])
+    ):
+        raise PipelineError("interrupted Git candidate evidence is invalid")
+    expected_violations = diff_violations(
+        evidence["changed_paths"], active["access"]["write"],
+    )
+    if evidence["violations"] != expected_violations or expected_violations:
         raise PipelineError(f"interrupted assignment changed forbidden paths: {expected_violations}")
     return {
-        "paths": [item["path"] for item in expected]
+        "paths": deepcopy(evidence["changed_paths"])
         if active["phase"] == "engineering" else [],
-        "after_checkout_sha256": evidence["checkout_sha256"],
-        "diff_sha256": digest(expected),
-        "changes": [
-            {"path": item["path"], "kind": item["kind"]} for item in expected
-        ],
+        "after_candidate_tree_oid": evidence["candidate_tree_oid"],
+        "changed_paths": deepcopy(evidence["changed_paths"]),
     }
 
 
@@ -465,29 +514,33 @@ def _interrupted_paths(state: dict[str, Any]) -> list[str]:
 
 
 def _controller_checkout_baseline(
-    authority_digest: str, value: Any,
+    authority_digest: str, pipeline_runtime_digest: str, value: Any,
 ) -> dict[str, Any] | None:
     """Represent an init observation with the ordinary non-passing artifact shape."""
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != {"inventory", "checkout_sha256"}:
-        raise PipelineError("controller checkout base is malformed")
-    checkout = _inventory(value["inventory"], "controller checkout base")
-    checkout_sha256 = value["checkout_sha256"]
-    if not is_digest(checkout_sha256) or checkout_sha256 != inventory_digest(checkout):
-        raise PipelineError("controller checkout base digest is invalid")
+    required = {"base_tree_oid", "candidate_tree_oid", "changed_paths"}
+    if (
+        not isinstance(value, dict) or set(value) != required
+        or not is_git_oid(value.get("base_tree_oid"))
+        or value.get("candidate_tree_oid") != value.get("base_tree_oid")
+        or value.get("changed_paths") != []
+    ):
+        raise PipelineError("controller Git candidate base is malformed")
     return {
         "assignment_id": "controller-checkout-baseline",
         "worker": {
             "outcome": "blocked",
             "summary": "Controller-owned checkout baseline; no phase credit.",
+            "blocker": "Plan has not completed for this authority epoch.",
+            "required_action": "Issue a fresh Plan worker assignment.",
         },
         "controller": {
             "authority_digest": authority_digest,
-            "base_checkout_sha256": checkout_sha256,
-            "current_checkout_sha256": checkout_sha256,
-            "inventory": deepcopy(checkout),
-            "diff": [], "diff_sha256": digest([]), "violations": [], "commands": [],
+            "pipeline_runtime_digest": pipeline_runtime_digest,
+            "base_tree_oid": value["base_tree_oid"],
+            "candidate_tree_oid": value["candidate_tree_oid"],
+            "changed_paths": [], "violations": [], "commands": [],
         },
         "candidate_binding": None,
     }
@@ -535,14 +588,14 @@ def _reduce_command(
             raise PipelineError("pipeline is not initialized")
         validate_state(state)
         return deepcopy(state)
-    if name in {"init", "migrate"}:
+    if name == "migrate":
+        raise PipelineError(SCHEMA10_UNSUPPORTED_MESSAGE)
+    if name == "init":
         _require_text(command.get("id"), "command id")
         if state is not None:
             validate_state(state)
             if replayed(state, command):
                 return deepcopy(state)
-            if name != "init":
-                raise ConflictError("pipeline is already initialized")
             if command.get("expected_generation") != state["generation"]:
                 raise ConflictError("stale generation")
             if (
@@ -558,6 +611,8 @@ def _reduce_command(
             proposed = new_state(
                 run_id=command["run_id"], project_root=command["project_root"],
                 authority=command["authority"], slices=command.get("slices", []),
+                base_tree_oid=command["controller_base"]["candidate_tree_oid"],
+                pipeline_runtime_digest=command["pipeline_runtime_digest"],
             )
             if (
                 authority_items_equal(
@@ -567,7 +622,8 @@ def _reduce_command(
             ):
                 raise PipelineError("reconfiguration did not change authority or scope")
             baseline = _controller_checkout_baseline(
-                proposed["authority"]["digest"], command.get("controller_base"),
+                proposed["authority"]["digest"], proposed["pipeline_runtime_digest"],
+                command.get("controller_base"),
             )
             work = deepcopy(state)
             audit_candidate = _latest_remediation_candidate(state) or current_candidate(state)
@@ -586,11 +642,10 @@ def _reduce_command(
                     "id": active["id"], "phase": active["phase"], "role": active["role"],
                     "worker_id": active["worker_id"], "task": active["task"],
                     "access": deepcopy(active["access"]),
-                    "base_checkout_sha256": active["base"]["checkout_sha256"],
+                    "base_tree_oid": active["base"]["candidate_tree_oid"],
                     "candidate": deepcopy(active["capsule"].get("candidate")),
-                    "after_checkout_sha256": interruption["after_checkout_sha256"],
-                    "diff_sha256": interruption["diff_sha256"],
-                    "changes": interruption["changes"],
+                    "after_candidate_tree_oid": interruption["after_candidate_tree_oid"],
+                    "changed_paths": interruption["changed_paths"],
                 }
                 prior["interrupted_paths"] = interruption["paths"]
             if pending(state["questions"]):
@@ -608,6 +663,9 @@ def _reduce_command(
                 retained_artifacts["plan"] = baseline
             work.update({
                 "authority": proposed["authority"], "phase": "plan",
+                "checkout_model": proposed["checkout_model"],
+                "base_tree_oid": proposed["base_tree_oid"],
+                "pipeline_runtime_digest": proposed["pipeline_runtime_digest"],
                 "active_assignment": None, "slices": proposed["slices"],
                 "artifacts": retained_artifacts,
                 "questions": {}, "gates": {},
@@ -616,43 +674,19 @@ def _reduce_command(
             work["history"][-1]["prior"] = prior
             validate_state(work)
             return work
-        if name == "init":
-            value = new_state(
-                run_id=command["run_id"], project_root=command["project_root"],
-                authority=command["authority"], slices=command.get("slices", []),
-            )
-            baseline = _controller_checkout_baseline(
-                value["authority"]["digest"], command.get("controller_base"),
-            )
-            if baseline is not None:
-                value["artifacts"]["plan"] = baseline
-            value["history"].append({"id": command["id"], "command": name, "command_digest": command_intent_digest(command), "generation": 0, "result": "initialized"})
-            validate_state(value)
-            return value
-        value = deepcopy(command.get("imported"))
-        validate_state(value)
+        value = new_state(
+            run_id=command["run_id"], project_root=command["project_root"],
+            authority=command["authority"], slices=command.get("slices", []),
+            base_tree_oid=command["controller_base"]["candidate_tree_oid"],
+            pipeline_runtime_digest=command["pipeline_runtime_digest"],
+        )
         baseline = _controller_checkout_baseline(
-            value["authority"]["digest"], command.get("controller_base"),
+            value["authority"]["digest"], value["pipeline_runtime_digest"],
+            command.get("controller_base"),
         )
         if baseline is not None:
-            audit = value["gates"].get("migration-audit")
-            resume_engineering = (
-                value["phase"] == "engineering"
-                and isinstance(audit, dict)
-                and audit.get("resolution") == "resume_first_slice_engineering"
-            )
-            if resume_engineering:
-                for phase in ("plan", "slice"):
-                    credit = deepcopy(baseline)
-                    credit["assignment_id"] = f"legacy-{phase}-credit"
-                    credit["worker"] = {
-                        "outcome": "pass",
-                        "summary": f"Approved schema-10 {phase} credit preserved by migration.",
-                    }
-                    value["artifacts"][phase] = credit
-            else:
-                value["artifacts"]["plan"] = baseline
-        value["history"].append({"id": command["id"], "command": name, "command_digest": command_intent_digest(command), "generation": value["generation"], "result": "migrated"})
+            value["artifacts"]["plan"] = baseline
+        value["history"].append({"id": command["id"], "command": name, "command_digest": command_intent_digest(command), "generation": 0, "result": "initialized"})
         validate_state(value)
         return value
 
@@ -705,34 +739,37 @@ def _reduce_command(
         if phase in {"engineering", "qa"} and not commands:
             raise PipelineError(f"{phase} requires planned controller commands")
         base = command.get("controller_base")
-        if not isinstance(base, dict) or set(base) != {"inventory", "checkout_sha256"}:
-            raise PipelineError("next requires a controller-derived checkout base")
-        _inventory(base["inventory"], "checkout base")
-        if inventory_digest(base["inventory"]) != base["checkout_sha256"]:
-            raise PipelineError("checkout base digest is invalid")
+        if (
+            not isinstance(base, dict) or set(base) != {"candidate_tree_oid"}
+            or not is_git_oid(base["candidate_tree_oid"])
+        ):
+            raise PipelineError("next requires a controller-derived Git candidate base")
         candidate = current_candidate(work)
-        engineering_inventory = None
+        engineering_tree = None
         if phase == "engineering":
             remediation_candidate = _latest_remediation_candidate(work)
             candidate = remediation_candidate or candidate
-            engineering_inventory = (
-                _newer_nonpassing_engineering_inventory(work, remediation_candidate)
+            engineering_tree = (
+                _newer_nonpassing_engineering_tree(work, remediation_candidate)
                 if remediation_candidate is not None else None
             )
-        engineering_base_sha256 = (
-            inventory_digest(engineering_inventory)
-            if engineering_inventory is not None else candidate.get("checkout_sha256")
+        engineering_base_tree = (
+            engineering_tree
+            if engineering_tree is not None else candidate.get("candidate_tree_oid")
             if candidate is not None else None
         )
         if (
             phase == "engineering" and candidate is not None
-            and engineering_base_sha256 != base["checkout_sha256"]
+            and engineering_base_tree != base["candidate_tree_oid"]
         ):
-            raise PipelineError("engineering checkout drifted from its retained candidate base")
+            raise PipelineError("engineering Git candidate drifted from its retained base")
         if phase in {"review", "qa"} and candidate is None:
             raise PipelineError(f"{phase} requires an engineering candidate")
-        if phase in {"review", "qa"} and candidate.get("checkout_sha256") != base["checkout_sha256"]:
-            raise PipelineError(f"{phase} checkout drifted from the current candidate")
+        if (
+            phase in {"review", "qa"}
+            and candidate.get("candidate_tree_oid") != base["candidate_tree_oid"]
+        ):
+            raise PipelineError(f"{phase} Git tree drifted from the current candidate")
         context = spec.get("context", {})
         if not isinstance(context, dict):
             raise PipelineError("assignment context must be an object")
@@ -786,7 +823,7 @@ def _reduce_command(
         if forbidden:
             raise PipelineError(f"worker artifact contains controller-owned field {forbidden!r}")
         controller_failure = _validate_controller(
-            work, active, command.get("controller"),
+            work, active, artifact, command.get("controller"),
         )
         failure_capsule = None
         if controller_failure is not None:
@@ -811,12 +848,14 @@ def _reduce_command(
                 active["phase"] == "engineering"
                 and artifact["outcome"] == "pass"
             )
-            or (active["phase"] == "docs" and evidence["diff"])
+            or (active["phase"] == "docs" and evidence["changed_paths"])
         ) and controller_failure is None:
             record["candidate"] = {
-                "checkout_sha256": evidence["current_checkout_sha256"],
-                "diff_sha256": evidence["diff_sha256"],
+                "base_tree_oid": _engineering_candidate_diff_base(work, active),
+                "candidate_tree_oid": evidence["candidate_tree_oid"],
+                "changed_paths": deepcopy(evidence["changed_paths"]),
                 "authority_digest": work["authority"]["digest"],
+                "pipeline_runtime_digest": work["pipeline_runtime_digest"],
                 "generation": work["generation"] + 1,
             }
         work["artifacts"][active["phase"]] = record
@@ -852,7 +891,7 @@ def _reduce_command(
         if active["phase"] == "engineering":
             for stale in ("review", "qa", "docs", "ready"):
                 work["artifacts"].pop(stale, None)
-        elif active["phase"] == "docs" and evidence["diff"]:
+        elif active["phase"] == "docs" and evidence["changed_paths"]:
             for stale in ("review", "qa", "ready"):
                 work["artifacts"].pop(stale, None)
         work["active_assignment"] = None
@@ -964,13 +1003,18 @@ def _reduce_command(
             raise PipelineError("ready requires Engineering, Review, and QA for every approved slice")
         candidate = current_candidate(work)
         controller = command.get("controller")
-        if not isinstance(controller, dict) or set(controller) != {"inventory", "checkout_sha256"}:
-            raise PipelineError("ready requires live controller inventory")
-        _inventory(controller["inventory"], "ready controller")
-        if not is_digest(controller["checkout_sha256"]) or controller["checkout_sha256"] != inventory_digest(controller["inventory"]):
-            raise PipelineError("ready controller inventory is malformed")
-        if candidate is None or candidate.get("checkout_sha256") != controller["checkout_sha256"]:
-            raise PipelineError("live checkout is not the current candidate")
+        if (
+            not isinstance(controller, dict)
+            or set(controller) != {"candidate_tree_oid", "pipeline_runtime_digest"}
+            or not is_git_oid(controller.get("candidate_tree_oid"))
+            or controller.get("pipeline_runtime_digest") != work["pipeline_runtime_digest"]
+        ):
+            raise PipelineError("ready requires the live Git candidate tree")
+        if (
+            candidate is None
+            or candidate.get("candidate_tree_oid") != controller["candidate_tree_oid"]
+        ):
+            raise PipelineError("live Git tree is not the current candidate")
         for phase in PHASES[:-1]:
             record = work["artifacts"].get(phase)
             if not isinstance(record, dict) or record.get("worker", {}).get("outcome") != "pass":

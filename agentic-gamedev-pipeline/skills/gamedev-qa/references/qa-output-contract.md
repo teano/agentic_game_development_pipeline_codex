@@ -10,4 +10,4 @@ Return one JSON object containing only:
 
 `outcome` is `pass`, `fail`, or `blocked`. `checks` is required and lists the QA scenarios and their observed results; pass/fail requires at least one check. Do not execute controller-owned planned-command argv in the live candidate merely to populate this list. `blocker` is required only with `blocked`. `questions` is an optional array of concise strings.
 
-Do not include SHA values, checkout inventory, command digests, or controller state. The controller runs assigned machine checks independently.
+Do not include Git tree OIDs, command digests, or controller state. The controller runs assigned machine checks independently.

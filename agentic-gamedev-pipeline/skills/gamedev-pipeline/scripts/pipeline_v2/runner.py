@@ -8,15 +8,25 @@ import json
 import os
 import re
 import shutil
-import stat
-import tempfile
-import time
 from copy import deepcopy
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .checkout import authority_items, authority_items_equal, canonical_project_root, diff, inventory, inventory_digest, path_identity, safe_path, verify_authority, violations
+from .checkout import (
+    authority_items,
+    authority_items_equal,
+    candidate_tree_oid,
+    canonical_project_root,
+    changed_paths,
+    path_identity,
+    pipeline_runtime_digest,
+    repository_policy_changed,
+    require_clean_head,
+    safe_path,
+    verify_authority,
+    violations,
+)
+from .legacy_gen53 import SCHEMA10_UNSUPPORTED_MESSAGE
 from .model import (
     PHASES,
     PipelineError,
@@ -29,6 +39,7 @@ from .model import (
     digest,
     is_digest,
     is_generation,
+    is_git_oid,
     is_strict_integer,
     reconfiguration_action,
     safe_identifier,
@@ -38,7 +49,11 @@ from .model import (
     validate_state,
 )
 from .process_tree import run_process_tree
-from .reducer import _newer_nonpassing_engineering_inventory
+from .reducer import (
+    _engineering_candidate_diff_base,
+    _newer_nonpassing_engineering_tree,
+    _worker_artifact,
+)
 from .transaction import StateStore
 
 
@@ -125,45 +140,6 @@ def _process_environment() -> dict[str, str]:
     return environment
 
 
-def _lexically_contained(root: Path, candidate: str | Path) -> bool:
-    root_value = os.path.normcase(os.path.abspath(root))
-    candidate_value = os.path.normcase(os.path.abspath(candidate))
-    try:
-        return os.path.commonpath((root_value, candidate_value)) == root_value
-    except (OSError, ValueError):
-        return False
-
-
-def _remove_read_only_temp(path: Path, label: str) -> None:
-    verified_scratch = Path(os.path.abspath(path))
-
-    def retry_read_only(function, failed_path, exc_info) -> None:
-        failed = Path(os.path.abspath(failed_path))
-        if not _lexically_contained(verified_scratch, failed):
-            raise exc_info[1]
-        try:
-            failed_stat = failed.lstat()
-        except OSError:
-            raise exc_info[1]
-        if failed.is_symlink() or bool(
-            getattr(failed_stat, "st_file_attributes", 0) & 0x400
-        ):
-            raise exc_info[1]
-        os.chmod(failed, stat.S_IREAD | stat.S_IWRITE)
-        function(failed_path)
-
-    for attempt in range(6):
-        try:
-            shutil.rmtree(path, onerror=retry_read_only if os.name == "nt" else None)
-            return
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            if attempt == 5:
-                raise PipelineError(f"cannot clean {label}: {exc}") from exc
-            time.sleep(0.05 * (attempt + 1))
-
-
 def _replace_literal(value: str, literal: str, replacement: str) -> tuple[str, bool]:
     if not literal:
         return value, False
@@ -175,7 +151,7 @@ def _replace_literal(value: str, literal: str, replacement: str) -> tuple[str, b
 
 def _stderr_excerpt(
     raw: bytes, *, raw_truncated: bool, environment: dict[str, str],
-    project_root: Path, scratch_root: Path | None,
+    project_root: Path,
 ) -> dict[str, Any]:
     """Return one redacted, path-normalized, byte-bounded failure tail."""
     text = raw.decode("utf-8", errors="replace")
@@ -201,10 +177,7 @@ def _stderr_excerpt(
             text,
         )
         redacted = redacted or count > 0
-    roots = []
-    if scratch_root is not None:
-        roots.append((str(Path(os.path.abspath(scratch_root))), "[SCRATCH_ROOT]"))
-    roots.append((str(Path(os.path.abspath(project_root))), "[PROJECT_ROOT]"))
+    roots = [(str(Path(os.path.abspath(project_root))), "[PROJECT_ROOT]")]
     for root_value, replacement in roots:
         for spelling in dict.fromkeys((root_value, root_value.replace("\\", "/"))):
             text, _ = _replace_literal(text, spelling, replacement)
@@ -220,38 +193,6 @@ def _stderr_excerpt(
     }
 
 
-@contextmanager
-def _read_only_process_environment(root: Path):
-    """Confine read-only command temp/cache data without copying candidate bytes."""
-    scratch_root = safe_path(root, ".agentic-pipeline-v2/read-only-temp", "read-only temp root")
-    if scratch_root.exists():
-        _remove_read_only_temp(scratch_root, "stale read-only command temp")
-    try:
-        scratch_root.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise PipelineError(f"cannot create read-only temp root: {exc}") from exc
-    scratch_root = safe_path(root, scratch_root, "read-only temp root", strict=True)
-    if not scratch_root.is_dir():
-        raise PipelineError("read-only temp root is not a directory")
-    try:
-        temporary = Path(tempfile.mkdtemp(prefix="command-", dir=scratch_root))
-    except OSError as exc:
-        raise PipelineError(f"cannot create read-only command temp: {exc}") from exc
-    try:
-        scratch = safe_path(root, temporary, "read-only command temp", strict=True)
-        environment = _process_environment()
-        value = str(scratch)
-        for name in (
-            "TEMP", "TMP", "TMPDIR", "XDG_CACHE_HOME", "NPM_CONFIG_CACHE",
-            "npm_config_cache", "YARN_CACHE_FOLDER", "PIP_CACHE_DIR",
-        ):
-            environment[name] = value
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        yield environment
-    finally:
-        _remove_read_only_temp(scratch_root, "read-only temp root")
-
-
 class Controller:
     def __init__(self, store: StateStore, *, timeout: float = 600.0):
         self.store = store
@@ -262,6 +203,10 @@ class Controller:
         validate_state(state)
         root = canonical_project_root(state["project_root"])
         self.store.validate_project_location(root)
+        if pipeline_runtime_digest() != state["pipeline_runtime_digest"]:
+            raise PipelineError(
+                "pipeline runtime changed during the run; stop and perform a fresh init"
+            )
         verify_authority(root, state["authority"])
         if not slices_are_read_sealed(state):
             raise PipelineError(
@@ -275,19 +220,6 @@ class Controller:
         validate_state(state)
         root = canonical_project_root(state["project_root"])
         self.store.validate_project_location(root)
-
-    @staticmethod
-    def _candidate_inventory(state: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any] | None:
-        for record in state["artifacts"].values():
-            if not isinstance(record, dict):
-                continue
-            if record.get("candidate") != candidate and record.get("candidate_binding") != candidate:
-                continue
-            controller = record.get("controller")
-            observed = controller.get("inventory") if isinstance(controller, dict) else None
-            if isinstance(observed, dict) and inventory_digest(observed) == candidate["checkout_sha256"]:
-                return observed
-        return None
 
     @staticmethod
     def _remediation_candidate(state: dict[str, Any]) -> dict[str, Any] | None:
@@ -314,6 +246,7 @@ class Controller:
             and item.get("phase") in {"review", "qa"}
             and candidate_record_valid(
                 item.get("candidate_base"), state["authority"]["digest"],
+                state["pipeline_runtime_digest"],
             )
             and item["candidate_base"]["generation"]
             > max(last_completed_slice_generation, retained_generation)
@@ -321,85 +254,79 @@ class Controller:
         return max(candidates, default=(0, "", None))[-1]
 
     @staticmethod
-    def _latest_controller_inventory(
-        state: dict[str, Any],
-    ) -> tuple[int, dict[str, Any] | None, str | None]:
+    def _latest_controller_tree(state: dict[str, Any]) -> str | None:
         completed_generation = {
             item["assignment_id"]: item["generation"]
             for item in state["history"]
             if isinstance(item.get("assignment_id"), str)
             and is_generation(item.get("generation"))
         }
-        observed = []
+        epoch_generation = max(
+            (
+                item["generation"] for item in state["history"]
+                if item.get("command") == "init" and is_generation(item.get("generation"))
+            ),
+            default=-1,
+        )
+        observed: list[tuple[int, int, str]] = []
         for phase in ("plan", "slice", "engineering", "review", "qa", "docs", "ready"):
             record = state["artifacts"].get(phase)
             controller = record.get("controller") if isinstance(record, dict) else None
-            checkout = controller.get("inventory") if isinstance(controller, dict) else None
-            if isinstance(checkout, dict):
-                generation = completed_generation.get(record.get("assignment_id"), -1)
-                observed.append((generation, phase, checkout, controller.get("authority_digest")))
-        latest = max(observed, default=(-1, "", None, None))
-        return latest[0], latest[-2], latest[-1]
+            tree = controller.get("candidate_tree_oid") if isinstance(controller, dict) else None
+            if is_git_oid(tree):
+                generation = completed_generation.get(
+                    record.get("assignment_id"),
+                    epoch_generation if record.get("assignment_id") == "controller-checkout-baseline" else -1,
+                )
+                observed.append((generation, PHASES.index(phase), tree))
+        return max(observed, default=(-1, -1, None))[-1]
 
     def _checkout_drift(
-        self, state: dict[str, Any], current: dict[str, Any], *, ignore_authority: bool = False,
+        self, state: dict[str, Any], root: Path, current: str,
+        *, ignore_authority: bool = False,
     ) -> list[str]:
         authority_paths = {
             path_identity(item["path"]) for item in state["authority"]["items"].values()
         }
         active = state["active_assignment"]
         if active is not None:
-            changes = diff(active["base"]["inventory"], current)
+            changes = changed_paths(root, active["base"]["candidate_tree_oid"], current)
             if ignore_authority:
                 changes = [
-                    item for item in changes
-                    if path_identity(item["path"]) not in authority_paths
+                    path for path in changes
+                    if path_identity(path) not in authority_paths
                 ]
             return violations(changes, active["access"]["write"])
-
-        remediation_candidate = self._remediation_candidate(state)
-        candidate = remediation_candidate or current_candidate(state)
-        expected = self._candidate_inventory(state, candidate) if candidate is not None else None
-        expected_authority = candidate.get("authority_digest") if candidate is not None else None
-        newer_engineering = (
-            _newer_nonpassing_engineering_inventory(state, remediation_candidate)
-            if remediation_candidate is not None else None
+        remediation = self._remediation_candidate(state)
+        expected = (
+            _newer_nonpassing_engineering_tree(state, remediation)
+            if isinstance(remediation, dict) else None
         )
-        if newer_engineering is not None:
-            expected = newer_engineering
-            expected_authority = state["authority"]["digest"]
-        elif expected is None and remediation_candidate is None:
-            latest_generation, latest_inventory, latest_authority = (
-                self._latest_controller_inventory(state)
-            )
-            candidate_generation = (
-                candidate["generation"]
-                if candidate_record_valid(candidate, state["authority"]["digest"])
-                else -1
-            )
-            if candidate is None or latest_generation > candidate_generation:
-                expected = latest_inventory
-                expected_authority = latest_authority
-        if expected is not None:
-            changes = diff(expected, current)
-            if ignore_authority or expected_authority != state["authority"]["digest"]:
-                changes = [
-                    item for item in changes
-                    if path_identity(item["path"]) not in authority_paths
-                ]
-            return [item["path"] for item in changes]
-        if (
-            candidate is not None and not ignore_authority
-            and candidate.get("checkout_sha256") != inventory_digest(current)
-        ):
-            return ["<checkout>"]
-        return []
+        if expected is None and isinstance(remediation, dict):
+            expected = remediation["candidate_tree_oid"]
+        if expected is None:
+            expected = self._latest_controller_tree(state)
+        if expected is None:
+            candidate = current_candidate(state)
+            expected = candidate.get("candidate_tree_oid") if isinstance(candidate, dict) else None
+        if expected is None or expected == current:
+            return []
+        changes = changed_paths(root, expected, current)
+        if ignore_authority:
+            changes = [path for path in changes if path_identity(path) not in authority_paths]
+        return changes
 
     def _verify_live_checkout(
         self, state: dict[str, Any], root: Path,
-    ) -> dict[str, dict[str, Any]]:
-        current = inventory(root)
-        drift = self._checkout_drift(state, current)
+    ) -> str:
+        current = candidate_tree_oid(root)
+        policy = repository_policy_changed(root, state["base_tree_oid"], current)
+        if policy:
+            raise PipelineError(
+                "repository policy changed during the run; perform a fresh init: "
+                + ", ".join(policy)
+            )
+        drift = self._checkout_drift(state, root, current)
         if drift:
             if state["active_assignment"] is not None:
                 raise PipelineError(f"candidate changed forbidden paths: {drift}")
@@ -414,6 +341,10 @@ class Controller:
             validate_state(state)
             root = canonical_project_root(state["project_root"])
             self.store.validate_project_location(root)
+            if pipeline_runtime_digest() != state["pipeline_runtime_digest"]:
+                raise PipelineError(
+                    "pipeline runtime changed during the run; stop and perform a fresh init"
+                )
             paths = {
                 name: item["path"] for name, item in state["authority"]["items"].items()
             }
@@ -429,12 +360,18 @@ class Controller:
                     _unsealed_projection(state["slices"]),
                 )
                 scope_changed = proposed_slices != state["slices"]
-            current = inventory(root)
+            current = candidate_tree_oid(root)
+            policy = repository_policy_changed(root, state["base_tree_oid"], current)
             drift = self._checkout_drift(
-                state, current, ignore_authority=authority_changed,
+                state, root, current, ignore_authority=authority_changed,
             )
             view = status_view(state)
-            if drift:
+            if policy:
+                view["next_action"] = {
+                    "kind": "terminal", "result": "fresh_init_required",
+                    "reason": "repository policy changed: " + ", ".join(policy),
+                }
+            elif drift:
                 view["next_action"] = {
                     "kind": "terminal", "result": "checkout_recovery_required",
                     "reason": f"restore or reconcile checkout drift before mutation: {drift}",
@@ -442,7 +379,7 @@ class Controller:
             elif authority_changed or scope_changed:
                 view["next_action"] = reconfiguration_action(
                     state, observed, proposed_slices,
-                    checkout_sha256=inventory_digest(current),
+                    candidate_tree_oid=current,
                 )
             return view
 
@@ -520,7 +457,7 @@ class Controller:
             command = {
                 **intent,
                 "expected_generation": state["generation"] if expected_generation is None else expected_generation,
-                "controller_base": {"inventory": snapshot, "checkout_sha256": inventory_digest(snapshot)},
+                "controller_base": {"candidate_tree_oid": snapshot},
             }
             return self.store._dispatch_locked(command)
 
@@ -536,6 +473,31 @@ class Controller:
             supplied_paths = value.pop("authority_paths", None)
             root = canonical_project_root(value["project_root"])
             value["project_root"] = str(root)
+            runtime_digest = pipeline_runtime_digest()
+            if state is not None:
+                validate_state(state)
+                if runtime_digest != state["pipeline_runtime_digest"]:
+                    raise PipelineError(
+                        "pipeline runtime changed during the run; stop and perform a fresh init"
+                    )
+                if supplied_paths is not None:
+                    expected_paths = {
+                        name: item["path"]
+                        for name, item in state["authority"]["items"].items()
+                    }
+                    if (
+                        not isinstance(supplied_paths, dict)
+                        or set(supplied_paths) != set(expected_paths)
+                        or any(
+                            not isinstance(supplied_paths[name], str)
+                            or path_identity(supplied_paths[name])
+                            != path_identity(expected_paths[name])
+                            for name in expected_paths
+                        )
+                    ):
+                        raise PipelineError(
+                            "stale approved authority reconfiguration action; run status again"
+                        )
             if supplied_paths is not None:
                 value["authority"] = {"items": authority_items(root, supplied_paths)}
             proposed_items = value.get("authority", {}).get("items", {})
@@ -556,15 +518,20 @@ class Controller:
                         "init slices must match the controller-projected status action"
                     )
                 value["slices"] = proposed_slices
-            current = inventory(root)
+            current = require_clean_head(root) if state is None else candidate_tree_oid(root)
             if state is not None:
-                validate_state(state)
+                policy = repository_policy_changed(root, state["base_tree_oid"], current)
+                if policy:
+                    raise PipelineError(
+                        "repository policy changed during the run; perform a fresh init: "
+                        + ", ".join(policy)
+                    )
                 authority_changed = not authority_items_equal(
                     value.get("authority", {}).get("items", {}),
                     state["authority"]["items"],
                 )
                 drift = self._checkout_drift(
-                    state, current, ignore_authority=authority_changed,
+                    state, root, current, ignore_authority=authority_changed,
                 )
                 if drift:
                     if state.get("active_assignment") is not None:
@@ -574,14 +541,17 @@ class Controller:
                 if authority_changed or scope_changed:
                     expected = reconfiguration_action(
                         state, value["authority"]["items"], value.get("slices"),
-                        checkout_sha256=inventory_digest(current),
+                        candidate_tree_oid=current,
                     )
                     if value.get("id") != expected["command_id"]:
                         raise PipelineError(
                             "stale approved authority or scope reconfiguration action; run status again"
                         )
+            value["pipeline_runtime_digest"] = runtime_digest
             value["controller_base"] = {
-                "inventory": current, "checkout_sha256": inventory_digest(current),
+                "base_tree_oid": current,
+                "candidate_tree_oid": current,
+                "changed_paths": [],
             }
             if state is not None and state.get("active_assignment") is not None:
                 active = state["active_assignment"]
@@ -590,58 +560,22 @@ class Controller:
                     for item in state["authority"]["items"].values()
                 }
                 changes = [
-                    item for item in diff(active["base"]["inventory"], current)
-                    if path_identity(item["path"]) not in authority_paths
+                    path for path in changed_paths(
+                        root, active["base"]["candidate_tree_oid"], current,
+                    )
+                    if path_identity(path) not in authority_paths
                 ]
                 value["controller_interrupt"] = {
-                    "inventory": current,
-                    "checkout_sha256": inventory_digest(current),
-                    "diff": changes,
+                    "base_tree_oid": active["base"]["candidate_tree_oid"],
+                    "candidate_tree_oid": current,
+                    "changed_paths": changes,
                     "violations": violations(changes, active["access"]["write"]),
                 }
             return self.store._dispatch_locked(value)
 
     def migrate(self, command: dict[str, Any]) -> dict[str, Any]:
-        """Import or replay migration only against its lock-bound live checkout."""
-        _require_expected_generation(command.get("expected_generation"))
-        value = canonical_command(command)
-        imported = value.get("imported")
-        validate_state(imported)
-        _caller_slices(imported["slices"])
-        proposed_root = canonical_project_root(imported["project_root"])
-        imported["project_root"] = str(proposed_root)
-        validate_state(imported)
-        existing = self.store.load(required=False)
-        if existing is None:
-            self.store.validate_project_location(proposed_root)
-        else:
-            self._preflight_existing_store_location()
-        with self.store.transaction():
-            state = self.store.load(required=False)
-            if state is None:
-                root = canonical_project_root(imported["project_root"])
-                verify_authority(root, imported["authority"])
-                imported["slices"] = seal_slices_from_approved_plan(
-                    root, imported["authority"]["items"]["plan"]["path"],
-                    imported["slices"],
-                )
-                value["imported"] = imported
-                current = inventory(root)
-            else:
-                state, root = self._loaded(state)
-                current = self._verify_live_checkout(state, root)
-                imported["slices"] = seal_slices_from_approved_plan(
-                    proposed_root, imported["authority"]["items"]["plan"]["path"],
-                    imported["slices"],
-                )
-                value["imported"] = imported
-                replay = self.store._replay_locked(value)
-                if replay is not None:
-                    return replay
-            value["controller_base"] = {
-                "inventory": current, "checkout_sha256": inventory_digest(current),
-            }
-            return self.store._dispatch_locked(value)
+        """Retain the public entry point as an explicit schema-10 tombstone."""
+        raise PipelineError(SCHEMA10_UNSUPPORTED_MESSAGE)
 
     def transition(self, command: dict[str, Any]) -> dict[str, Any]:
         """Run a non-I/O transition only while its bound authority is still exact."""
@@ -699,12 +633,14 @@ class Controller:
                 return checked
             if active is None:  # pragma: no cover - conflicting replay is reported above
                 raise PipelineError("there is no active assignment")
+            artifact = _worker_artifact(artifact, active["phase"], active["role"])
             results = []
 
             def run_checks(
                 checkout: Path, environment: dict[str, str],
             ) -> None:
                 for argv in active["commands"]:
+                    before_command = candidate_tree_oid(checkout)
                     try:
                         executable = shutil.which(argv[0]) if os.name == "nt" else None
                         execution_argv = [executable, *argv[1:]] if executable else argv
@@ -723,7 +659,6 @@ class Controller:
                                 raw_truncated=result.stderr_tail_truncated,
                                 environment=environment,
                                 project_root=root,
-                                scratch_root=Path(environment["TEMP"]),
                             ))
                     except OSError as exc:
                         raw_error = str(exc).encode("utf-8", errors="replace")
@@ -737,34 +672,47 @@ class Controller:
                             raw_truncated=False,
                             environment=environment,
                             project_root=root,
-                            scratch_root=Path(environment["TEMP"]),
                         ))
                     results.append(command_result)
-                    command_inventory = inventory(checkout)
-                    command_changes = diff(active["base"]["inventory"], command_inventory)
-                    forbidden = violations(command_changes, active["access"]["write"])
-                    if forbidden:
-                        raise PipelineError(f"candidate changed forbidden paths: {forbidden}")
+                    after_command = candidate_tree_oid(checkout)
+                    policy = repository_policy_changed(
+                        checkout, state["base_tree_oid"], after_command,
+                    )
+                    if policy:
+                        raise PipelineError(
+                            "planned command changed repository policy; perform a fresh init: "
+                            + ", ".join(policy)
+                        )
+                    if after_command != before_command:
+                        command_changes = changed_paths(
+                            checkout, before_command, after_command,
+                        )
+                        raise PipelineError(
+                            "planned command changed the Git candidate: "
+                            + ", ".join(command_changes)
+                        )
                     if command_result["returncode"] != 0:
                         break
 
-            if active["commands"]:
-                with _read_only_process_environment(root) as environment:
-                    run_checks(
-                        root, environment,
-                    )
-            else:
+            if artifact["outcome"] != "blocked":
                 run_checks(root, _process_environment())
             verify_authority(root, state["authority"])
-            current = inventory(root)
-            changes = diff(active["base"]["inventory"], current)
+            current = candidate_tree_oid(root)
+            policy = repository_policy_changed(root, state["base_tree_oid"], current)
+            if policy:
+                raise PipelineError(
+                    "repository policy changed during the run; perform a fresh init: "
+                    + ", ".join(policy)
+                )
+            changes = changed_paths(
+                root, _engineering_candidate_diff_base(state, active), current,
+            )
             evidence = {
                 "authority_digest": state["authority"]["digest"],
-                "base_checkout_sha256": active["base"]["checkout_sha256"],
-                "current_checkout_sha256": inventory_digest(current),
-                "inventory": current,
-                "diff": changes,
-                "diff_sha256": digest(changes),
+                "pipeline_runtime_digest": state["pipeline_runtime_digest"],
+                "base_tree_oid": active["base"]["candidate_tree_oid"],
+                "candidate_tree_oid": current,
+                "changed_paths": changes,
                 "violations": violations(changes, active["access"]["write"]),
                 "commands": results,
             }
@@ -784,6 +732,9 @@ class Controller:
             command = {
                 **intent,
                 "expected_generation": state["generation"] if expected_generation is None else expected_generation,
-                "controller": {"inventory": current, "checkout_sha256": inventory_digest(current)},
+                "controller": {
+                    "candidate_tree_oid": current,
+                    "pipeline_runtime_digest": state["pipeline_runtime_digest"],
+                },
             }
             return self.store._dispatch_locked(command)

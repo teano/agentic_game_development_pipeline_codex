@@ -129,6 +129,28 @@ class SharedOperationalInvariantTests(unittest.TestCase):
         self.assertIn("direct authority contradiction that changes the verdict", contract)
         self.assertIn("mandatory assigned input or capability", contract)
 
+    def test_pipeline_defect_is_an_instruction_only_incident_stop(self) -> None:
+        pipeline_skill = (SKILLS / "gamedev-pipeline" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        protocol = (
+            SKILLS / "gamedev-pipeline" / "references" / "pipeline-protocol.md"
+        ).read_text(encoding="utf-8")
+        default_prompt = (
+            SKILLS / "gamedev-pipeline" / "agents" / "openai.yaml"
+        ).read_text(encoding="utf-8")
+        root_readme = (BUNDLE.parent / "README.md").read_text(encoding="utf-8")
+        invariant = INVARIANT.read_text(encoding="utf-8")
+
+        self.assertIn("MUST immediately stop the product run", invariant)
+        self.assertIn("MUST NOT edit, patch, bypass", invariant)
+        self.assertIn("new explicit user command", invariant)
+        for text in (pipeline_skill, protocol, default_prompt, root_readme):
+            with self.subTest(source=text[:40]):
+                self.assertRegex(text, r"(?i)stop|остана")
+                self.assertRegex(text, r"(?i)patch|патч|менять")
+                self.assertRegex(text, r"(?i)new explicit user|новой явной команд")
+
     def test_v2_authority_reopen_has_one_public_fail_closed_route(self) -> None:
         protocol = (
             SKILLS / "gamedev-pipeline" / "references" / "pipeline-protocol.md"

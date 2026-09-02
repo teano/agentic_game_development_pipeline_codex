@@ -84,7 +84,10 @@ def parser() -> argparse.ArgumentParser:
     resume.add_argument("--id", required=True); resume.add_argument("--expected-generation", type=int, required=True); resume.add_argument("--gate-id", required=True); resume.add_argument("--resolution", required=True); resume.add_argument("--run", action="append", default=[])
     accept = commands.add_parser("accept", help="Accept current passing phase evidence and advance.")
     accept.add_argument("--id", required=True); accept.add_argument("--expected-generation", type=int, required=True)
-    migrate = commands.add_parser("migrate", help="Import schema-10 audit context into a fresh v2 run.")
+    migrate = commands.add_parser(
+        "migrate",
+        help="Unsupported schema-10 tombstone; archive legacy state/findings and run fresh Plan/init.",
+    )
     migrate.add_argument("--id", required=True); migrate.add_argument("--legacy-state", type=Path, required=True); migrate.add_argument("--slice", action="append", required=True)
     ready = commands.add_parser("ready", help="Seal the fully verified live candidate as production-ready.")
     ready.add_argument("--id", required=True); ready.add_argument("--expected-generation", type=int, required=True)

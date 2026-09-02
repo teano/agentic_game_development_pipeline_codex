@@ -11,11 +11,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 SCHEMA = 2
+CHECKOUT_MODEL = "git-tree-v1"
 PHASES = ("plan", "slice", "engineering", "review", "qa", "docs", "ready")
 NEXT_PHASE = dict(zip(PHASES, PHASES[1:]))
 AUTHORITY_KEYS = {"requirements", "specification", "plan"}
 CANDIDATE_FIELDS = {
-    "checkout_sha256", "diff_sha256", "authority_digest", "generation",
+    "base_tree_oid", "candidate_tree_oid", "changed_paths", "authority_digest",
+    "pipeline_runtime_digest", "generation",
 }
 ROLES = {
     "plan": "planner",
@@ -27,26 +29,38 @@ ROLES = {
 }
 _ARTIFACT_SHAPES = {
     "plan": (
-        ("outcome", "summary", "questions"), ("outcome", "summary"),
-        {"summary": "non-empty string", "questions[]": "non-empty string"},
+        ("outcome", "summary", "questions", "blocker", "required_action"),
+        ("outcome", "summary"),
+        {
+            "summary": "non-empty string", "questions[]": "non-empty string",
+            "blocker": "non-empty string only and always when blocked",
+            "required_action": "non-empty string only and always when blocked",
+        },
     ),
     "slice": (
-        ("outcome", "summary", "slices", "questions"), ("outcome", "summary"),
+        ("outcome", "summary", "slices", "questions", "blocker", "required_action"),
+        ("outcome", "summary"),
         {
             "summary": "non-empty string",
             "slices[]": "optional ordered {id,allowed_paths,planned_commands} records",
             "questions[]": "non-empty string",
+            "blocker": "non-empty string only and always when blocked",
+            "required_action": "non-empty string only and always when blocked",
         },
     ),
     "engineering": (
-        ("outcome", "summary", "questions", "assumptions"), ("outcome", "summary"),
+        ("outcome", "summary", "questions", "assumptions", "blocker", "required_action"),
+        ("outcome", "summary"),
         {
             "summary": "non-empty string", "questions[]": "non-empty string",
             "assumptions[]": "non-empty string",
+            "blocker": "non-empty string only and always when blocked",
+            "required_action": "non-empty string only and always when blocked",
         },
     ),
     "review": (
-        ("outcome", "findings", "questions"), ("outcome", "findings"),
+        ("outcome", "findings", "questions", "blocker", "required_action"),
+        ("outcome", "findings"),
         {
             "findings[]": {
                 "allowed_keys": ["text", "severity", "kind"],
@@ -55,24 +69,34 @@ _ARTIFACT_SHAPES = {
             },
             "findings": "empty on pass; non-empty on fail",
             "questions[]": "non-empty string",
+            "blocker": "non-empty string only and always when blocked",
+            "required_action": "non-empty string only and always when blocked",
         },
     ),
     "qa": (
-        ("outcome", "checks", "blocker", "questions"), ("outcome", "checks"),
+        ("outcome", "checks", "blocker", "required_action", "questions"),
+        ("outcome", "checks"),
         {
             "checks[]": "non-empty string; at least one unless blocked",
             "blocker": "non-empty string only and always when blocked",
+            "required_action": "non-empty string only and always when blocked",
             "questions[]": "non-empty string",
         },
     ),
     "docs": (
-        ("outcome", "summary", "questions"), ("outcome", "summary"),
-        {"summary": "non-empty string", "questions[]": "non-empty string"},
+        ("outcome", "summary", "questions", "blocker", "required_action"),
+        ("outcome", "summary"),
+        {
+            "summary": "non-empty string", "questions[]": "non-empty string",
+            "blocker": "non-empty string only and always when blocked",
+            "required_action": "non-empty string only and always when blocked",
+        },
     ),
 }
 STATE_FIELDS = {
     "schema", "run_id", "generation", "project_root", "authority", "phase",
     "active_assignment", "slices", "artifacts", "questions", "gates", "history",
+    "checkout_model", "base_tree_oid", "pipeline_runtime_digest",
 }
 HEX64 = set("0123456789abcdef")
 ASSIGNMENT_OUTPUT_DIR = ".agentic-pipeline/outputs"
@@ -135,6 +159,13 @@ def is_digest(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64 and set(value) <= HEX64
 
 
+def is_git_oid(value: Any) -> bool:
+    return (
+        isinstance(value, str) and len(value) in {40, 64}
+        and set(value) <= HEX64
+    )
+
+
 def is_strict_integer(value: Any) -> bool:
     """Accept JSON integers without treating booleans as numbers."""
     return type(value) is int
@@ -144,15 +175,20 @@ def is_generation(value: Any) -> bool:
     return is_strict_integer(value) and value >= 0
 
 
-def candidate_record_valid(value: Any, authority_digest: Any) -> bool:
+def candidate_record_valid(
+    value: Any, authority_digest: Any, pipeline_runtime_digest: Any,
+) -> bool:
     """Validate one exact candidate bound to the current authority epoch."""
     return (
         isinstance(value, dict)
         and set(value) == CANDIDATE_FIELDS
-        and is_digest(value.get("checkout_sha256"))
-        and is_digest(value.get("diff_sha256"))
+        and is_git_oid(value.get("base_tree_oid"))
+        and is_git_oid(value.get("candidate_tree_oid"))
+        and literal_paths_valid(value.get("changed_paths"))
         and is_digest(value.get("authority_digest"))
         and value.get("authority_digest") == authority_digest
+        and is_digest(value.get("pipeline_runtime_digest"))
+        and value.get("pipeline_runtime_digest") == pipeline_runtime_digest
         and is_generation(value.get("generation"))
     )
 
@@ -323,18 +359,43 @@ def normalize_rule(value: str) -> str:
         return rule
     prefix = rule[:-3] if rule.endswith("/**") else None
     wildcard_source = prefix if prefix is not None else rule
-    if any(char in wildcard_source for char in "*?[") or (prefix is not None and not prefix.rstrip("/")):
+    if any(char in wildcard_source for char in "*?") or (prefix is not None and not prefix.rstrip("/")):
         raise PipelineError("path rules allow only exact paths, '**', or 'dir/**'")
     if path.as_posix() != rule or rule in {".", ""}:
         raise PipelineError(f"invalid project-relative path rule: {value!r}")
     return path.as_posix()
 
 
+def normalize_literal_path(value: str) -> str:
+    """Normalize one Git-reported project-relative path without glob semantics."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise PipelineError("literal paths must be non-empty strings")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise PipelineError("literal paths cannot contain control characters")
+    normalized = value.replace("\\", "/")
+    if len(normalized) >= 2 and normalized[0].isalpha() and normalized[1] == ":":
+        raise PipelineError(f"unsafe project-relative literal path: {value!r}")
+    path = PurePosixPath(normalized)
+    if path.is_absolute() or ".." in path.parts or normalized.startswith("/"):
+        raise PipelineError(f"unsafe project-relative literal path: {value!r}")
+    if path.as_posix() != normalized or normalized in {".", ""}:
+        raise PipelineError(f"invalid project-relative literal path: {value!r}")
+    return path.as_posix()
+
+
+def literal_paths_valid(value: Any) -> bool:
+    if not isinstance(value, list) or value != sorted(dict.fromkeys(value)):
+        return False
+    try:
+        return all(normalize_literal_path(path) == path for path in value)
+    except PipelineError:
+        return False
+
+
 def normalize_read_rule(value: str) -> str:
     """Validate a controller-sealed exact or terminal-directory read rule."""
     rule = normalize_rule(value)
-    wildcard_source = rule[:-3] if rule.endswith("/**") else rule
-    if rule != value or rule == "**" or "]" in wildcard_source:
+    if rule != value or rule == "**":
         raise PipelineError(
             "slice read_paths allow only canonical exact paths or terminal dir/** rules"
         )
@@ -360,7 +421,7 @@ def authority_record(items: dict[str, dict[str, Any]]) -> dict[str, Any]:
         path, sha = item.get("path"), item.get("sha256")
         if not isinstance(path, str) or not is_digest(sha):
             raise PipelineError(f"invalid authority item {name!r}")
-        clean[name] = {"path": normalize_rule(path), "sha256": sha}
+        clean[name] = {"path": normalize_literal_path(path), "sha256": sha}
     return {"items": clean, "digest": digest(clean)}
 
 
@@ -470,13 +531,10 @@ def review_target(
     """Return the small controller-derived target for one Review assignment."""
     def changed_paths(record: Any) -> list[str]:
         controller = record.get("controller") if isinstance(record, dict) else None
-        changes = controller.get("diff") if isinstance(controller, dict) else None
-        if not isinstance(changes, list):
+        changes = controller.get("changed_paths") if isinstance(controller, dict) else None
+        if not literal_paths_valid(changes):
             return []
-        return list(dict.fromkeys(
-            item["path"] for item in changes
-            if isinstance(item, dict) and isinstance(item.get("path"), str)
-        ))
+        return deepcopy(changes)
 
     selected = current_slice(state) if selected is None else deepcopy(selected)
     candidate = current_candidate(state) if candidate is None else deepcopy(candidate)
@@ -516,12 +574,19 @@ def all_slices_completed(state: dict[str, Any]) -> bool:
     return not completed and len(expected) == 1 and isinstance(state.get("artifacts", {}).get("ready"), dict)
 
 
-def new_state(*, run_id: str, project_root: str, authority: dict[str, Any], slices: list[dict[str, Any]]) -> dict[str, Any]:
+def new_state(
+    *, run_id: str, project_root: str, authority: dict[str, Any],
+    slices: list[dict[str, Any]], base_tree_oid: str,
+    pipeline_runtime_digest: str,
+) -> dict[str, Any]:
     run_id = safe_identifier(run_id)
     if not isinstance(project_root, str) or not project_root:
         raise PipelineError("project_root is required")
     state = {
         "schema": SCHEMA,
+        "checkout_model": CHECKOUT_MODEL,
+        "base_tree_oid": base_tree_oid,
+        "pipeline_runtime_digest": pipeline_runtime_digest,
         "run_id": run_id,
         "generation": 0,
         "project_root": project_root,
@@ -567,6 +632,7 @@ def current_candidate(state: dict[str, Any]) -> dict[str, Any] | None:
         if (
             candidate_record_valid(
                 candidate, state.get("authority", {}).get("digest"),
+                state.get("pipeline_runtime_digest"),
             )
             and assignment_generation > epoch_generation
         ):
@@ -631,6 +697,7 @@ def passing_artifact(state: dict[str, Any], phase: str) -> dict[str, Any] | None
         if (
             not candidate_record_valid(
                 candidate, state.get("authority", {}).get("digest"),
+                state.get("pipeline_runtime_digest"),
             )
             or candidate["generation"] <= accepted_generation
             or any(
@@ -645,21 +712,6 @@ def passing_artifact(state: dict[str, Any], phase: str) -> dict[str, Any] | None
         ):
             return None
     return record
-
-
-def _inventory_valid(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
-    try:
-        return all(
-            isinstance(path, str) and normalize_rule(path) == path
-            and isinstance(item, dict) and set(item) == {"kind", "sha256", "size"}
-            and item["kind"] in {"file", "legacy"} and is_digest(item["sha256"])
-            and (item["size"] is None or type(item["size"]) is int and item["size"] >= 0)
-            for path, item in value.items()
-        )
-    except PipelineError:
-        return False
 
 
 def production_ready(state: dict[str, Any]) -> bool:
@@ -677,10 +729,10 @@ def production_ready(state: dict[str, Any]) -> bool:
         and candidate is not None and record["candidate"] == candidate
         and record["authority_digest"] == state.get("authority", {}).get("digest")
         and candidate.get("authority_digest") == record["authority_digest"]
-        and isinstance(controller, dict) and set(controller) == {"inventory", "checkout_sha256"}
-        and _inventory_valid(controller["inventory"])
-        and controller["checkout_sha256"] == digest(controller["inventory"])
-        and controller["checkout_sha256"] == candidate.get("checkout_sha256")
+        and isinstance(controller, dict)
+        and set(controller) == {"candidate_tree_oid", "pipeline_runtime_digest"}
+        and controller["candidate_tree_oid"] == candidate.get("candidate_tree_oid")
+        and controller["pipeline_runtime_digest"] == state.get("pipeline_runtime_digest")
         and all_slices_completed(state)
         and not pending(state.get("questions", {})) and not pending(state.get("gates", {}))
     )
@@ -704,16 +756,16 @@ def _action_id(state: dict[str, Any], verb: str) -> str:
 def reconfiguration_action(
     state: dict[str, Any], authority_items: dict[str, dict[str, Any]],
     slices: list[dict[str, Any]] | None = None,
-    *, checkout_sha256: str,
+    *, candidate_tree_oid: str,
 ) -> dict[str, Any]:
     """Bind the public init capability to the exact controller observation."""
-    if not is_digest(checkout_sha256):
-        raise PipelineError("reconfiguration checkout digest is malformed")
+    if not is_git_oid(candidate_tree_oid):
+        raise PipelineError("reconfiguration Git candidate tree is malformed")
     authority = authority_record(authority_items)
     proposed_slices = slice_records(state["slices"] if slices is None else slices)
     token = digest([
         state["run_id"], state["generation"], authority["digest"],
-        digest(proposed_slices), checkout_sha256,
+        digest(proposed_slices), candidate_tree_oid,
     ])[:10]
     return {
         "kind": "command", "command": "init",
@@ -727,19 +779,6 @@ def reconfiguration_action(
         "reason": "approved authority or scope binding changed; restart at plan and re-slice",
         "user_input_required": False,
     }
-
-
-def _latest_inventory(state: dict[str, Any]) -> dict[str, Any]:
-    for phase in ("qa", "review", "docs", "engineering", "slice", "plan"):
-        record = state["artifacts"].get(phase)
-        controller = record.get("controller") if isinstance(record, dict) else None
-        inventory = controller.get("inventory") if isinstance(controller, dict) else None
-        if _inventory_valid(inventory):
-            return inventory
-    ready = state["artifacts"].get("ready")
-    controller = ready.get("controller") if isinstance(ready, dict) else None
-    inventory = controller.get("inventory") if isinstance(controller, dict) else None
-    return inventory if _inventory_valid(inventory) else {}
 
 
 def assignment_identity(run_id: str, generation: int, phase: str) -> dict[str, str]:
@@ -1011,12 +1050,26 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_state(state: dict[str, Any]) -> None:
+    if (
+        isinstance(state, dict) and state.get("schema") == SCHEMA
+        and state.get("checkout_model") != CHECKOUT_MODEL
+    ):
+        raise PipelineError(
+            "legacy filesystem-inventory schema-2 state is unsupported; "
+            "remove the old state and run a fresh init"
+        )
     if not isinstance(state, dict) or set(state) != STATE_FIELDS:
         extra = sorted(set(state) - STATE_FIELDS) if isinstance(state, dict) else []
         missing = sorted(STATE_FIELDS - set(state)) if isinstance(state, dict) else sorted(STATE_FIELDS)
         raise PipelineError(f"invalid state fields; missing={missing}, extra={extra}")
-    if len(state) > 12 or state["schema"] != SCHEMA:
+    if len(state) > 15 or state["schema"] != SCHEMA:
         raise PipelineError("state must use the compact schema-2 shape")
+    if state["checkout_model"] != CHECKOUT_MODEL:
+        raise PipelineError("state must use the git-tree-v1 checkout model")
+    if not is_git_oid(state["base_tree_oid"]):
+        raise PipelineError("state base_tree_oid is malformed")
+    if not is_digest(state["pipeline_runtime_digest"]):
+        raise PipelineError("state pipeline_runtime_digest is malformed")
     safe_identifier(state["run_id"])
     if not isinstance(state["project_root"], str) or not state["project_root"]:
         raise PipelineError("project_root is required")
@@ -1044,7 +1097,7 @@ def validate_state(state: dict[str, Any]) -> None:
             raise PipelineError("phase artifact has an invalid worker outcome")
         candidate = item.get("candidate")
         if candidate is not None and not candidate_record_valid(
-            candidate, authority["digest"],
+            candidate, authority["digest"], state["pipeline_runtime_digest"],
         ):
             raise PipelineError("artifact candidate is malformed")
     if slice_records(state["slices"]) != state["slices"] or not isinstance(state["history"], list):
@@ -1068,7 +1121,7 @@ def validate_state(state: dict[str, Any]) -> None:
         ):
             raise PipelineError("gate has an invalid shape")
         if candidate_base is not None and not candidate_record_valid(
-            candidate_base, authority["digest"],
+            candidate_base, authority["digest"], state["pipeline_runtime_digest"],
         ):
             raise PipelineError("gate candidate_base is malformed")
         if item.get("kind") == "controller_result" and (
@@ -1172,12 +1225,10 @@ def validate_state(state: dict[str, Any]) -> None:
         ):
             raise PipelineError("assignment authority is stale")
         if (
-            not isinstance(base, dict) or set(base) != {"inventory", "checkout_sha256"}
-            or not isinstance(base["inventory"], dict) or not is_digest(base["checkout_sha256"])
+            not isinstance(base, dict) or set(base) != {"candidate_tree_oid"}
+            or not is_git_oid(base["candidate_tree_oid"])
         ):
-            raise PipelineError("assignment checkout base is malformed")
-        if not _inventory_valid(base["inventory"]):
-            raise PipelineError("assignment checkout inventory is malformed")
+            raise PipelineError("assignment Git candidate base is malformed")
         if (
             not isinstance(commands, list)
             or any(not isinstance(argv, list) or not argv or any(not isinstance(x, str) or not x for x in argv) for argv in commands)

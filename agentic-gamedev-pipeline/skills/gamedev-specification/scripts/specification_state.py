@@ -41,6 +41,8 @@ PREACCEPT_INVENTORY_ROW_KEYS = {
 }
 HELPER_REQUEST_SCHEMA = 1
 HELPER_RESULT_SCHEMA = 1
+HELPER_PREFLIGHT_SCHEMA = 1
+HELPER_REJECTION_SCHEMA = 1
 HELPER_REQUEST_KEYS = {
     "schema",
     "request_id",
@@ -53,8 +55,10 @@ HELPER_REQUEST_KEYS = {
     "allowed_write_paths",
     "artifacts",
     "helper_identity",
+    "controller",
     "correction_ids",
 }
+HELPER_LEGACY_REQUEST_KEYS = HELPER_REQUEST_KEYS - {"controller"}
 HELPER_ROUTE_KEYS = {"mode", "submode", "target_operation"}
 HELPER_AUTHORITY_KEYS = {"path", "revision", "sha256"}
 HELPER_SPECIFICATION_KEYS = {"path", "input"}
@@ -71,6 +75,7 @@ HELPER_IDENTITY_KEYS = {
     "result_emitter_path",
     "result_emitter_sha256",
 }
+HELPER_CONTROLLER_KEYS = {"path", "sha256"}
 HELPER_RESULT_KEYS = {
     "schema",
     "request",
@@ -86,6 +91,30 @@ HELPER_RESULT_REQUEST_KEYS = {"id", "sha256"}
 HELPER_RESULT_SPECIFICATION_KEYS = {"path", "sha256"}
 HELPER_RESULT_ARTIFACT_KEYS = {"kind", "path", "sha256"}
 HELPER_EVIDENCE_KEYS = {"source_spec_sha256", "results"}
+HELPER_PREFLIGHT_KEYS = {
+    "schema",
+    "controller",
+    "request",
+    "output_specification",
+}
+HELPER_PREFLIGHT_CONTROLLER_KEYS = {"path", "sha256"}
+HELPER_PREFLIGHT_REQUEST_KEYS = {"id", "sha256"}
+HELPER_REJECTION_EVENT = "invalid_initial_generation_helper_result_rejected"
+HELPER_REJECTION_RECEIPT_KEYS = {
+    "schema",
+    "event",
+    "rejected_at",
+    "reason",
+    "request_id",
+    "request_sha256",
+    "result_path",
+    "result_sha256",
+    "output_specification",
+    "preserved_generation_input_sha256",
+    "trace_errors",
+    "history_length_after",
+    "post_state_sha256",
+}
 _NO_CONTENT_FOOTER_ITEM = (
     r"(?:additional\s+)?assumptions?"
     r"|source\s+conflicts?"
@@ -187,6 +216,15 @@ class SpecificationStateError(RuntimeError):
     pass
 
 
+class HelperOutputPreflightError(SpecificationStateError):
+    def __init__(self, trace_errors: list[str]) -> None:
+        self.trace_errors = list(trace_errors)
+        super().__init__(
+            "external helper output fails canonical specification preflight: "
+            + "; ".join(self.trace_errors)
+        )
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -219,6 +257,14 @@ def external_helper_identity() -> dict[str, str]:
         "entrypoint_sha256": sha256(entrypoint),
         "result_emitter_path": str(emitter),
         "result_emitter_sha256": sha256(emitter),
+    }
+
+
+def specification_controller_identity() -> dict[str, str]:
+    controller = Path(__file__).resolve()
+    return {
+        "path": str(controller),
+        "sha256": sha256(controller),
     }
 
 
@@ -482,7 +528,11 @@ def validate_helper_request(
 ) -> dict[str, Any]:
     label = "controller-issued helper request"
     path, request_bytes, request = _read_helper_json(root, supplied_path, label)
-    if set(request) != HELPER_REQUEST_KEYS:
+    request_keys = set(request)
+    if (
+        request_keys != HELPER_REQUEST_KEYS
+        and request_keys != HELPER_LEGACY_REQUEST_KEYS
+    ):
         raise SpecificationStateError("controller-issued helper request schema is invalid")
     if type(request.get("schema")) is not int or request["schema"] != HELPER_REQUEST_SCHEMA:
         raise SpecificationStateError("controller-issued helper request version is invalid")
@@ -497,6 +547,28 @@ def validate_helper_request(
         )
     if request.get("project_root") != str(root):
         raise SpecificationStateError("controller-issued helper request project is foreign")
+
+    controller_binding = request.get("controller")
+    if controller_binding is None:
+        if require_current_identity:
+            raise SpecificationStateError(
+                "controller-issued helper request controller binding is missing"
+            )
+    elif (
+        not isinstance(controller_binding, dict)
+        or set(controller_binding) != HELPER_CONTROLLER_KEYS
+        or not isinstance(controller_binding.get("path"), str)
+        or not Path(controller_binding["path"]).is_absolute()
+        or str(Path(controller_binding["path"]).resolve()) != controller_binding["path"]
+        or not _is_exact_sha256(controller_binding.get("sha256"))
+    ):
+        raise SpecificationStateError(
+            "controller-issued helper request controller binding is invalid"
+        )
+    elif require_current_identity and controller_binding != specification_controller_identity():
+        raise SpecificationStateError(
+            "controller-issued helper request controller binding is stale or foreign"
+        )
 
     route = request.get("route")
     correction_ids = request.get("correction_ids")
@@ -622,6 +694,84 @@ def validate_helper_request(
         "sha256": hashlib.sha256(request_bytes).hexdigest(),
         "summary": copy.deepcopy(request),
     }
+
+
+def validate_helper_output_preflight(
+    root: Path,
+    state: dict[str, Any],
+    request_record: dict[str, Any],
+    *,
+    require_current_identity: bool,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Validate current helper output without consuming or writing controller state."""
+    if not isinstance(request_record, dict) or set(request_record) != {
+        "path",
+        "sha256",
+        "summary",
+    }:
+        raise SpecificationStateError("recorded helper request is malformed")
+    current_request = validate_helper_request(
+        root,
+        state,
+        request_record.get("path"),
+        require_current_identity=require_current_identity,
+    )
+    if current_request != request_record:
+        raise SpecificationStateError(
+            "controller-issued helper request changed after preparation"
+        )
+    request = current_request["summary"]
+    prd = resolve_project_path(root, state["prd"]["path"], "canonical PRD")
+    validate_approved_prd_contract(prd)
+    if sha256(prd) != state["prd"]["sha256"]:
+        raise SpecificationStateError("PRD changed after helper request preparation")
+
+    spec_relative = request["specification"]["path"]
+    spec = resolve_project_path(root, spec_relative, "helper output specification")
+    if not spec.is_file():
+        raise SpecificationStateError(
+            "external helper output specification does not exist"
+        )
+    output_sha = sha256(spec)
+    input_sha = _helper_input_sha(request)
+    if input_sha is not None and output_sha == input_sha:
+        raise SpecificationStateError(
+            "external helper output did not change the requested specification"
+        )
+    try:
+        meta, drift = specification_trace(root, prd, spec)
+    except SpecificationStateError as error:
+        raise HelperOutputPreflightError([str(error)]) from error
+    metadata_errors = list(drift)
+    try:
+        exact_positive_revision(spec, "helper output specification")
+    except SpecificationStateError as error:
+        metadata_errors.append(str(error))
+    if meta.get("status") not in {"draft", "approved"}:
+        metadata_errors.append(
+            "helper output specification status must be draft or approved"
+        )
+    if meta.get("language") != request["expected_user_language"]:
+        metadata_errors.append(
+            "helper output specification language does not match the approved PRD language"
+        )
+    if metadata_errors:
+        raise HelperOutputPreflightError(metadata_errors)
+
+    controller_identity = specification_controller_identity()
+    envelope = {
+        "schema": HELPER_PREFLIGHT_SCHEMA,
+        "controller": controller_identity,
+        "request": {
+            "id": request["request_id"],
+            "sha256": current_request["sha256"],
+        },
+        "output_specification": {
+            "path": spec.relative_to(root).as_posix(),
+            "sha256": output_sha,
+        },
+    }
+    return envelope, meta
 
 
 def validate_helper_result(
@@ -1198,7 +1348,7 @@ def state_path(root: Path) -> Path:
     return root / STATE_RELATIVE_PATH
 
 
-def load_state(root: Path) -> dict[str, Any]:
+def load_state(root: Path, *, persist_migration: bool = True) -> dict[str, Any]:
     path = state_path(root)
     if not path.is_file():
         raise SpecificationStateError(f"state does not exist; run init first: {path}")
@@ -1228,7 +1378,8 @@ def load_state(root: Path) -> dict[str, Any]:
         validate_approved_prd_contract(
             migrated_prd, label="legacy state approved PRD"
         )
-        write_state_file(path, data)
+        if persist_migration:
+            write_state_file(path, data)
     return data
 
 
@@ -1362,6 +1513,10 @@ def runtime_recovery_authorization(
         raise SpecificationStateError(
             f"cannot classify the bound runtime safely: {error}"
         ) from error
+    if any(legacy_presence):
+        raise SpecificationStateError(
+            _development_plan_controller.SCHEMA10_UNSUPPORTED_MESSAGE
+        )
     if v2_paths:
         if len(v2_paths) != 1:
             raise SpecificationStateError(
@@ -1380,13 +1535,6 @@ def runtime_recovery_authorization(
         try:
             before = v2_path.read_bytes()
             runtime = _development_plan_controller.load_valid_v2_runtime(v2_path)
-            if any(legacy_presence):
-                if not all(legacy_presence):
-                    raise _development_plan_controller.DevelopmentPlanError(
-                        "retired schema-10 lineage requires the complete legacy "
-                        "state/findings pair"
-                    )
-                _development_plan_controller.require_retired_schema10_lineage(root, runtime)
         except (
             OSError,
             _development_plan_controller.DevelopmentPlanError,
@@ -1478,63 +1626,15 @@ def runtime_recovery_authorization(
                 "bound v2 runtime authorization changed after the audited reopen boundary"
             )
         return authorization
-    bound = [
-        path
-        for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
-        if (root / path).exists()
-    ]
-    if not bound:
-        if expected_authorization is not None:
-            raise SpecificationStateError(
-                "bound runtime authorization disappeared after the audited reopen boundary"
-            )
-        if recovery_token:
-            raise SpecificationStateError(
-                "--recovery-token is valid only for an open bound runtime recovery hold"
-            )
-        return None
-    if len(bound) != 2:
-        raise SpecificationStateError("runtime binding is incomplete and fails closed")
-    runtime = json.loads((root / RUNTIME_STATE_RELATIVE_PATH).read_text(encoding="utf-8"))
-    hold = runtime.get("authority_recovery_hold") or {}
-    token_payload = {
-        "feature": hold.get("feature"),
-        "opened_at": hold.get("opened_at"),
-        "authorized_by": hold.get("authorized_by"),
-        "reason": hold.get("reason"),
-        "requirements_sha256": (hold.get("requirements") or {}).get("sha256"),
-        "spec_sha256": (hold.get("specification") or {}).get("sha256"),
-        "plan_sha256": (hold.get("development_plan") or {}).get("sha256"),
-        "revision": hold.get("revision"),
-    }
-    expected_token = "ARH-" + canonical_json_sha256(token_payload)[:32].upper()
-    if (
-        runtime.get("phase") != "authority_recovery_hold"
-        or hold.get("status") != "open"
-        or hold.get("token") != expected_token
-        or not recovery_token
-        or recovery_token != hold.get("token")
-        or reason != hold.get("reason")
-        or prior_spec_sha256 != (hold.get("specification") or {}).get("sha256")
-    ):
+    if expected_authorization is not None:
         raise SpecificationStateError(
-            "bound specification revision requires the exact authority_recovery_hold "
-            "token, reason, and prior specification SHA"
+            "bound runtime authorization disappeared after the audited reopen boundary"
         )
-    require_runtime_preengineering_gate(runtime)
-    authorization = {
-        "schema": 1,
-        "token": recovery_token,
-        "reason": reason,
-        "runtime_state_path": RUNTIME_STATE_RELATIVE_PATH.as_posix(),
-        "hold_opened_at": hold.get("opened_at"),
-        "prior_spec_sha256": prior_spec_sha256,
-    }
-    if expected_authorization is not None and authorization != expected_authorization:
+    if recovery_token:
         raise SpecificationStateError(
-            "bound runtime authorization changed after the audited reopen boundary"
+            "--recovery-token is invalid without a supported v2 runtime binding"
         )
-    return authorization
+    return None
 
 
 def require_bound_recovery_continuation(root: Path, state: dict[str, Any]) -> None:
@@ -3040,6 +3140,7 @@ def command_prepare_helper(args: argparse.Namespace) -> dict[str, Any]:
         ],
         "artifacts": artifacts,
         "helper_identity": external_helper_identity(),
+        "controller": specification_controller_identity(),
         "correction_ids": correction_ids,
     }
     request_path = resolve_project_path(root, request_relative, "helper request")
@@ -3055,6 +3156,317 @@ def command_prepare_helper(args: argparse.Namespace) -> dict[str, Any]:
     state["helper_sequence"] = sequence
     state["active_helper_request"] = request_record
     state["updated_at"] = utc_now()
+    save_state(root, state)
+    return state
+
+
+def command_preflight_helper_output(args: argparse.Namespace) -> dict[str, Any]:
+    root = Path(args.project_root).resolve()
+    state = load_state(root, persist_migration=False)
+    ensure_helper_state(state)
+    active = state.get("active_helper_request")
+    if not isinstance(active, dict):
+        raise SpecificationStateError(
+            "no active controller-issued helper request is awaiting output"
+        )
+    request = validate_helper_request(
+        root,
+        state,
+        args.request,
+        require_current_identity=True,
+    )
+    if request != active:
+        raise SpecificationStateError(
+            "preflight request is not the exact active controller-issued request"
+        )
+    envelope, _ = validate_helper_output_preflight(
+        root,
+        state,
+        request,
+        require_current_identity=True,
+    )
+    return envelope
+
+
+def _helper_rejection_state_sha256(state: dict[str, Any]) -> str:
+    return canonical_json_sha256(
+        {key: value for key, value in state.items() if key != "history"}
+    )
+
+
+def _require_initial_generation_rejection_state(state: dict[str, Any]) -> None:
+    ensure_helper_state(state)
+    if (
+        state.get("status") != "needs_generation"
+        or state.get("acceptance") is not None
+        or state.get("active_wave") is not None
+        or state.get("waves") != []
+        or state.get("ready") is not None
+        or state.get("total_cycles_completed") != 0
+        or state.get("helper_sequence") != 1
+        or state.get("helper_history") != []
+        or state.get("history") != []
+    ):
+        raise SpecificationStateError(
+            "helper-result rejection is limited to the initial generation before further progress"
+        )
+    evidence = state.get("helper_evidence")
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != HELPER_EVIDENCE_KEYS
+        or evidence.get("results") != []
+    ):
+        raise SpecificationStateError(
+            "initial generation helper-result rejection cannot revoke helper credit"
+        )
+
+
+def _validate_helper_rejection_receipt(receipt: Any) -> dict[str, Any]:
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != HELPER_REJECTION_RECEIPT_KEYS
+        or type(receipt.get("schema")) is not int
+        or receipt.get("schema") != HELPER_REJECTION_SCHEMA
+        or receipt.get("event") != HELPER_REJECTION_EVENT
+        or not isinstance(receipt.get("reason"), str)
+        or not receipt["reason"]
+        or not isinstance(receipt.get("request_id"), str)
+        or re.fullmatch(r"HREQ-[0-9]{6}", receipt["request_id"]) is None
+        or not _is_exact_sha256(receipt.get("request_sha256"))
+        or not isinstance(receipt.get("result_path"), str)
+        or not receipt["result_path"]
+        or not _is_exact_sha256(receipt.get("result_sha256"))
+        or not _is_exact_sha256(receipt.get("preserved_generation_input_sha256"))
+        or not isinstance(receipt.get("trace_errors"), list)
+        or not receipt["trace_errors"]
+        or not all(isinstance(item, str) and item for item in receipt["trace_errors"])
+        or type(receipt.get("history_length_after")) is not int
+        or receipt["history_length_after"] < 1
+        or not _is_exact_sha256(receipt.get("post_state_sha256"))
+    ):
+        raise SpecificationStateError("helper-result rejection receipt is malformed")
+    utc_timestamp(receipt.get("rejected_at"), "helper-result rejection timestamp")
+    output = receipt.get("output_specification")
+    if (
+        not isinstance(output, dict)
+        or set(output) != HELPER_RESULT_SPECIFICATION_KEYS
+        or not isinstance(output.get("path"), str)
+        or not output["path"]
+        or not _is_exact_sha256(output.get("sha256"))
+        or receipt["preserved_generation_input_sha256"] != output["sha256"]
+    ):
+        raise SpecificationStateError("helper-result rejection receipt is malformed")
+    return receipt
+
+
+def _replay_rejected_helper_result(
+    root: Path,
+    state: dict[str, Any],
+    request_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    history = state.get("history")
+    if not isinstance(history, list) or not history:
+        raise SpecificationStateError(
+            "no active initial generation helper result can be rejected"
+        )
+    receipt = _validate_helper_rejection_receipt(history[-1])
+    if receipt["request_id"] != request_id or receipt["reason"] != reason:
+        raise SpecificationStateError(
+            "helper-result rejection replay requires the exact original request ID and reason"
+        )
+    if (
+        len(history) != receipt["history_length_after"]
+        or state.get("updated_at") != receipt["rejected_at"]
+        or _helper_rejection_state_sha256(state) != receipt["post_state_sha256"]
+        or state.get("status") != "needs_generation"
+        or state.get("active_helper_request") is not None
+        or state.get("helper_history") != []
+        or state.get("helper_evidence")
+        != {
+            "source_spec_sha256": receipt["preserved_generation_input_sha256"],
+            "results": [],
+        }
+    ):
+        raise SpecificationStateError(
+            "helper-result rejection replay is forbidden after drift or further progress"
+        )
+    specification = state.get("specification")
+    if (
+        not isinstance(specification, dict)
+        or specification.get("path") != receipt["output_specification"]["path"]
+        or specification.get("sha256") is not None
+        or specification.get("generation_input_sha256")
+        != receipt["preserved_generation_input_sha256"]
+        or specification.get("trace_errors") != receipt["trace_errors"]
+    ):
+        raise SpecificationStateError(
+            "helper-result rejection replay is forbidden after state drift"
+        )
+
+    request_path = f".agentic-pipeline/helper-requests/{request_id}.json"
+    request = validate_helper_request(
+        root,
+        state,
+        request_path,
+        require_current_identity=False,
+    )
+    if request["sha256"] != receipt["request_sha256"]:
+        raise SpecificationStateError(
+            "rejected controller-issued helper request bytes drifted"
+        )
+    result = validate_helper_result(
+        root,
+        state,
+        request,
+        require_current_identity=False,
+        require_output_bytes=True,
+    )
+    result_record = result["result"]
+    if (
+        result_record["path"] != receipt["result_path"]
+        or result_record["sha256"] != receipt["result_sha256"]
+        or result_record["summary"]["output_specification"]
+        != receipt["output_specification"]
+    ):
+        raise SpecificationStateError("rejected helper result bytes drifted")
+    try:
+        validate_helper_output_preflight(
+            root,
+            state,
+            request,
+            require_current_identity=False,
+        )
+    except HelperOutputPreflightError as error:
+        if error.trace_errors != receipt["trace_errors"]:
+            raise SpecificationStateError(
+                "rejected helper output preflight errors drifted"
+            ) from error
+    else:
+        raise SpecificationStateError(
+            "helper-result rejection replay is forbidden for valid output"
+        )
+    return state
+
+
+def command_reject_helper_result(args: argparse.Namespace) -> dict[str, Any]:
+    root = Path(args.project_root).resolve()
+    state = load_state(root, persist_migration=False)
+    request_id = args.request_id
+    reason = args.reason
+    if (
+        not isinstance(request_id, str)
+        or request_id != request_id.strip()
+        or re.fullmatch(r"HREQ-[0-9]{6}", request_id) is None
+    ):
+        raise SpecificationStateError("helper-result rejection request ID is invalid")
+    if not isinstance(reason, str) or reason != reason.strip() or not reason:
+        raise SpecificationStateError("helper-result rejection reason is required")
+
+    active = state.get("active_helper_request")
+    if not isinstance(active, dict):
+        return _replay_rejected_helper_result(root, state, request_id, reason)
+    _require_initial_generation_rejection_state(state)
+    request = validate_helper_request(
+        root,
+        state,
+        active.get("path"),
+        require_current_identity=False,
+    )
+    if request != active:
+        raise SpecificationStateError(
+            "active controller-issued helper request changed after preparation"
+        )
+    request_summary = request["summary"]
+    if (
+        request_summary["request_id"] != request_id
+        or request_id != "HREQ-000001"
+        or request_summary["operation"] != "generation"
+    ):
+        raise SpecificationStateError(
+            "helper-result rejection requires the exact initial generation request"
+        )
+
+    prd = resolve_project_path(root, state["prd"]["path"], "canonical PRD")
+    input_sha = _helper_input_sha(request_summary)
+    revalidate_helper_evidence(
+        root,
+        state,
+        prd,
+        state["helper_evidence"],
+        input_sha,
+    )
+    result = validate_helper_result(
+        root,
+        state,
+        request,
+        require_current_identity=False,
+        require_output_bytes=True,
+    )
+    try:
+        validate_helper_output_preflight(
+            root,
+            state,
+            request,
+            require_current_identity=False,
+        )
+    except HelperOutputPreflightError as error:
+        trace_errors = error.trace_errors
+    else:
+        raise SpecificationStateError(
+            "valid helper output cannot be rejected through recovery"
+        )
+
+    output = copy.deepcopy(
+        result["result"]["summary"]["output_specification"]
+    )
+    spec = resolve_project_path(
+        root, output["path"], "rejected helper output specification"
+    )
+    confirmed_result = validate_helper_result(
+        root,
+        state,
+        request,
+        require_current_identity=False,
+        require_output_bytes=True,
+    )
+    if confirmed_result != result or sha256(spec) != output["sha256"]:
+        raise SpecificationStateError(
+            "helper output or immutable result artifacts drifted during rejection"
+        )
+    try:
+        meta = parse_frontmatter(spec, "Specification")
+    except SpecificationStateError:
+        meta = {}
+    rejected_at = utc_now()
+    reset_helper_chain(state, output["sha256"])
+    state["specification"] = {
+        **state["specification"],
+        "path": output["path"],
+        "sha256": None,
+        "generation_input_sha256": output["sha256"],
+        "status": meta.get("status"),
+        "trace_errors": list(trace_errors),
+    }
+    state["status"] = "needs_generation"
+    state["updated_at"] = rejected_at
+    refresh_identity_history(state)
+    receipt = {
+        "schema": HELPER_REJECTION_SCHEMA,
+        "event": HELPER_REJECTION_EVENT,
+        "rejected_at": rejected_at,
+        "reason": reason,
+        "request_id": request_id,
+        "request_sha256": request["sha256"],
+        "result_path": result["result"]["path"],
+        "result_sha256": result["result"]["sha256"],
+        "output_specification": output,
+        "preserved_generation_input_sha256": output["sha256"],
+        "trace_errors": list(trace_errors),
+        "history_length_after": len(state["history"]) + 1,
+        "post_state_sha256": _helper_rejection_state_sha256(state),
+    }
+    state["history"].append(receipt)
     save_state(root, state)
     return state
 
@@ -3079,10 +3491,13 @@ def command_record_helper_result(args: argparse.Namespace) -> dict[str, Any]:
         raise SpecificationStateError(
             "active controller-issued helper request changed after preparation"
         )
+    preflight, meta = validate_helper_output_preflight(
+        root,
+        state,
+        request,
+        require_current_identity=True,
+    )
     prd = resolve_project_path(root, state["prd"]["path"], "canonical PRD")
-    validate_approved_prd_contract(prd)
-    if sha256(prd) != state["prd"]["sha256"]:
-        raise SpecificationStateError("PRD changed after helper request preparation")
     result = validate_helper_result(
         root,
         state,
@@ -3097,6 +3512,10 @@ def command_record_helper_result(args: argparse.Namespace) -> dict[str, Any]:
     updated_evidence = copy.deepcopy(evidence)
     updated_evidence["results"].append(result)
     output_sha = result["result"]["summary"]["output_specification"]["sha256"]
+    if output_sha != preflight["output_specification"]["sha256"]:
+        raise SpecificationStateError(
+            "external helper result does not bind the canonical preflight output"
+        )
     updated_evidence = revalidate_helper_evidence(
         root, state, prd, updated_evidence, output_sha
     )
@@ -3111,12 +3530,6 @@ def command_record_helper_result(args: argparse.Namespace) -> dict[str, Any]:
     spec = resolve_project_path(
         root, state["specification"]["path"], "helper output specification"
     )
-    meta, drift = specification_trace(root, prd, spec)
-    if drift:
-        raise SpecificationStateError(
-            "external helper output has stale specification authority: "
-            + "; ".join(drift)
-        )
     state["helper_evidence"] = updated_evidence
     state["helper_history"].append(copy.deepcopy(result))
     state["active_helper_request"] = None
@@ -3525,8 +3938,17 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_helper.add_argument("--correction-id", action="append", default=[])
     prepare_helper.set_defaults(handler=command_prepare_helper)
 
+    preflight_helper = commands.add_parser("preflight-helper-output")
+    preflight_helper.add_argument("--request", required=True)
+    preflight_helper.set_defaults(handler=command_preflight_helper_output)
+
     record_helper = commands.add_parser("record-helper-result")
     record_helper.set_defaults(handler=command_record_helper_result)
+
+    reject_helper = commands.add_parser("reject-helper-result")
+    reject_helper.add_argument("--request-id", required=True)
+    reject_helper.add_argument("--reason", required=True)
+    reject_helper.set_defaults(handler=command_reject_helper_result)
 
     accept = commands.add_parser("accept-spec")
     accept.add_argument("--preaccept-receipt", required=True)

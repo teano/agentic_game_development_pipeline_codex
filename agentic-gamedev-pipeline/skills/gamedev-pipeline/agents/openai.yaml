@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Production Pipeline"
   short_description: "Explicit-only bounded GameDev production pipeline"
-  default_prompt: "Use $gamedev-pipeline as the sole v2 Director for exact requirements/specification/plan authority and structured slices; delegate fresh phase workers and continue through verified production-ready candidate."
+  default_prompt: "Use $gamedev-pipeline as the sole v2 Director for exact requirements/specification/plan authority and structured slices; delegate fresh phase workers and continue through verified production-ready candidate. On any suspected pipeline/controller/runtime/skill defect, stop the product run, report bounded redacted evidence, and never patch or bypass the pipeline without a new explicit user maintenance command."
 policy:
   allow_implicit_invocation: false

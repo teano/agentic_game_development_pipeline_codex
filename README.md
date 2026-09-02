@@ -1,6 +1,6 @@
 # Agentic Game Development Skills
 
-Пользовательский bundle explicit-only Codex skills для подготовки игровой фичи к статусу production-ready candidate. Основной runtime — компактный controller-owned Pipeline v2: семь фаз, девять CLI-команд и двенадцать верхнеуровневых полей состояния.
+Пользовательский bundle explicit-only Codex skills для подготовки игровой фичи к статусу production-ready candidate. Основной runtime — компактный controller-owned Pipeline v2: семь фаз, девять CLI-команд и одна минимальная Git-tree модель состояния.
 
 Bundle обнаруживается через пользовательскую junction `~/.codex/skills/agentic-gamedev-pipeline`, указывающую на `agentic-gamedev-pipeline/skills` этого репозитория. Полный regression suite:
 
@@ -25,6 +25,8 @@ GameDev skills запускаются только когда пользоват
 - `$gamedev-coverage-steward` — отдельный advisory-only аудит предоставленного coverage.
 
 Явный запуск `$gamedev-pipeline` разрешает Director делегировать внутренние фазы остальным активным ролям. Каждый assignment использует новый worker session ID. Engineer никогда не может быть Review или QA worker того же run.
+
+Если Director или worker подозревает дефект controller/runtime/skill/protocol/state transition, product run немедленно останавливается. Агент подробно, но bounded и redacted описывает действие, фазу/generation, фактическое и ожидаемое поведение, влияние на candidate и условие восстановления. Ему запрещено самостоятельно менять, патчить, обходить или локально подменять pipeline и продолжать run на изменённой версии. Отдельная pipeline-maintenance работа разрешается только новой явной командой пользователя.
 
 ## Pipeline v2
 
@@ -54,20 +56,21 @@ Workers возвращают только простые semantic artifacts:
 plan/engineering/docs: outcome + non-empty summary
 slice: outcome + summary + optional ordered slice records
 review: outcome + findings[{text,severity,kind}]
-qa: outcome + checks; blocked also requires blocker
+qa: outcome + checks
+blocked: every role also requires blocker + required_action
 ```
 
-SHA, inventory, diff и process receipts принадлежат controller, а не worker artifact. Controller проверяет authority bytes, checkout diff, allowed paths и запланированные команды самостоятельно.
+Git tree OID, changed paths, authority/runtime digests и process receipts принадлежат controller, а не worker artifact. `init` требует чистый committed Git root и tracked authority. Pipeline контролирует tracked и новые non-ignored candidate paths; ignored editor/cache/log files полностью вне его границы. Planned command обязан оставить candidate tree неизменным, а изменение `.gitignore`, `.gitattributes` или `.gitmodules` требует fresh `init`.
 
 ## Rework и readiness
 
-Review/QA остаются read-only. `fail` в Review или QA создаёт сохраняемый gate с finding/check context и точным candidate base; после `resume` controller возвращает run в writable `engineering`, инвалидирует engineering и downstream artifacts, а затем требует свежие Review и QA. `blocked` после устранения внешней причины повторяет исходную фазу с новым worker session ID.
+Review/QA остаются read-only. `fail` в Review или QA создаёт сохраняемый gate с finding/check context и точным candidate base; после `resume` controller возвращает run в writable `engineering`, инвалидирует engineering и downstream artifacts, а затем требует свежие Review и QA. `blocked` требует непустые `blocker` и `required_action`, не запускает planned commands, не выдаёт candidate/phase credit и после устранения внешней причины повторяет исходную фазу с новым worker session ID.
 
 Изменившая candidate документация также инвалидирует Review/QA. `ready` требует доказанное завершение всех ordered slices, повторно сравнивает live checkout с последним независимо reviewed/tested candidate и только тогда устанавливает `PRODUCTION_READY_CANDIDATE`. Это не разрешает deployment, публикацию, spending, store submission или risk acceptance.
 
 ## Schema-10 cutover
 
-`migrate` — однонаправленный импорт в пустой v2 state. Он всегда начинает с `plan`; старый candidate сохраняется только как закрытый controller audit/base context и не получает v2 verification credit. Migration требует новые v2 slice records, после чего выполняется полный путь:
+`migrate` сохранён только как fail-closed tombstone. Миграция schema-10 не поддерживается `git-tree-v1`: legacy state/findings нужно архивировать и запустить свежие Plan/`init`. Import, reconstruction и продолжение старого assignment не выполняются; свежий run проходит полный путь:
 
 ```text
 plan -> slice -> engineering -> review -> qa -> docs -> ready

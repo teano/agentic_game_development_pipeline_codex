@@ -7,6 +7,19 @@
 
 ## [Unreleased]
 
+### Добавлено
+
+- Specification helper request теперь привязан к точному пути и SHA-256 текущего GameDev controller; перед публикацией immutable result внешний helper получает controller-issued preflight envelope, который подтверждает request/output/controller chain, authority, язык и разрешённую write boundary.
+- Добавлен ограниченный `reject-helper-result` recovery для несовместимого pre-preflight результата начальной generation: controller сохраняет specification и evidence bytes, фиксирует audit receipt и выдаёт новый последовательный generation request, а drift, повторное использование и более поздний workflow progress отклоняются fail-closed.
+
+### Изменено
+
+- Pipeline v2 использует Git tree как единственную candidate boundary: чистый committed baseline, `base_tree_oid`/`candidate_tree_oid`, tracked и новые non-ignored пути, без физической inventory, engine profiles и контроля ignored editor/cache файлов.
+- Planned commands обязаны оставлять Git candidate tree неизменным; изменения `.gitignore`, `.gitattributes` или `.gitmodules` требуют fresh `init`, а runtime привязан к digest фиксированного production manifest.
+- `blocked` semantic artifact требует `blocker` и `required_action`, закрывает assignment без запуска planned commands и без candidate/phase credit; exact replay также не запускает checks.
+- При подозрении на дефект pipeline/controller/runtime/skill агент обязан остановить product run, подробно и redacted сообщить incident и не имеет права самостоятельно менять или обходить pipeline без новой явной maintenance-команды пользователя.
+- Schema-10 bridge заменён явным fail-closed tombstone: legacy state/findings архивируются, после чего запускаются свежие Plan/`init`; import и reconstruction больше не выполняются.
+
 ## [0.10.0] - 2026-08-29
 
 ### Добавлено

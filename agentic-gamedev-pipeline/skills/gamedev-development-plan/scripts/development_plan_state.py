@@ -14,7 +14,7 @@ import re
 import sys
 import unicodedata
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Any
 
 try:
@@ -107,6 +107,7 @@ SPEC_STATE_RELATIVE_PATH = Path(".agentic-pipeline/specification-state.json")
 RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline/state.json")
 RUNTIME_FINDINGS_RELATIVE_PATH = Path(".agentic-pipeline/findings.json")
 V2_RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline-v2/state.json")
+SCHEMA10_UNSUPPORTED_MESSAGE = _pipeline_v2_legacy.SCHEMA10_UNSUPPORTED_MESSAGE
 MODES = {"single_owner", "sequential_slices"}
 REQUIRED_GLOBAL_SECTIONS = {
     "Decision",
@@ -1423,355 +1424,17 @@ def runtime_path_exists(path: Path) -> bool:
     return os.path.lexists(path)
 
 
-def require_canonical_runtime_file(root: Path, relative: Path, label: str) -> Path:
-    directory = root / relative.parent
-    path = root / relative
-    try:
-        directory_stat = directory.lstat()
-        path_stat = path.lstat()
-    except OSError as error:
-        raise DevelopmentPlanError(
-            f"retired schema-10 lineage requires the complete canonical legacy pair: {error}"
-        ) from error
-    if (
-        not directory.is_dir()
-        or directory.is_symlink()
-        or bool(getattr(directory_stat, "st_file_attributes", 0) & 0x400)
-        or not path.is_file()
-        or path.is_symlink()
-        or bool(getattr(path_stat, "st_file_attributes", 0) & 0x400)
-    ):
-        raise DevelopmentPlanError(
-            f"retired schema-10 lineage requires a canonical regular {label} file"
-        )
-    return path
-
-
-def legacy_relative_path(legacy_root: str, supplied: Any, label: str) -> str:
-    if not isinstance(supplied, str) or not supplied:
-        raise DevelopmentPlanError(
-            f"retired schema-10 lineage has an invalid {label} path"
-        )
-    windows = bool(re.match(r"^[A-Za-z]:[\\/]", legacy_root))
-    path_type = PureWindowsPath if windows else PurePosixPath
-    base = path_type(legacy_root)
-    path = path_type(supplied)
-    if not base.is_absolute():
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage project root must be absolute"
-        )
-    if not path.is_absolute():
-        path = base / path
-    try:
-        relative = path.relative_to(base)
-    except ValueError as error:
-        raise DevelopmentPlanError(
-            f"retired schema-10 lineage {label} path escapes the project root"
-        ) from error
-    value = relative.as_posix()
-    if (
-        not value
-        or value == "."
-        or ".." in relative.parts
-        or any(character in value for character in "*?[")
-    ):
-        raise DevelopmentPlanError(
-            f"retired schema-10 lineage has an invalid {label} path"
-        )
-    return value
-
-
-def derived_schema10_authority(root: Path, legacy: dict[str, Any]) -> dict[str, Any]:
-    legacy_root = legacy.get("project_root")
-    if (
-        not isinstance(legacy_root, str)
-        or not legacy_root
-        or Path(legacy_root).resolve() != root
-    ):
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage belongs to a different project root"
-        )
-    candidates = {
-        "requirements": (
-            legacy.get("requirements_path"), legacy.get("requirements_sha256")
-        ),
-        "specification": (legacy.get("spec_path"), legacy.get("spec_sha256")),
-        "plan": (
-            legacy.get("development_plan_path"),
-            legacy.get("development_plan_sha256"),
-        ),
-    }
-    items: dict[str, dict[str, str]] = {}
-    for name, (path, digest) in candidates.items():
-        if not is_sha256(digest):
-            raise DevelopmentPlanError(
-                f"retired schema-10 lineage has an invalid {name} authority digest"
-            )
-        items[name] = {
-            "path": legacy_relative_path(legacy_root, path, name),
-            "sha256": digest,
-        }
-    return {"items": items, "digest": canonical_json_digest(items)}
-
-
-def require_retired_schema10_history(
-    runtime: dict[str, Any], legacy_generation: int,
-) -> list[dict[str, Any]]:
-    runtime_generation = runtime.get("generation")
-    history = runtime.get("history")
-    if (
-        type(runtime_generation) is not int
-        or runtime_generation < legacy_generation
-        or not isinstance(history, list)
-        or len(history) < 2
-    ):
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage has an invalid runtime generation or history"
-        )
-    seen_ids: set[str] = set()
-    for index, item in enumerate(history):
-        expected_generation = (
-            legacy_generation if index < 2 else legacy_generation + index - 1
-        )
-        record_id = item.get("id") if isinstance(item, dict) else None
-        if (
-            not isinstance(item, dict)
-            or type(item.get("generation")) is not int
-            or item["generation"] < 0
-            or item["generation"] != expected_generation
-            or not isinstance(record_id, str)
-            or not record_id.strip()
-            or record_id in seen_ids
-            or any(
-                not isinstance(item.get(field), str) or not item[field].strip()
-                for field in ("command", "result")
-            )
-        ):
-            raise DevelopmentPlanError(
-                "retired schema-10 lineage has invalid public history sequencing"
-            )
-        seen_ids.add(record_id)
-    if history[-1]["generation"] != runtime_generation:
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage history does not reach the runtime generation"
-        )
-    return history
-
-
 def reconstruct_retired_schema10_import(
     legacy: dict[str, Any], runtime: dict[str, Any],
     first: dict[str, Any], migrate: dict[str, Any], *, evolved: bool,
 ) -> dict[str, Any]:
-    runtime_slices = runtime.get("slices")
-    legacy_slice_fields = ("id", "allowed_paths", "planned_commands")
-    if not isinstance(runtime_slices, list):
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage has invalid imported slice records"
-        )
-    if evolved:
-        slices = [
-            {field: copy.deepcopy(item[field]) for field in legacy_slice_fields}
-            for item in runtime_slices
-            if isinstance(item, dict)
-            and all(field in item for field in legacy_slice_fields)
-        ]
-        if len(slices) != len(runtime_slices):
-            raise DevelopmentPlanError(
-                "retired schema-10 lineage has invalid imported slice records"
-            )
-    else:
-        slices = runtime_slices
-    try:
-        slices = _pipeline_v2_model.slice_records(slices, sealed=False)
-        imported = _pipeline_v2_legacy.import_schema10(legacy, slices)
-    except (
-        _pipeline_v2_model.PipelineError,
-        _pipeline_v2_legacy.PipelineError,
-        KeyError,
-    ) as error:
-        raise DevelopmentPlanError(
-            f"retired schema-10 lineage import snapshot is invalid: {error}"
-        ) from error
-    if imported.get("history") != [first]:
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage import snapshot does not match its public record"
-        )
-    expected_migrate_digest = canonical_json_digest(
-        {"name": "migrate", "id": migrate["id"], "imported": imported}
-    )
-    if migrate.get("command_digest") != expected_migrate_digest:
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage public migrate digest is invalid"
-        )
-    return imported
+    raise DevelopmentPlanError(SCHEMA10_UNSUPPORTED_MESSAGE)
 
 
 def require_retired_schema10_lineage(
     root: Path, runtime: dict[str, Any]
 ) -> None:
-    legacy_state_path = require_canonical_runtime_file(
-        root, RUNTIME_STATE_RELATIVE_PATH, "legacy state"
-    )
-    legacy_findings_path = require_canonical_runtime_file(
-        root, RUNTIME_FINDINGS_RELATIVE_PATH, "legacy findings"
-    )
-    try:
-        legacy = json.loads(legacy_state_path.read_text(encoding="utf-8"))
-        findings = json.loads(legacy_findings_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise DevelopmentPlanError(
-            f"retired schema-10 lineage evidence is unreadable: {error}"
-        ) from error
-    if not isinstance(legacy, dict) or legacy.get("schema_version") != 10:
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage requires an exact schema-10 legacy state"
-        )
-    generation = legacy.get("generation")
-    if type(generation) is not int or generation < 0:
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage has an invalid legacy generation"
-        )
-    if (
-        not isinstance(findings, dict)
-        or set(findings) != {"schema_version", "items", "generation"}
-        or findings.get("schema_version") != 10
-        or type(findings.get("generation")) is not int
-        or findings.get("generation") != generation
-        or findings.get("items") != []
-    ):
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage requires empty same-generation schema-10 findings"
-        )
-
-    authority = derived_schema10_authority(root, legacy)
-    source_digest = canonical_json_digest(legacy)
-    feature = legacy.get("feature")
-    if not isinstance(feature, str) or not feature:
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage requires a non-empty legacy feature"
-        )
-    expected_run_id = f"migrated-{feature}-{source_digest[:12]}"
-    if runtime.get("run_id") != expected_run_id:
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage has a mismatched deterministic v2 run ID"
-        )
-    history = require_retired_schema10_history(runtime, generation)
-    first, migrate = history[0], history[1]
-    first_result_phases = {
-        "resumed_at_first_slice_engineering": "engineering",
-        "audit_preserved": "plan",
-        "projected_to_plan": "plan",
-    }
-    if (
-        not isinstance(first, dict)
-        or set(first) != {"id", "command", "command_digest", "generation", "result"}
-        or first.get("id") != f"legacy-{source_digest[:16]}"
-        or first.get("command") != "schema10_import"
-        or first.get("command_digest") != source_digest
-        or first.get("generation") != generation
-        or first.get("result") not in first_result_phases
-        or sum(
-            isinstance(item, dict) and item.get("command") == "schema10_import"
-            for item in history
-        )
-        != 1
-    ):
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage does not match the immutable import record"
-        )
-    if (
-        not isinstance(migrate, dict)
-        or set(migrate) != {"id", "command", "command_digest", "generation", "result"}
-        or not isinstance(migrate.get("id"), str)
-        or not migrate["id"].strip()
-        or migrate.get("command") != "migrate"
-        or not is_sha256(migrate.get("command_digest"))
-        or migrate.get("generation") != generation
-        or migrate.get("result") != "migrated"
-        or sum(
-            isinstance(item, dict) and item.get("command") == "migrate"
-            for item in history
-        )
-        != 1
-    ):
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage is missing the following public migrate record"
-        )
-
-    bridge_candidates = [
-        (index, item)
-        for index, item in enumerate(history[2:], 2)
-        if isinstance(item, dict)
-        and item.get("result") == "authority_scope_reconfigured"
-    ]
-    imported = reconstruct_retired_schema10_import(
-        legacy, runtime, first, migrate, evolved=bool(bridge_candidates)
-    )
-    if bridge_candidates:
-        bridge_index, bridge = bridge_candidates[0]
-        bridge_generation = bridge.get("generation")
-        prior = bridge.get("prior")
-        prior_fields = {
-            "phase", "authority_digest", "slices_digest", "candidate",
-            "artifact_phases", "question_ids", "gate_ids",
-        }
-        prior_lists = (
-            prior.get("artifact_phases"), prior.get("question_ids"),
-            prior.get("gate_ids"),
-        ) if isinstance(prior, dict) else (None, None, None)
-        valid_prior_lists = all(
-            isinstance(value, list)
-            and all(isinstance(item, str) and item for item in value)
-            and value == sorted(set(value))
-            for value in prior_lists
-        )
-        migration_audit_required = first["result"] != "projected_to_plan"
-        duplicate_legacy_bridge = sum(
-            isinstance(item.get("prior"), dict)
-            and item["prior"].get("authority_digest") == authority["digest"]
-            for _, item in bridge_candidates
-        ) > 1
-        if (
-            set(bridge) != {
-                "id", "command", "command_digest", "generation", "result", "prior",
-            }
-            or not isinstance(bridge.get("id"), str)
-            or not bridge["id"].strip()
-            or bridge.get("command") != "init"
-            or not is_sha256(bridge.get("command_digest"))
-            or bridge.get("result") != "authority_scope_reconfigured"
-            or type(bridge_generation) is not int
-            or bridge_generation <= generation
-            or not isinstance(prior, dict)
-            or not prior_fields <= set(prior)
-            or prior.get("authority_digest") != authority["digest"]
-            or prior.get("slices_digest") != canonical_json_digest(imported["slices"])
-            or prior.get("phase") not in _pipeline_v2_model.PHASES
-            or not valid_prior_lists
-            or (
-                migration_audit_required
-                and "migration-audit" not in prior["gate_ids"]
-            )
-            or duplicate_legacy_bridge
-        ):
-            raise DevelopmentPlanError(
-                "retired schema-10 lineage has an invalid public reconfiguration bridge"
-            )
-        return
-
-    if runtime.get("authority") != authority:
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage authority does not match the v2 authority"
-        )
-    expected_audit = imported["gates"].get("migration-audit")
-    runtime_gates = runtime.get("gates")
-    if expected_audit is not None and (
-        not isinstance(runtime_gates, dict)
-        or runtime_gates.get("migration-audit") != expected_audit
-    ):
-        raise DevelopmentPlanError(
-            "retired schema-10 lineage has invalid migration audit evidence"
-        )
+    raise DevelopmentPlanError(SCHEMA10_UNSUPPORTED_MESSAGE)
 
 
 def discover_v2_runtime_states(root: Path) -> list[Path]:
@@ -1861,100 +1524,29 @@ def runtime_recovery_authorization(
         runtime_path_exists(root / path)
         for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
     ]
+    if any(legacy_presence):
+        raise DevelopmentPlanError(SCHEMA10_UNSUPPORTED_MESSAGE)
     if v2_paths:
         if len(v2_paths) != 1:
             raise DevelopmentPlanError(
-                "multiple v2 runtime state candidates exist; retired schema-10 lineage "
-                "cannot be proven and the ambiguous binding fails closed"
+                "multiple v2 runtime state candidates exist; the ambiguous binding fails closed"
             )
-        try:
-            runtime = require_v2_runtime_binding(
-                root,
-                v2_paths[0],
-                prior_plan_sha256=prior_plan_sha256,
-                prior_plan_path=prior_plan_path,
-            )
-        except DevelopmentPlanError as error:
-            if any(legacy_presence):
-                raise DevelopmentPlanError(
-                    "retired schema-10 lineage cannot use an invalid v2 binding: "
-                    f"{error}"
-                ) from error
-            raise
+        require_v2_runtime_binding(
+            root,
+            v2_paths[0],
+            prior_plan_sha256=prior_plan_sha256,
+            prior_plan_path=prior_plan_path,
+        )
         if recovery_token:
             raise DevelopmentPlanError(
                 "v2 runtime reconfiguration uses public status -> init, not a recovery token"
             )
-        if any(legacy_presence):
-            if not all(legacy_presence):
-                raise DevelopmentPlanError(
-                    "retired schema-10 lineage requires the complete legacy state/findings pair"
-                )
-            require_retired_schema10_lineage(root, runtime)
         return None
-    legacy_bound = [
-        path
-        for path, present in zip(
-            (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH),
-            legacy_presence,
-            strict=True,
-        )
-        if present
-    ]
-    if not legacy_bound:
-        if recovery_token:
-            raise DevelopmentPlanError(
-                "--recovery-token is valid only for an open bound runtime recovery hold"
-            )
-        return None
-    if len(legacy_bound) != 2:
+    if recovery_token:
         raise DevelopmentPlanError(
-            "runtime pipeline state binding is incomplete and cannot authorize plan recovery"
+            "--recovery-token is invalid without a supported v2 runtime binding"
         )
-    legacy_state_path = require_canonical_runtime_file(
-        root, RUNTIME_STATE_RELATIVE_PATH, "legacy state"
-    )
-    require_canonical_runtime_file(
-        root, RUNTIME_FINDINGS_RELATIVE_PATH, "legacy findings"
-    )
-    runtime = load_json(legacy_state_path, "runtime state")
-    hold = runtime.get("authority_recovery_hold") or {}
-    token_payload = {
-        "feature": hold.get("feature"),
-        "opened_at": hold.get("opened_at"),
-        "authorized_by": hold.get("authorized_by"),
-        "reason": hold.get("reason"),
-        "requirements_sha256": (hold.get("requirements") or {}).get("sha256"),
-        "spec_sha256": (hold.get("specification") or {}).get("sha256"),
-        "plan_sha256": (hold.get("development_plan") or {}).get("sha256"),
-        "revision": hold.get("revision"),
-    }
-    expected_token = "ARH-" + hashlib.sha256(
-        json.dumps(
-            token_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-    ).hexdigest()[:32].upper()
-    if (
-        runtime.get("phase") != "authority_recovery_hold"
-        or hold.get("status") != "open"
-        or hold.get("token") != expected_token
-        or not recovery_token
-        or recovery_token != hold.get("token")
-        or reason != hold.get("reason")
-        or prior_plan_sha256 != (hold.get("development_plan") or {}).get("sha256")
-    ):
-        raise DevelopmentPlanError(
-            "bound plan recovery requires the exact open authority_recovery_hold token, "
-            "reason, and prior approved plan SHA"
-        )
-    return {
-        "schema": 1,
-        "token": recovery_token,
-        "reason": reason,
-        "runtime_state_path": RUNTIME_STATE_RELATIVE_PATH.as_posix(),
-        "hold_opened_at": hold.get("opened_at"),
-        "prior_plan_sha256": prior_plan_sha256,
-    }
+    return None
 
 
 def require_runtime_unbound(
@@ -2302,11 +1894,11 @@ def build_parser() -> argparse.ArgumentParser:
         "revise-approved",
         help=(
             "revoke exact approved bytes and open a resumable new draft revision; "
-            "v2 continues through public status -> init; legacy binding requires its token"
+            "v2 continues through public status -> init; schema-10 is unsupported"
         ),
         description=(
             "Reopen approved plan bytes. A bound v2 runtime fails closed until its public "
-            "status -> init reconfiguration; --recovery-token is legacy-only."
+            "status -> init reconfiguration; schema-10 recovery tokens are unsupported."
         ),
     )
     revise.add_argument("--reason", required=True, help="exact audited revision reason")
@@ -2320,7 +1912,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     revise.add_argument(
         "--recovery-token",
-        help="legacy-only exact token from a controller-owned authority_recovery_hold",
+        help="retained tombstone argument; schema-10 recovery is unsupported",
     )
     revise.set_defaults(handler=command_revise_approved)
 

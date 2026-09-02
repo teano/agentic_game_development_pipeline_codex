@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
+import re
 import sys
 import subprocess
 import tempfile
@@ -17,6 +19,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import development_plan_state as controller
+pipeline_checkout = importlib.import_module("pipeline_v2.checkout")
 
 
 PRD = """---
@@ -95,9 +98,30 @@ class DevelopmentPlanStateTests(unittest.TestCase):
         self.ledger = self.feature_dir / "decision-ledger.jsonl"
         self.prd.write_text(PRD, encoding="utf-8")
         self.write_spec_and_ready_state()
+        (self.root / ".gitignore").write_text(
+            "/.agentic-pipeline/\n/.agentic-pipeline-v2/\n/.codegraph/\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "config", "user.name", "Plan Tests"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "config", "user.email", "plan-tests@example.invalid"],
+            check=True,
+        )
+        self.commit_fixture("initial fixture")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def commit_fixture(self, message: str) -> None:
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "--allow-empty", "-qm", message],
+            check=True,
+        )
 
     def args(self, **values: object) -> Namespace:
         return Namespace(project_root=str(self.root), **values)
@@ -288,8 +312,12 @@ product_authority:
                 "sha256": plan_sha256 or controller.sha256(self.plan),
             },
         }
+        self.commit_fixture("v2 binding fixture")
         runtime = {
             "schema": 2,
+            "checkout_model": "git-tree-v1",
+            "base_tree_oid": pipeline_checkout.require_clean_head(self.root),
+            "pipeline_runtime_digest": pipeline_checkout.pipeline_runtime_digest(),
             "run_id": f"{self.feature}-runtime",
             "generation": 0,
             "project_root": str(self.root),
@@ -301,6 +329,7 @@ product_authority:
                     "id": "SLICE-001",
                     "allowed_paths": ["src/example.txt"],
                     "planned_commands": [["python", "-B", "-c", "pass"]],
+                    "read_paths": ["src/example.txt"],
                 }
             ],
             "artifacts": {},
@@ -312,210 +341,6 @@ product_authority:
         runtime_path.parent.mkdir(parents=True, exist_ok=True)
         runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
         return runtime_path
-
-    def write_same_lineage_retired_schema10_bindings(
-        self, *, legacy_generation: int = 14, evolved: bool = False,
-    ) -> tuple[Path, Path, Path]:
-        legacy_state_path = self.root / controller.RUNTIME_STATE_RELATIVE_PATH
-        legacy_findings_path = self.root / controller.RUNTIME_FINDINGS_RELATIVE_PATH
-        v2_path = self.root / controller.V2_RUNTIME_STATE_RELATIVE_PATH
-        slices = [
-            {
-                "id": "SLICE-001",
-                "allowed_paths": ["src/example.txt"],
-                "planned_commands": [["python", "-B", "-c", "pass"]],
-            }
-        ]
-        selected = slices[0]
-        legacy_state = {
-            "schema_version": 10,
-            "project_root": str(self.root),
-            "feature": self.feature,
-            "generation": legacy_generation,
-            "requirements_path": self.prd.relative_to(self.root).as_posix(),
-            "requirements_sha256": controller.sha256(self.prd),
-            "spec_path": self.spec.relative_to(self.root).as_posix(),
-            "spec_sha256": controller.sha256(self.spec),
-            "development_plan_path": self.plan.relative_to(self.root).as_posix(),
-            "development_plan_sha256": (
-                "a" * 64 if evolved else controller.sha256(self.plan)
-            ),
-            "active_write_lease": {
-                "lease_id": "LEASE-0001",
-                "role": "engineer",
-                "worker_id": "legacy-engineer",
-                "capsule_id": "legacy-capsule",
-                "phase": "slice_engineering",
-                "write_scope": selected["id"],
-                "status": "active",
-                "rebaseline_carried": False,
-                "allowed_paths": list(selected["allowed_paths"]),
-            },
-            "lease_snapshots": {
-                "LEASE-0001": {"checkout": {"src/example.txt": "1" * 64}}
-            },
-            "phase": "scope_expansion_hold",
-            "execution_stage": "implementation",
-            "active_slice": selected["id"],
-            "slice_id": selected["id"],
-            "ordered_slices": [selected["id"]],
-            "slices": {
-                selected["id"]: {
-                    "id": selected["id"],
-                    "status": "active",
-                    "scope_contract": {
-                        "editable_paths": list(selected["allowed_paths"])
-                    },
-                    "scope_pre_edit_check": {
-                        "slice_id": selected["id"],
-                        "owner_id": "legacy-engineer",
-                        "development_plan_sha256": (
-                            "a" * 64 if evolved else controller.sha256(self.plan)
-                        ),
-                        "scope_contract": {
-                            "editable_paths": list(selected["allowed_paths"])
-                        },
-                        "status": "passed",
-                    },
-                }
-            },
-            "engineer_runs": [],
-            "pending_engineer_completion": None,
-            "last_engineer_run_id": None,
-            "last_engineer_outcome": None,
-            "scope_guard": {
-                "status": "scope_expansion_hold",
-                "hold": {
-                    "slice_id": selected["id"],
-                    "resume_phase": "slice_engineering",
-                    "lease_id": "LEASE-0001",
-                    "candidate_paths": list(selected["allowed_paths"]),
-                    "development_plan_sha256": (
-                        "a" * 64 if evolved else controller.sha256(self.plan)
-                    ),
-                },
-            },
-            "retired_controller_evidence": "preserved after public schema10 cutover",
-        }
-        legacy_findings = {
-            "schema_version": 10,
-            "items": [],
-            "generation": legacy_generation,
-        }
-        legacy_state_path.write_text(json.dumps(legacy_state), encoding="utf-8")
-        legacy_findings_path.write_text(json.dumps(legacy_findings), encoding="utf-8")
-
-        imported = controller._pipeline_v2_legacy.import_schema10(legacy_state, slices)
-        authority = imported["authority"]
-        migrate = {
-            "id": "MIGRATE-SCHEMA10",
-            "command": "migrate",
-            "command_digest": self.canonical_digest(
-                {"name": "migrate", "id": "MIGRATE-SCHEMA10", "imported": imported}
-            ),
-            "generation": legacy_generation,
-            "result": "migrated",
-        }
-        current = __import__("copy").deepcopy(imported)
-        current["generation"] = legacy_generation
-        current["history"].append(migrate)
-        if evolved:
-            current_items = {
-                "requirements": {
-                    "path": self.prd.relative_to(self.root).as_posix(),
-                    "sha256": controller.sha256(self.prd),
-                },
-                "specification": {
-                    "path": self.spec.relative_to(self.root).as_posix(),
-                    "sha256": controller.sha256(self.spec),
-                },
-                "plan": {
-                    "path": self.plan.relative_to(self.root).as_posix(),
-                    "sha256": controller.sha256(self.plan),
-                },
-            }
-            bridge_generation = legacy_generation + 1
-            current["authority"] = {
-                "items": current_items,
-                "digest": self.canonical_digest(current_items),
-            }
-            current["phase"] = "plan"
-            current["slices"] = [
-                {**item, "read_paths": ["docs/evolved-context.md"]}
-                for item in slices
-            ]
-            current["gates"] = {}
-            current["generation"] = bridge_generation
-            current["history"].append({
-                "id": "reconfigure-evolved-lineage",
-                "command": "init",
-                "command_digest": self.canonical_digest(
-                    ["public-reconfigure", bridge_generation]
-                ),
-                "generation": bridge_generation,
-                "result": "authority_scope_reconfigured",
-                "prior": {
-                    "phase": imported["phase"],
-                    "authority_digest": authority["digest"],
-                    "slices_digest": self.canonical_digest(slices),
-                    "candidate": None,
-                    "artifact_phases": [],
-                    "question_ids": [],
-                    "gate_ids": ["migration-audit"],
-                },
-            })
-        v2_path.parent.mkdir(parents=True, exist_ok=True)
-        v2_path.write_text(json.dumps(current), encoding="utf-8")
-        return legacy_state_path, legacy_findings_path, v2_path
-
-    def reinitialize_revised_plan_with_evolved_bindings(self) -> dict[str, object]:
-        first = self.approve_current_plan()
-        first_sha256 = first["approval"]["approved_sha256"]
-        controller.command_revise_approved(
-            self.args(
-                reason="Open the first approved revision",
-                reopened_by="development-plan-director-2",
-                analyst_id="planning-analyst-2",
-            )
-        )
-        self.accept_revised_analysis()
-        controller.command_submit(self.args())
-        second = controller.command_approve(
-            self.args(
-                approved_by="delegated-technical-approver",
-                approval_note="Approve the revised authority",
-            )
-        )
-        second_sha256 = second["approval"]["approved_sha256"]
-        self.assertNotEqual(first_sha256, second_sha256)
-        old_prd_sha256 = controller.sha256(self.prd)
-        old_spec_sha256 = controller.sha256(self.spec)
-        bindings = self.write_same_lineage_retired_schema10_bindings(evolved=True)
-        binding_bytes = {path: path.read_bytes() for path in bindings}
-
-        self.prd.write_text(
-            self.prd.read_text(encoding="utf-8") + "\nRevised authority input.\n",
-            encoding="utf-8",
-        )
-        self.write_spec_and_ready_state()
-        self.assertEqual("stale", controller.command_status(self.args())["status"])
-        renewed = controller.command_reinitialize(
-            self.args(analyst_id="planning-analyst-3")
-        )
-        self.assertEqual("analyzing", renewed["status"])
-        self.assertEqual(first_sha256, renewed["history"][0]["prior_approved_sha256"])
-        self.assertEqual(
-            second_sha256,
-            renewed["history"][-1]["approval"]["approved_sha256"],
-        )
-        return {
-            "bindings": bindings,
-            "binding_bytes": binding_bytes,
-            "first_sha256": first_sha256,
-            "second_sha256": second_sha256,
-            "old_prd_sha256": old_prd_sha256,
-            "old_spec_sha256": old_spec_sha256,
-        }
 
     def slice_text(self, number: int, dependencies: str) -> str:
         return f"""## Slice SLICE-{number:03d}
@@ -779,6 +604,7 @@ Only the approved feature and named shared symbol are in scope.
             Path(controller.__file__).resolve().parents[2]
             / "gamedev-pipeline" / "scripts" / "pipeline_state.py"
         )
+        self.commit_fixture("approved plan pipeline fixture")
         runtime_state = self.root / ".agentic-pipeline-v2" / "state.json"
         slice_record = json.dumps({
             "id": "SLICE-001",
@@ -1480,7 +1306,10 @@ Only the approved feature and named shared symbol are in scope.
         runtime_state = self.root / controller.RUNTIME_STATE_RELATIVE_PATH
         runtime_state.write_text("{}\n", encoding="utf-8")
 
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "runtime pipeline state"):
+        with self.assertRaisesRegex(
+            controller.DevelopmentPlanError,
+            re.escape(controller.SCHEMA10_UNSUPPORTED_MESSAGE),
+        ):
             controller.command_revise_approved(
                 self.args(
                     reason="unsafe late repair",
@@ -1489,641 +1318,33 @@ Only the approved feature and named shared symbol are in scope.
                 )
             )
 
-    def test_same_lineage_retired_schema10_pair_allows_initial_revise_approved(self) -> None:
+    def test_schema10_runtime_residue_requires_archive_and_fresh_plan_init(self) -> None:
         self.approve_current_plan()
-        bindings = self.write_same_lineage_retired_schema10_bindings()
-        binding_bytes = {path: path.read_bytes() for path in bindings}
-
-        reopened = controller.command_revise_approved(
-            self.args(
-                reason="Add the approved integration context",
-                reopened_by="development-plan-director-2",
-                analyst_id="planning-analyst-2",
-            )
+        runtime_state = self.root / controller.RUNTIME_STATE_RELATIVE_PATH
+        findings = self.root / controller.RUNTIME_FINDINGS_RELATIVE_PATH
+        runtime_state.write_text(
+            json.dumps({"schema_version": 10}), encoding="utf-8",
         )
-
-        self.assertEqual("analyzing", reopened["status"])
-        self.assertNotIn("recovery_authorization", reopened)
-        self.assertEqual(binding_bytes, {path: path.read_bytes() for path in bindings})
-
-    def test_same_lineage_classifier_is_reused_by_bound_continuation(self) -> None:
-        self.approve_current_plan()
-        bindings = self.write_same_lineage_retired_schema10_bindings()
-        binding_bytes = {path: path.read_bytes() for path in bindings}
-        controller.command_revise_approved(
-            self.args(
-                reason="Add the approved integration context",
-                reopened_by="development-plan-director-2",
-                analyst_id="planning-analyst-2",
-            )
+        findings.write_text(
+            json.dumps({"schema_version": 10, "items": []}), encoding="utf-8",
         )
-
-        accepted = self.accept_revised_analysis()
-        validated = controller.command_validate(self.args())
-
-        self.assertEqual("drafting", accepted["status"])
-        self.assertEqual(self.plan.relative_to(self.root).as_posix(), accepted["plan_path"])
-        self.assertEqual(controller.sha256(self.plan), validated["sha256"])
-        self.assertEqual(binding_bytes, {path: path.read_bytes() for path in bindings})
-
-    def test_evolved_retired_schema10_bridge_allows_reopen_and_continuation(self) -> None:
-        self.approve_current_plan()
-        bindings = self.write_same_lineage_retired_schema10_bindings(evolved=True)
-        binding_bytes = {path: path.read_bytes() for path in bindings}
-
-        reopened = controller.command_revise_approved(
-            self.args(
-                reason="Use the current publicly reconfigured plan authority",
-                reopened_by="development-plan-director-2",
-                analyst_id="planning-analyst-2",
-            )
-        )
-        accepted = self.accept_revised_analysis()
-        validated = controller.command_validate(self.args())
-
-        self.assertEqual("analyzing", reopened["status"])
-        self.assertEqual("drafting", accepted["status"])
-        self.assertEqual(controller.sha256(self.plan), validated["sha256"])
-        self.assertEqual(binding_bytes, {path: path.read_bytes() for path in bindings})
-
-    def test_reinitialized_revised_v2_plan_uses_latest_archive_direct_and_cli(
-        self,
-    ) -> None:
-        for route in ("direct", "cli"):
-            with self.subTest(route=route):
-                try:
-                    context = self.reinitialize_revised_plan_with_evolved_bindings()
-                    bindings = context["bindings"]
-                    binding_bytes = context["binding_bytes"]
-                    state_before = controller.state_path(self.root).read_bytes()
-                    plan_before = self.plan.read_bytes()
-                    if route == "direct":
-                        accepted = self.accept_revised_analysis(
-                            analyst_id="planning-analyst-3"
-                        )
-                    else:
-                        result = self.cli(
-                            "accept-analysis",
-                            "--analyst-id",
-                            "planning-analyst-3",
-                            "--mode",
-                            "single_owner",
-                            "--rationale",
-                            "fresh analysis for the revised plan authority",
-                            "--working-set",
-                            "8 files, 3 tests, one revised planning packet",
-                            "--seams-assessment",
-                            "fresh review confirms one coherent integration seam",
-                        )
-                        self.assertEqual(0, result.returncode, result.stderr)
-                        accepted = json.loads(result.stdout)
-                    self.assertEqual("drafting", accepted["status"])
-                    self.assertNotEqual(
-                        state_before, controller.state_path(self.root).read_bytes()
-                    )
-                    self.assertEqual(plan_before, self.plan.read_bytes())
-                    self.assertEqual(
-                        binding_bytes, {path: path.read_bytes() for path in bindings}
-                    )
-
-                    draft_bytes, _, _ = controller.reopened_plan_bytes(
-                        self.plan, "planning-analyst-3"
-                    )
-                    draft_text = draft_bytes.decode("utf-8").replace(
-                        str(context["old_prd_sha256"]), controller.sha256(self.prd)
-                    ).replace(
-                        str(context["old_spec_sha256"]), controller.sha256(self.spec)
-                    )
-                    self.plan.write_text(draft_text, encoding="utf-8")
-                    self.assertEqual(
-                        controller.sha256(self.plan),
-                        controller.command_validate(self.args())["sha256"],
-                    )
-                    submitted = controller.command_submit(self.args())
-                    self.assertEqual("awaiting_approval", submitted["status"])
-                    approved = controller.command_approve(
-                        self.args(
-                            approved_by="delegated-plan-revision-approver",
-                            approval_note="Approve the specification-aligned plan",
-                        )
-                    )
-                    self.assertEqual("approved", approved["status"])
-                    self.assertEqual(
-                        binding_bytes, {path: path.read_bytes() for path in bindings}
-                    )
-                finally:
-                    self.tearDown()
-                    self.setUp()
-
-    def test_reinitialized_v2_plan_archive_tampering_never_falls_back(self) -> None:
-        cases = (
-            (
-                "changed approval SHA",
-                "direct",
-                "plan SHA",
-                lambda archive: archive["approval"].update(
-                    {"approved_sha256": "f" * 64}
-                ),
-            ),
-            (
-                "missing approval",
-                "cli",
-                "reinitialized plan authority history",
-                lambda archive: archive.pop("approval"),
-            ),
-            (
-                "malformed approval",
-                "direct",
-                "reinitialized plan authority history",
-                lambda archive: archive.update({"approval": []}),
-            ),
-            (
-                "wrong archived plan path",
-                "cli",
-                "reinitialized plan authority history",
-                lambda archive: archive.update(
-                    {"plan_path": "docs/foreign/development-plan.md"}
-                ),
-            ),
-        )
-        for label, route, message, mutate in cases:
-            with self.subTest(label=label, route=route):
-                try:
-                    context = self.reinitialize_revised_plan_with_evolved_bindings()
-                    state = controller.load_state(self.root)
-                    mutate(state["history"][-1])
-                    controller.state_path(self.root).write_text(
-                        json.dumps(state), encoding="utf-8"
-                    )
-                    protected = {
-                        controller.state_path(self.root): controller.state_path(
-                            self.root
-                        ).read_bytes(),
-                        self.plan: self.plan.read_bytes(),
-                        **{
-                            path: path.read_bytes()
-                            for path in context["bindings"]
-                        },
-                    }
-                    if route == "direct":
-                        with self.assertRaisesRegex(
-                            controller.DevelopmentPlanError, message
-                        ):
-                            self.accept_revised_analysis(
-                                analyst_id="planning-analyst-3"
-                            )
-                    else:
-                        result = self.cli(
-                            "accept-analysis",
-                            "--analyst-id",
-                            "planning-analyst-3",
-                            "--mode",
-                            "single_owner",
-                            "--rationale",
-                            "fresh analysis for the revised plan authority",
-                            "--working-set",
-                            "8 files, 3 tests, one revised planning packet",
-                            "--seams-assessment",
-                            "fresh review confirms one coherent integration seam",
-                        )
-                        self.assertEqual(2, result.returncode)
-                        self.assertIn(message, result.stderr)
-                    self.assertEqual(
-                        protected,
-                        {path: path.read_bytes() for path in protected},
-                    )
-                finally:
-                    self.tearDown()
-                    self.setUp()
-
-    def test_reinitialized_v2_plan_missing_latest_archive_rejects_old_fallback(
-        self,
-    ) -> None:
-        context = self.reinitialize_revised_plan_with_evolved_bindings()
-        state = controller.load_state(self.root)
-        state["history"].pop()
-        state["history"][-1]["prior_approved_sha256"] = context["second_sha256"]
-        controller.state_path(self.root).write_text(
-            json.dumps(state), encoding="utf-8"
-        )
-        protected = {
-            controller.state_path(self.root): controller.state_path(
-                self.root
-            ).read_bytes(),
-            self.plan: self.plan.read_bytes(),
-            **{path: path.read_bytes() for path in context["bindings"]},
-        }
-
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "plan SHA"):
-            self.accept_revised_analysis(analyst_id="planning-analyst-3")
-
-        self.assertEqual(
-            protected,
-            {path: path.read_bytes() for path in protected},
-        )
-
-    def test_evolved_retired_schema10_bridge_replays_interrupted_reopen(self) -> None:
-        self.approve_current_plan()
-        bindings = self.write_same_lineage_retired_schema10_bindings(evolved=True)
-        binding_bytes = {path: path.read_bytes() for path in bindings}
-        args = self.args(
-            reason="Replay the current publicly reconfigured plan authority",
-            reopened_by="development-plan-director-2",
-            analyst_id="planning-analyst-2",
-        )
-        real_save_state = controller.save_state
-        save_count = 0
-
-        def fail_final_save(root: Path, state: dict) -> None:
-            nonlocal save_count
-            save_count += 1
-            if save_count == 2:
-                raise OSError("simulated evolved-lineage lost response")
-            real_save_state(root, state)
-
-        with mock.patch.object(controller, "save_state", side_effect=fail_final_save):
-            with self.assertRaisesRegex(OSError, "evolved-lineage lost response"):
-                controller.command_revise_approved(args)
-        pending = controller.load_state(self.root)
-        self.assertEqual("revision_reopen_pending", pending["status"])
-
-        resumed = controller.command_revise_approved(args)
-        self.assertEqual("analyzing", resumed["status"])
-        self.assertEqual(binding_bytes, {path: path.read_bytes() for path in bindings})
-
-    def test_evolved_retired_schema10_bridge_adversarial_matrix_fails_closed(self) -> None:
-        def rewrite(path: Path, mutate: object) -> None:
-            value = json.loads(path.read_text(encoding="utf-8"))
-            mutate(value)
-            path.write_text(json.dumps(value), encoding="utf-8")
-
-        def mismatch_current_plan(value: dict) -> None:
-            value["authority"]["items"]["plan"]["sha256"] = "e" * 64
-            value["authority"]["digest"] = self.canonical_digest(
-                value["authority"]["items"]
-            )
-
-        cases = {
-            "unbridged authority change": lambda value: value["history"].pop(),
-            "migrate command digest mismatch": lambda value: value["history"][1].update(
-                {"command_digest": "f" * 64}
-            ),
-            "malformed bridge": lambda value: value["history"][2]["prior"].pop(
-                "slices_digest"
-            ),
-            "wrong bridge authority": lambda value: value["history"][2]["prior"].update(
-                {"authority_digest": "f" * 64}
-            ),
-            "wrong bridge order": lambda value: value["history"].__setitem__(
-                slice(1, 3), [value["history"][2], value["history"][1]]
-            ),
-            "non-newer bridge generation": lambda value: value["history"][2].update(
-                {"generation": 14}
-            ),
-            "wrong bridge result": lambda value: value["history"][2].update(
-                {"result": "initialized"}
-            ),
-            "invalid prior slices digest": lambda value: value["history"][2]["prior"].update(
-                {"slices_digest": "not-a-digest"}
-            ),
-            "mismatched prior slices digest": lambda value: value["history"][2]["prior"].update(
-                {"slices_digest": "e" * 64}
-            ),
-            "missing migration audit gate": lambda value: value["history"][2]["prior"].update(
-                {"gate_ids": []}
-            ),
-            "current plan mismatch": mismatch_current_plan,
-            "multiple v2 states": lambda value: (
-                self.root / controller.V2_RUNTIME_STATE_RELATIVE_PATH
-            ).with_name("alternate-state.json").write_text(
-                json.dumps(value), encoding="utf-8"
-            ),
-        }
-        for label, mutate in cases.items():
-            with self.subTest(label=label):
-                try:
-                    self.approve_current_plan()
-                    _, _, v2 = self.write_same_lineage_retired_schema10_bindings(
-                        evolved=True
-                    )
-                    rewrite(v2, mutate)
-                    state_before = controller.state_path(self.root).read_bytes()
-                    plan_before = self.plan.read_bytes()
-
-                    with self.assertRaises(controller.DevelopmentPlanError):
-                        controller.command_revise_approved(
-                            self.args(
-                                reason="Reject an invalid lineage evolution",
-                                reopened_by="development-plan-director-2",
-                                analyst_id="planning-analyst-2",
-                            )
-                        )
-
-                    self.assertEqual(
-                        state_before, controller.state_path(self.root).read_bytes()
-                    )
-                    self.assertEqual(plan_before, self.plan.read_bytes())
-                finally:
-                    self.tearDown()
-                    self.setUp()
-
-    def test_retired_schema10_public_history_sequence_fails_closed(self) -> None:
-        def append_record(
-            value: dict, *, record_id: str, generation: int, result: str = "advanced",
-        ) -> None:
-            value["history"].append({
-                "id": record_id,
-                "command": "next",
-                "command_digest": "d" * 64,
-                "generation": generation,
-                "result": result,
-            })
-
-        def duplicate_bridge(value: dict) -> None:
-            bridge = __import__("copy").deepcopy(value["history"][2])
-            bridge.update({
-                "id": "reconfigure-duplicate-lineage",
-                "command_digest": "e" * 64,
-                "generation": 16,
-            })
-            value["history"].append(bridge)
-            value["generation"] = 16
-
-        cases = {
-            "negative history generation": (
-                True, lambda value: value["history"][2].update({"generation": -1})
-            ),
-            "future history generation": (
-                True, lambda value: value["history"][2].update({"generation": 99})
-            ),
-            "boolean history generation": (
-                True, lambda value: value["history"][2].update({"generation": True})
-            ),
-            "runtime generation below bridge": (
-                True, lambda value: value.update({"generation": 14})
-            ),
-            "post-bridge generation exceeds runtime": (
-                True,
-                lambda value: append_record(
-                    value, record_id="future-record", generation=16
-                ),
-            ),
-            "duplicate public generation": (
-                True,
-                lambda value: append_record(
-                    value, record_id="duplicate-generation", generation=15
-                ),
-            ),
-            "duplicate public id": (
-                True,
-                lambda value: (
-                    append_record(
-                        value,
-                        record_id="reconfigure-evolved-lineage",
-                        generation=16,
-                    ),
-                    value.update({"generation": 16}),
-                ),
-            ),
-            "duplicate legacy bridge": (True, duplicate_bridge),
-            "missing public result": (
-                True, lambda value: value["history"][2].pop("result")
-            ),
-            "empty public id": (
-                True, lambda value: value["history"][2].update({"id": ""})
-            ),
-            "empty public command": (
-                True, lambda value: value["history"][2].update({"command": ""})
-            ),
-            "no-bridge trailing generation gap": (
-                False,
-                lambda value: (
-                    append_record(value, record_id="gap-record", generation=16),
-                    value.update({"generation": 16}),
-                ),
-            ),
-        }
-        for label, (evolved, mutate) in cases.items():
-            with self.subTest(label=label):
-                try:
-                    self.approve_current_plan()
-                    _, _, v2 = self.write_same_lineage_retired_schema10_bindings(
-                        evolved=evolved
-                    )
-                    runtime = json.loads(v2.read_text(encoding="utf-8"))
-                    mutate(runtime)
-                    v2.write_text(json.dumps(runtime), encoding="utf-8")
-                    state_before = controller.state_path(self.root).read_bytes()
-                    plan_before = self.plan.read_bytes()
-
-                    with self.assertRaises(controller.DevelopmentPlanError):
-                        controller.command_revise_approved(
-                            self.args(
-                                reason="Reject impossible public history",
-                                reopened_by="development-plan-director-2",
-                                analyst_id="planning-analyst-2",
-                            )
-                        )
-
-                    self.assertEqual(
-                        state_before, controller.state_path(self.root).read_bytes()
-                    )
-                    self.assertEqual(plan_before, self.plan.read_bytes())
-                finally:
-                    self.tearDown()
-                    self.setUp()
-
-    def test_malformed_same_lineage_v2_rejects_initial_reopen_without_mutation(
-        self,
-    ) -> None:
-        self.approve_current_plan()
-        _, _, v2 = self.write_same_lineage_retired_schema10_bindings()
-        runtime = json.loads(v2.read_text(encoding="utf-8"))
-        runtime.pop("artifacts")
-        v2.write_text(json.dumps(runtime), encoding="utf-8")
-        state_before = controller.state_path(self.root).read_bytes()
-        plan_before = self.plan.read_bytes()
-
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "v2 runtime state"):
-            controller.command_revise_approved(
-                self.args(
-                    reason="reject malformed v2 before reopen",
-                    reopened_by="development-plan-director-2",
-                    analyst_id="planning-analyst-2",
-                )
-            )
-
-        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
-        self.assertEqual(plan_before, self.plan.read_bytes())
-
-    def test_malformed_same_lineage_v2_rejects_continuation_without_mutation(
-        self,
-    ) -> None:
-        self.approve_current_plan()
-        _, _, v2 = self.write_same_lineage_retired_schema10_bindings()
-        controller.command_revise_approved(
-            self.args(
-                reason="open a valid same-lineage revision",
-                reopened_by="development-plan-director-2",
-                analyst_id="planning-analyst-2",
-            )
-        )
-        runtime = json.loads(v2.read_text(encoding="utf-8"))
-        runtime.pop("artifacts")
-        v2.write_text(json.dumps(runtime), encoding="utf-8")
-        state_before = controller.state_path(self.root).read_bytes()
-        plan_before = self.plan.read_bytes()
-
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "v2 runtime state"):
-            self.accept_revised_analysis()
-
-        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
-        self.assertEqual(plan_before, self.plan.read_bytes())
-
-    def test_retired_schema10_findings_bool_generation_fails_without_mutation(
-        self,
-    ) -> None:
-        self.approve_current_plan()
-        _, findings, _ = self.write_same_lineage_retired_schema10_bindings(
-            legacy_generation=1
-        )
-        finding_state = json.loads(findings.read_text(encoding="utf-8"))
-        finding_state["generation"] = True
-        findings.write_text(json.dumps(finding_state), encoding="utf-8")
-        state_before = controller.state_path(self.root).read_bytes()
-        plan_before = self.plan.read_bytes()
 
         with self.assertRaisesRegex(
-            controller.DevelopmentPlanError, "same-generation schema-10 findings"
+            controller.DevelopmentPlanError,
+            re.escape(controller.SCHEMA10_UNSUPPORTED_MESSAGE),
         ):
             controller.command_revise_approved(
                 self.args(
-                    reason="reject boolean legacy findings generation",
+                    reason="schema-10 cannot be bridged",
                     reopened_by="development-plan-director-2",
                     analyst_id="planning-analyst-2",
                 )
             )
-
-        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
-        self.assertEqual(plan_before, self.plan.read_bytes())
-
-    def test_retired_schema10_lineage_adversarial_matrix_fails_closed(self) -> None:
-        def rewrite(path: Path, mutate: object) -> None:
-            value = json.loads(path.read_text(encoding="utf-8"))
-            mutate(value)
-            path.write_text(json.dumps(value), encoding="utf-8")
-
-        cases = {
-            "legacy digest mismatch": lambda legacy, findings, v2: rewrite(
-                legacy, lambda value: value.update({"unexpected_mutation": True})
-            ),
-            "legacy wrong project": lambda legacy, findings, v2: rewrite(
-                legacy, lambda value: value.update({"project_root": str(self.root.parent)})
-            ),
-            "missing import proof": lambda legacy, findings, v2: rewrite(
-                v2, lambda value: value["history"].pop(0)
-            ),
-            "import id mismatch": lambda legacy, findings, v2: rewrite(
-                v2, lambda value: value["history"][0].update({"id": "legacy-forged"})
-            ),
-            "import generation mismatch": lambda legacy, findings, v2: rewrite(
-                v2, lambda value: value["history"][0].update({"generation": 13})
-            ),
-            "run id mismatch": lambda legacy, findings, v2: rewrite(
-                v2, lambda value: value.update({"run_id": "migrated-other-forged"})
-            ),
-            "public migrate digest mismatch": lambda legacy, findings, v2: rewrite(
-                v2,
-                lambda value: value["history"][1].update(
-                    {"command_digest": "f" * 64}
-                ),
-            ),
-            "authority mismatch": lambda legacy, findings, v2: rewrite(
-                v2,
-                lambda value: value["authority"].update(
-                    {
-                        "items": {
-                            **value["authority"]["items"],
-                            "plan": {
-                                **value["authority"]["items"]["plan"],
-                                "sha256": "e" * 64,
-                            },
-                        }
-                    }
-                ),
-            ),
-            "nonempty findings": lambda legacy, findings, v2: rewrite(
-                findings, lambda value: value.update({"items": [{"id": "F-OPEN"}]})
-            ),
-            "findings generation mismatch": lambda legacy, findings, v2: rewrite(
-                findings, lambda value: value.update({"generation": 15})
-            ),
-            "findings schema mismatch": lambda legacy, findings, v2: rewrite(
-                findings, lambda value: value.update({"schema_version": 9})
-            ),
-            "partial legacy pair": lambda legacy, findings, v2: findings.unlink(),
-            "malformed legacy": lambda legacy, findings, v2: legacy.write_text(
-                "{", encoding="utf-8"
-            ),
-            "multiple v2 states": lambda legacy, findings, v2: (
-                v2.with_name("custom-state.json").write_bytes(v2.read_bytes())
-            ),
-        }
-        for label, mutate in cases.items():
-            with self.subTest(label=label):
-                try:
-                    self.approve_current_plan()
-                    legacy, findings, v2 = self.write_same_lineage_retired_schema10_bindings()
-                    mutate(legacy, findings, v2)
-                    state_before = controller.state_path(self.root).read_bytes()
-                    plan_before = self.plan.read_bytes()
-
-                    with self.assertRaisesRegex(
-                        controller.DevelopmentPlanError, "retired schema-10 lineage"
-                    ):
-                        controller.command_revise_approved(
-                            self.args(
-                                reason="unsafe ambiguous revision",
-                                reopened_by="development-plan-director-2",
-                                analyst_id="planning-analyst-2",
-                            )
-                        )
-
-                    self.assertEqual(
-                        state_before, controller.state_path(self.root).read_bytes()
-                    )
-                    self.assertEqual(plan_before, self.plan.read_bytes())
-                finally:
-                    self.tearDown()
-                    self.setUp()
-
-    def test_retired_schema10_link_like_pair_is_rejected(self) -> None:
-        self.approve_current_plan()
-        legacy, _, _ = self.write_same_lineage_retired_schema10_bindings()
-        state_before = controller.state_path(self.root).read_bytes()
-        plan_before = self.plan.read_bytes()
-        original_is_symlink = Path.is_symlink
-
-        with mock.patch.object(
-            Path,
-            "is_symlink",
-            autospec=True,
-            side_effect=lambda path: path == legacy or original_is_symlink(path),
+        with self.assertRaisesRegex(
+            controller._pipeline_v2_legacy.PipelineError,
+            re.escape(controller.SCHEMA10_UNSUPPORTED_MESSAGE),
         ):
-            with self.assertRaisesRegex(
-                controller.DevelopmentPlanError, "retired schema-10 lineage"
-            ):
-                controller.command_revise_approved(
-                    self.args(
-                        reason="unsafe linked revision",
-                        reopened_by="development-plan-director-2",
-                        analyst_id="planning-analyst-2",
-                    )
-                )
-
-        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
-        self.assertEqual(plan_before, self.plan.read_bytes())
-
+            controller._pipeline_v2_legacy.import_schema10({}, [])
     def test_v2_binding_rejects_a_plan_sha_mismatch_before_reopen(self) -> None:
         self.initialize()
         self.write_plan()
@@ -2250,7 +1471,7 @@ Only the approved feature and named shared symbol are in scope.
         self.assertEqual(plan_before, self.plan.read_bytes())
         self.assertEqual(state_before, controller.load_state(self.root))
 
-    def test_revise_approved_help_distinguishes_v2_status_init_from_legacy_token(self) -> None:
+    def test_revise_approved_help_marks_schema10_token_unsupported(self) -> None:
         parser = controller.build_parser()
         subparsers = next(
             action for action in parser._actions
@@ -2260,7 +1481,7 @@ Only the approved feature and named shared symbol are in scope.
         self.assertIn("v2", text)
         self.assertIn("status", text)
         self.assertIn("init", text)
-        self.assertIn("legacy-only", text)
+        self.assertIn("schema-10 recovery tokens are unsupported", text)
 
     def test_v2_binding_uses_public_reconfiguration_without_a_legacy_hold(self) -> None:
         self.initialize()
@@ -2284,73 +1505,33 @@ Only the approved feature and named shared symbol are in scope.
         self.assertNotIn("recovery_authorization", reopened)
         self.assertEqual(runtime_before, runtime_path.read_bytes())
 
-    def test_bound_approved_plan_revision_requires_exact_authority_recovery_hold(self) -> None:
-        self.initialize()
-        self.write_plan()
-        controller.command_submit(self.args())
-        controller.command_approve(
-            self.args(approved_by="user", approval_note="exact SHA approval")
-        )
-        approved_sha = controller.sha256(self.plan)
+    def test_legacy_recovery_hold_is_the_same_schema10_tombstone(self) -> None:
+        self.approve_current_plan()
         runtime_dir = self.root / ".agentic-pipeline"
-        hold = {
-            "status": "open",
-            "reason": "repair authority",
-            "opened_at": "2026-08-13T00:00:00+00:00",
-            "authorized_by": "director",
-            "feature": self.feature,
-            "revision": "runtime-revision",
-            "requirements": {"sha256": controller.sha256(self.prd)},
-            "specification": {"sha256": controller.sha256(self.spec)},
-            "development_plan": {"sha256": approved_sha},
-        }
-        payload = {
-            "feature": hold["feature"],
-            "opened_at": hold["opened_at"],
-            "authorized_by": hold["authorized_by"],
-            "reason": hold["reason"],
-            "requirements_sha256": hold["requirements"]["sha256"],
-            "spec_sha256": hold["specification"]["sha256"],
-            "plan_sha256": approved_sha,
-            "revision": hold["revision"],
-        }
-        exact_token = "ARH-" + __import__("hashlib").sha256(
-            __import__("json").dumps(
-                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-        ).hexdigest()[:32].upper()
-        hold["token"] = exact_token
         (runtime_dir / "state.json").write_text(
-            __import__("json").dumps(
-                {
-                    "phase": "authority_recovery_hold",
-                    "authority_recovery_hold": hold,
-                }
-            ),
+            json.dumps({
+                "schema_version": 10,
+                "phase": "authority_recovery_hold",
+            }),
             encoding="utf-8",
         )
-        (runtime_dir / "findings.json").write_text("{}\n", encoding="utf-8")
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "exact open"):
+        (runtime_dir / "findings.json").write_text(
+            json.dumps({"schema_version": 10, "items": []}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            controller.DevelopmentPlanError,
+            re.escape(controller.SCHEMA10_UNSUPPORTED_MESSAGE),
+        ):
             controller.command_revise_approved(
                 self.args(
-                    reason="repair authority",
+                    reason="schema-10 cannot be recovered",
                     reopened_by="director",
                     analyst_id="planning-analyst-2",
-                    recovery_token="ARH-WRONG",
+                    recovery_token="ARH-RETIRED",
                 )
             )
-        reopened = controller.command_revise_approved(
-            self.args(
-                reason="repair authority",
-                reopened_by="director",
-                analyst_id="planning-analyst-2",
-                    recovery_token=exact_token,
-            )
-        )
-        self.assertEqual("analyzing", reopened["status"])
-        self.assertEqual(exact_token, reopened["recovery_authorization"]["token"])
-        self.assertIsNone(reopened["approval"])
-
     def test_interrupted_approved_plan_revision_resumes_fail_closed(self) -> None:
         self.initialize()
         self.write_plan()

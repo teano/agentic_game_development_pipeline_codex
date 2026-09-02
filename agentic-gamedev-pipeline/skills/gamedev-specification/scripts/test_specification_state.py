@@ -6,7 +6,9 @@ from __future__ import annotations
 import sys
 import json
 import hashlib
+import importlib
 import importlib.util
+import re
 import subprocess
 import tempfile
 import unittest
@@ -33,6 +35,7 @@ if _PLAN_CONTROLLER_SPEC is None or _PLAN_CONTROLLER_SPEC.loader is None:
     raise RuntimeError("cannot load the Development Plan controller for tests")
 plan_controller = importlib.util.module_from_spec(_PLAN_CONTROLLER_SPEC)
 _PLAN_CONTROLLER_SPEC.loader.exec_module(plan_controller)
+pipeline_checkout = importlib.import_module("pipeline_v2.checkout")
 
 
 PRD = """---
@@ -109,9 +112,33 @@ class SpecificationStateTests(unittest.TestCase):
         )
         self.helper_receipt_counter = 0
         self.prd.write_text(PRD, encoding="utf-8")
+        self.initialize_git_fixture()
+
+    def initialize_git_fixture(self) -> None:
+        (self.root / ".gitignore").write_text(
+            "/.agentic-pipeline/\n/.agentic-pipeline-v2/\n/.codegraph/\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "config", "user.name", "Specification Tests"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "config", "user.email", "spec-tests@example.invalid"],
+            check=True,
+        )
+        self.commit_fixture("initial fixture")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def commit_fixture(self, message: str) -> None:
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "--allow-empty", "-qm", message],
+            check=True,
+        )
 
     def args(self, **values: object) -> Namespace:
         return Namespace(project_root=str(self.root), **values)
@@ -381,77 +408,6 @@ Android build gate remains.
             encoding="utf-8",
         )
 
-    def bind_authority_recovery(self, ready: dict, reason: str = "fresh PRD authority") -> str:
-        state_dir = self.root / ".agentic-pipeline"
-        prd_sha = ready["prd"]["sha256"]
-        spec_sha = ready["ready"]["spec_sha256"]
-        hold = {
-            "schema": 1,
-            "status": "open",
-            "reason": reason,
-            "authorized_by": "technical-director",
-            "opened_at": "2026-08-10T00:00:00+00:00",
-            "feature": "sample-feature",
-            "revision": "runtime-revision",
-            "product_revision": "runtime-product-revision",
-            "requirements": {
-                "path": ready["prd"]["path"],
-                "revision": ready["prd"]["revision"],
-                "sha256": prd_sha,
-            },
-            "specification": {
-                "path": ready["specification"]["path"],
-                "revision": "1",
-                "sha256": spec_sha,
-            },
-            "development_plan": {
-                "path": "docs/Features/template/sample-feature/development-plan.md",
-                "sha256": "a" * 64,
-            },
-            "ordered_slices": ["SLICE-001"],
-        }
-        payload = {
-            "feature": hold["feature"],
-            "opened_at": hold["opened_at"],
-            "authorized_by": hold["authorized_by"],
-            "reason": hold["reason"],
-            "requirements_sha256": prd_sha,
-            "spec_sha256": spec_sha,
-            "plan_sha256": "a" * 64,
-            "revision": hold["revision"],
-        }
-        token = "ARH-" + hashlib.sha256(
-            json.dumps(
-                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-        ).hexdigest()[:32].upper()
-        hold["token"] = token
-        runtime = {
-            "phase": "authority_recovery_hold",
-            "authority_recovery_hold": hold,
-            "active_write_lease": None,
-            "write_lease_history": [],
-            "engineer_runs": [],
-            "engineer_clean": None,
-            "last_engineer_run_id": None,
-            "last_engineer_outcome": None,
-            "pending_engineer_completion": None,
-            "implementation_state": {"status": "pending"},
-            "feature_verification_state": {"status": "pending"},
-            "ordered_slices": ["SLICE-001"],
-            "slices": {
-                "SLICE-001": {
-                    "status": "active",
-                    "sealed_at": None,
-                    "result_revision": None,
-                    "scope_pre_edit_check": None,
-                }
-            },
-        }
-        (state_dir / "state.json").write_text(json.dumps(runtime), encoding="utf-8")
-        (state_dir / "findings.json").write_text("{}\n", encoding="utf-8")
-        return token
-
     def write_v2_plan(self, ready: dict) -> Path:
         plan = self.feature_dir / "development-plan.md"
         plan.write_text(
@@ -497,6 +453,7 @@ approved_at: 2026-08-10T00:00:00Z
 
     def bind_direct_v2(self, ready: dict, filename: str = "state.json") -> Path:
         plan = self.write_v2_plan(ready)
+        self.commit_fixture("direct v2 fixture")
         items = {
             "requirements": {
                 "path": ready["prd"]["path"],
@@ -521,6 +478,8 @@ approved_at: 2026-08-10T00:00:00Z
                 "planned_commands": [[sys.executable, "-B", "-c", "pass"]],
                 "read_paths": ["docs/context.md", "tests/evidence.md"],
             }],
+            base_tree_oid=pipeline_checkout.require_clean_head(self.root),
+            pipeline_runtime_digest=pipeline_checkout.pipeline_runtime_digest(),
         )
         runtime_path = self.root / ".agentic-pipeline-v2" / filename
         runtime_path.parent.mkdir(parents=True, exist_ok=True)
@@ -537,106 +496,16 @@ approved_at: 2026-08-10T00:00:00Z
         self.assertTrue(status["next_action"]["command_id"].startswith("next-plan-"))
         return runtime_path
 
-    def bind_retired_schema10_v2(self, ready: dict) -> Path:
-        plan = self.write_v2_plan(ready)
-        legacy_generation = 14
-        legacy = {
-            "schema_version": 10,
-            "project_root": str(self.root),
-            "feature": "sample-feature",
-            "generation": legacy_generation,
-            "requirements_path": ready["prd"]["path"],
-            "requirements_sha256": ready["prd"]["sha256"],
-            "spec_path": ready["specification"]["path"],
-            "spec_sha256": ready["ready"]["spec_sha256"],
-            "development_plan_path": plan.relative_to(self.root).as_posix(),
-            "development_plan_sha256": "a" * 64,
-        }
+    def bind_schema10_residue(self, ready: dict) -> Path:
+        runtime_path = self.bind_direct_v2(ready)
         state_dir = self.root / ".agentic-pipeline"
-        (state_dir / "state.json").write_text(json.dumps(legacy), encoding="utf-8")
-        (state_dir / "findings.json").write_text(
-            json.dumps({
-                "schema_version": 10,
-                "items": [],
-                "generation": legacy_generation,
-            }),
-            encoding="utf-8",
+        (state_dir / "state.json").write_text(
+            json.dumps({"schema_version": 10}), encoding="utf-8",
         )
-        slices = [{
-            "id": "SLICE-001",
-            "allowed_paths": ["src/example.txt"],
-            "planned_commands": [[sys.executable, "-B", "-c", "pass"]],
-        }]
-        imported = plan_controller._pipeline_v2_legacy.import_schema10(legacy, slices)
-        migrate = {
-            "id": "MIGRATE-SCHEMA10",
-            "command": "migrate",
-            "command_digest": self.canonical_digest({
-                "name": "migrate",
-                "id": "MIGRATE-SCHEMA10",
-                "imported": imported,
-            }),
-            "generation": legacy_generation,
-            "result": "migrated",
-        }
-        items = {
-            "requirements": {
-                "path": ready["prd"]["path"],
-                "sha256": ready["prd"]["sha256"],
-            },
-            "specification": {
-                "path": ready["specification"]["path"],
-                "sha256": ready["ready"]["spec_sha256"],
-            },
-            "plan": {
-                "path": plan.relative_to(self.root).as_posix(),
-                "sha256": controller.sha256(plan),
-            },
-        }
-        runtime = json.loads(json.dumps(imported))
-        runtime.update({
-            "generation": legacy_generation + 1,
-            "authority": {
-                "items": items,
-                "digest": self.canonical_digest(items),
-            },
-            "phase": "plan",
-            "active_assignment": None,
-            "slices": [{
-                **slices[0],
-                "read_paths": ["docs/context.md", "tests/evidence.md"],
-            }],
-            "artifacts": {},
-            "questions": {},
-            "gates": {},
-        })
-        runtime["history"].extend([
-            migrate,
-            {
-                "id": "reconfigure-current-authority",
-                "command": "init",
-                "command_digest": self.canonical_digest(
-                    ["public-reconfigure", legacy_generation + 1]
-                ),
-                "generation": legacy_generation + 1,
-                "result": "authority_scope_reconfigured",
-                "prior": {
-                    "phase": imported["phase"],
-                    "authority_digest": imported["authority"]["digest"],
-                    "slices_digest": self.canonical_digest(imported["slices"]),
-                    "candidate": None,
-                    "artifact_phases": [],
-                    "question_ids": [],
-                    "gate_ids": [],
-                },
-            },
-        ])
-        plan_controller._pipeline_v2_model.validate_state(runtime)
-        runtime_path = self.root / ".agentic-pipeline-v2" / "state.json"
-        runtime_path.parent.mkdir(parents=True, exist_ok=True)
-        runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+        (state_dir / "findings.json").write_text(
+            json.dumps({"schema_version": 10, "items": []}), encoding="utf-8",
+        )
         return runtime_path
-
     def complete_fresh_v2_reopen(self, report_path: str) -> dict:
         self.prepare_helper("correction")
         self.spec.write_text(
@@ -1021,6 +890,276 @@ approved_at: 2026-08-10T00:00:00Z
             controller.sha256(self.spec), started["active_wave"]["spec_sha256"]
         )
 
+    def test_helper_output_preflight_is_exact_read_only_and_shared_with_record(
+        self,
+    ) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec()
+        state = controller.load_state(self.root)
+        request_path = self.root / state["active_helper_request"]["path"]
+        self.assertEqual(
+            controller.specification_controller_identity(),
+            state["active_helper_request"]["summary"]["controller"],
+        )
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_before = state_path.read_bytes()
+        request_before = request_path.read_bytes()
+        spec_before = self.spec.read_bytes()
+
+        envelope = controller.command_preflight_helper_output(
+            self.args(request=str(request_path))
+        )
+        self.assertEqual(
+            {"schema", "controller", "request", "output_specification"},
+            set(envelope),
+        )
+        self.assertEqual({"path", "sha256"}, set(envelope["controller"]))
+        self.assertEqual({"id", "sha256"}, set(envelope["request"]))
+        self.assertEqual(
+            {"path", "sha256"}, set(envelope["output_specification"])
+        )
+        self.assertEqual(controller.HELPER_PREFLIGHT_SCHEMA, envelope["schema"])
+        self.assertEqual(str(Path(controller.__file__).resolve()), envelope["controller"]["path"])
+        self.assertEqual(
+            controller.sha256(Path(controller.__file__).resolve()),
+            envelope["controller"]["sha256"],
+        )
+        self.assertEqual("HREQ-000001", envelope["request"]["id"])
+        self.assertEqual(
+            state["active_helper_request"]["sha256"], envelope["request"]["sha256"]
+        )
+        self.assertEqual(
+            self.spec.relative_to(self.root).as_posix(),
+            envelope["output_specification"]["path"],
+        )
+        self.assertEqual(controller.sha256(self.spec), envelope["output_specification"]["sha256"])
+        self.assertEqual(state_before, state_path.read_bytes())
+        self.assertEqual(request_before, request_path.read_bytes())
+        self.assertEqual(spec_before, self.spec.read_bytes())
+
+        cli = self.cli("preflight-helper-output", "--request", str(request_path))
+        self.assertEqual(0, cli.returncode, cli.stderr)
+        self.assertEqual(envelope, json.loads(cli.stdout))
+        self.assertEqual(state_before, state_path.read_bytes())
+
+        self.spec.write_text(
+            self.spec.read_text(encoding="utf-8").replace(
+                controller.sha256(self.prd), "0" * 64, 1
+            ),
+            encoding="utf-8",
+        )
+        self.write_fake_helper_result()
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.HelperOutputPreflightError, "canonical specification preflight"
+        ):
+            controller.command_preflight_helper_output(
+                self.args(request=str(request_path))
+            )
+        with self.assertRaisesRegex(
+            controller.HelperOutputPreflightError, "canonical specification preflight"
+        ):
+            controller.command_record_helper_result(self.args())
+        self.assertEqual(state_before, state_path.read_bytes())
+
+    def test_helper_output_preflight_requires_metadata_and_accepts_flat_trace(
+        self,
+    ) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec(nested_trace=False)
+        valid = self.spec.read_text(encoding="utf-8")
+        state = controller.load_state(self.root)
+        request_path = self.root / state["active_helper_request"]["path"]
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        mutations = {
+            "missing status": valid.replace("status: draft\n", "", 1),
+            "invalid status": valid.replace("status: draft", "status: ready", 1),
+            "missing revision": valid.replace("revision: 1\n", "", 1),
+            "zero revision": valid.replace("revision: 1", "revision: 0", 1),
+            "quoted revision": valid.replace("revision: 1", "revision: '1'", 1),
+            "missing language": valid.replace("language: English\n", "", 1),
+            "mismatched language": valid.replace(
+                "language: English", "language: Russian", 1
+            ),
+        }
+        for label, candidate in mutations.items():
+            with self.subTest(label=label):
+                self.spec.write_text(candidate, encoding="utf-8")
+                self.write_fake_helper_result()
+                state_before = state_path.read_bytes()
+                with self.assertRaisesRegex(
+                    controller.HelperOutputPreflightError,
+                    "canonical specification preflight",
+                ):
+                    controller.command_preflight_helper_output(
+                        self.args(request=str(request_path))
+                    )
+                with self.assertRaisesRegex(
+                    controller.HelperOutputPreflightError,
+                    "canonical specification preflight",
+                ):
+                    controller.command_record_helper_result(self.args())
+                self.assertEqual(state_before, state_path.read_bytes())
+
+        self.spec.write_text(valid, encoding="utf-8")
+        self.write_fake_helper_result()
+        controller.command_preflight_helper_output(
+            self.args(request=str(request_path))
+        )
+        consumed = controller.command_record_helper_result(self.args())
+        self.assertIsNone(consumed["active_helper_request"])
+
+    def test_reject_invalid_initial_generation_recovers_once_and_routes_hreq2(
+        self,
+    ) -> None:
+        self.initialize(with_spec=False)
+        initial = controller.load_state(self.root)
+        request_path = self.root / initial["active_helper_request"]["path"]
+        legacy_request = json.loads(request_path.read_text(encoding="utf-8"))
+        legacy_request.pop("controller")
+        request_path.write_text(
+            json.dumps(legacy_request, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        initial["active_helper_request"] = controller.validate_helper_request(
+            self.root,
+            initial,
+            str(request_path),
+            require_current_identity=False,
+        )
+        controller.save_state(self.root, initial)
+        self.spec.write_text(
+            "# Headerless helper output\n\n## Goal\n\nImplement the behavior.\n",
+            encoding="utf-8",
+        )
+        result_path = self.write_fake_helper_result()
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        initial = controller.load_state(self.root)
+        artifact_paths = [
+            request_path,
+            result_path,
+            self.spec,
+            self.root
+            / initial["active_helper_request"]["summary"]["artifacts"]
+            ["helper_report_path"],
+            self.root
+            / initial["active_helper_request"]["summary"]["artifacts"]
+            ["coverage_path"],
+        ]
+        artifact_bytes = {path: path.read_bytes() for path in artifact_paths}
+        reason = "canonical output preflight rejected stale PRD authority"
+
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "exact initial generation request"
+        ):
+            controller.command_reject_helper_result(
+                self.args(request_id="HREQ-999999", reason=reason)
+            )
+        self.assertEqual(state_before, state_path.read_bytes())
+
+        drifted_identity = dict(
+            initial["active_helper_request"]["summary"]["helper_identity"]
+        )
+        drifted_identity["result_emitter_sha256"] = "f" * 64
+        with mock.patch.object(
+            controller, "external_helper_identity", return_value=drifted_identity
+        ):
+            state_before = state_path.read_bytes()
+            with self.assertRaisesRegex(
+                controller.SpecificationStateError, "controller binding is missing"
+            ):
+                controller.command_record_helper_result(self.args())
+            self.assertEqual(state_before, state_path.read_bytes())
+            recovered = controller.command_reject_helper_result(
+                self.args(request_id="HREQ-000001", reason=reason)
+            )
+
+        output_sha = controller.sha256(self.spec)
+        self.assertEqual("needs_generation", recovered["status"])
+        self.assertIsNone(recovered["active_helper_request"])
+        self.assertEqual([], recovered["helper_history"])
+        self.assertEqual(
+            {"source_spec_sha256": output_sha, "results": []},
+            recovered["helper_evidence"],
+        )
+        self.assertIsNone(recovered["specification"]["sha256"])
+        self.assertEqual(
+            output_sha, recovered["specification"]["generation_input_sha256"]
+        )
+        self.assertTrue(recovered["specification"]["trace_errors"])
+        self.assertEqual(1, len(recovered["history"]))
+        self.assertEqual(
+            controller.HELPER_REJECTION_EVENT,
+            recovered["history"][-1]["event"],
+        )
+        for path, before in artifact_bytes.items():
+            self.assertEqual(before, path.read_bytes(), path)
+
+        replay_before = state_path.read_bytes()
+        replayed = controller.command_reject_helper_result(
+            self.args(request_id="HREQ-000001", reason=reason)
+        )
+        self.assertEqual(recovered, replayed)
+        self.assertEqual(replay_before, state_path.read_bytes())
+
+        report_path = artifact_paths[-2]
+        report_before = report_path.read_bytes()
+        report_path.write_bytes(report_before + b"drift")
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(controller.SpecificationStateError, "artifact SHA"):
+            controller.command_reject_helper_result(
+                self.args(request_id="HREQ-000001", reason=reason)
+            )
+        self.assertEqual(state_before, state_path.read_bytes())
+        report_path.write_bytes(report_before)
+
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "initial generation must be consumed"
+        ):
+            self.prepare_helper("correction", ["CORR-FORBIDDEN"])
+        self.assertEqual(state_before, state_path.read_bytes())
+
+        prepared = self.prepare_helper("generation")
+        hreq2 = prepared["active_helper_request"]["summary"]
+        self.assertEqual("HREQ-000002", hreq2["request_id"])
+        self.assertEqual(
+            controller.specification_controller_identity(), hreq2["controller"]
+        )
+        self.assertEqual("continue", hreq2["route"]["target_operation"])
+        self.assertEqual(
+            {"kind": "sha256", "sha256": output_sha},
+            hreq2["specification"]["input"],
+        )
+        state_before = state_path.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "before further progress"
+        ):
+            controller.command_reject_helper_result(
+                self.args(request_id="HREQ-000001", reason=reason)
+            )
+        self.assertEqual(state_before, state_path.read_bytes())
+
+    def test_reject_helper_result_refuses_valid_output_as_byte_noop(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec()
+        self.write_fake_helper_result()
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_before = state_path.read_bytes()
+        spec_before = self.spec.read_bytes()
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "valid helper output cannot be rejected"
+        ):
+            controller.command_reject_helper_result(
+                self.args(
+                    request_id="HREQ-000001",
+                    reason="attempt to reject a valid output",
+                )
+            )
+        self.assertEqual(state_before, state_path.read_bytes())
+        self.assertEqual(spec_before, self.spec.read_bytes())
+
     def test_helper_request_and_result_binding_failures_are_byte_noops(self) -> None:
         self.initialize(with_spec=False)
         self.write_spec()
@@ -1100,6 +1239,26 @@ approved_at: 2026-08-10T00:00:00Z
             controller.command_record_helper_result(self.args())
         self.assertEqual(state_before, state_path.read_bytes())
 
+    def test_record_helper_result_requires_current_helper_fingerprint(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec()
+        self.write_fake_helper_result()
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state = controller.load_state(self.root)
+        drifted_identity = dict(
+            state["active_helper_request"]["summary"]["helper_identity"]
+        )
+        drifted_identity["result_emitter_sha256"] = "f" * 64
+        state_before = state_path.read_bytes()
+        with mock.patch.object(
+            controller, "external_helper_identity", return_value=drifted_identity
+        ):
+            with self.assertRaisesRegex(
+                controller.SpecificationStateError, "fingerprint changed"
+            ):
+                controller.command_record_helper_result(self.args())
+        self.assertEqual(state_before, state_path.read_bytes())
+
     def test_actual_external_emitter_creates_one_immutable_result(self) -> None:
         self.initialize(with_spec=False)
         self.write_spec()
@@ -1112,7 +1271,15 @@ approved_at: 2026-08-10T00:00:00Z
         )
 
         emitted = subprocess.run(
-            [sys.executable, "-B", str(emitter), "--request", str(request)],
+            [
+                sys.executable,
+                "-B",
+                str(emitter),
+                "--controller",
+                str(Path(controller.__file__).resolve()),
+                "--request",
+                str(request),
+            ],
             text=True,
             capture_output=True,
             check=False,
@@ -1129,7 +1296,15 @@ approved_at: 2026-08-10T00:00:00Z
         self.assertEqual("reviewing", accepted["status"])
 
         replay = subprocess.run(
-            [sys.executable, "-B", str(emitter), "--request", str(request)],
+            [
+                sys.executable,
+                "-B",
+                str(emitter),
+                "--controller",
+                str(Path(controller.__file__).resolve()),
+                "--request",
+                str(request),
+            ],
             text=True,
             capture_output=True,
             check=False,
@@ -1137,6 +1312,187 @@ approved_at: 2026-08-10T00:00:00Z
         self.assertEqual(2, replay.returncode)
         self.assertIn("already exists", replay.stderr)
         self.assertEqual(result_before, result_path.read_bytes())
+
+    def test_actual_external_emitter_rejects_foreign_controller_before_launch(
+        self,
+    ) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec()
+        self.write_actual_helper_artifacts()
+        state = controller.load_state(self.root)
+        request = self.root / state["active_helper_request"]["path"]
+        result_path = self.root / (
+            state["active_helper_request"]["summary"]["artifacts"]["result_path"]
+        )
+        emitter = Path(
+            state["active_helper_request"]["summary"]["helper_identity"]
+            ["result_emitter_path"]
+        )
+        foreign = self.root / "foreign-compatible-controller.py"
+        marker = self.root / "foreign-controller-ran.txt"
+        foreign.write_text(
+            f"""import argparse
+import hashlib
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--project-root", required=True)
+parser.add_argument("command")
+parser.add_argument("--request", required=True)
+args = parser.parse_args()
+request_path = Path(args.request).resolve()
+request_bytes = request_path.read_bytes()
+request = json.loads(request_bytes.decode("utf-8"))
+root = Path(request["project_root"]).resolve()
+specification = root / request["specification"]["path"]
+current = Path(__file__).resolve()
+Path({json.dumps(str(marker))}).write_text("ran", encoding="utf-8")
+print(json.dumps({{
+    "schema": 1,
+    "controller": {{
+        "path": str(current),
+        "sha256": hashlib.sha256(current.read_bytes()).hexdigest(),
+    }},
+    "request": {{
+        "id": request["request_id"],
+        "sha256": hashlib.sha256(request_bytes).hexdigest(),
+    }},
+    "output_specification": {{
+        "path": request["specification"]["path"],
+        "sha256": hashlib.sha256(specification.read_bytes()).hexdigest(),
+    }},
+}}))
+""",
+            encoding="utf-8",
+        )
+
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(emitter),
+                "--controller",
+                str(foreign),
+                "--request",
+                str(request),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(2, rejected.returncode)
+        self.assertIn("does not match the helper request binding", rejected.stderr)
+        self.assertFalse(marker.exists())
+        self.assertFalse(result_path.exists())
+
+        emitted = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(emitter),
+                "--controller",
+                str(Path(controller.__file__).resolve()),
+                "--request",
+                str(request),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, emitted.returncode, emitted.stderr)
+        self.assertTrue(result_path.is_file())
+
+    def test_actual_external_emitter_preflight_rejects_headerless_output(self) -> None:
+        self.initialize(with_spec=False)
+        self.spec.write_text(
+            "# Headerless helper output\n\n## Goal\n\nImplement the behavior.\n",
+            encoding="utf-8",
+        )
+        report, coverage = self.write_actual_helper_artifacts()
+        state = controller.load_state(self.root)
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        request = self.root / state["active_helper_request"]["path"]
+        result_path = self.root / (
+            state["active_helper_request"]["summary"]["artifacts"]["result_path"]
+        )
+        emitter = Path(
+            state["active_helper_request"]["summary"]["helper_identity"]
+            ["result_emitter_path"]
+        )
+        state_before = state_path.read_bytes()
+        immutable_before = {
+            path: path.read_bytes()
+            for path in (request, self.spec, report, coverage)
+        }
+
+        emitted = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(emitter),
+                "--controller",
+                str(Path(controller.__file__).resolve()),
+                "--request",
+                str(request),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(2, emitted.returncode)
+        self.assertIn("preflight", emitted.stderr.casefold())
+        self.assertFalse(result_path.exists())
+        self.assertEqual(state_before, state_path.read_bytes())
+        for path, before in immutable_before.items():
+            self.assertEqual(before, path.read_bytes(), path)
+
+    def test_actual_external_emitter_preflight_rejects_missing_metadata(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec()
+        self.spec.write_text(
+            self.spec.read_text(encoding="utf-8").replace(
+                "language: English\n", "", 1
+            ),
+            encoding="utf-8",
+        )
+        report, coverage = self.write_actual_helper_artifacts()
+        state = controller.load_state(self.root)
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        request = self.root / state["active_helper_request"]["path"]
+        result_path = self.root / (
+            state["active_helper_request"]["summary"]["artifacts"]["result_path"]
+        )
+        emitter = Path(
+            state["active_helper_request"]["summary"]["helper_identity"]
+            ["result_emitter_path"]
+        )
+        state_before = state_path.read_bytes()
+        immutable_before = {
+            path: path.read_bytes()
+            for path in (request, self.spec, report, coverage)
+        }
+
+        emitted = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(emitter),
+                "--controller",
+                str(Path(controller.__file__).resolve()),
+                "--request",
+                str(request),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(2, emitted.returncode)
+        self.assertIn("preflight", emitted.stderr.casefold())
+        self.assertFalse(result_path.exists())
+        self.assertEqual(state_before, state_path.read_bytes())
+        for path, before in immutable_before.items():
+            self.assertEqual(before, path.read_bytes(), path)
 
     def test_accept_spec_preaccept_receipt_failures_are_byte_noops(self) -> None:
         self.initialize(with_spec=False)
@@ -2330,70 +2686,6 @@ PRD-REQ-001 is covered by the formatter and runner.
                 self.assertEqual(state_before, state_path.read_bytes())
                 self.assertEqual(spec_before, self.spec.read_bytes())
 
-    def test_revise_ready_bound_happy_path_requires_fresh_full_convergence(self) -> None:
-        ready = self.make_ready()
-        token = self.bind_authority_recovery(ready)
-        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
-        reopened = controller.command_revise_ready(
-            self.args(
-                reason="fresh PRD authority",
-                architect_id="architect-2",
-                recovery_token=token,
-            )
-        )
-        self.assertEqual("awaiting_accept", reopened["status"])
-        self.assertIsNone(reopened["ready"])
-        self.assertEqual("4", reopened["prd"]["revision"])
-        self.assertEqual("architect-2", reopened["active_architect_id"])
-        self.assertIn("status: draft", self.spec.read_text(encoding="utf-8"))
-        self.assertIn("revision: 2", self.spec.read_text(encoding="utf-8"))
-        self.assertEqual(
-            "ready_specification_revision_opened", reopened["history"][-1]["event"]
-        )
-        with self.assertRaisesRegex(
-            controller.SpecificationStateError, "cannot confirm readiness in awaiting_accept"
-        ):
-            controller.command_confirm_ready(
-                self.args(architect_id="architect-2", confirmation="cannot skip proofreading")
-            )
-        with self.assertRaisesRegex(controller.SpecificationStateError, "awaiting_accept"):
-            controller.command_start_cycle(
-                self.args(architect_id="architect-2", proofreader_id="proofreader-2")
-            )
-        draft_text = self.spec.read_text(encoding="utf-8")
-        self.prepare_helper("correction")
-        self.spec.write_text(
-            draft_text.replace("status: draft", "status: approved", 1),
-            encoding="utf-8",
-        )
-        self.accept_spec()
-        controller.command_start_cycle(
-            self.args(architect_id="architect-2", proofreader_id="proofreader-2")
-        )
-        controller.command_record_proofread(
-            self.args(
-                proofreader_id="proofreader-2",
-                critical=0,
-                major=0,
-                minor=0,
-                product_questions=0,
-                scope_questions=0,
-                boundary_questions=0,
-                ownership_questions=0,
-                public_contract_questions=0,
-                minors_engineer_resolvable=False,
-                coverage_complete=True,
-                report_path="fresh-proofread.md",
-                finding_id=[],
-                question_id=[],
-            )
-        )
-        fresh = controller.command_confirm_ready(
-            self.args(architect_id="architect-2", confirmation="fresh exact SHA confirmed")
-        )
-        self.assertEqual("spec_ready", fresh["status"])
-        self.assertEqual(controller.sha256(self.prd), fresh["ready"]["prd_sha256"])
-
     def test_revise_ready_rejects_no_prd_change_and_stale_spec_bytes(self) -> None:
         ready = self.make_ready()
         with self.assertRaisesRegex(controller.SpecificationStateError, "newly approved higher"):
@@ -2524,80 +2816,29 @@ PRD-REQ-001 is covered by the formatter and runner.
     def test_direct_v2_reopen_rejects_boolean_gate_candidate_generation_without_mutation(self) -> None:
         self.assert_direct_v2_generation_poison_rejected("gate candidate_base")
 
-    def test_specification_only_reopen_accepts_safe_proven_retired_v2_lineage(self) -> None:
+    def test_schema10_residue_requires_archive_and_fresh_plan_init(self) -> None:
         ready = self.make_ready()
-        self.bind_retired_schema10_v2(ready)
-        reopened = controller.command_revise_ready(
-            self.args(
-                reason="clarify specification under the bound v2 runtime",
-                architect_id="architect-2",
-                recovery_token=None,
-                specification_only=True,
+        runtime = self.bind_schema10_residue(ready)
+        state_path = self.root / controller.STATE_RELATIVE_PATH
+        before = {
+            path: path.read_bytes()
+            for path in (state_path, self.prd, self.spec, runtime)
+        }
+
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError,
+            re.escape(plan_controller.SCHEMA10_UNSUPPORTED_MESSAGE),
+        ):
+            controller.command_revise_ready(
+                self.args(
+                    reason="schema-10 cannot be bridged",
+                    architect_id="architect-2",
+                    recovery_token=None,
+                    specification_only=True,
+                )
             )
-        )
-        self.assertEqual("awaiting_accept", reopened["status"])
-        authorization = reopened["recovery_authorization"]
-        self.assertEqual(2, authorization["schema"])
-        self.assertEqual(
-            ".agentic-pipeline-v2/state.json",
-            authorization["runtime_state_path"],
-        )
-        self.assertEqual(
-            ready["ready"]["spec_sha256"],
-            authorization["prior_specification"]["sha256"],
-        )
 
-        self.prepare_helper("correction")
-        self.spec.write_text(
-            self.spec.read_text(encoding="utf-8").replace(
-                "status: draft", "status: approved", 1
-            ),
-            encoding="utf-8",
-        )
-        self.accept_spec()
-        controller.command_start_cycle(
-            self.args(architect_id="architect-2", proofreader_id="proofreader-2")
-        )
-        controller.command_record_proofread(
-            self.args(
-                proofreader_id="proofreader-2",
-                critical=0,
-                major=0,
-                minor=0,
-                product_questions=0,
-                scope_questions=0,
-                boundary_questions=0,
-                ownership_questions=0,
-                public_contract_questions=0,
-                minors_engineer_resolvable=False,
-                coverage_complete=True,
-                report_path="v2-proofread.md",
-                finding_id=[],
-                question_id=[],
-            )
-        )
-        final = controller.command_confirm_ready(
-            self.args(architect_id="architect-2", confirmation="exact SHA confirmed")
-        )
-        self.assertEqual("spec_ready", final["status"])
-
-    def test_committed_ready_replay_is_byte_noop_for_legacy_binding(self) -> None:
-        ready = self.make_ready()
-        token = self.bind_authority_recovery(ready)
-        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
-        arguments = self.args(
-            reason="fresh PRD authority",
-            architect_id="architect-2",
-            recovery_token=token,
-        )
-        controller.command_revise_ready(arguments)
-
-        self.assert_committed_ready_replay_byte_noop(
-            arguments,
-            self.root / controller.RUNTIME_STATE_RELATIVE_PATH,
-            self.root / controller.RUNTIME_FINDINGS_RELATIVE_PATH,
-        )
-
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
     def test_committed_ready_replay_is_byte_noop_for_direct_v2_binding(self) -> None:
         ready = self.make_ready()
         runtime = self.bind_direct_v2(ready)
@@ -2632,24 +2873,6 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertEqual(0, replay.returncode, replay.stderr)
         self.assertEqual(json.loads(first.stdout), json.loads(replay.stdout))
         self.assertEqual(before, {path: path.read_bytes() for path in tracked})
-
-    def test_committed_ready_replay_is_byte_noop_for_migrated_v2_binding(self) -> None:
-        ready = self.make_ready()
-        runtime = self.bind_retired_schema10_v2(ready)
-        arguments = self.args(
-            reason="migrated v2 committed replay",
-            architect_id="architect-2",
-            recovery_token=None,
-            specification_only=True,
-        )
-        controller.command_revise_ready(arguments)
-
-        self.assert_committed_ready_replay_byte_noop(
-            arguments,
-            runtime,
-            self.root / controller.RUNTIME_STATE_RELATIVE_PATH,
-            self.root / controller.RUNTIME_FINDINGS_RELATIVE_PATH,
-        )
 
     def test_committed_ready_replay_accepts_nfkc_equivalent_actor(self) -> None:
         ready = self.make_ready()
@@ -3064,7 +3287,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_v2_reopen_custom_state_path_revalidates_through_fresh_convergence(self) -> None:
         ready = self.make_ready()
-        default_runtime = self.bind_retired_schema10_v2(ready)
+        default_runtime = self.bind_direct_v2(ready)
         runtime = default_runtime.with_name("custom-run.json")
         default_runtime.replace(runtime)
 
@@ -3128,7 +3351,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_v2_reopen_allows_closed_gate_and_answered_question_audit_history(self) -> None:
         ready = self.make_ready()
-        runtime = self.bind_retired_schema10_v2(ready)
+        runtime = self.bind_direct_v2(ready)
 
         def add_closed_gate(value: dict) -> None:
             value["gates"] = {
@@ -3159,7 +3382,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
         self.assertEqual("awaiting_accept", reopened["status"])
 
-    def test_v2_reopen_rejects_ambiguous_malformed_foreign_and_unproven_binding(self) -> None:
+    def test_v2_reopen_rejects_ambiguous_malformed_and_foreign_binding(self) -> None:
         cases = {
             "ambiguous": lambda runtime: (
                 runtime.parent / "other.json"
@@ -3169,13 +3392,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             ),
             "foreign": lambda runtime: self._rewrite_runtime(
                 runtime, lambda value: value.update({"project_root": str(self.root.parent)})
-            ),
-            "incomplete lineage": lambda runtime: (
-                self.root / controller.RUNTIME_FINDINGS_RELATIVE_PATH
-            ).unlink(),
-            "unproven lineage": lambda runtime: self._rewrite_runtime(
-                self.root / controller.RUNTIME_STATE_RELATIVE_PATH,
-                lambda value: value.update({"generation": 999}),
             ),
         }
         for label, mutate in cases.items():
@@ -3192,12 +3408,13 @@ PRD-REQ-001 is covered by the formatter and runner.
                 self.prd = self.feature_dir / "product-requirements.md"
                 self.spec = self.feature_dir / "technical-specification.md"
                 self.prd.write_text(PRD, encoding="utf-8")
+                self.initialize_git_fixture()
                 try:
                     ready = self.make_ready()
-                    runtime = self.bind_retired_schema10_v2(ready)
+                    runtime = self.bind_direct_v2(ready)
                     mutate(runtime)
                     self.assert_v2_reopen_rejected(
-                        "ambiguous|invalid|different project|exact project|complete proven|lineage"
+                        "ambiguous|invalid|different project|exact project"
                     )
                 finally:
                     self.root, self.temp, self.feature_dir, self.prd, self.spec = (
@@ -3253,9 +3470,10 @@ PRD-REQ-001 is covered by the formatter and runner.
                 self.prd = self.feature_dir / "product-requirements.md"
                 self.spec = self.feature_dir / "technical-specification.md"
                 self.prd.write_text(PRD, encoding="utf-8")
+                self.initialize_git_fixture()
                 try:
                     ready = self.make_ready()
-                    runtime = self.bind_retired_schema10_v2(ready)
+                    runtime = self.bind_direct_v2(ready)
 
                     def bound_mutation(value: dict) -> None:
                         mutate(value)
@@ -3272,7 +3490,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_v2_specification_only_reopen_rejects_active_terminal_drift_and_token(self) -> None:
         ready = self.make_ready()
-        runtime = self.bind_retired_schema10_v2(ready)
+        runtime = self.bind_direct_v2(ready)
         runtime_controller = controller._pipeline_v2_runner.Controller(
             controller._pipeline_v2_transaction.StateStore(runtime)
         )
@@ -3280,12 +3498,12 @@ PRD-REQ-001 is covered by the formatter and runner.
         runtime_controller.next(
             command_id=action["command_id"],
             assignment=action["assignment"],
-            expected_generation=15,
+            expected_generation=action["expected_generation"],
         )
         self.assert_v2_reopen_rejected("quiescent")
 
         runtime.unlink()
-        runtime = self.bind_retired_schema10_v2(ready)
+        runtime = self.bind_direct_v2(ready)
         with mock.patch.object(
             controller._pipeline_v2_runner.Controller,
             "status",
@@ -3512,7 +3730,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_v2_reopen_rejects_unknown_public_status_effect(self) -> None:
         ready = self.make_ready()
-        self.bind_retired_schema10_v2(ready)
+        self.bind_direct_v2(ready)
         with mock.patch.object(
             controller._pipeline_v2_runner.Controller,
             "status",
@@ -3527,7 +3745,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_v2_reopen_revalidates_runtime_cas_at_every_continuation(self) -> None:
         ready = self.make_ready()
-        runtime = self.bind_retired_schema10_v2(ready)
+        runtime = self.bind_direct_v2(ready)
         original_runtime = runtime.read_bytes()
         reopened = controller.command_revise_ready(
             self.args(
@@ -3596,7 +3814,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_pending_v2_reopen_replays_exactly_and_rejects_runtime_change(self) -> None:
         ready = self.make_ready()
-        runtime = self.bind_retired_schema10_v2(ready)
+        runtime = self.bind_direct_v2(ready)
         args = self.args(
             reason="replay-bound v2 specification correction",
             architect_id="architect-2",
@@ -3623,7 +3841,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_pending_v2_reopen_rejects_changed_inputs_then_replays_exactly(self) -> None:
         ready = self.make_ready()
-        self.bind_retired_schema10_v2(ready)
+        self.bind_direct_v2(ready)
         args = self.args(
             reason="exact replay inputs",
             architect_id="architect-2",
@@ -3974,42 +4192,6 @@ PRD-REQ-001 is covered by the formatter and runner.
                 self.args(reason="reuse", architect_id="PROOFREADER-1", recovery_token=None)
             )
 
-    def test_revise_ready_bound_rejects_wrong_token_non_hold_and_late_evidence(self) -> None:
-        ready = self.make_ready()
-        token = self.bind_authority_recovery(ready)
-        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
-        with self.assertRaisesRegex(controller.SpecificationStateError, "exact"):
-            controller.command_revise_ready(
-                self.args(
-                    reason="fresh PRD authority",
-                    architect_id="architect-2",
-                    recovery_token="ARH-WRONG",
-                )
-            )
-        runtime_path = self.root / controller.RUNTIME_STATE_RELATIVE_PATH
-        runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-        runtime["phase"] = "slice_engineering"
-        runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
-        with self.assertRaisesRegex(controller.SpecificationStateError, "exact"):
-            controller.command_revise_ready(
-                self.args(
-                    reason="fresh PRD authority",
-                    architect_id="architect-2",
-                    recovery_token=token,
-                )
-            )
-        runtime["phase"] = "authority_recovery_hold"
-        runtime["engineer_runs"] = [{"run_id": "engineer-1"}]
-        runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
-        with self.assertRaisesRegex(controller.SpecificationStateError, "Engineer/product"):
-            controller.command_revise_ready(
-                self.args(
-                    reason="fresh PRD authority",
-                    architect_id="architect-2",
-                    recovery_token=token,
-                )
-            )
-
     def test_revise_ready_cli_help_and_alias(self) -> None:
         help_result = self.cli("revise-ready", "--help")
         self.assertEqual(0, help_result.returncode)
@@ -4020,60 +4202,6 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertIn("tokenless", help_result.stdout)
         alias_result = self.cli("reopen-ready", "--help")
         self.assertEqual(0, alias_result.returncode)
-
-    def test_revise_ready_cli_requires_fresh_accept_receipt_before_cycle(self) -> None:
-        ready = self.make_ready()
-        token = self.bind_authority_recovery(ready)
-        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
-        reopened = self.cli(
-            "revise-ready",
-            "--reason",
-            "fresh PRD authority",
-            "--architect-id",
-            "architect-2",
-            "--recovery-token",
-            token,
-        )
-        self.assertEqual(0, reopened.returncode, reopened.stderr)
-        prepared = self.cli(
-            "prepare-helper",
-            "--operation",
-            "correction",
-            "--correction-id",
-            "CORR-CLI-001",
-        )
-        self.assertEqual(0, prepared.returncode, prepared.stderr)
-        draft = self.spec.read_text(encoding="utf-8")
-        self.spec.write_text(
-            draft.replace("status: draft", "status: approved", 1), encoding="utf-8"
-        )
-        blocked = self.cli(
-            "start-cycle",
-            "--architect-id",
-            "architect-2",
-            "--proofreader-id",
-            "proofreader-2",
-        )
-        self.assertEqual(2, blocked.returncode)
-        self.assertIn("external helper request is active", blocked.stderr)
-        self.write_fake_helper_result()
-        recorded = self.cli("record-helper-result")
-        self.assertEqual(0, recorded.returncode, recorded.stderr)
-        receipt = self.write_preaccept_receipt()
-        accepted = self.cli(
-            "accept-spec",
-            "--preaccept-receipt",
-            receipt.relative_to(self.root).as_posix(),
-        )
-        self.assertEqual(0, accepted.returncode, accepted.stderr)
-        started = self.cli(
-            "start-cycle",
-            "--architect-id",
-            "architect-2",
-            "--proofreader-id",
-            "proofreader-2",
-        )
-        self.assertEqual(0, started.returncode, started.stderr)
 
     def test_start_cycle_rejects_stale_acceptance_receipt(self) -> None:
         self.initialize()
@@ -4116,9 +4244,9 @@ PRD-REQ-001 is covered by the formatter and runner.
             skill_root / "references" / "specification-contract.md"
         ).read_text(encoding="utf-8")
         for text in (skill_text, contract_text):
-            self.assertIn("retired schema-10", text)
+            self.assertIn("Schema-10 migration is unsupported", text)
             self.assertIn("direct v2", text)
-            self.assertIn("legacy residue", text)
+            self.assertIn("legacy state/findings residue", text)
             self.assertIn("revise-ready", text)
             self.assertIn("--specification-only", text)
             self.assertIn("token", text)
@@ -4128,7 +4256,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             self.assertIn("active assignment", text)
         self.assertIn("exact v2 state SHA", skill_text)
         self.assertIn("normalized in memory and never rewritten", skill_text)
-        self.assertIn("Multiple, malformed, foreign, mixed, or unproven", contract_text)
+        self.assertIn("Multiple, malformed, foreign, or mixed", contract_text)
         self.assertIn("New tokenless v2 `recovery_authorization` receipts use nested schema 2", contract_text)
         self.assertIn("mixed, missing, extra, PRD-mode, ambiguous, or tampered", contract_text)
 
@@ -4183,6 +4311,8 @@ PRD-REQ-001 is covered by the formatter and runner.
             self.assertIn("$skill-specification-pipeline", text)
             self.assertIn("prepare-helper --operation generation", text)
             self.assertIn("GAMEDEV_HELPER_REQUEST_PATH", text)
+            self.assertIn("GAMEDEV_SPECIFICATION_CONTROLLER_PATH", text)
+            self.assertIn("path and SHA-256", text)
             for binding in (
                 "`TARGET_OPERATION`",
                 "`SPECIFICATION_PATH`",
@@ -4198,6 +4328,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             "actual external $skill-specification-pipeline",
             "prepare-helper --operation generation",
             "GAMEDEV_HELPER_REQUEST_PATH",
+            "request-bound resolved GAMEDEV_SPECIFICATION_CONTROLLER_PATH/SHA",
             "TARGET_OPERATION, SPECIFICATION_PATH",
             "approved PRD path/revision/SHA",
             "PRD-language USER_REQUEST",
@@ -4230,6 +4361,10 @@ PRD-REQ-001 is covered by the formatter and runner.
             "MUST NOT skip, duplicate, parse, normalize, or locally reimplement that topology",
             "`USER_REQUEST`: a complete generation request that must be authored entirely in the approved PRD language",
             "the helper-derived `USER_LANGUAGE` must exactly match the approved PRD language",
+            "the exact resolved absolute current GameDev controller path and SHA-256",
+            "one exact positive integer revision",
+            "`status: draft|approved`",
+            "language equal to the request-bound approved PRD language",
             "Director runs `record-helper-result`",
             "The Director does not author the result, parse detailed stage/pass topology or coverage content",
             "The same persistent Technical Spec Architect then performs the read-only pre-accept semantic assessment",
@@ -4261,7 +4396,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             "request-bypass": contract_text.replace(
                 "prepare-helper --operation generation",
                 "generate without controller request",
-                1,
             ),
             "wrapper-owns-topology": contract_text.replace(
                 "MUST NOT skip, duplicate, parse, normalize, or locally reimplement that topology",

@@ -1,18 +1,22 @@
-"""Controller-owned filesystem inventory, hashes, and allowed-path diff."""
+"""Controller-owned Git candidate trees and path confinement."""
 
 from __future__ import annotations
 
 import hashlib
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from .model import PipelineError, digest, normalize_rule
+from .model import PipelineError, digest, is_git_oid, normalize_literal_path, normalize_rule
 
-DEFAULT_EXCLUDES = (
-    ".git", ".agentic-pipeline", ".agentic-pipeline-v2", "__pycache__",
+CHECKOUT_MODEL = "git-tree-v1"
+CONTROL_PATHS = (
+    ".agentic-pipeline",
+    ".agentic-pipeline-v2",
 )
-ROOT_CONTROL_DIRECTORY = ".codegraph"
+REPOSITORY_POLICY_NAMES = (".gitignore", ".gitattributes", ".gitmodules")
 
 
 def safe_path(root: Path, supplied: str | Path | None, label: str, *, strict: bool = False) -> Path:
@@ -59,17 +63,9 @@ def canonical_project_root(supplied: str | Path) -> Path:
 
 
 def path_identity(value: str) -> str:
-    """Compare project-relative paths using the host filesystem's case rules."""
+    """Compare paths using the host filesystem's case rules."""
     native = value.replace("/", os.sep)
     return os.path.normcase(os.path.normpath(native)).replace(os.sep, "/")
-
-
-def _root_control_descendant(path: str) -> bool:
-    parts = Path(path).parts
-    return (
-        len(parts) > 1
-        and path_identity(parts[0]) == path_identity(ROOT_CONTROL_DIRECTORY)
-    )
 
 
 def authority_items_equal(
@@ -94,62 +90,201 @@ def file_sha256(path: Path) -> str:
     return value.hexdigest()
 
 
-def inventory(root: Path, *, excludes: tuple[str, ...] = DEFAULT_EXCLUDES) -> dict[str, dict[str, Any]]:
-    root = safe_path(root, None, "project root", strict=True)
-    if not root.is_dir():
-        raise PipelineError("project root must be a directory")
-    result: dict[str, dict[str, Any]] = {}
-    for base, dirs, files in os.walk(root, followlinks=False):
-        base_path = Path(base)
-        kept = []
-        for name in sorted(dirs):
-            path = safe_path(root, base_path / name, "inventory path")
-            if (
-                name not in excludes
-                and not (
-                    base_path == root
-                    and path_identity(name) == path_identity(ROOT_CONTROL_DIRECTORY)
-                )
-            ):
-                kept.append(name)
-        dirs[:] = kept
-        for name in sorted(files):
-            path = safe_path(root, base_path / name, "inventory path")
-            relative = path.relative_to(root).as_posix()
-            if (
-                _root_control_descendant(relative)
-                or any(part in excludes for part in Path(relative).parts)
-            ):
-                continue
-            if path.is_file():
-                stat = path.stat()
-                result[relative] = {"kind": "file", "sha256": file_sha256(path), "size": stat.st_size}
+def _git(
+    root: Path, args: list[str], *, env: dict[str, str] | None = None,
+    label: str = "Git operation",
+) -> bytes:
+    environment = os.environ.copy()
+    if env:
+        environment.update(env)
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args], check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+        )
+    except OSError as exc:
+        raise PipelineError(f"cannot run Git for {label}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        if len(detail) > 512:
+            detail = detail[-512:]
+        raise PipelineError(f"{label} failed: {detail or f'return code {result.returncode}'}")
+    return result.stdout
+
+
+def require_repository_root(root: Path) -> Path:
+    """Require project_root to be the exact root of one ordinary Git worktree."""
+    root = canonical_project_root(root)
+    try:
+        top = _git(root, ["rev-parse", "--show-toplevel"], label="Git root discovery")
+        top_text = top.decode("utf-8").strip()
+    except UnicodeError as exc:
+        raise PipelineError("Git root is not valid UTF-8") from exc
+    discovered = canonical_project_root(top_text)
+    if path_identity(str(discovered)) != path_identity(str(root)):
+        raise PipelineError("project root must be the exact Git worktree root")
+    inside = _git(root, ["rev-parse", "--is-inside-work-tree"], label="Git worktree check")
+    if inside.strip() != b"true":
+        raise PipelineError("project root must be a Git worktree")
+    return root
+
+
+def _control_pathspecs() -> list[str]:
+    result: list[str] = []
+    for path in CONTROL_PATHS:
+        result.extend((f":(exclude){path}", f":(exclude){path}/**"))
     return result
 
 
-def inventory_digest(value: dict[str, dict[str, Any]]) -> str:
-    return digest(value)
+def _require_untracked_control_paths(root: Path) -> None:
+    tracked = _git(
+        root,
+        ["--literal-pathspecs", "ls-files", "-z", "--", *CONTROL_PATHS],
+        label="controller path ownership check",
+    )
+    if tracked:
+        names = [item.decode("utf-8", errors="replace") for item in tracked.split(b"\0") if item]
+        raise PipelineError(
+            "controller directories must not be Git-tracked: " + ", ".join(names[:8])
+        )
 
 
-def diff(
-    base: dict[str, Any], current: dict[str, Any],
-    *, excludes: tuple[str, ...] = DEFAULT_EXCLUDES,
-) -> list[dict[str, Any]]:
-    changes = []
-    for path in sorted(set(base) | set(current)):
-        if (
-            _root_control_descendant(path)
-            or any(part in excludes for part in Path(path).parts)
-        ):
-            continue
-        if base.get(path) == current.get(path):
-            continue
-        kind = "add" if path not in base else "delete" if path not in current else "modify"
-        changes.append({"path": path, "kind": kind, "before": base.get(path), "after": current.get(path)})
-    return changes
+def _require_no_gitlinks(root: Path) -> None:
+    staged = _git(
+        root,
+        ["ls-files", "--stage", "-z"],
+        label="Git gitlink check",
+    )
+    if any(record.startswith(b"160000 ") for record in staged.split(b"\0") if record):
+        raise PipelineError(
+            "gitlinks/submodules are unsupported; remove them before fresh init"
+        )
+
+
+def _repository_policy_files(root: Path) -> list[str]:
+    pathspecs = [
+        pathspec
+        for name in REPOSITORY_POLICY_NAMES
+        for pathspec in (name, f":(glob)**/{name}")
+    ]
+    records = []
+    for args in (
+        ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    ):
+        records.extend(
+            item.decode("utf-8")
+            for item in _git(
+                root, [*args, "--", *pathspecs],
+                label="Git repository-policy discovery",
+            ).split(b"\0")
+            if item
+        )
+    return sorted(dict.fromkeys(records))
+
+
+def head_tree_oid(root: Path) -> str:
+    root = require_repository_root(root)
+    try:
+        value = _git(root, ["rev-parse", "HEAD^{tree}"], label="Git HEAD tree").decode("ascii").strip()
+    except UnicodeError as exc:
+        raise PipelineError("Git returned a malformed HEAD tree OID") from exc
+    if not is_git_oid(value):
+        raise PipelineError("Git returned a malformed HEAD tree OID")
+    return value
+
+
+def require_clean_head(root: Path) -> str:
+    """Require a committed, clean versioned baseline; ignored files stay invisible."""
+    root = require_repository_root(root)
+    _require_untracked_control_paths(root)
+    _require_no_gitlinks(root)
+    status = _git(
+        root,
+        [
+            "status", "--porcelain=v1", "-z", "--untracked-files=all", "--",
+            ".", *_control_pathspecs(),
+        ],
+        label="clean Git baseline check",
+    )
+    if status:
+        raise PipelineError(
+            "init requires a clean Git checkout with no tracked or non-ignored changes"
+        )
+    head = head_tree_oid(root)
+    if candidate_tree_oid(root) != head:
+        raise PipelineError(
+            "init requires repository policy files to be committed and match HEAD"
+        )
+    return head
+
+
+def candidate_tree_oid(root: Path) -> str:
+    """Write the live tracked plus non-ignored worktree into an external temporary index."""
+    root = require_repository_root(root)
+    _require_untracked_control_paths(root)
+    with tempfile.TemporaryDirectory(prefix="agentic-pipeline-git-index-") as temporary:
+        index = Path(temporary) / "index"
+        index_env = {"GIT_INDEX_FILE": str(index)}
+        _git(root, ["read-tree", "HEAD"], env=index_env, label="temporary Git index initialization")
+        _git(
+            root,
+            ["add", "-A"],
+            env=index_env,
+            label="Git candidate staging",
+        )
+        _git(
+            root,
+            ["--literal-pathspecs", "rm", "-r", "--cached", "--ignore-unmatch", "--", *CONTROL_PATHS],
+            env=index_env,
+            label="controller path exclusion",
+        )
+        policy_files = _repository_policy_files(root)
+        if policy_files:
+            _git(
+                root,
+                ["--literal-pathspecs", "add", "-f", "--", *policy_files],
+                env=index_env,
+                label="Git repository-policy staging",
+            )
+        try:
+            value = _git(root, ["write-tree"], env=index_env, label="Git candidate tree").decode("ascii").strip()
+        except UnicodeError as exc:
+            raise PipelineError("Git returned a malformed candidate tree OID") from exc
+    if not is_git_oid(value):
+        raise PipelineError("Git returned a malformed candidate tree OID")
+    return value
+
+
+def changed_paths(root: Path, base_tree_oid: str, candidate_tree_oid_value: str) -> list[str]:
+    """Return the exact sorted path delta between two Git trees."""
+    if not is_git_oid(base_tree_oid) or not is_git_oid(candidate_tree_oid_value):
+        raise PipelineError("Git tree comparison requires valid tree OIDs")
+    raw = _git(
+        require_repository_root(root),
+        [
+            "diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z",
+            base_tree_oid, candidate_tree_oid_value,
+        ],
+        label="Git candidate diff",
+    )
+    try:
+        paths = [item.decode("utf-8") for item in raw.split(b"\0") if item]
+    except UnicodeError as exc:
+        raise PipelineError("Git candidate paths must be valid UTF-8") from exc
+    normalized = [normalize_literal_path(path) for path in paths]
+    return sorted(dict.fromkeys(normalized))
+
+
+def repository_policy_changed(root: Path, base_tree_oid: str, candidate_tree_oid_value: str) -> list[str]:
+    return [
+        path for path in changed_paths(root, base_tree_oid, candidate_tree_oid_value)
+        if path.rsplit("/", 1)[-1] in REPOSITORY_POLICY_NAMES
+    ]
 
 
 def matches(path: str, rule: str) -> bool:
+    path = normalize_literal_path(path)
     rule = normalize_rule(rule)
     if rule == "**":
         return True
@@ -159,21 +294,38 @@ def matches(path: str, rule: str) -> bool:
     return path == rule
 
 
-def violations(changes: list[dict[str, Any]], write_rules: list[str]) -> list[str]:
-    return [item["path"] for item in changes if not any(matches(item["path"], rule) for rule in write_rules)]
+def violations(paths: list[str], write_rules: list[str]) -> list[str]:
+    return [path for path in paths if not any(matches(path, rule) for rule in write_rules)]
 
 
 def authority_items(root: Path, paths: dict[str, str]) -> dict[str, dict[str, str]]:
-    root = safe_path(root, None, "project root", strict=True)
+    root = require_repository_root(root)
     items = {}
     for name, relative in paths.items():
-        rule = normalize_rule(relative)
-        if rule == "**" or rule.endswith("/**"):
-            raise PipelineError("authority paths must name exact files")
-        path = safe_path(root, rule, "authority path", strict=True)
+        literal = normalize_literal_path(relative)
+        pathspec = f":({'icase,' if os.name == 'nt' else ''}literal){literal}"
+        tracked = _git(
+            root,
+            ["ls-files", "-z", "--error-unmatch", "--", pathspec],
+            label=f"tracked authority path {literal}",
+        )
+        try:
+            tracked_paths = [
+                normalize_literal_path(item.decode("utf-8"))
+                for item in tracked.split(b"\0") if item
+            ]
+        except UnicodeError as exc:
+            raise PipelineError("tracked authority paths must be valid UTF-8") from exc
+        if (
+            len(tracked_paths) != 1
+            or path_identity(tracked_paths[0]) != path_identity(literal)
+        ):
+            raise PipelineError(f"authority path must be Git-tracked: {literal}")
+        canonical = tracked_paths[0]
+        path = safe_path(root, canonical, "authority path", strict=True)
         if not path.is_file():
-            raise PipelineError(f"authority path is not a file: {rule}")
-        items[name] = {"path": rule, "sha256": file_sha256(path)}
+            raise PipelineError(f"authority path is not a file: {canonical}")
+        items[name] = {"path": canonical, "sha256": file_sha256(path)}
     return items
 
 
@@ -183,3 +335,42 @@ def verify_authority(root: Path, authority: dict[str, Any]) -> None:
         raise PipelineError(
             "authority bytes changed; run status and execute its init reconfiguration"
         )
+
+
+def pipeline_runtime_digest() -> str:
+    """Hash one fixed production manifest; never discover runtime files by walking."""
+    skill_root = Path(__file__).resolve().parents[2]
+    bundle_root = skill_root.parents[1]
+    skills_root = skill_root.parent
+    runtime_dir = Path(__file__).resolve().parent
+    manifest = (
+        (skill_root / "SKILL.md", "skill/SKILL.md"),
+        (skill_root / "agents" / "openai.yaml", "skill/agents/openai.yaml"),
+        (skill_root / "references" / "pipeline-protocol.md", "skill/references/pipeline-protocol.md"),
+        (skill_root / "references" / "semantic-write-packet.md", "skill/references/semantic-write-packet.md"),
+        (skill_root / "references" / "stage-handoff-invariant.md", "skill/references/stage-handoff-invariant.md"),
+        (skill_root / "scripts" / "pipeline_state.py", "skill/scripts/pipeline_state.py"),
+        (skills_root / "gamedev-engineer" / "SKILL.md", "delegates/engineering/SKILL.md"),
+        (skills_root / "gamedev-review" / "SKILL.md", "delegates/review/SKILL.md"),
+        (skills_root / "gamedev-review" / "references" / "review-output-contract.md", "delegates/review/review-output-contract.md"),
+        (skills_root / "gamedev-qa" / "SKILL.md", "delegates/qa/SKILL.md"),
+        (skills_root / "gamedev-qa" / "references" / "qa-output-contract.md", "delegates/qa/qa-output-contract.md"),
+        (skills_root / "gamedev-documentation-finisher" / "SKILL.md", "delegates/docs/SKILL.md"),
+        (skills_root / "gamedev-documentation-finisher" / "references" / "documentation-contract.md", "delegates/docs/documentation-contract.md"),
+        (runtime_dir / "__init__.py", "pipeline_v2/__init__.py"),
+        (runtime_dir / "checkout.py", "pipeline_v2/checkout.py"),
+        (runtime_dir / "cli.py", "pipeline_v2/cli.py"),
+        (runtime_dir / "legacy_gen53.py", "pipeline_v2/legacy_gen53.py"),
+        (runtime_dir / "model.py", "pipeline_v2/model.py"),
+        (runtime_dir / "process_tree.py", "pipeline_v2/process_tree.py"),
+        (runtime_dir / "reducer.py", "pipeline_v2/reducer.py"),
+        (runtime_dir / "runner.py", "pipeline_v2/runner.py"),
+        (runtime_dir / "transaction.py", "pipeline_v2/transaction.py"),
+        (bundle_root / "scripts" / "development_plan_contract.py", "scripts/development_plan_contract.py"),
+    )
+    records = []
+    for path, label in manifest:
+        if not path.is_file():
+            raise PipelineError(f"pipeline runtime manifest file is missing: {label}")
+        records.append({"path": label, "sha256": file_sha256(path)})
+    return digest(records)
