@@ -32,7 +32,7 @@ Agent-originated proposals, assumptions, open questions, risks, exclusions, exam
 
 ## Resolve product decisions
 
-1. Match the user's language. Resolve the project root, lowercase feature slug, and canonical PRD through the contract. Ask one blocking path question only when resolution remains ambiguous.
+1. Match the user's language. Resolve the project root, lowercase `FEATURE` slug, exact `WORKFLOW_PATH=.agentic-pipeline/Workflows/<feature>`, and canonical PRD through the contract. Requirements creates no state there and never inspects a sibling workflow. Ask one blocking path question only when resolution remains ambiguous.
 2. Read an existing PRD before interviewing. Preserve stable IDs and epistemic state; do not replace it without explicit approval.
 3. For authorized file-backed work with no PRD, copy [product-requirements.md](assets/product-requirements.md), set the language, and keep `status: draft`. For discussion-only work, write no file.
 4. Ask one compact round of one to five related highest-impact unanswered questions. Each numbered question resolves one independently choosable decision; never hide several decisions behind one yes/no prompt. Preserve and reuse every prior or partial answer, and do not repeat an unchanged answered question. The user may answer any subset or reply free-form; the next round asks only the still-material remainder. Cover only relevant outcome, audience, core loop, scope/non-goals, release/platform constraints, observable states/failures/recovery, UX/quality constraints, integrations/operations, risks, and build-verifiable acceptance.
@@ -55,6 +55,7 @@ The validator requires exact canonical list declarations: `- PRD-REQ-001: plain-
 Return only:
 
 - `PRD_READY: yes|no`, canonical path, status, revision, and exact SHA-256 when ready;
+- exact `FEATURE` and `WORKFLOW_PATH=.agentic-pipeline/Workflows/<feature>`;
 - changed IDs and affected assumptions/questions;
 - the next blocking question or reason the gate is not ready;
 - `NEXT_ACTION: $gamedev-specification` when `PRD_READY: yes`, otherwise `NEXT_ACTION: user-decision` or `NEXT_ACTION: $gamedev-requirements`.

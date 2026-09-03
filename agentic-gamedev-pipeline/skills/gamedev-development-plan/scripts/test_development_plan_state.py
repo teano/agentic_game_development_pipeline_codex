@@ -124,7 +124,11 @@ class DevelopmentPlanStateTests(unittest.TestCase):
         )
 
     def args(self, **values: object) -> Namespace:
-        return Namespace(project_root=str(self.root), **values)
+        return Namespace(
+            project_root=str(self.root),
+            feature=values.pop("feature", self.feature),
+            **values,
+        )
 
     def cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -133,6 +137,8 @@ class DevelopmentPlanStateTests(unittest.TestCase):
                 str(Path(controller.__file__).resolve()),
                 "--project-root",
                 str(self.root),
+                "--feature",
+                self.feature,
                 *arguments,
             ],
             text=True,
@@ -157,13 +163,15 @@ product_authority:
             encoding="utf-8",
         )
         spec_hash = controller.sha256(self.spec)
-        state_path = self.root / ".agentic-pipeline" / "specification-state.json"
+        workflow = controller.workflow_relative_path(self.feature)
+        state_path = self.root / workflow / controller.SPEC_STATE_FILENAME
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(
             __import__("json").dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "feature": self.feature,
+                    "workflow_path": workflow.as_posix(),
                     "status": "spec_ready",
                     "prd": {
                         "path": self.prd.relative_to(self.root).as_posix(),
@@ -202,7 +210,10 @@ product_authority:
     def assert_init_rejected_direct_and_cli_without_mutation(
         self, message: str
     ) -> None:
-        spec_state_path = self.root / controller.SPEC_STATE_RELATIVE_PATH
+        spec_state_path = (
+            controller.workflow_path(self.root, self.feature)
+            / controller.SPEC_STATE_FILENAME
+        )
         upstream = {
             path: path.read_bytes()
             for path in (self.prd, self.spec, spec_state_path)
@@ -217,11 +228,9 @@ product_authority:
         }
         with self.assertRaisesRegex(controller.DevelopmentPlanError, message):
             controller.command_init(self.args(**values))
-        self.assertFalse(controller.state_path(self.root).exists())
+        self.assertFalse(controller.state_path(self.root, self.feature).exists())
         result = self.cli(
             "init",
-            "--feature",
-            values["feature"],
             "--prd",
             values["prd"],
             "--spec",
@@ -235,7 +244,7 @@ product_authority:
         )
         self.assertEqual(2, result.returncode, msg=result.stdout or result.stderr)
         self.assertIn(message, result.stderr)
-        self.assertFalse(controller.state_path(self.root).exists())
+        self.assertFalse(controller.state_path(self.root, self.feature).exists())
         self.assertEqual(upstream, {path: path.read_bytes() for path in upstream})
 
     def leave_approval_pending_after_replace(self) -> Namespace:
@@ -259,7 +268,7 @@ product_authority:
         with mock.patch.object(controller, "save_state", side_effect=fail_final_save):
             with self.assertRaisesRegex(OSError, "simulated crash"):
                 controller.command_approve(approval_args)
-        self.assertEqual("approval_pending", controller.load_state(self.root)["status"])
+        self.assertEqual("approval_pending", controller.load_state(self.root, self.feature)["status"])
         return approval_args
 
     def accept_revised_analysis(
@@ -542,6 +551,187 @@ Only the approved feature and named shared symbol are in scope.
                 )
             )
 
+    def test_feature_plan_init_leaves_active_sibling_workflow_byte_identical(self) -> None:
+        self.initialize()
+        first_root = controller.workflow_path(self.root, self.feature)
+        first_snapshot = {
+            path.relative_to(first_root).as_posix(): path.read_bytes()
+            for path in first_root.rglob("*")
+            if path.is_file()
+        }
+        other = "other-feature"
+        other_dir = self.root / "docs" / "Features" / "template" / other
+        other_dir.mkdir(parents=True)
+        other_prd = other_dir / "product-requirements.md"
+        other_spec = other_dir / "technical-specification.md"
+        other_plan = other_dir / "development-plan.md"
+        other_ledger = other_dir / "decision-ledger.jsonl"
+        other_prd.write_text(PRD, encoding="utf-8")
+        prd_hash = controller.sha256(other_prd)
+        other_spec.write_text(
+            "---\ndocument_type: technical-specification\nstatus: approved\n"
+            "revision: 1\nproduct_authority:\n"
+            f"  path: {other_prd.relative_to(self.root).as_posix()}\n"
+            "  revision: 2\n"
+            f"  sha256: {prd_hash}\n---\n# Specification\n",
+            encoding="utf-8",
+        )
+        spec_hash = controller.sha256(other_spec)
+        workflow = controller.workflow_relative_path(other)
+        spec_state = self.root / workflow / controller.SPEC_STATE_FILENAME
+        spec_state.parent.mkdir(parents=True)
+        spec_state.write_text(
+            json.dumps({
+                "schema_version": controller.SPECIFICATION_STATE_SCHEMA_VERSION,
+                "feature": other,
+                "workflow_path": workflow.as_posix(),
+                "status": "spec_ready",
+                "prd": {"path": other_prd.relative_to(self.root).as_posix()},
+                "specification": {"path": other_spec.relative_to(self.root).as_posix()},
+                "ready": {"prd_sha256": prd_hash, "spec_sha256": spec_hash},
+            }),
+            encoding="utf-8",
+        )
+
+        second = controller.command_init(self.args(
+            feature=other,
+            prd=other_prd.relative_to(self.root).as_posix(),
+            spec=other_spec.relative_to(self.root).as_posix(),
+            plan=other_plan.relative_to(self.root).as_posix(),
+            decision_ledger=other_ledger.relative_to(self.root).as_posix(),
+            analyst_id="planning-analyst-other",
+        ))
+        self.assertEqual(other, second["feature"])
+        self.assertEqual(
+            first_snapshot,
+            {
+                path.relative_to(first_root).as_posix(): path.read_bytes()
+                for path in first_root.rglob("*")
+                if path.is_file()
+            },
+        )
+
+    def test_cross_stage_other_feature_leaves_first_workflow_byte_identical(self) -> None:
+        self.initialize()
+        first_root = controller.workflow_path(self.root, self.feature)
+        first_snapshot = {
+            path.relative_to(first_root).as_posix(): path.read_bytes()
+            for path in first_root.rglob("*")
+            if path.is_file()
+        }
+
+        self.feature = "other-feature"
+        self.feature_dir = self.root / "docs" / "Features" / "template" / self.feature
+        self.feature_dir.mkdir(parents=True)
+        self.prd = self.feature_dir / "product-requirements.md"
+        self.spec = self.feature_dir / "technical-specification.md"
+        self.plan = self.feature_dir / "development-plan.md"
+        self.ledger = self.feature_dir / "decision-ledger.jsonl"
+        self.prd.write_text(PRD, encoding="utf-8")
+        self.write_spec_and_ready_state()
+
+        specification_cli = (
+            Path(controller.__file__).resolve().parents[2]
+            / "gamedev-specification" / "scripts" / "specification_state.py"
+        )
+        accepted_spec = subprocess.run(
+            [
+                sys.executable, str(specification_cli), "--project-root", str(self.root),
+                "--feature", self.feature, "status",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(0, accepted_spec.returncode, accepted_spec.stderr)
+
+        self.initialize()
+        self.write_plan()
+        controller.command_submit(self.args())
+        controller.command_approve(
+            self.args(approved_by="user", approval_note="exact other-feature approval")
+        )
+        self.commit_fixture("approve isolated other feature")
+
+        runtime_runner = importlib.import_module("pipeline_v2.runner")
+        runtime_transaction = importlib.import_module("pipeline_v2.transaction")
+        runtime_model = importlib.import_module("pipeline_v2.model")
+        runtime_path = (
+            controller.workflow_path(self.root, self.feature)
+            / controller.RUNTIME_STATE_FILENAME
+        )
+        runtime = runtime_runner.Controller(runtime_transaction.StateStore(runtime_path))
+        slices = [{
+            "id": "SLICE-001",
+            "allowed_paths": ["src/feature-1.lua"],
+            "planned_commands": [[sys.executable, "-B", "-c", "pass"]],
+        }]
+        runtime.reconfigure({
+            "name": "init",
+            "id": "INIT-SHARED-ID",
+            "run_id": "RUN-OTHER-FEATURE",
+            "feature": self.feature,
+            "workflow_path": controller.workflow_relative_path(self.feature).as_posix(),
+            "project_root": str(self.root),
+            "authority_paths": {
+                "requirements": self.prd.relative_to(self.root).as_posix(),
+                "specification": self.spec.relative_to(self.root).as_posix(),
+                "plan": self.plan.relative_to(self.root).as_posix(),
+            },
+            "slices": slices,
+        })
+        action = runtime.status()["next_action"]
+        issued = runtime.next(
+            command_id=action["command_id"],
+            assignment=action["assignment"],
+            expected_generation=action["expected_generation"],
+        )
+        artifact = self.root / runtime_model.assignment_output_path(
+            issued["active_assignment"], self.feature
+        )
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(
+            json.dumps({"outcome": "pass", "summary": "other feature plan complete"}),
+            encoding="utf-8",
+        )
+        runtime.complete(command_id="COMPLETE-SHARED-ID", artifact_path=artifact)
+        self.assertTrue(artifact.is_file())
+
+        self.assertEqual(
+            first_snapshot,
+            {
+                path.relative_to(first_root).as_posix(): path.read_bytes()
+                for path in first_root.rglob("*")
+                if path.is_file()
+            },
+        )
+        runtime_package_root = Path(runtime_runner.__file__).resolve().parents[1]
+        for command, command_cwd in (
+            ([sys.executable, str(specification_cli), "--project-root", str(self.root), "status"], None),
+            ([sys.executable, str(Path(controller.__file__).resolve()), "--project-root", str(self.root), "status"], None),
+            ([sys.executable, "-m", "pipeline_v2.cli", "--root", str(self.root), "status"], runtime_package_root),
+        ):
+            rejected = subprocess.run(
+                command, cwd=command_cwd, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(2, rejected.returncode)
+            self.assertIn("--feature", rejected.stderr)
+
+    def test_plan_rejects_copied_foreign_spec_ready_state(self) -> None:
+        source = controller.workflow_path(self.root, self.feature) / controller.SPEC_STATE_FILENAME
+        foreign = controller.workflow_path(self.root, "other-feature") / controller.SPEC_STATE_FILENAME
+        foreign.parent.mkdir(parents=True)
+        foreign.write_bytes(source.read_bytes())
+        before = foreign.read_bytes()
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "same feature|SPEC_READY"):
+            controller.require_sources(
+                self.root,
+                "other-feature",
+                self.prd.relative_to(self.root).as_posix(),
+                self.spec.relative_to(self.root).as_posix(),
+                self.plan.relative_to(self.root).as_posix(),
+                self.ledger.relative_to(self.root).as_posix(),
+            )
+        self.assertEqual(before, foreign.read_bytes())
+
     def test_init_rejects_invalid_prd_without_mutating_upstream_direct_and_cli(self) -> None:
         invalid_prds = (
             PRD.replace(
@@ -562,7 +752,10 @@ Only the approved feature and named shared symbol are in scope.
                 )
 
     def test_init_rejects_legacy_spec_state_without_mutation_direct_and_cli(self) -> None:
-        spec_state_path = self.root / controller.SPEC_STATE_RELATIVE_PATH
+        spec_state_path = (
+            controller.workflow_path(self.root, self.feature)
+            / controller.SPEC_STATE_FILENAME
+        )
         spec_state = __import__("json").loads(spec_state_path.read_text(encoding="utf-8"))
         spec_state["schema_version"] = 1
         spec_state_path.write_text(
@@ -685,10 +878,10 @@ Only the approved feature and named shared symbol are in scope.
         self.assertIn("approved_by: development-plan-director-2", plan_text)
         self.assertNotIn("approved_by: user", plan_text)
 
-        replay_state = controller.state_path(self.root).read_bytes()
+        replay_state = controller.state_path(self.root, self.feature).read_bytes()
         replay_plan = self.plan.read_bytes()
         self.assertEqual(approved, controller.command_approve(approval_args))
-        self.assertEqual(replay_state, controller.state_path(self.root).read_bytes())
+        self.assertEqual(replay_state, controller.state_path(self.root, self.feature).read_bytes())
         self.assertEqual(replay_plan, self.plan.read_bytes())
 
         reopened = controller.command_revise_approved(
@@ -708,7 +901,7 @@ Only the approved feature and named shared symbol are in scope.
         self.initialize()
         self.write_plan()
         controller.command_submit(self.args())
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, self.feature)
         state["status"] = "awaiting_user_approval"
         controller.save_state(self.root, state)
 
@@ -728,7 +921,7 @@ Only the approved feature and named shared symbol are in scope.
         self.initialize()
         self.write_plan()
         controller.command_submit(self.args())
-        state_before = controller.state_path(self.root).read_bytes()
+        state_before = controller.state_path(self.root, self.feature).read_bytes()
         plan_before = self.plan.read_bytes()
 
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "approval actor"):
@@ -739,13 +932,13 @@ Only the approved feature and named shared symbol are in scope.
                 )
             )
 
-        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
+        self.assertEqual(state_before, controller.state_path(self.root, self.feature).read_bytes())
         self.assertEqual(plan_before, self.plan.read_bytes())
 
     def test_exact_submit_replay_is_state_and_artifact_byte_noop(self) -> None:
         self.initialize()
         self.write_plan()
-        state_path = controller.state_path(self.root)
+        state_path = controller.state_path(self.root, self.feature)
         with mock.patch.object(
             controller, "utc_now", return_value="2026-08-24T02:35:45+00:00"
         ):
@@ -772,7 +965,7 @@ Only the approved feature and named shared symbol are in scope.
         self.assertEqual(0, result.returncode, msg=result.stdout or result.stderr)
         self.assertEqual(state_before, state_path.read_bytes())
         self.assertEqual(plan_before, self.plan.read_bytes())
-        replay_cli = controller.load_state(self.root)
+        replay_cli = controller.load_state(self.root, self.feature)
         self.assertEqual(history_before, replay_cli["history"])
         self.assertEqual(submitted_at_before, replay_cli["submission"]["submitted_at"])
         self.assertEqual(updated_at_before, replay_cli["updated_at"])
@@ -799,7 +992,7 @@ Only the approved feature and named shared symbol are in scope.
             with self.assertRaisesRegex(OSError, "simulated crash"):
                 controller.command_approve(approval_args)
 
-        pending = controller.load_state(self.root)
+        pending = controller.load_state(self.root, self.feature)
         self.assertEqual("approval_pending", pending["status"])
         self.assertIn("status: approved", self.plan.read_text(encoding="utf-8"))
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "exact original"):
@@ -825,12 +1018,12 @@ Only the approved feature and named shared symbol are in scope.
         )
         (controller_dir / "findings.json").write_text("{}\n", encoding="utf-8")
         plan_before = self.plan.read_bytes()
-        state_before = controller.state_path(self.root).read_bytes()
+        state_before = controller.state_path(self.root, self.feature).read_bytes()
 
         replay = controller.command_approve(approval_args)
         self.assertEqual(approved, replay)
         self.assertEqual(plan_before, self.plan.read_bytes())
-        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
+        self.assertEqual(state_before, controller.state_path(self.root, self.feature).read_bytes())
 
         result = self.cli(
             "approve",
@@ -841,7 +1034,7 @@ Only the approved feature and named shared symbol are in scope.
         )
         self.assertEqual(0, result.returncode, msg=result.stdout or result.stderr)
         self.assertEqual(plan_before, self.plan.read_bytes())
-        self.assertEqual(state_before, controller.state_path(self.root).read_bytes())
+        self.assertEqual(state_before, controller.state_path(self.root, self.feature).read_bytes())
 
     def test_approval_rejects_changed_submitted_draft(self) -> None:
         self.initialize()
@@ -876,7 +1069,7 @@ Only the approved feature and named shared symbol are in scope.
 
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "stale"):
             controller.command_approve(approval_args)
-        self.assertEqual("approval_pending", controller.load_state(self.root)["status"])
+        self.assertEqual("approval_pending", controller.load_state(self.root, self.feature)["status"])
         self.prd.write_text(original_prd, encoding="utf-8")
         resumed = controller.command_approve(approval_args)
         self.assertEqual("approved", resumed["status"])
@@ -919,7 +1112,7 @@ Only the approved feature and named shared symbol are in scope.
         for route in ("direct", "cli"):
             with self.subTest(route=route):
                 self.leave_approval_pending_after_replace()
-                pending = controller.load_state(self.root)
+                pending = controller.load_state(self.root, self.feature)
                 submitted_sha = pending["approval_transition"]["submitted_sha256"]
                 recovered_draft_sha = hashlib.sha256(
                     controller.recovered_submitted_plan_bytes(self.plan)
@@ -960,7 +1153,7 @@ Only the approved feature and named shared symbol are in scope.
 
     def test_pending_approval_drift_reinitialize_is_crash_idempotent(self) -> None:
         self.leave_approval_pending_after_replace()
-        pending = controller.load_state(self.root)
+        pending = controller.load_state(self.root, self.feature)
         submitted_sha = pending["approval_transition"]["submitted_sha256"]
         recovered_draft_sha = hashlib.sha256(
             controller.recovered_submitted_plan_bytes(self.plan)
@@ -979,7 +1172,7 @@ Only the approved feature and named shared symbol are in scope.
                 )
         self.assertNotEqual(submitted_sha, recovered_draft_sha)
         self.assertEqual(recovered_draft_sha, controller.sha256(self.plan))
-        self.assertEqual("approval_pending", controller.load_state(self.root)["status"])
+        self.assertEqual("approval_pending", controller.load_state(self.root, self.feature)["status"])
         renewed = controller.command_reinitialize(
             self.args(analyst_id="planning-analyst-2")
         )
@@ -1023,7 +1216,7 @@ Only the approved feature and named shared symbol are in scope.
                 self.write_spec_and_ready_state()
                 before_plan = self.plan.read_bytes()
                 if tamper == "transition":
-                    state = controller.load_state(self.root)
+                    state = controller.load_state(self.root, self.feature)
                     state["approval_transition"]["approved_by"] = "director\nforged: true"
                     controller.save_state(self.root, state)
                     with self.assertRaisesRegex(
@@ -1041,7 +1234,7 @@ Only the approved feature and named shared symbol are in scope.
                     self.assertEqual(2, result.returncode)
                     self.assertIn("unexpected development-plan bytes", result.stderr)
                 self.assertEqual(
-                    "approval_pending", controller.load_state(self.root)["status"]
+                    "approval_pending", controller.load_state(self.root, self.feature)["status"]
                 )
                 if route == "direct":
                     self.temp.cleanup()
@@ -1049,7 +1242,7 @@ Only the approved feature and named shared symbol are in scope.
 
     def test_abort_approval_surface_is_absent_direct_and_cli(self) -> None:
         self.leave_approval_pending_after_replace()
-        before_state = controller.load_state(self.root)
+        before_state = controller.load_state(self.root, self.feature)
         before_sha = controller.sha256(self.plan)
         self.assertFalse(hasattr(controller, "command_abort_approval"))
         result = self.cli(
@@ -1061,7 +1254,7 @@ Only the approved feature and named shared symbol are in scope.
         )
         self.assertEqual(2, result.returncode)
         self.assertIn("invalid choice", result.stderr)
-        self.assertEqual(before_state, controller.load_state(self.root))
+        self.assertEqual(before_state, controller.load_state(self.root, self.feature))
         self.assertEqual(before_sha, controller.sha256(self.plan))
 
     def test_completed_approval_replay_checks_source_freshness_direct_and_cli(self) -> None:
@@ -1091,7 +1284,7 @@ Only the approved feature and named shared symbol are in scope.
                     )
                     self.assertEqual(2, result.returncode)
                     self.assertIn("stale", result.stderr)
-                self.assertEqual("stale", controller.load_state(self.root)["status"])
+                self.assertEqual("stale", controller.load_state(self.root, self.feature)["status"])
                 if route == "direct":
                     self.temp.cleanup()
                     self.setUp()
@@ -1233,7 +1426,7 @@ Only the approved feature and named shared symbol are in scope.
             ),
             encoding="utf-8",
         )
-        legacy_state = controller.load_state(self.root)
+        legacy_state = controller.load_state(self.root, self.feature)
         legacy_state["approval"]["approved_sha256"] = controller.sha256(self.plan)
         controller.save_state(self.root, legacy_state)
 
@@ -1274,7 +1467,7 @@ Only the approved feature and named shared symbol are in scope.
         controller.command_approve(
             self.args(approved_by="user", approval_note="exact SHA approval")
         )
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, self.feature)
         state["history"] = [
             {"legacy_cycle": {"planning_analyst_id": " History-Agent "}},
             {"revision_reopen": {"new_analyst_id": "Earlier-Agent"}},
@@ -1302,7 +1495,10 @@ Only the approved feature and named shared symbol are in scope.
         controller.command_approve(
             self.args(approved_by="user", approval_note="exact SHA approval")
         )
-        runtime_state = self.root / controller.RUNTIME_STATE_RELATIVE_PATH
+        runtime_state = (
+            controller.workflow_path(self.root, self.feature)
+            / controller.RUNTIME_STATE_FILENAME
+        )
         runtime_state.write_text("{}\n", encoding="utf-8")
 
         with self.assertRaisesRegex(
@@ -1317,33 +1513,6 @@ Only the approved feature and named shared symbol are in scope.
                 )
             )
 
-    def test_schema10_runtime_residue_requires_archive_and_fresh_plan_init(self) -> None:
-        self.approve_current_plan()
-        runtime_state = self.root / controller.RUNTIME_STATE_RELATIVE_PATH
-        findings = self.root / controller.RUNTIME_FINDINGS_RELATIVE_PATH
-        runtime_state.write_text(
-            json.dumps({"schema_version": 10}), encoding="utf-8",
-        )
-        findings.write_text(
-            json.dumps({"schema_version": 10, "items": []}), encoding="utf-8",
-        )
-
-        with self.assertRaisesRegex(
-            controller.DevelopmentPlanError,
-            re.escape(controller.SCHEMA10_UNSUPPORTED_MESSAGE),
-        ):
-            controller.command_revise_approved(
-                self.args(
-                    reason="schema-10 cannot be bridged",
-                    reopened_by="development-plan-director-2",
-                    analyst_id="planning-analyst-2",
-                )
-            )
-        with self.assertRaisesRegex(
-            controller._pipeline_v2_legacy.PipelineError,
-            re.escape(controller.SCHEMA10_UNSUPPORTED_MESSAGE),
-        ):
-            controller._pipeline_v2_legacy.import_schema10({}, [])
     def test_v2_binding_rejects_a_plan_sha_mismatch_before_reopen(self) -> None:
         self.initialize()
         self.write_plan()
@@ -1351,7 +1520,7 @@ Only the approved feature and named shared symbol are in scope.
         controller.command_approve(
             self.args(approved_by="user", approval_note="exact SHA approval")
         )
-        state_before = controller.load_state(self.root)
+        state_before = controller.load_state(self.root, self.feature)
         plan_before = self.plan.read_bytes()
         self.write_v2_runtime_binding(plan_sha256="0" * 64)
 
@@ -1365,7 +1534,7 @@ Only the approved feature and named shared symbol are in scope.
             )
 
         self.assertEqual(plan_before, self.plan.read_bytes())
-        self.assertEqual(state_before, controller.load_state(self.root))
+        self.assertEqual(state_before, controller.load_state(self.root, self.feature))
 
     def test_v2_binding_rejects_an_alternate_same_sha_plan_path_before_reopen(self) -> None:
         self.initialize()
@@ -1374,7 +1543,7 @@ Only the approved feature and named shared symbol are in scope.
         controller.command_approve(
             self.args(approved_by="user", approval_note="exact SHA approval")
         )
-        state_before = controller.load_state(self.root)
+        state_before = controller.load_state(self.root, self.feature)
         plan_before = self.plan.read_bytes()
         alternate = self.plan.with_name("alternate-development-plan.md")
         alternate.write_bytes(plan_before)
@@ -1391,7 +1560,7 @@ Only the approved feature and named shared symbol are in scope.
             ))
 
         self.assertEqual(plan_before, self.plan.read_bytes())
-        self.assertEqual(state_before, controller.load_state(self.root))
+        self.assertEqual(state_before, controller.load_state(self.root, self.feature))
 
     def test_custom_v2_state_path_cannot_bypass_alternate_same_sha_plan_binding(self) -> None:
         self.initialize()
@@ -1400,7 +1569,7 @@ Only the approved feature and named shared symbol are in scope.
         controller.command_approve(
             self.args(approved_by="user", approval_note="exact SHA approval")
         )
-        state_before = controller.load_state(self.root)
+        state_before = controller.load_state(self.root, self.feature)
         plan_before = self.plan.read_bytes()
         alternate = self.plan.with_name("alternate-development-plan.md")
         alternate.write_bytes(plan_before)
@@ -1417,7 +1586,7 @@ Only the approved feature and named shared symbol are in scope.
             ))
 
         self.assertEqual(plan_before, self.plan.read_bytes())
-        self.assertEqual(state_before, controller.load_state(self.root))
+        self.assertEqual(state_before, controller.load_state(self.root, self.feature))
 
     def test_multiple_v2_runtime_state_candidates_fail_closed_as_ambiguous(self) -> None:
         self.initialize()
@@ -1426,7 +1595,7 @@ Only the approved feature and named shared symbol are in scope.
         controller.command_approve(
             self.args(approved_by="user", approval_note="exact SHA approval")
         )
-        state_before = controller.load_state(self.root)
+        state_before = controller.load_state(self.root, self.feature)
         plan_before = self.plan.read_bytes()
         authority_items = {
             "requirements": {
@@ -1469,7 +1638,7 @@ Only the approved feature and named shared symbol are in scope.
             ))
 
         self.assertEqual(plan_before, self.plan.read_bytes())
-        self.assertEqual(state_before, controller.load_state(self.root))
+        self.assertEqual(state_before, controller.load_state(self.root, self.feature))
 
     def test_revise_approved_help_marks_schema10_token_unsupported(self) -> None:
         parser = controller.build_parser()
@@ -1558,7 +1727,7 @@ Only the approved feature and named shared symbol are in scope.
             with self.assertRaisesRegex(OSError, "simulated interruption"):
                 controller.command_revise_approved(args)
 
-        pending = controller.load_state(self.root)
+        pending = controller.load_state(self.root, self.feature)
         self.assertEqual("revision_reopen_pending", pending["status"])
         self.assertIn("status: draft", self.plan.read_text(encoding="utf-8"))
         original_prd = self.prd.read_text(encoding="utf-8")
@@ -1928,7 +2097,7 @@ Only the approved feature and named shared symbol are in scope.
                     ),
                     encoding="utf-8",
                 )
-                state = controller.load_state(self.root)
+                state = controller.load_state(self.root, self.feature)
                 state["approval"]["approved_sha256"] = controller.sha256(self.plan)
                 controller.save_state(self.root, state)
                 with self.assertRaisesRegex(
@@ -1964,7 +2133,7 @@ Only the approved feature and named shared symbol are in scope.
                     ),
                     encoding="utf-8",
                 )
-                state = controller.load_state(self.root)
+                state = controller.load_state(self.root, self.feature)
                 state["submission"]["sha256"] = controller.sha256(self.plan)
                 controller.save_state(self.root, state)
                 if use_cli:
@@ -2165,7 +2334,7 @@ Only the approved feature and named shared symbol are in scope.
 
     def test_reinitialize_cannot_reuse_any_historical_analyst(self) -> None:
         self.test_stale_state_reinitializes_only_after_new_spec_ready()
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, self.feature)
         state["status"] = "stale"
         controller.save_state(self.root, state)
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "all planning history"):
@@ -2175,7 +2344,7 @@ Only the approved feature and named shared symbol are in scope.
 
     def test_reinitialize_rejects_normalized_alias_from_reinitialized_history(self) -> None:
         self.test_stale_state_reinitializes_only_after_new_spec_ready()
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, self.feature)
         state["status"] = "stale"
         state["history"].append(
             {"reinitialized": {"planning_analyst_id": " Nested-History-３ "}}

@@ -10,7 +10,13 @@ from typing import Any
 
 from .checkout import safe_path
 from .legacy_gen53 import load_schema10
-from .model import PipelineError, status_view
+from .model import (
+    PIPELINE_STATE_FILENAME,
+    PipelineError,
+    feature_slug,
+    status_view,
+    workflow_relative_path,
+)
 from .runner import Controller
 from .transaction import StateStore
 
@@ -54,17 +60,14 @@ def parser() -> argparse.ArgumentParser:
         prog="pipeline-v2",
         description="Run the replay-safe seven-phase GameDev pipeline controller.",
     )
+    value.add_argument("--root", type=Path, required=True)
     value.add_argument(
-        "--state", type=Path, default=Path(".agentic-pipeline-v2/state.json"),
-        help=(
-            "Controller state path; must be a direct .json child of the project "
-            "root's .agentic-pipeline-v2 directory "
-            "(default: .agentic-pipeline-v2/state.json)."
-        ),
+        "--feature", required=True, type=feature_slug,
+        help="lowercase feature slug selecting .agentic-pipeline/Workflows/<feature>",
     )
     commands = value.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init", help="Initialize or reconfigure approved authority and slices.")
-    init.add_argument("--id", required=True); init.add_argument("--root", type=Path, required=True)
+    init.add_argument("--id", required=True)
     init.add_argument("--run-id", required=True, help="Compact safe run identifier (letters, digits, dot, underscore, or hyphen).")
     init.add_argument("--authority", action="append", default=[], required=True)
     init.add_argument("--slice", action="append", required=True); init.add_argument("--expected-generation", type=int)
@@ -93,10 +96,11 @@ def parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    store = StateStore(args.state)
+    root = safe_path(args.root, None, "project root", strict=True)
+    workflow = workflow_relative_path(args.feature)
+    store = StateStore(root / workflow / PIPELINE_STATE_FILENAME)
     if args.command == "init":
-        root = safe_path(args.root, None, "project root", strict=True)
-        state = Controller(store).reconfigure({"name": "init", "id": args.id, "expected_generation": args.expected_generation, "run_id": args.run_id, "project_root": str(root), "authority_paths": _pairs(args.authority, "authority"), "slices": _slices(args.slice)})
+        state = Controller(store).reconfigure({"name": "init", "id": args.id, "expected_generation": args.expected_generation, "run_id": args.run_id, "feature": args.feature, "workflow_path": workflow, "project_root": str(root), "authority_paths": _pairs(args.authority, "authority"), "slices": _slices(args.slice)})
     elif args.command == "status":
         return Controller(store).status()
     elif args.command == "next":

@@ -4,6 +4,8 @@
 
 The repository owns the PRD location and namespace. Resolve one path from explicit user context, repository instructions, feature manifests/indexes, existing feature artifacts, or an unambiguous sibling specification. Keep it inside `<project-root>`, preserve path case, and maintain exactly one canonical PRD. Never duplicate, symlink, move, or rename project documents solely to satisfy this skill bundle.
 
+Resolve one lowercase hyphen `FEATURE` and emit the exact downstream operational root `WORKFLOW_PATH=.agentic-pipeline/Workflows/<feature>`. Requirements stores no controller artifact there. Downstream stages may use only that exact folder and must not scan, archive, move, or delete sibling workflow folders.
+
 If the repository is empty and defines no layout, recommend `<project-root>/docs/features/<feature>/product-requirements.md` with a sibling `technical-specification.md` as a proposed default. Do not create the proposed layout until the user confirms it. Keep canonical documents version-controlled and runtime evidence in the repository-defined evidence area.
 
 ## Frontmatter

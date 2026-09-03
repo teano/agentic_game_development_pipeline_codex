@@ -529,6 +529,8 @@ def _reduce_command(
                 raise ConflictError("stale generation")
             if (
                 command.get("run_id") != state["run_id"]
+                or command.get("feature") != state["feature"]
+                or command.get("workflow_path") != state["workflow_path"]
                 or not isinstance(command.get("project_root"), str)
                 or path_identity(command["project_root"])
                 != path_identity(state["project_root"])
@@ -538,7 +540,9 @@ def _reduce_command(
             if state["active_assignment"] is not None:
                 interruption = _validate_interrupted_assignment(state, command.get("controller_interrupt"))
             proposed = new_state(
-                run_id=command["run_id"], project_root=command["project_root"],
+                run_id=command["run_id"], feature=command["feature"],
+                workflow_path=command["workflow_path"],
+                project_root=command["project_root"],
                 authority=command["authority"], slices=command.get("slices", []),
                 base_tree_oid=command["controller_base"]["candidate_tree_oid"],
                 pipeline_runtime_digest=command["pipeline_runtime_digest"],
@@ -599,7 +603,9 @@ def _reduce_command(
             validate_state(work)
             return work
         value = new_state(
-            run_id=command["run_id"], project_root=command["project_root"],
+            run_id=command["run_id"], feature=command["feature"],
+            workflow_path=command["workflow_path"],
+            project_root=command["project_root"],
             authority=command["authority"], slices=command.get("slices", []),
             base_tree_oid=command["controller_base"]["candidate_tree_oid"],
             pipeline_runtime_digest=command["pipeline_runtime_digest"],
@@ -723,7 +729,7 @@ def _reduce_command(
             "capsule": {"authority_digest": work["authority"]["digest"], "candidate": candidate, "context": context},
             "base": deepcopy(base),
             "commands": commands,
-            "output_path": assignment_output_path(assignment_id),
+            "output_path": assignment_output_path(assignment_id, work["feature"]),
             "artifact_schema": artifact_schema(phase, ROLES[phase]),
             "status": "active",
         }

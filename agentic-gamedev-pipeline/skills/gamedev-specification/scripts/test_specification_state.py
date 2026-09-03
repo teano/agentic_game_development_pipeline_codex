@@ -108,7 +108,8 @@ class SpecificationStateTests(unittest.TestCase):
         self.prd = self.feature_dir / "product-requirements.md"
         self.spec = self.feature_dir / "technical-specification.md"
         self.preaccept_receipt = (
-            self.root / ".agentic-pipeline" / "evidence" / "architect-preaccept.json"
+            self.root / ".agentic-pipeline" / "Workflows" / "sample-feature"
+            / "architect-receipts" / "architect-preaccept.json"
         )
         self.helper_receipt_counter = 0
         self.prd.write_text(PRD, encoding="utf-8")
@@ -141,7 +142,11 @@ class SpecificationStateTests(unittest.TestCase):
         )
 
     def args(self, **values: object) -> Namespace:
-        return Namespace(project_root=str(self.root), **values)
+        return Namespace(
+            project_root=str(self.root),
+            feature=values.pop("feature", "sample-feature"),
+            **values,
+        )
 
     def write_spec(
         self,
@@ -181,7 +186,8 @@ Implement the exact approved behavior.
 
     def write_preaccept_receipt(self, **overrides: object) -> Path:
         self.preaccept_receipt = (
-            self.root / ".agentic-pipeline" / "evidence" / "architect-preaccept.json"
+            self.root / ".agentic-pipeline" / "Workflows" / "sample-feature"
+            / "architect-receipts" / "architect-preaccept.json"
         )
         self.preaccept_receipt.parent.mkdir(parents=True, exist_ok=True)
         inventory = [
@@ -194,7 +200,9 @@ Implement the exact approved behavior.
         ]
         payload: dict[str, object] = {
             "schema": controller.PREACCEPT_RECEIPT_SCHEMA,
-            "architect_id": controller.load_state(self.root)["active_architect_id"],
+            "architect_id": controller.load_state(
+                self.root, "sample-feature"
+            )["active_architect_id"],
             "prd_sha256": controller.sha256(self.prd),
             "assessed_spec_sha256": controller.sha256(self.spec),
             "semantic_assessment": "accept",
@@ -223,7 +231,7 @@ Implement the exact approved behavior.
         )
 
     def write_fake_helper_result(self, **overrides: object) -> Path:
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, "sample-feature")
         request_record = state["active_helper_request"]
         self.assertIsNotNone(request_record)
         request = request_record["summary"]
@@ -288,7 +296,7 @@ Implement the exact approved behavior.
         return controller.command_record_helper_result(self.args())
 
     def write_actual_helper_artifacts(self) -> tuple[Path, Path]:
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, "sample-feature")
         request = state["active_helper_request"]["summary"]
         report = self.root / request["artifacts"]["helper_report_path"]
         coverage = self.root / request["artifacts"]["coverage_path"]
@@ -304,7 +312,7 @@ Implement the exact approved behavior.
         self,
         receipt: Path | None = None,
     ) -> dict:
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, "sample-feature")
         if state.get("active_helper_request") is not None:
             self.consume_fake_helper_result()
         receipt = receipt or self.write_preaccept_receipt()
@@ -340,7 +348,7 @@ Implement the exact approved behavior.
     def prepare_in_progress_revision(self) -> dict:
         self.initialize()
         self.start_and_record(1)
-        prior = controller.load_state(self.root)
+        prior = controller.load_state(self.root, "sample-feature")
         self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
         return prior
 
@@ -451,7 +459,7 @@ approved_at: 2026-08-10T00:00:00Z
         )
         return plan
 
-    def bind_direct_v2(self, ready: dict, filename: str = "state.json") -> Path:
+    def bind_direct_v2(self, ready: dict, filename: str = "pipeline-state.json") -> Path:
         plan = self.write_v2_plan(ready)
         self.commit_fixture("direct v2 fixture")
         items = {
@@ -470,6 +478,8 @@ approved_at: 2026-08-10T00:00:00Z
         }
         runtime = plan_controller._pipeline_v2_model.new_state(
             run_id="direct-v2-specification-test",
+            feature="sample-feature",
+            workflow_path=".agentic-pipeline/Workflows/sample-feature",
             project_root=str(self.root.resolve()),
             authority={"items": items},
             slices=[{
@@ -481,11 +491,9 @@ approved_at: 2026-08-10T00:00:00Z
             base_tree_oid=pipeline_checkout.require_clean_head(self.root),
             pipeline_runtime_digest=pipeline_checkout.pipeline_runtime_digest(),
         )
-        runtime_path = self.root / ".agentic-pipeline-v2" / filename
+        runtime_path = controller.workflow_path(self.root, "sample-feature") / filename
         runtime_path.parent.mkdir(parents=True, exist_ok=True)
         runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
-        self.assertFalse((self.root / controller.RUNTIME_STATE_RELATIVE_PATH).exists())
-        self.assertFalse((self.root / controller.RUNTIME_FINDINGS_RELATIVE_PATH).exists())
         status = controller._pipeline_v2_runner.Controller(
             controller._pipeline_v2_transaction.StateStore(runtime_path)
         ).status()
@@ -552,8 +560,8 @@ approved_at: 2026-08-10T00:00:00Z
         }
 
     def persist_released_v2_schema1_authorization(self) -> dict:
-        state_path = self.root / controller.STATE_RELATIVE_PATH
-        state = controller.load_state(self.root)
+        state_path = controller.state_path(self.root, "sample-feature")
+        state = controller.load_state(self.root, "sample-feature")
         if state["status"] == "ready_revision_pending":
             receipt = state["ready_revision"]
             legacy = self.released_v2_schema1_authorization(
@@ -574,7 +582,7 @@ approved_at: 2026-08-10T00:00:00Z
     def assert_committed_ready_replay_byte_noop(
         self, arguments: Namespace, *bound_paths: Path
     ) -> None:
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         tracked = (state_path, self.prd, self.spec, *bound_paths)
         before = {path: path.read_bytes() for path in tracked}
         expected = json.loads(before[state_path])
@@ -590,7 +598,7 @@ approved_at: 2026-08-10T00:00:00Z
     def assert_committed_ready_replay_rejected_without_mutation(
         self, arguments: Namespace, pattern: str, *tracked_paths: Path
     ) -> None:
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         tracked = (state_path, self.prd, self.spec, *tracked_paths)
         before = {path: path.read_bytes() for path in tracked}
         with self.assertRaisesRegex(controller.SpecificationStateError, pattern):
@@ -598,7 +606,7 @@ approved_at: 2026-08-10T00:00:00Z
         self.assertEqual(before, {path: path.read_bytes() for path in tracked})
 
     def assert_v2_reopen_rejected(self, pattern: str) -> None:
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, pattern):
@@ -650,7 +658,7 @@ approved_at: 2026-08-10T00:00:00Z
         else:  # pragma: no cover - test helper contract
             raise AssertionError(location)
         runtime.write_text(json.dumps(value), encoding="utf-8")
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
         runtime_before = runtime.read_bytes()
@@ -777,7 +785,7 @@ approved_at: 2026-08-10T00:00:00Z
                     "full approved requirements contract",
                 ):
                     controller.command_init(args)
-                self.assertFalse((self.root / controller.STATE_RELATIVE_PATH).exists())
+                self.assertFalse(controller.state_path(self.root, "sample-feature").exists())
 
                 cli = self.cli(
                     "init",
@@ -788,7 +796,7 @@ approved_at: 2026-08-10T00:00:00Z
                 )
                 self.assertEqual(2, cli.returncode)
                 self.assertIn("full approved requirements contract", cli.stderr)
-                self.assertFalse((self.root / controller.STATE_RELATIVE_PATH).exists())
+                self.assertFalse(controller.state_path(self.root, "sample-feature").exists())
                 self.temp.cleanup()
                 self.setUp()
 
@@ -803,7 +811,7 @@ approved_at: 2026-08-10T00:00:00Z
             encoding="utf-8",
         )
         self.write_spec()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         legacy = json.loads(state_path.read_text(encoding="utf-8"))
         legacy["schema_version"] = 1
         legacy.pop("identity_history", None)
@@ -845,7 +853,7 @@ approved_at: 2026-08-10T00:00:00Z
         )
         self.write_spec()
         preaccept = self.write_preaccept_receipt()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
 
@@ -861,7 +869,7 @@ approved_at: 2026-08-10T00:00:00Z
 
         self.assertEqual(state_before, state_path.read_bytes())
         self.assertEqual(spec_before, self.spec.read_bytes())
-        self.assertIsNone(controller.load_state(self.root)["acceptance"])
+        self.assertIsNone(controller.load_state(self.root, "sample-feature")["acceptance"])
 
     def test_valid_generation_result_is_consumed_and_revalidated(self) -> None:
         self.initialize(with_spec=False)
@@ -883,7 +891,7 @@ approved_at: 2026-08-10T00:00:00Z
         )
         report_before = report_path.read_bytes()
         report_path.write_bytes(report_before + b"drift")
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         with self.assertRaisesRegex(
             controller.SpecificationStateError, "artifact SHA is stale or invalid"
@@ -908,13 +916,13 @@ approved_at: 2026-08-10T00:00:00Z
     ) -> None:
         self.initialize(with_spec=False)
         self.write_spec()
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, "sample-feature")
         request_path = self.root / state["active_helper_request"]["path"]
         self.assertEqual(
             controller.specification_controller_identity(),
             state["active_helper_request"]["summary"]["controller"],
         )
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         request_before = request_path.read_bytes()
         spec_before = self.spec.read_bytes()
@@ -981,9 +989,9 @@ approved_at: 2026-08-10T00:00:00Z
         self.initialize(with_spec=False)
         self.write_spec(nested_trace=False)
         valid = self.spec.read_text(encoding="utf-8")
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, "sample-feature")
         request_path = self.root / state["active_helper_request"]["path"]
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         mutations = {
             "missing status": valid.replace("status: draft\n", "", 1),
             "invalid status": valid.replace("status: draft", "status: ready", 1),
@@ -1026,7 +1034,7 @@ approved_at: 2026-08-10T00:00:00Z
         self,
     ) -> None:
         self.initialize(with_spec=False)
-        initial = controller.load_state(self.root)
+        initial = controller.load_state(self.root, "sample-feature")
         request_path = self.root / initial["active_helper_request"]["path"]
         legacy_request = json.loads(request_path.read_text(encoding="utf-8"))
         legacy_request.pop("controller")
@@ -1046,8 +1054,8 @@ approved_at: 2026-08-10T00:00:00Z
             encoding="utf-8",
         )
         result_path = self.write_fake_helper_result()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
-        initial = controller.load_state(self.root)
+        state_path = controller.state_path(self.root, "sample-feature")
+        initial = controller.load_state(self.root, "sample-feature")
         artifact_paths = [
             request_path,
             result_path,
@@ -1158,7 +1166,7 @@ approved_at: 2026-08-10T00:00:00Z
         self.initialize(with_spec=False)
         self.write_spec()
         self.write_fake_helper_result()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
         with self.assertRaisesRegex(
@@ -1176,8 +1184,8 @@ approved_at: 2026-08-10T00:00:00Z
     def test_helper_request_and_result_binding_failures_are_byte_noops(self) -> None:
         self.initialize(with_spec=False)
         self.write_spec()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
-        state = controller.load_state(self.root)
+        state_path = controller.state_path(self.root, "sample-feature")
+        state = controller.load_state(self.root, "sample-feature")
         request_path = self.root / state["active_helper_request"]["path"]
         request_before = request_path.read_bytes()
         spec_before = self.spec.read_bytes()
@@ -1256,8 +1264,8 @@ approved_at: 2026-08-10T00:00:00Z
         self.initialize(with_spec=False)
         self.write_spec()
         self.write_fake_helper_result()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
-        state = controller.load_state(self.root)
+        state_path = controller.state_path(self.root, "sample-feature")
+        state = controller.load_state(self.root, "sample-feature")
         drifted_identity = dict(
             state["active_helper_request"]["summary"]["helper_identity"]
         )
@@ -1276,7 +1284,7 @@ approved_at: 2026-08-10T00:00:00Z
         self.initialize(with_spec=False)
         self.write_spec()
         self.write_actual_helper_artifacts()
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, "sample-feature")
         request = self.root / state["active_helper_request"]["path"]
         emitter = Path(
             state["active_helper_request"]["summary"]["helper_identity"]
@@ -1332,7 +1340,7 @@ approved_at: 2026-08-10T00:00:00Z
         self.initialize(with_spec=False)
         self.write_spec()
         self.write_actual_helper_artifacts()
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, "sample-feature")
         request = self.root / state["active_helper_request"]["path"]
         result_path = self.root / (
             state["active_helper_request"]["summary"]["artifacts"]["result_path"]
@@ -1423,8 +1431,8 @@ print(json.dumps({{
             encoding="utf-8",
         )
         report, coverage = self.write_actual_helper_artifacts()
-        state = controller.load_state(self.root)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state = controller.load_state(self.root, "sample-feature")
+        state_path = controller.state_path(self.root, "sample-feature")
         request = self.root / state["active_helper_request"]["path"]
         result_path = self.root / (
             state["active_helper_request"]["summary"]["artifacts"]["result_path"]
@@ -1470,8 +1478,8 @@ print(json.dumps({{
             encoding="utf-8",
         )
         report, coverage = self.write_actual_helper_artifacts()
-        state = controller.load_state(self.root)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state = controller.load_state(self.root, "sample-feature")
+        state_path = controller.state_path(self.root, "sample-feature")
         request = self.root / state["active_helper_request"]["path"]
         result_path = self.root / (
             state["active_helper_request"]["summary"]["artifacts"]["result_path"]
@@ -1511,7 +1519,7 @@ print(json.dumps({{
         self.initialize(with_spec=False)
         self.write_spec()
         self.consume_fake_helper_result()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         spec_before = self.spec.read_bytes()
 
         def assert_rejected(receipt: Path | None, pattern: str = "pre-accept") -> None:
@@ -1657,7 +1665,7 @@ No assumptions or risks are introduced.
             semantic_assessment="reject",
             section_applicability_inventory=inventory,
         )
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         with self.assertRaisesRegex(
             controller.SpecificationStateError, "semantic assessment must be accept"
@@ -1723,7 +1731,7 @@ None.
             self.args(architect_id="architect-1", proofreader_id="proofreader-late")
         )
         receipt = self.write_preaccept_receipt()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
         with self.assertRaisesRegex(
@@ -1740,8 +1748,8 @@ None.
         controller.command_start_cycle(
             self.args(architect_id="architect-1", proofreader_id="proofreader-legacy")
         )
-        state_path = self.root / controller.STATE_RELATIVE_PATH
-        legacy = controller.load_state(self.root)
+        state_path = controller.state_path(self.root, "sample-feature")
+        legacy = controller.load_state(self.root, "sample-feature")
         legacy["acceptance"].pop("preaccept_receipt")
         controller.save_state(self.root, legacy)
         spec_before = self.spec.read_bytes()
@@ -1770,7 +1778,7 @@ None.
         self.assertEqual(state_before, state_path.read_bytes())
         self.assertEqual(spec_before, self.spec.read_bytes())
 
-        legacy = controller.load_state(self.root)
+        legacy = controller.load_state(self.root, "sample-feature")
         legacy["active_wave"]["proofread"] = {
             "critical": 0,
             "major": 0,
@@ -1826,8 +1834,8 @@ None.
         controller.command_start_cycle(
             self.args(architect_id="architect-1", proofreader_id="proofreader-time")
         )
-        state_path = self.root / controller.STATE_RELATIVE_PATH
-        state = controller.load_state(self.root)
+        state_path = controller.state_path(self.root, "sample-feature")
+        state = controller.load_state(self.root, "sample-feature")
         state["acceptance"]["accepted_at"] = "2099-08-29T00:00:00+00:00"
         controller.save_state(self.root, state)
         before = state_path.read_bytes()
@@ -1925,7 +1933,7 @@ No additional assumptions or risks exist.
         receipt = self.write_preaccept_receipt(
             section_applicability_inventory=inventory
         )
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         before = state_path.read_bytes()
         with self.assertRaisesRegex(
             controller.SpecificationStateError, "disposition must be retain"
@@ -2037,190 +2045,45 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertEqual(state["total_cycles_completed"], 1)
         self.assertEqual(len(state["waves"]), 1)
 
-    def test_init_archives_completed_other_feature_specification_artifacts(self) -> None:
-        ready = self.make_ready()
-        pipeline_root = self.root / ".agentic-pipeline"
-        unrelated_state = pipeline_root / "development-plan-state.json"
-        unrelated_output = pipeline_root / "outputs" / "engineering.json"
-        unrelated_state.write_bytes(b"plan-state\n")
-        unrelated_output.parent.mkdir(parents=True, exist_ok=True)
-        unrelated_output.write_bytes(b"runtime-output\n")
-
-        archive_root = pipeline_root / "Workflows" / "sample-feature"
-        archive_root.mkdir(parents=True)
-        old_state_bytes = (self.root / controller.STATE_RELATIVE_PATH).read_bytes()
-        owned: dict[str, bytes] = {
-            "specification-state.json": old_state_bytes,
-        }
-        for directory in (
-            "architect-receipts",
-            "helper-requests",
-            "helper-results",
-        ):
-            source_root = pipeline_root / directory
-            for source in source_root.rglob("*"):
-                if source.is_file():
-                    owned[source.relative_to(pipeline_root).as_posix()] = source.read_bytes()
-        preaccept = (
-            pipeline_root.parent / ready["acceptance"]["preaccept_receipt"]["path"]
-        )
-        owned[preaccept.relative_to(pipeline_root).as_posix()] = preaccept.read_bytes()
-
-        initialized = controller.command_init(self.other_feature_init_args())
-
-        self.assertEqual("other-feature", initialized["feature"])
-        self.assertEqual("needs_generation", initialized["status"])
-        self.assertEqual(ready, json.loads(old_state_bytes.decode("utf-8")))
-        for relative, expected_bytes in owned.items():
-            with self.subTest(relative=relative):
-                self.assertEqual(expected_bytes, (archive_root / relative).read_bytes())
-                if relative != "specification-state.json":
-                    self.assertFalse((pipeline_root / relative).exists())
-        self.assertEqual(
-            set(owned),
-            {
-                path.relative_to(archive_root).as_posix()
-                for path in archive_root.rglob("*")
-                if path.is_file()
-            },
-        )
-        self.assertEqual(b"plan-state\n", unrelated_state.read_bytes())
-        self.assertEqual(b"runtime-output\n", unrelated_output.read_bytes())
-
-    def test_init_preflights_malformed_new_spec_before_archiving_old_feature(self) -> None:
-        self.make_ready()
-        pipeline_root = self.root / ".agentic-pipeline"
-        before = {
-            path.relative_to(pipeline_root).as_posix(): path.read_bytes()
-            for path in pipeline_root.rglob("*")
-            if path.is_file()
-        }
-        arguments = self.other_feature_init_args()
-        other_spec = self.root / arguments.spec
-        other_spec.write_bytes(b"---\ndocument_type: technical-specification\n")
-
-        with self.assertRaisesRegex(
-            controller.SpecificationStateError,
-            "frontmatter|technical specification",
-        ):
-            controller.command_init(arguments)
-
-        self.assertEqual(
-            before,
-            {
-                path.relative_to(pipeline_root).as_posix(): path.read_bytes()
-                for path in pipeline_root.rglob("*")
-                if path.is_file()
-            },
-        )
-        self.assertFalse(
-            (pipeline_root / "Workflows" / "sample-feature").exists()
-        )
-
-    def test_init_revalidates_preaccept_receipt_before_archiving_old_feature(self) -> None:
-        ready = self.make_ready()
-        pipeline_root = self.root / ".agentic-pipeline"
-        receipt = self.root / ready["acceptance"]["preaccept_receipt"]["path"]
-        receipt.unlink()
-        before = {
-            path.relative_to(pipeline_root).as_posix(): path.read_bytes()
-            for path in pipeline_root.rglob("*")
+    def test_feature_workflows_keep_state_and_helper_ids_isolated(self) -> None:
+        first = self.initialize(with_spec=False)
+        first_root = controller.workflow_path(self.root, "sample-feature")
+        first_snapshot = {
+            path.relative_to(first_root).as_posix(): path.read_bytes()
+            for path in first_root.rglob("*")
             if path.is_file()
         }
 
-        with self.assertRaisesRegex(
-            controller.SpecificationStateError,
-            "pre-accept receipt",
-        ):
-            controller.command_init(self.other_feature_init_args())
+        second = controller.command_init(self.other_feature_init_args())
+        second = controller.command_prepare_helper(
+            self.args(feature="other-feature", operation="generation", correction_id=[])
+        )
 
+        self.assertEqual("HREQ-000001", first["active_helper_request"]["summary"]["request_id"])
+        self.assertEqual("HREQ-000001", second["active_helper_request"]["summary"]["request_id"])
+        self.assertNotEqual(first["active_helper_request"]["path"], second["active_helper_request"]["path"])
         self.assertEqual(
-            before,
+            first_snapshot,
             {
-                path.relative_to(pipeline_root).as_posix(): path.read_bytes()
-                for path in pipeline_root.rglob("*")
+                path.relative_to(first_root).as_posix(): path.read_bytes()
+                for path in first_root.rglob("*")
                 if path.is_file()
             },
         )
-        self.assertFalse(receipt.exists())
-        self.assertFalse(
-            (pipeline_root / "Workflows" / "sample-feature").exists()
-        )
 
-    def test_init_rejects_nonterminal_or_busy_other_feature_without_mutation(self) -> None:
-        self.make_ready()
-        state_file = self.root / controller.STATE_RELATIVE_PATH
-        pristine = json.loads(state_file.read_text(encoding="utf-8"))
-        unsafe_states = {
-            "not ready": {"status": "reviewing"},
-            "active helper": {"active_helper_request": {"request": "active"}},
-            "active wave": {"active_wave": {"number": 99}},
-            "active hold": {"hold": {"reason": "active"}},
-        }
-        for label, changes in unsafe_states.items():
-            with self.subTest(label=label):
-                state = json.loads(json.dumps(pristine))
-                state.update(changes)
-                controller.write_state_file(state_file, state)
-                before = state_file.read_bytes()
-                with self.assertRaisesRegex(
-                    controller.SpecificationStateError,
-                    "terminal SPEC_READY|active helper|active wave|active hold",
-                ):
-                    controller.command_init(self.other_feature_init_args())
-                self.assertEqual(before, state_file.read_bytes())
-                self.assertFalse(
-                    (self.root / ".agentic-pipeline" / "Workflows" / "sample-feature").exists()
-                )
+    def test_foreign_copied_state_and_traversal_feature_fail_closed(self) -> None:
+        self.initialize(with_spec=False)
+        source = controller.state_path(self.root, "sample-feature")
+        foreign = controller.state_path(self.root, "other-feature")
+        foreign.parent.mkdir(parents=True, exist_ok=True)
+        foreign.write_bytes(source.read_bytes())
+        before = foreign.read_bytes()
 
-    def test_init_rejects_draft_source_with_forged_terminal_receipts_without_mutation(
-        self,
-    ) -> None:
-        self.make_ready()
-        state_file = self.root / controller.STATE_RELATIVE_PATH
-        draft_bytes = self.spec.read_bytes().replace(
-            b"status: approved", b"status: draft", 1
-        )
-        self.spec.write_bytes(draft_bytes)
-        draft_sha = controller.sha256(self.spec)
-        state = json.loads(state_file.read_text(encoding="utf-8"))
-        state["specification"]["sha256"] = draft_sha
-        state["ready"]["spec_sha256"] = draft_sha
-        state["acceptance"]["specification_sha256"] = draft_sha
-        state["waves"][-1]["result_spec_sha256"] = draft_sha
-        controller.write_state_file(state_file, state)
-        before_state = state_file.read_bytes()
-
-        with self.assertRaisesRegex(
-            controller.SpecificationStateError,
-            "incomplete or inconsistent terminal SPEC_READY evidence",
-        ):
-            controller.command_init(self.other_feature_init_args())
-
-        self.assertEqual(before_state, state_file.read_bytes())
-        self.assertEqual(draft_bytes, self.spec.read_bytes())
-        self.assertFalse(
-            (self.root / ".agentic-pipeline" / "Workflows" / "sample-feature").exists()
-        )
-
-    def test_init_rejects_nonempty_other_feature_archive_without_mutation(self) -> None:
-        self.make_ready()
-        state_file = self.root / controller.STATE_RELATIVE_PATH
-        archive_root = (
-            self.root / ".agentic-pipeline" / "Workflows" / "sample-feature"
-        )
-        archive_root.mkdir(parents=True)
-        marker = archive_root / "foreign.txt"
-        marker.write_bytes(b"foreign\n")
-        before = state_file.read_bytes()
-
-        with self.assertRaisesRegex(
-            controller.SpecificationStateError, "archive destination.*non-empty|ambiguous"
-        ):
-            controller.command_init(self.other_feature_init_args())
-
-        self.assertEqual(before, state_file.read_bytes())
-        self.assertEqual(b"foreign\n", marker.read_bytes())
+        with self.assertRaisesRegex(controller.SpecificationStateError, "feature/workflow binding"):
+            controller.load_state(self.root, "other-feature")
+        with self.assertRaisesRegex(controller.SpecificationStateError, "lowercase hyphen slug"):
+            controller.state_path(self.root, "../other")
+        self.assertEqual(before, foreign.read_bytes())
 
     def test_flat_source_prd_trace_remains_compatible(self) -> None:
         self.write_spec(nested_trace=False)
@@ -2249,7 +2112,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             controller.command_start_cycle(
                 self.args(architect_id="architect-1", proofreader_id="proofreader-6")
             )
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, "sample-feature")
         self.assertEqual(state["status"], "spec_convergence_hold")
         self.assertEqual(state["total_cycles_completed"], 5)
         self.assertEqual(len(state["waves"]), 5)
@@ -2409,7 +2272,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             self.spec.read_text(encoding="utf-8") + "\nUnreviewed edit.\n",
             encoding="utf-8",
         )
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         with self.assertRaisesRegex(
             controller.SpecificationStateError,
@@ -2438,7 +2301,7 @@ PRD-REQ-001 is covered by the formatter and runner.
     def test_no_edit_complete_cycle_preserves_acceptance_and_reviewing(self) -> None:
         self.initialize()
         self.start_and_record(1, major=1, coverage_complete=True)
-        before = controller.load_state(self.root)
+        before = controller.load_state(self.root, "sample-feature")
         completed = controller.command_complete_cycle(
             self.args(
                 architect_id="architect-1",
@@ -2469,7 +2332,7 @@ PRD-REQ-001 is covered by the formatter and runner.
         corrected_sha256 = controller.sha256(self.spec)
         result_path = self.write_fake_helper_result()
         base = json.loads(result_path.read_text(encoding="utf-8"))
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         spec_before = self.spec.read_bytes()
         mutations = {
             "request": lambda value: value["request"].update(
@@ -2565,7 +2428,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             finding_id=["F-001"],
             question_id=["F-001"],
         )
-        prior = controller.load_state(self.root)
+        prior = controller.load_state(self.root, "sample-feature")
         self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
         new_prd_sha = controller.sha256(self.prd)
 
@@ -2663,7 +2526,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             self.args(architect_id="architect-1", proofreader_id="proofreader-1")
         )
         self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
 
@@ -2677,7 +2540,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_revise_in_progress_rejects_reused_identity(self) -> None:
         self.prepare_in_progress_revision()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, "fresh"):
@@ -2690,7 +2553,7 @@ PRD-REQ-001 is covered by the formatter and runner.
     def test_revise_in_progress_rejects_ready_state(self) -> None:
         self.make_ready()
         self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, "use revise-ready"):
@@ -2703,7 +2566,7 @@ PRD-REQ-001 is covered by the formatter and runner.
     def test_revise_in_progress_rejects_stale_prd_authority_without_mutation(self) -> None:
         self.initialize()
         self.start_and_record(1)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
 
@@ -2732,7 +2595,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_revise_in_progress_rejects_invalid_authority_and_tampered_spec(self) -> None:
         self.prepare_in_progress_revision()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         self.prd.write_text(
             self.prd.read_text(encoding="utf-8").replace(
@@ -2766,7 +2629,7 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.prepare_in_progress_revision()
         state_dir = self.root / ".agentic-pipeline"
         (state_dir / "state.json").write_text("{}\n", encoding="utf-8")
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
 
@@ -2788,7 +2651,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             with self.assertRaisesRegex(OSError, "interrupted write"):
                 controller.command_revise_in_progress(args)
 
-        pending = controller.load_state(self.root)
+        pending = controller.load_state(self.root, "sample-feature")
         self.assertEqual("in_progress_revision_pending", pending["status"])
         self.assertIn("revision: 1", self.spec.read_text(encoding="utf-8"))
         reopened = controller.command_revise_in_progress(args)
@@ -2813,7 +2676,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             with self.assertRaisesRegex(OSError, "interrupted final state write"):
                 controller.command_revise_in_progress(args)
 
-        pending = controller.load_state(self.root)
+        pending = controller.load_state(self.root, "sample-feature")
         self.assertEqual("in_progress_revision_pending", pending["status"])
         self.assertIn("revision: 2", self.spec.read_text(encoding="utf-8"))
         reopened = controller.command_revise_in_progress(args)
@@ -2830,7 +2693,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             with self.assertRaisesRegex(OSError, "interrupted write"):
                 controller.command_revise_in_progress(args)
 
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, "exact original inputs"):
@@ -2864,7 +2727,7 @@ PRD-REQ-001 is covered by the formatter and runner.
                 controller.command_revise_in_progress(args)
 
         self.prd.write_bytes(prior_prd)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
         commands = (
@@ -2946,7 +2809,7 @@ PRD-REQ-001 is covered by the formatter and runner.
         authorization = reopened["recovery_authorization"]
         self.assertEqual(2, authorization["schema"])
         self.assertEqual(
-            ".agentic-pipeline-v2/state.json",
+            ".agentic-pipeline/Workflows/sample-feature/pipeline-state.json",
             authorization["runtime_state_path"],
         )
         self.assertEqual(
@@ -2970,38 +2833,6 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertEqual("spec_ready", final["status"])
         self.assertEqual(runtime_before, runtime.read_bytes())
 
-    def test_specification_only_reopen_replays_canonical_direct_v2_custom_path(self) -> None:
-        ready = self.make_ready()
-        runtime = self.bind_direct_v2(ready, "custom-run.json")
-        runtime_before = runtime.read_bytes()
-        arguments = self.args(
-            reason="replay specification correction under a direct custom v2 runtime",
-            architect_id="architect-2",
-            recovery_token=None,
-            specification_only=True,
-        )
-
-        with mock.patch.object(
-            controller, "write_bytes_atomically", side_effect=OSError("lost response")
-        ):
-            with self.assertRaisesRegex(OSError, "lost response"):
-                controller.command_revise_ready(arguments)
-        self.assertEqual(
-            "ready_revision_pending", controller.load_state(self.root)["status"]
-        )
-        self.assertEqual(runtime_before, runtime.read_bytes())
-
-        reopened = controller.command_revise_ready(arguments)
-        self.assertEqual("awaiting_accept", reopened["status"])
-        self.assertEqual(
-            ".agentic-pipeline-v2/custom-run.json",
-            reopened["recovery_authorization"]["runtime_state_path"],
-        )
-        self.assertEqual(runtime_before, runtime.read_bytes())
-        final = self.complete_fresh_v2_reopen("direct-custom-v2-proofread.md")
-        self.assertEqual("spec_ready", final["status"])
-        self.assertEqual(runtime_before, runtime.read_bytes())
-
     def test_direct_v2_reopen_rejects_boolean_top_level_generation_without_mutation(self) -> None:
         self.assert_direct_v2_generation_poison_rejected("top-level")
 
@@ -3017,7 +2848,7 @@ PRD-REQ-001 is covered by the formatter and runner.
     def test_schema10_residue_requires_archive_and_fresh_plan_init(self) -> None:
         ready = self.make_ready()
         runtime = self.bind_schema10_residue(ready)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         before = {
             path: path.read_bytes()
             for path in (state_path, self.prd, self.spec, runtime)
@@ -3063,7 +2894,7 @@ PRD-REQ-001 is covered by the formatter and runner.
         )
         first = self.cli(*command)
         self.assertEqual(0, first.returncode, first.stderr)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         tracked = (state_path, self.prd, self.spec, runtime)
         before = {path: path.read_bytes() for path in tracked}
 
@@ -3103,7 +2934,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             specification_only=True,
         )
         controller.command_revise_ready(arguments)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
 
         changed_inputs = {
             "actor": self.args(
@@ -3189,7 +3020,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             specification_only=True,
         )
         controller.command_revise_ready(arguments)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         original_state = state_path.read_bytes()
 
         poison_labels = (
@@ -3278,8 +3109,8 @@ PRD-REQ-001 is covered by the formatter and runner.
             specification_only=True,
         )
         controller.command_revise_ready(arguments)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
-        schema2 = controller.load_state(self.root)
+        state_path = controller.state_path(self.root, "sample-feature")
+        schema2 = controller.load_state(self.root, "sample-feature")
         schema1 = json.loads(json.dumps(schema2))
         legacy = self.released_v2_schema1_authorization(
             schema1["recovery_authorization"]
@@ -3325,8 +3156,8 @@ PRD-REQ-001 is covered by the formatter and runner.
             with self.assertRaisesRegex(OSError, "lost response"):
                 controller.command_revise_ready(arguments)
 
-        state_path = self.root / controller.STATE_RELATIVE_PATH
-        poisoned = controller.load_state(self.root)
+        state_path = controller.state_path(self.root, "sample-feature")
+        poisoned = controller.load_state(self.root, "sample-feature")
         transition = poisoned["ready_revision"]
         transition["new_prd"]["revision"] = "999"
         draft, _, _ = controller.reopened_specification_bytes(
@@ -3360,8 +3191,8 @@ PRD-REQ-001 is covered by the formatter and runner.
         )
         controller.command_revise_ready(arguments)
 
-        state_path = self.root / controller.STATE_RELATIVE_PATH
-        poisoned = controller.load_state(self.root)
+        state_path = controller.state_path(self.root, "sample-feature")
+        poisoned = controller.load_state(self.root, "sample-feature")
         receipt = poisoned["history"][-1]
         receipt["new_prd"]["revision"] = "999"
         poisoned["prd"]["revision"] = "999"
@@ -3411,7 +3242,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             specification_only=True,
         )
         controller.command_revise_ready(arguments)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         original_state = state_path.read_bytes()
 
         for label in (
@@ -3483,61 +3314,9 @@ PRD-REQ-001 is covered by the formatter and runner.
             arguments, "requires exact spec_ready state", runtime
         )
 
-    def test_v2_reopen_custom_state_path_revalidates_through_fresh_convergence(self) -> None:
-        ready = self.make_ready()
-        default_runtime = self.bind_direct_v2(ready)
-        runtime = default_runtime.with_name("custom-run.json")
-        default_runtime.replace(runtime)
-
-        reopened = controller.command_revise_ready(
-            self.args(
-                reason="custom v2 state specification correction",
-                architect_id="architect-2",
-                recovery_token=None,
-                specification_only=True,
-            )
-        )
-        self.assertEqual(
-            ".agentic-pipeline-v2/custom-run.json",
-            reopened["recovery_authorization"]["runtime_state_path"],
-        )
-        self.prepare_helper("correction")
-        self.spec.write_text(
-            self.spec.read_text(encoding="utf-8").replace(
-                "status: draft", "status: approved", 1
-            ),
-            encoding="utf-8",
-        )
-        self.accept_spec()
-        controller.command_start_cycle(
-            self.args(architect_id="architect-2", proofreader_id="proofreader-2")
-        )
-        controller.command_record_proofread(
-            self.args(
-                proofreader_id="proofreader-2",
-                critical=0,
-                major=0,
-                minor=0,
-                product_questions=0,
-                scope_questions=0,
-                boundary_questions=0,
-                ownership_questions=0,
-                public_contract_questions=0,
-                minors_engineer_resolvable=False,
-                coverage_complete=True,
-                report_path="custom-v2-proofread.md",
-                finding_id=[],
-                question_id=[],
-            )
-        )
-        final = controller.command_confirm_ready(
-            self.args(architect_id="architect-2", confirmation="custom v2 SHA confirmed")
-        )
-        self.assertEqual("spec_ready", final["status"])
-
     def test_unrelated_v2_directory_does_not_create_a_runtime_binding(self) -> None:
         self.initialize()
-        runtime_directory = self.root / controller.V2_RUNTIME_STATE_RELATIVE_PATH.parent
+        runtime_directory = controller.workflow_path(self.root, "sample-feature")
         runtime_directory.mkdir()
         (runtime_directory / "diagnostics.json").write_text("{}\n", encoding="utf-8")
 
@@ -3702,7 +3481,7 @@ PRD-REQ-001 is covered by the formatter and runner.
         ):
             self.assert_v2_reopen_rejected("terminal|checkout recovery")
 
-        state_before = (self.root / controller.STATE_RELATIVE_PATH).read_bytes()
+        state_before = controller.state_path(self.root, "sample-feature").read_bytes()
         spec_before = self.spec.read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, "tokenless"):
             controller.command_revise_ready(
@@ -3713,7 +3492,7 @@ PRD-REQ-001 is covered by the formatter and runner.
                     specification_only=True,
                 )
             )
-        self.assertEqual(state_before, (self.root / controller.STATE_RELATIVE_PATH).read_bytes())
+        self.assertEqual(state_before, controller.state_path(self.root, "sample-feature").read_bytes())
         self.assertEqual(spec_before, self.spec.read_bytes())
 
     def test_prd_revision_rewinds_active_v2_plan_and_reconverges(self) -> None:
@@ -3804,9 +3583,9 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_prd_revision_rejects_non_init_recovery_unknown_and_token_without_mutation(self) -> None:
         self.make_ready()
-        runtime = self.bind_direct_v2(controller.load_state(self.root))
+        runtime = self.bind_direct_v2(controller.load_state(self.root, "sample-feature"))
         self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         cases = {
             "non-init": {
                 "active_assignment": None,
@@ -3901,7 +3680,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             encoding="utf-8",
         )
         runtime.write_text(json.dumps(json.loads(runtime_before), indent=2), encoding="utf-8")
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, "authorization changed"):
@@ -3950,10 +3729,10 @@ PRD-REQ-001 is covered by the formatter and runner.
             )
 
         change_runtime_bytes()
-        state_before = (self.root / controller.STATE_RELATIVE_PATH).read_bytes()
+        state_before = controller.state_path(self.root, "sample-feature").read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, "authorization changed"):
             self.accept_spec()
-        self.assertEqual(state_before, (self.root / controller.STATE_RELATIVE_PATH).read_bytes())
+        self.assertEqual(state_before, controller.state_path(self.root, "sample-feature").read_bytes())
         runtime.write_bytes(original_runtime)
         self.accept_spec()
         controller.command_start_cycle(
@@ -3977,20 +3756,20 @@ PRD-REQ-001 is covered by the formatter and runner.
             question_id=[],
         )
         change_runtime_bytes()
-        state_before = (self.root / controller.STATE_RELATIVE_PATH).read_bytes()
+        state_before = controller.state_path(self.root, "sample-feature").read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, "authorization changed"):
             controller.command_record_proofread(proofread_args)
-        self.assertEqual(state_before, (self.root / controller.STATE_RELATIVE_PATH).read_bytes())
+        self.assertEqual(state_before, controller.state_path(self.root, "sample-feature").read_bytes())
         runtime.write_bytes(original_runtime)
         controller.command_record_proofread(proofread_args)
 
         change_runtime_bytes()
-        state_before = (self.root / controller.STATE_RELATIVE_PATH).read_bytes()
+        state_before = controller.state_path(self.root, "sample-feature").read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, "authorization changed"):
             controller.command_confirm_ready(
                 self.args(architect_id="architect-2", confirmation="exact SHA confirmed")
             )
-        self.assertEqual(state_before, (self.root / controller.STATE_RELATIVE_PATH).read_bytes())
+        self.assertEqual(state_before, controller.state_path(self.root, "sample-feature").read_bytes())
 
     def test_pending_v2_reopen_replays_exactly_and_rejects_runtime_change(self) -> None:
         ready = self.make_ready()
@@ -4006,17 +3785,17 @@ PRD-REQ-001 is covered by the formatter and runner.
         ):
             with self.assertRaisesRegex(OSError, "lost response"):
                 controller.command_revise_ready(args)
-        pending = controller.load_state(self.root)
+        pending = controller.load_state(self.root, "sample-feature")
         self.assertEqual("ready_revision_pending", pending["status"])
         runtime.write_text(
             json.dumps(json.loads(runtime.read_text(encoding="utf-8")), indent=2),
             encoding="utf-8",
         )
-        state_before = (self.root / controller.STATE_RELATIVE_PATH).read_bytes()
+        state_before = controller.state_path(self.root, "sample-feature").read_bytes()
         spec_before = self.spec.read_bytes()
         with self.assertRaisesRegex(controller.SpecificationStateError, "authorization changed"):
             controller.command_revise_ready(args)
-        self.assertEqual(state_before, (self.root / controller.STATE_RELATIVE_PATH).read_bytes())
+        self.assertEqual(state_before, controller.state_path(self.root, "sample-feature").read_bytes())
         self.assertEqual(spec_before, self.spec.read_bytes())
 
     def test_pending_v2_reopen_rejects_changed_inputs_then_replays_exactly(self) -> None:
@@ -4033,7 +3812,7 @@ PRD-REQ-001 is covered by the formatter and runner.
         ):
             with self.assertRaisesRegex(OSError, "lost response"):
                 controller.command_revise_ready(args)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         for label, changed in {
             "reason": self.args(
                 reason="different reason",
@@ -4083,9 +3862,9 @@ PRD-REQ-001 is covered by the formatter and runner.
                 controller.command_revise_ready(arguments)
         self.assertIn("status: approved", self.spec.read_text(encoding="utf-8"))
         legacy = self.persist_released_v2_schema1_authorization()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         stored_before_load = state_path.read_bytes()
-        controller.load_state(self.root)
+        controller.load_state(self.root, "sample-feature")
         self.assertEqual(stored_before_load, state_path.read_bytes())
 
         reopened = controller.command_revise_ready(arguments)
@@ -4166,7 +3945,7 @@ PRD-REQ-001 is covered by the formatter and runner.
         )
         controller.command_revise_ready(arguments)
         self.persist_released_v2_schema1_authorization()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         original_state = state_path.read_bytes()
 
         for label in ("extra", "missing", "mixed", "history-mismatch", "archive"):
@@ -4265,8 +4044,8 @@ PRD-REQ-001 is covered by the formatter and runner.
             encoding="utf-8",
         )
         new_spec_sha = controller.sha256(self.spec)
-        state_path = self.root / controller.STATE_RELATIVE_PATH
-        state = controller.load_state(self.root)
+        state_path = controller.state_path(self.root, "sample-feature")
+        state = controller.load_state(self.root, "sample-feature")
         state["prd"]["sha256"] = new_prd_sha
         state["specification"]["sha256"] = new_spec_sha
         state["ready"]["prd_sha256"] = new_prd_sha
@@ -4304,7 +4083,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_schema1_migrates_identity_history_and_preserves_alias_rejection(self) -> None:
         self.initialize()
-        state_path = self.root / controller.STATE_RELATIVE_PATH
+        state_path = controller.state_path(self.root, "sample-feature")
         state = json.loads(state_path.read_text(encoding="utf-8"))
         state["schema_version"] = 1
         state.pop("identity_history", None)
@@ -4313,7 +4092,7 @@ PRD-REQ-001 is covered by the formatter and runner.
         cli = self.cli("status")
         self.assertEqual(0, cli.returncode, cli.stderr)
         self.assertEqual(controller.SCHEMA_VERSION, json.loads(cli.stdout)["schema_version"])
-        migrated = controller.load_state(self.root)
+        migrated = controller.load_state(self.root, "sample-feature")
         self.assertEqual(controller.SCHEMA_VERSION, migrated["schema_version"])
         self.assertIn("architect-1", migrated["identity_history"])
         persisted = json.loads(state_path.read_text(encoding="utf-8"))
@@ -4385,7 +4164,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_start_cycle_rejects_stale_acceptance_receipt(self) -> None:
         self.initialize()
-        state = controller.load_state(self.root)
+        state = controller.load_state(self.root, "sample-feature")
         state["acceptance"]["specification_sha256"] = "0" * 64
         controller.save_state(self.root, state)
         with self.assertRaisesRegex(controller.SpecificationStateError, "fresh accept-spec"):

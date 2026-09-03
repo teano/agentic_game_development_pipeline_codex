@@ -27,7 +27,7 @@ From this skill directory use:
 python scripts/pipeline_state.py --help
 ```
 
-Place the optional global `--state PATH` before the command. The default is `.agentic-pipeline-v2/state.json` under the current directory. A custom state filename is allowed only as a direct `.json` child of the exact project root's `.agentic-pipeline-v2` directory; external, nested, symlinked, or reparse-point state paths fail before mutation. Read the exact syntax for the current operation from `COMMAND --help`.
+Place required global `--root <project-root> --feature <lowercase-slug>` before every command. The controller derives `.agentic-pipeline/Workflows/<feature>/pipeline-state.json`; callers cannot supply another state path. State, lock, and outputs stay inside that workflow, and foreign, escaping, symlinked, or reparse-point bindings fail before mutation. Read exact operation syntax from `COMMAND --help`.
 
 The phases are exactly:
 

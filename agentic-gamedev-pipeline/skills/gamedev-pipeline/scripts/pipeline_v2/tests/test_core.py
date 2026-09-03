@@ -130,7 +130,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             ".agentic-pipeline/history.json",
             ".agentic-pipeline/deleted-history.json",
             ".agentic-pipeline/.gitignore",
-            ".agentic-pipeline-v2/state.json.lock",
+            ".agentic-pipeline/Workflows/test-feature/pipeline-state.json.lock",
         ]
         control_files = [self.root / path for path in control_paths]
         for path in control_files:
@@ -323,7 +323,9 @@ class PipelineV2CoreTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.root), "config", "user.email", "pipeline-tests@example.invalid"], check=True)
         subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
         subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "fixture"], check=True)
-        self.store = StateStore(self.root / ".agentic-pipeline-v2" / "state.json")
+        self.feature = "test-feature"
+        self.workflow_path = ".agentic-pipeline/Workflows/test-feature"
+        self.store = StateStore(self.root / self.workflow_path / "pipeline-state.json")
         self._initialize()
 
     def tearDown(self) -> None:
@@ -333,7 +335,9 @@ class PipelineV2CoreTests(unittest.TestCase):
         paths = {"requirements": "requirements.md", "specification": "specification.md", "plan": "plan.md"}
         controller = _CanonicalTestController(self.store, timeout=10)
         controller.reconfigure({
-            "name": "init", "id": "CMD-INIT", "run_id": "RUN-TEST", "project_root": str(self.root),
+            "name": "init", "id": "CMD-INIT", "run_id": "RUN-TEST",
+            "feature": self.feature, "workflow_path": self.workflow_path,
+            "project_root": str(self.root),
             "authority_paths": paths, "slices": self.slices,
         })
         self.controller = controller
@@ -497,7 +501,9 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.controller.reconfigure({
             "name": "init", "id": action["command_id"],
             "expected_generation": action["expected_generation"],
-            "run_id": action["run_id"], "project_root": action["project_root"],
+            "run_id": action["run_id"], "feature": self.feature,
+            "workflow_path": self.workflow_path,
+            "project_root": action["project_root"],
             "authority_paths": action["authority"], "slices": action["slices"],
         })
 
@@ -509,7 +515,7 @@ class PipelineV2CoreTests(unittest.TestCase):
 
     def _write_artifact(self, artifact: dict) -> Path:
         active = self.store.load()["active_assignment"]
-        path = self.root / assignment_output_path(active)
+        path = self.root / assignment_output_path(active, self.feature)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(artifact), encoding="utf-8")
         return path
@@ -762,11 +768,93 @@ class PipelineV2CoreTests(unittest.TestCase):
     def test_normal_run_reaches_ready_with_git_tree_state_fields(self) -> None:
         self._reach_candidate()
         ready = self._finish_ready("reviewer-1", "qa-1", "docs-1")
-        self.assertEqual(14, len(ready))
+        self.assertEqual(16, len(ready))
+        self.assertEqual("test-feature", ready["feature"])
+        self.assertEqual(self.workflow_path, ready["workflow_path"])
         self.assertNotIn("gates", ready)
         self.assertEqual(7, len(PHASES)); self.assertEqual(8, len(COMMANDS))
 
-    def test_schema3_blocked_is_terminal_replay_safe_and_fresh_init_only(self) -> None:
+    def test_feature_runtime_states_and_repeat_assignment_ids_are_isolated(self) -> None:
+        first_before = self.store.path.read_bytes()
+        other = "other-feature"
+        other_plan = self.root / "other-plan.md"
+        other_plan.write_text(
+            (self.root / "plan.md").read_text(encoding="utf-8").replace(
+                "feature: test-feature", "feature: other-feature", 1
+            ),
+            encoding="utf-8",
+        )
+        self._commit_fixture_and_restart("add other plan")
+        first_before = self.store.path.read_bytes()
+        other_store = StateStore(
+            self.root / ".agentic-pipeline" / "Workflows" / other
+            / "pipeline-state.json"
+        )
+        other_controller = _CanonicalTestController(other_store, timeout=10)
+        other_controller.reconfigure({
+            "name": "init", "id": "CMD-INIT", "run_id": "RUN-TEST",
+            "feature": other,
+            "workflow_path": ".agentic-pipeline/Workflows/other-feature",
+            "project_root": str(self.root),
+            "authority_paths": {
+                "requirements": "requirements.md",
+                "specification": "specification.md",
+                "plan": "other-plan.md",
+            },
+            "slices": self.slices,
+        })
+
+        first_action = self.controller.status()["next_action"]
+        other_action = other_controller.status()["next_action"]
+        self.assertEqual(first_action["assignment"]["id"], other_action["assignment"]["id"])
+        self.assertNotEqual(
+            first_action["assignment"]["output_path"],
+            other_action["assignment"]["output_path"],
+        )
+        self.assertEqual(first_before, self.store.path.read_bytes())
+
+    def test_copied_foreign_runtime_state_is_rejected_without_mutation(self) -> None:
+        foreign_path = (
+            self.root / ".agentic-pipeline" / "Workflows" / "other-feature"
+            / "pipeline-state.json"
+        )
+        foreign_path.parent.mkdir(parents=True)
+        foreign_path.write_bytes(self.store.path.read_bytes())
+        before = foreign_path.read_bytes()
+        with self.assertRaisesRegex(PipelineError, "pipeline state path must equal"):
+            _CanonicalTestController(StateStore(foreign_path), timeout=10).status()
+        self.assertEqual(before, foreign_path.read_bytes())
+        self.assertFalse(foreign_path.with_suffix(".json.lock").exists())
+
+    def test_runtime_rejects_plan_from_another_feature_before_state_write(self) -> None:
+        foreign_plan = self.root / "foreign-plan.md"
+        foreign_plan.write_text(
+            (self.root / "plan.md").read_text(encoding="utf-8").replace(
+                "feature: test-feature", "feature: foreign-feature", 1
+            ),
+            encoding="utf-8",
+        )
+        self._commit_fixture_and_restart("add foreign plan")
+        target = (
+            self.root / ".agentic-pipeline" / "Workflows" / "selected-feature"
+            / "pipeline-state.json"
+        )
+        with self.assertRaisesRegex(PipelineError, "plan feature"):
+            _CanonicalTestController(StateStore(target), timeout=10).reconfigure({
+                "name": "init", "id": "INIT-FOREIGN-PLAN", "run_id": "RUN-FOREIGN",
+                "feature": "selected-feature",
+                "workflow_path": ".agentic-pipeline/Workflows/selected-feature",
+                "project_root": str(self.root),
+                "authority_paths": {
+                    "requirements": "requirements.md",
+                    "specification": "specification.md",
+                    "plan": "foreign-plan.md",
+                },
+                "slices": self.slices,
+            })
+        self.assertFalse(target.exists())
+
+    def test_schema4_blocked_is_terminal_replay_safe_and_fresh_init_only(self) -> None:
         self._reach_engineering("-terminal-block")
         self.controller.next(command_id="NEXT-terminal-block")
         (self.root / "game.txt").write_text("partial blocked change\n", encoding="utf-8")
@@ -3148,7 +3236,7 @@ class PipelineV2CoreTests(unittest.TestCase):
     def test_complete_reduces_checked_snapshot_when_command_replaces_controller_state(self) -> None:
         replace_state = [
             sys.executable, "-c",
-            "import json; from pathlib import Path; p=Path('.agentic-pipeline-v2/state.json'); "
+            "import json; from pathlib import Path; p=Path('.agentic-pipeline/Workflows/test-feature/pipeline-state.json'); "
             "state=json.loads(p.read_text(encoding='utf-8')); state['run_id']='RUN-TAMPERED'; "
             "p.write_text(json.dumps(state), encoding='utf-8')",
         ]
@@ -3261,11 +3349,11 @@ class PipelineV2CoreTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            assignment_output_path(issued["active_assignment"]),
+            assignment_output_path(issued["active_assignment"], self.feature),
             issued["active_assignment"]["output_path"],
         )
         assigned = self._write_artifact({"outcome": "pass", "summary": "planned"})
-        wrong = self.root / ".agentic-pipeline" / "outputs" / "substitute.json"
+        wrong = assigned.parent / "substitute.json"
         wrong.write_text('{"outcome":"pass","summary":"wrong"}', encoding="utf-8")
         with self.assertRaisesRegex(PipelineError, "only the assigned artifact path"):
             self.controller.complete(command_id="OUTPUT-COMPLETE", artifact_path=wrong)
@@ -3284,10 +3372,12 @@ class PipelineV2CoreTests(unittest.TestCase):
         validate_state(legacy)
         self.store._write(legacy)
         self.assertEqual(
-            assignment_output_path(legacy["active_assignment"]),
+            assignment_output_path(legacy["active_assignment"], self.feature),
             status_view(legacy)["active_assignment"]["output_path"],
         )
-        assigned = self.root / assignment_output_path(legacy["active_assignment"])
+        assigned = self.root / assignment_output_path(
+            legacy["active_assignment"], self.feature
+        )
         assigned.parent.mkdir(parents=True, exist_ok=True)
         alternate = assigned.with_name("alternate.json")
         alternate.write_text('{"outcome":"pass","summary":"planned"}', encoding="utf-8")
@@ -3326,7 +3416,10 @@ class PipelineV2CoreTests(unittest.TestCase):
         before = self.store.path.read_bytes()
         view = self.controller.status()["active_assignment"]
         self.assertEqual(artifact_schema("review", "reviewer"), view["artifact_schema"])
-        self.assertEqual(assignment_output_path(legacy["active_assignment"]), view["output_path"])
+        self.assertEqual(
+            assignment_output_path(legacy["active_assignment"], self.feature),
+            view["output_path"],
+        )
         self.assertEqual(
             {
                 "kind": "current_slice_implementation",
@@ -3967,7 +4060,9 @@ class PipelineV2CoreTests(unittest.TestCase):
             action["assignment"]["access"]["read"],
         )
         self.assertEqual(
-            ".agentic-pipeline/outputs/" + action["assignment"]["id"] + ".json",
+            ".agentic-pipeline/Workflows/test-feature/outputs/"
+            + action["assignment"]["id"]
+            + ".json",
             action["assignment"]["output_path"],
         )
         issued = self.controller.next(
@@ -4547,7 +4642,9 @@ class PipelineV2CoreTests(unittest.TestCase):
 
     def test_public_status_derives_one_machine_action_for_every_route(self) -> None:
         def public_status() -> dict:
-            args = cli_parser().parse_args(["--state", str(self.store.path), "status"])
+            args = cli_parser().parse_args([
+                "--root", str(self.root), "--feature", self.feature, "status",
+            ])
             first = cli_run(args)
             self.assertEqual(first, cli_run(args))
             return first
@@ -4591,7 +4688,10 @@ class PipelineV2CoreTests(unittest.TestCase):
             return
         self.assertEqual("next", views["next"]["next_action"]["command"])
         next_assignment = views["next"]["next_action"]["assignment"]
-        self.assertEqual(assignment_output_path(next_assignment["id"]), next_assignment["output_path"])
+        self.assertEqual(
+            assignment_output_path(next_assignment["id"], self.feature),
+            next_assignment["output_path"],
+        )
         self.assertTrue(next_assignment["worker_id"] and next_assignment["task"])
         self.assertEqual({"read", "write"}, set(next_assignment["access"]))
         self.assertIn("checks", next_assignment)

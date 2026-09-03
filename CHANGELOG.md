@@ -7,6 +7,28 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-03
+
+### Изменено
+
+- Requirements передаёт точные `FEATURE` и `WORKFLOW_PATH`, а контроллеры Specification, Development Plan и Pipeline требуют явный `--feature` и работают только с выбранным workflow.
+- Все служебные состояния и evidence одного процесса размещаются в `.agentic-pipeline/Workflows/<feature>/`: `specification-state.json`, `development-plan-state.json`, `pipeline-state.json`, lock, helper requests/results, review receipts и assignment outputs.
+- Схемы Specification, Development Plan и Pipeline повышены до 3, 2 и 4 соответственно; прежние состояния без feature/workflow binding несовместимы и требуют свежей инициализации в новом каталоге.
+
+### Исправлено
+
+- Параллельные процессы разных features больше не блокируют друг друга общими state-файлами, одинаковыми helper/assignment ID или активными стадиями соседнего workflow.
+- Контроллеры не сканируют, не архивируют, не перемещают и не удаляют соседние workflow; скопированное чужое состояние, несовпадающая authority и небезопасный путь отклоняются до записи.
+
+### Удалено
+
+- Удалено переключение Specification через архивирование завершённой другой feature и частный recovery `supersede-helper-request`; изоляция обеспечивается непосредственно namespace выбранного workflow.
+
+### Проверено
+
+- Feature-isolation regressions: 7/7 PASS; сквозной A/B сценарий с проверкой побайтовой неизменности соседнего workflow: 1/1 PASS; затронутые Runtime regressions: 4/4 PASS.
+- Все изменённые Python-модули проходят `py_compile`, а `git diff --check` не находит ошибок. Полный regression suite не запускался.
+
 ## [0.12.0] - 2026-09-03
 
 ### Изменено
@@ -305,7 +327,8 @@
 - Полный набор из 97 тестов контроллеров, активации и межрежимных контрактов.
 - Валидация manifest плагина и всех восьми skill-пакетов.
 
-[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.9.1...v0.10.0

@@ -4,7 +4,7 @@
 
 Use the one repository-owned PRD and specification resolved from current user context, repository instructions, feature manifests/indexes, and existing artifacts. Both paths must remain inside the project root. Do not create a duplicate, symlink, move, or alternate namespace to accommodate the controller. If the repository provides more than one plausible pair, ask the user. For an empty repository with no convention, recommend `docs/features/<feature>/product-requirements.md` and its sibling `technical-specification.md` as a proposal and wait for confirmation.
 
-Keep controller state at `.agentic-pipeline/specification-state.json`. State is operational evidence, not part of the specification hash.
+Keep controller state and all helper/receipt/report artifacts under `.agentic-pipeline/Workflows/<feature>/`: `specification-state.json`, `helper-requests/`, `helper-results/`, `architect-receipts/`, and `proofreader-reports/`. Every controller invocation requires the same lowercase `--feature`; state binds both `feature` and `workflow_path`. A different, escaping, linked, or copied foreign workflow fails closed. State is operational evidence, not part of the specification hash. Never scan, archive, move, or delete a sibling workflow.
 
 Preserve the repository's established trace convention. The controller accepts either flat fields:
 
@@ -132,7 +132,7 @@ Only after the Architect accepts the semantic draft, the exact helper result cha
 
 ### Controller helper challenge/result gate
 
-`prepare-helper` is the sole request authority. It writes a canonical immutable one-use `schema: 1` request at `.agentic-pipeline/helper-requests/HREQ-xxxxxx.json`, records its path/SHA/ID in state, and rejects a second active request. The request binds `generation|correction`, the exact PRD path/revision/SHA, canonical specification path, exact input SHA or absent marker, expected language, exact external skill entrypoint/emitter paths and fingerprints, the exact resolved absolute current GameDev controller path and SHA-256, correction IDs when applicable, and the only allowed write paths: specification plus request-named report, coverage, and result artifacts.
+`prepare-helper` is the sole request authority. It writes a canonical immutable one-use `schema: 1` request at `.agentic-pipeline/Workflows/<feature>/helper-requests/HREQ-xxxxxx.json`, records its path/SHA/ID in state, and rejects a second active request. The request binds `generation|correction`, the exact PRD path/revision/SHA, canonical specification path, exact input SHA or absent marker, expected language, exact external skill entrypoint/emitter paths and fingerprints, the exact resolved absolute current GameDev controller path and SHA-256, correction IDs when applicable, and the only allowed write paths: specification plus request-named report, coverage, and result artifacts in the same selected workflow.
 
 Generation requests route the external helper to `spec-generator` with raw target `new` for an absent input or `continue` for an exact stale draft. Correction requests route `spec-assistant -> fragment-capture`, require one or more distinct correction IDs, and bind the exact current/prewrite SHA. For an active wave they are allowed only after a recorded Proofreader result and bind the wave input plus its still-valid acceptance.
 

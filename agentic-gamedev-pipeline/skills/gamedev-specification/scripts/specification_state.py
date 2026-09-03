@@ -18,24 +18,11 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 V2_RECOVERY_AUTHORIZATION_SCHEMA = 2
-STATE_RELATIVE_PATH = Path(".agentic-pipeline/specification-state.json")
-SPECIFICATION_ARCHIVE_ROOT_RELATIVE_PATH = Path(".agentic-pipeline/Workflows")
-SPECIFICATION_ARTIFACT_DIRECTORIES = (
-    "architect-receipts",
-    "helper-requests",
-    "helper-results",
-)
-NON_SPECIFICATION_PIPELINE_ARTIFACTS = {
-    "development-plan-state.json",
-    "findings.json",
-    "state.json",
-}
-NON_SPECIFICATION_PIPELINE_DIRECTORIES = {"outputs"}
-RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline/state.json")
-RUNTIME_FINDINGS_RELATIVE_PATH = Path(".agentic-pipeline/findings.json")
-V2_RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline-v2/state.json")
+WORKFLOWS_RELATIVE_PATH = Path(".agentic-pipeline/Workflows")
+STATE_FILENAME = "specification-state.json"
+RUNTIME_STATE_FILENAME = "pipeline-state.json"
 MAX_CYCLES_PER_ARCHITECT = 5
 PREACCEPT_RECEIPT_SCHEMA = 1
 PREACCEPT_RECEIPT_KEYS = {
@@ -552,7 +539,7 @@ def validate_helper_request(
     if not isinstance(request_id, str) or re.fullmatch(r"HREQ-[0-9]{6}", request_id) is None:
         raise SpecificationStateError("controller-issued helper request id is invalid")
     if path.relative_to(root).as_posix() != (
-        f".agentic-pipeline/helper-requests/{request_id}.json"
+        f"{state['workflow_path']}/helper-requests/{request_id}.json"
     ):
         raise SpecificationStateError(
             "controller-issued helper request path is non-canonical"
@@ -669,7 +656,7 @@ def validate_helper_request(
         raise SpecificationStateError(
             "controller-issued helper request artifact paths are invalid"
         )
-    base = f".agentic-pipeline/helper-results/{request_id}"
+    base = f"{state['workflow_path']}/helper-results/{request_id}"
     expected_artifacts = {
         "helper_report_path": f"{base}.report.md",
         "coverage_path": f"{base}.coverage.json",
@@ -980,6 +967,14 @@ def validate_preaccept_receipt(
     receipt_path = resolve_project_path(
         root, supplied_path.strip(), "Architect pre-accept receipt"
     )
+    expected_receipt_root = workflow_path(root, state["feature"]) / "architect-receipts"
+    try:
+        receipt_path.relative_to(expected_receipt_root)
+    except ValueError as error:
+        raise SpecificationStateError(
+            "Architect pre-accept receipt must stay inside the selected workflow's "
+            "architect-receipts directory"
+        ) from error
     if receipt_path.suffix.casefold() != ".json" or not receipt_path.is_file():
         raise SpecificationStateError(
             "Architect pre-accept receipt must be one readable in-project JSON file"
@@ -1173,6 +1168,37 @@ def require_slug(feature: str) -> str:
     return feature
 
 
+def workflow_relative_path(feature: str) -> Path:
+    return WORKFLOWS_RELATIVE_PATH / require_slug(feature)
+
+
+def workflow_path(root: Path, feature: str) -> Path:
+    """Return the one controller-artifact root owned by ``feature``."""
+    root = root.resolve()
+    candidate = root / workflow_relative_path(feature)
+    workflows = root / WORKFLOWS_RELATIVE_PATH
+    for existing in (root / ".agentic-pipeline", workflows, candidate):
+        if existing.exists() and _is_link_or_junction(existing):
+            raise SpecificationStateError(
+                f"workflow path must not be a link or junction: {existing}"
+            )
+    return candidate
+
+
+def workflow_artifact_path(
+    root: Path, state: dict[str, Any], relative: str, label: str
+) -> Path:
+    candidate = resolve_project_path(root, relative, label)
+    expected_root = workflow_path(root, state["feature"])
+    try:
+        candidate.relative_to(expected_root)
+    except ValueError as error:
+        raise SpecificationStateError(
+            f"{label} must stay inside {state['workflow_path']}: {candidate}"
+        ) from error
+    return candidate
+
+
 def resolve_project_path(root: Path, supplied: str, label: str) -> Path:
     path = Path(supplied)
     if not path.is_absolute():
@@ -1356,44 +1382,28 @@ def specification_trace(root: Path, prd: Path, spec: Path) -> tuple[dict[str, st
     return meta, drift
 
 
-def state_path(root: Path) -> Path:
-    return root / STATE_RELATIVE_PATH
+def state_path(root: Path, feature: str) -> Path:
+    return workflow_path(root, feature) / STATE_FILENAME
 
 
-def load_state(root: Path, *, persist_migration: bool = True) -> dict[str, Any]:
-    path = state_path(root)
+def load_state(root: Path, feature: str) -> dict[str, Any]:
+    feature = require_slug(feature)
+    path = state_path(root, feature)
     if not path.is_file():
         raise SpecificationStateError(f"state does not exist; run init first: {path}")
     data = json.loads(path.read_text(encoding="utf-8"))
-    migrated = False
-    if data.get("schema_version") == 1:
-        data["schema_version"] = SCHEMA_VERSION
-        data.setdefault("identity_history", [])
-        transition = data.get("ready_revision")
-        if isinstance(transition, dict):
-            transition.setdefault("specification_only", False)
-            transition.setdefault("revision_kind", "prd_revision")
-        migrated = True
     if data.get("schema_version") != SCHEMA_VERSION:
-        raise SpecificationStateError("unsupported specification state schema")
+        raise SpecificationStateError(
+            "unsupported specification state schema; initialize this feature "
+            "under its exact workflow root"
+        )
+    expected_workflow = workflow_relative_path(feature).as_posix()
+    if data.get("feature") != feature or data.get("workflow_path") != expected_workflow:
+        raise SpecificationStateError(
+            "specification state feature/workflow binding does not match --feature"
+        )
     refresh_identity_history(data)
-    if migrated:
-        prd_entry = data.get("prd") or {}
-        prd_relative = prd_entry.get("path")
-        if not isinstance(prd_relative, str) or not prd_relative:
-            raise SpecificationStateError(
-                "legacy specification state lacks canonical PRD authority"
-            )
-        migrated_prd = resolve_project_path(
-            root, prd_relative, "legacy state canonical PRD"
-        )
-        validate_approved_prd_contract(
-            migrated_prd, label="legacy state approved PRD"
-        )
-        if persist_migration:
-            write_state_file(path, data)
     return data
-
 
 def write_state_file(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1405,319 +1415,21 @@ def write_state_file(path: Path, state: dict[str, Any]) -> None:
 
 
 def save_state(root: Path, state: dict[str, Any]) -> None:
+    feature = require_slug(state.get("feature", ""))
+    expected_workflow = workflow_relative_path(feature).as_posix()
+    if state.get("workflow_path") != expected_workflow:
+        raise SpecificationStateError(
+            "specification state workflow_path does not match its feature"
+        )
     state["schema_version"] = SCHEMA_VERSION
     refresh_identity_history(state)
-    write_state_file(state_path(root), state)
+    write_state_file(state_path(root, feature), state)
 
 
 def _is_link_or_junction(path: Path) -> bool:
     return path.is_symlink() or (
         hasattr(path, "is_junction") and path.is_junction()
     )
-
-
-def _require_archivable_completed_state(root: Path, state: dict[str, Any]) -> str:
-    feature_value = state.get("feature")
-    if not isinstance(feature_value, str):
-        raise SpecificationStateError("existing specification feature is invalid")
-    feature = require_slug(feature_value)
-    if state.get("status") != "spec_ready":
-        raise SpecificationStateError(
-            "another feature may be archived only from exact terminal SPEC_READY state"
-        )
-    for key, label in (
-        ("active_helper_request", "active helper request"),
-        ("active_wave", "active wave"),
-        ("hold", "active hold"),
-    ):
-        if state.get(key) is not None:
-            raise SpecificationStateError(
-                f"terminal SPEC_READY archive is blocked by an {label}"
-            )
-    if any(
-        state.get(key) is not None
-        for key in ("in_progress_revision", "ready_revision")
-    ):
-        raise SpecificationStateError(
-            "terminal SPEC_READY archive is blocked by a pending revision"
-        )
-
-    prd, spec = require_source_unchanged(root, state)
-    current_prd_sha = sha256(prd)
-    current_spec_sha = sha256(spec)
-    current_specification_meta = parse_frontmatter(spec, "Specification")
-    specification = state.get("specification")
-    ready = state.get("ready")
-    acceptance = state.get("acceptance")
-    waves = state.get("waves")
-    if (
-        not isinstance(specification, dict)
-        or specification.get("sha256") != current_spec_sha
-        or specification.get("status") != "approved"
-        or current_specification_meta.get("status") != "approved"
-        or not isinstance(ready, dict)
-        or ready.get("prd_sha256") != current_prd_sha
-        or ready.get("spec_sha256") != current_spec_sha
-        or not isinstance(ready.get("architect_id"), str)
-        or not ready["architect_id"].strip()
-        or not isinstance(ready.get("proofreader_id"), str)
-        or not ready["proofreader_id"].strip()
-        or not isinstance(acceptance, dict)
-        or acceptance.get("prd_sha256") != current_prd_sha
-        or acceptance.get("specification_sha256") != current_spec_sha
-        or not isinstance(waves, list)
-        or not waves
-        or not isinstance(waves[-1], dict)
-        or waves[-1].get("outcome") != "spec_ready"
-        or waves[-1].get("result_spec_sha256") != current_spec_sha
-        or not same_actor(waves[-1].get("architect_id", ""), ready["architect_id"])
-        or not same_actor(waves[-1].get("proofreader_id", ""), ready["proofreader_id"])
-    ):
-        raise SpecificationStateError(
-            "another feature has incomplete or inconsistent terminal SPEC_READY evidence"
-        )
-    require_current_preaccept_acceptance(root, state, prd, spec)
-    proofread = waves[-1].get("proofread")
-    questions = proofread.get("questions") if isinstance(proofread, dict) else None
-    if (
-        not isinstance(proofread, dict)
-        or not isinstance(questions, dict)
-        or proofread.get("critical") != 0
-        or proofread.get("major") != 0
-        or not proofread.get("coverage_complete")
-        or any(questions.values())
-        or (
-            proofread.get("minor", 0) != 0
-            and proofread.get("minors_engineer_resolvable") is not True
-        )
-    ):
-        raise SpecificationStateError(
-            "another feature lacks a clean terminal SPEC_READY proofreader result"
-        )
-    return feature
-
-
-def _specification_archive_file(
-    root: Path, candidate: Path, *, required: bool = False
-) -> tuple[str, bytes] | None:
-    pipeline_root = root / ".agentic-pipeline"
-    if not candidate.is_absolute():
-        candidate = root / candidate
-    resolved = candidate.resolve()
-    try:
-        relative = resolved.relative_to(pipeline_root.resolve())
-    except ValueError:
-        if required:
-            raise SpecificationStateError(
-                f"specification archive source is outside .agentic-pipeline: {candidate}"
-            )
-        return None
-    if not relative.parts or relative.parts[0].casefold() == "workflows":
-        raise SpecificationStateError(
-            "specification archive source overlaps the workflow archive namespace"
-        )
-    relative_text = relative.as_posix()
-    if (
-        relative_text.casefold() in NON_SPECIFICATION_PIPELINE_ARTIFACTS
-        or relative.parts[0].casefold() in NON_SPECIFICATION_PIPELINE_DIRECTORIES
-    ):
-        raise SpecificationStateError(
-            f"specification archive cannot claim another controller artifact: {relative_text}"
-        )
-    if not candidate.exists():
-        if required:
-            raise SpecificationStateError(
-                f"required specification archive source does not exist: {candidate}"
-            )
-        return None
-    if _is_link_or_junction(candidate) or not candidate.is_file():
-        raise SpecificationStateError(
-            f"specification archive source must be a regular file: {candidate}"
-        )
-    return relative_text, candidate.read_bytes()
-
-
-def _referenced_specification_artifact_paths(state: dict[str, Any]) -> list[str]:
-    paths: list[str] = []
-
-    def visit(value: Any) -> None:
-        if isinstance(value, dict):
-            report_path = value.get("report_path")
-            if isinstance(report_path, str) and report_path.strip():
-                paths.append(report_path.strip())
-            preaccept = value.get("preaccept_receipt")
-            if isinstance(preaccept, dict):
-                preaccept_path = preaccept.get("path")
-                if isinstance(preaccept_path, str) and preaccept_path.strip():
-                    paths.append(preaccept_path.strip())
-            for nested in value.values():
-                visit(nested)
-        elif isinstance(value, list):
-            for nested in value:
-                visit(nested)
-
-    visit(state)
-    return paths
-
-
-def _specification_archive_files(
-    root: Path, state: dict[str, Any]
-) -> dict[str, bytes]:
-    pipeline_root = root / ".agentic-pipeline"
-    if _is_link_or_junction(pipeline_root) or not pipeline_root.is_dir():
-        raise SpecificationStateError(
-            ".agentic-pipeline must be a regular project-owned directory"
-        )
-    state_file = _specification_archive_file(root, state_path(root), required=True)
-    if state_file is None:
-        raise SpecificationStateError("specification archive lacks its source state")
-    files = {state_file[0]: state_file[1]}
-
-    def add(candidate: Path, *, required: bool = False) -> None:
-        artifact = _specification_archive_file(root, candidate, required=required)
-        if artifact is None:
-            return
-        relative, value = artifact
-        if relative in files and files[relative] != value:
-            raise SpecificationStateError(
-                f"specification archive source is ambiguous: {relative}"
-            )
-        files[relative] = value
-
-    for directory_name in SPECIFICATION_ARTIFACT_DIRECTORIES:
-        directory = pipeline_root / directory_name
-        if not directory.exists():
-            continue
-        if _is_link_or_junction(directory) or not directory.is_dir():
-            raise SpecificationStateError(
-                f"specification artifact namespace must be a regular directory: {directory}"
-            )
-        for candidate in directory.rglob("*"):
-            if candidate.is_dir():
-                if _is_link_or_junction(candidate):
-                    raise SpecificationStateError(
-                        f"specification artifact namespace contains a link: {candidate}"
-                    )
-                continue
-            add(candidate, required=True)
-    for supplied in _referenced_specification_artifact_paths(state):
-        candidate = Path(supplied)
-        if not candidate.is_absolute():
-            candidate = root / candidate
-        try:
-            candidate.resolve().relative_to(pipeline_root.resolve())
-        except ValueError:
-            continue
-        add(candidate, required=True)
-    return files
-
-
-def _remove_archived_specification_sources(
-    root: Path, archive_root: Path, files: dict[str, bytes]
-) -> None:
-    pipeline_root = root / ".agentic-pipeline"
-    state_relative = STATE_RELATIVE_PATH.name
-    parents: set[Path] = set()
-    for relative, expected_bytes in files.items():
-        if relative == state_relative:
-            continue
-        source = pipeline_root / relative
-        archived = archive_root / relative
-        if not archived.is_file() or archived.read_bytes() != expected_bytes:
-            raise SpecificationStateError(
-                f"published specification archive cannot verify cleanup source: {relative}"
-            )
-        if _is_link_or_junction(source) or not source.is_file():
-            raise SpecificationStateError(
-                f"specification archive cleanup source is not a regular file: {source}"
-            )
-        if source.read_bytes() != expected_bytes:
-            raise SpecificationStateError(
-                f"specification artifact changed after archive publication: {relative}"
-            )
-        source.unlink()
-        parents.add(source.parent)
-    for parent in sorted(parents, key=lambda item: len(item.parts), reverse=True):
-        current = parent
-        while current != pipeline_root:
-            if current == archive_root or current.parent == archive_root:
-                break
-            try:
-                current.rmdir()
-            except OSError:
-                break
-            current = current.parent
-
-    source_state = state_path(root)
-    expected_state = files[state_relative]
-    if not source_state.is_file() or source_state.read_bytes() != expected_state:
-        raise SpecificationStateError(
-            "specification state changed after archive publication"
-        )
-    source_state.unlink()
-
-
-def archive_completed_specification_state(
-    root: Path, state: dict[str, Any]
-) -> Path:
-    feature = _require_archivable_completed_state(root, state)
-    files = _specification_archive_files(root, state)
-    workflows_root = root / SPECIFICATION_ARCHIVE_ROOT_RELATIVE_PATH
-    if workflows_root.exists() and (
-        _is_link_or_junction(workflows_root) or not workflows_root.is_dir()
-    ):
-        raise SpecificationStateError(
-            "specification workflow archive root must be a regular directory"
-        )
-    workflows_root.mkdir(parents=True, exist_ok=True)
-    archive_root = workflows_root / feature
-    if archive_root.exists() and (
-        _is_link_or_junction(archive_root) or not archive_root.is_dir()
-    ):
-        raise SpecificationStateError(
-            "specification archive destination must be a regular directory"
-        )
-
-    if archive_root.exists() and any(archive_root.iterdir()):
-        raise SpecificationStateError(
-            "specification archive destination is non-empty and ambiguous"
-        )
-
-    staging_root = workflows_root / f".{feature}.specification-archive.tmp"
-    if staging_root.exists():
-        raise SpecificationStateError(
-            f"incomplete specification archive staging directory requires inspection: {staging_root}"
-        )
-    staging_root.mkdir()
-    for relative, value in sorted(files.items()):
-        write_new_bytes_atomically(
-            staging_root / relative,
-            value,
-            f"staged specification archive file {relative}",
-        )
-    for relative, value in files.items():
-        if (staging_root / relative).read_bytes() != value:
-            raise SpecificationStateError(
-                f"staged specification archive bytes changed: {relative}"
-            )
-    if archive_root.exists():
-        archive_root.rmdir()
-    os.replace(staging_root, archive_root)
-    for relative, value in files.items():
-        if (archive_root / relative).read_bytes() != value:
-            raise SpecificationStateError(
-                f"published specification archive bytes changed: {relative}"
-            )
-    _remove_archived_specification_sources(root, archive_root, files)
-    return archive_root
-
-
-def canonical_json_sha256(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-    ).hexdigest()
 
 
 def normalized_actor_id(value: str) -> str:
@@ -1808,6 +1520,7 @@ def require_runtime_preengineering_gate(runtime: dict[str, Any]) -> None:
 def runtime_recovery_authorization(
     root: Path,
     *,
+    feature: str,
     recovery_token: str | None,
     reason: str | None,
     prior_spec_sha256: str | None,
@@ -1817,26 +1530,14 @@ def runtime_recovery_authorization(
     revision_kind: str = "prd_revision",
     expected_authorization: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    v2_path = workflow_path(root, feature) / RUNTIME_STATE_FILENAME
     try:
-        v2_paths = _development_plan_controller.discover_v2_runtime_states(root)
-        legacy_presence = [
-            _development_plan_controller.runtime_path_exists(root / path)
-            for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
-        ]
+        runtime_present = _development_plan_controller.runtime_path_exists(v2_path)
     except _development_plan_controller.DevelopmentPlanError as error:
         raise SpecificationStateError(
             f"cannot classify the bound runtime safely: {error}"
         ) from error
-    if any(legacy_presence):
-        raise SpecificationStateError(
-            _development_plan_controller.SCHEMA10_UNSUPPORTED_MESSAGE
-        )
-    if v2_paths:
-        if len(v2_paths) != 1:
-            raise SpecificationStateError(
-                "multiple v2 runtime state candidates exist; specification authority "
-                "binding is ambiguous and fails closed"
-            )
+    if runtime_present:
         if recovery_token:
             raise SpecificationStateError(
                 "v2 specification revision uses the public tokenless reopen route"
@@ -1845,7 +1546,6 @@ def runtime_recovery_authorization(
             raise SpecificationStateError(
                 "bound v2 runtime revision kind is invalid"
             )
-        v2_path = v2_paths[0]
         try:
             before = v2_path.read_bytes()
             runtime = _development_plan_controller.load_valid_v2_runtime(v2_path)
@@ -1864,6 +1564,9 @@ def runtime_recovery_authorization(
             runtime.get("schema")
             != _development_plan_controller._pipeline_v2_model.SCHEMA
             or Path(str(runtime.get("project_root", ""))).resolve() != root
+            or runtime.get("feature") != feature
+            or runtime.get("workflow_path")
+            != workflow_relative_path(feature).as_posix()
             or not isinstance(authority, dict)
             or set(authority) != {"items", "digest"}
             or set(items or {}) != {"requirements", "specification", "plan"}
@@ -1959,27 +1662,20 @@ def require_bound_recovery_continuation(root: Path, state: dict[str, Any]) -> No
         else raw_authorization
     )
     if not authorization:
+        v2_path = workflow_path(root, state["feature"]) / RUNTIME_STATE_FILENAME
         try:
-            v2_paths = _development_plan_controller.discover_v2_runtime_states(root)
-            legacy_presence = [
-                _development_plan_controller.runtime_path_exists(root / path)
-                for path in (
-                    RUNTIME_STATE_RELATIVE_PATH,
-                    RUNTIME_FINDINGS_RELATIVE_PATH,
-                )
-            ]
+            runtime_present = _development_plan_controller.runtime_path_exists(v2_path)
         except _development_plan_controller.DevelopmentPlanError as error:
             raise SpecificationStateError(
                 f"cannot classify the bound runtime safely: {error}"
             ) from error
-        if not v2_paths and not any(legacy_presence):
+        if not runtime_present:
             return
     runtime_state_path = authorization.get("runtime_state_path")
     authorized_v2_path = (
         isinstance(runtime_state_path, str)
-        and Path(runtime_state_path).parent
-        == V2_RUNTIME_STATE_RELATIVE_PATH.parent
-        and Path(runtime_state_path).suffix == ".json"
+        and Path(runtime_state_path)
+        == workflow_relative_path(state["feature"]) / RUNTIME_STATE_FILENAME
     )
     revision_kind = authorization.get("revision_kind")
     prior_requirements = authorization.get("prior_requirements")
@@ -1996,6 +1692,7 @@ def require_bound_recovery_continuation(root: Path, state: dict[str, Any]) -> No
         )
     runtime_recovery_authorization(
         root,
+        feature=state["feature"],
         recovery_token=authorization.get("token"),
         reason=authorization.get("reason"),
         prior_spec_sha256=(
@@ -2031,11 +1728,8 @@ def active_architect(state: dict[str, Any]) -> dict[str, Any]:
     raise SpecificationStateError("active Architect is missing from history")
 
 
-def require_no_runtime_binding(root: Path) -> None:
-    if any(
-        (root / path).exists()
-        for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
-    ):
+def require_no_runtime_binding(root: Path, feature: str) -> None:
+    if (workflow_path(root, feature) / RUNTIME_STATE_FILENAME).exists():
         raise SpecificationStateError(
             "revise-in-progress is allowed only before runtime pipeline binding"
         )
@@ -2067,7 +1761,7 @@ def finalize_in_progress_revision(
         raise SpecificationStateError(
             "pending in-progress revision must resume with exact original inputs"
         )
-    require_no_runtime_binding(root)
+    require_no_runtime_binding(root, state["feature"])
     prd = root / transition["new_prd"]["path"]
     if sha256(prd) != transition["new_prd"]["sha256"]:
         raise SpecificationStateError("pending in-progress revision found changed PRD bytes")
@@ -2132,7 +1826,7 @@ def finalize_in_progress_revision(
 
 def command_revise_in_progress(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     require_no_active_helper_request(state)
     if state.get("status") == "in_progress_revision_pending":
         return finalize_in_progress_revision(root, state, args)
@@ -2150,7 +1844,7 @@ def command_revise_in_progress(args: argparse.Namespace) -> dict[str, Any]:
         raise SpecificationStateError(
             "revise-in-progress requires an Architect identity fresh across specification history"
         )
-    require_no_runtime_binding(root)
+    require_no_runtime_binding(root, state["feature"])
     prd = resolve_project_path(root, state["prd"]["path"], "canonical PRD")
     spec = resolve_project_path(
         root, state["specification"]["path"], "canonical technical specification"
@@ -2300,6 +1994,7 @@ def finalize_ready_revision(
     )
     runtime_recovery_authorization(
         root,
+        feature=state["feature"],
         recovery_token=getattr(args, "recovery_token", None),
         reason=args.reason,
         prior_spec_sha256=transition["prior_ready_sha256"],
@@ -2995,6 +2690,7 @@ def replay_committed_ready_revision(
     )
     runtime_recovery_authorization(
         root,
+        feature=state["feature"],
         recovery_token=getattr(args, "recovery_token", None),
         reason=args.reason,
         prior_spec_sha256=event["prior_ready_sha256"],
@@ -3066,7 +2762,7 @@ def replay_committed_ready_revision(
 
 def command_revise_ready(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     require_no_active_helper_request(state)
     if state.get("status") == "ready_revision_pending":
         return finalize_ready_revision(root, state, args)
@@ -3156,6 +2852,7 @@ def command_revise_ready(args: argparse.Namespace) -> dict[str, Any]:
             )
     authorization = runtime_recovery_authorization(
         root,
+        feature=state["feature"],
         recovery_token=getattr(args, "recovery_token", None),
         reason=args.reason,
         prior_spec_sha256=state["ready"]["spec_sha256"],
@@ -3237,32 +2934,28 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
     prd = resolve_project_path(root, args.prd, "approved PRD")
     spec = resolve_project_path(root, args.spec, "technical specification")
     validate_approved_prd_contract(prd)
-    existing_to_archive: dict[str, Any] | None = None
-    if state_path(root).is_file():
-        existing = load_state(root, persist_migration=False)
-        if existing["feature"] != feature:
-            existing_to_archive = existing
-        else:
-            existing = load_state(root)
-            requested_paths = (
-                prd.relative_to(root).as_posix(),
-                spec.relative_to(root).as_posix(),
+    if state_path(root, feature).is_file():
+        existing = load_state(root, feature)
+        requested_paths = (
+            prd.relative_to(root).as_posix(),
+            spec.relative_to(root).as_posix(),
+        )
+        recorded_paths = (
+            existing["prd"]["path"],
+            existing["specification"]["path"],
+        )
+        if requested_paths != recorded_paths:
+            raise SpecificationStateError(
+                "specification state already exists with different repository-owned paths"
             )
-            recorded_paths = (
-                existing["prd"]["path"],
-                existing["specification"]["path"],
-            )
-            if requested_paths != recorded_paths:
-                raise SpecificationStateError(
-                    "specification state already exists with different repository-owned paths"
-                )
-            return existing
+        return existing
     prd_meta = require_approved_prd(prd)
     spec_meta, drift = specification_trace(root, prd, spec)
     now = utc_now()
     state = {
         "schema_version": SCHEMA_VERSION,
         "feature": feature,
+        "workflow_path": workflow_relative_path(feature).as_posix(),
         "status": "needs_generation" if drift else "reviewing",
         "prd": {
             "path": prd.relative_to(root).as_posix(),
@@ -3308,15 +3001,13 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
     }
     if spec_meta and not drift:
         state["specification"]["status"] = spec_meta.get("status")
-    if existing_to_archive is not None:
-        archive_completed_specification_state(root, existing_to_archive)
     save_state(root, state)
     return state
 
 
 def command_prepare_helper(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     require_bound_recovery_continuation(root, state)
     require_no_active_helper_request(state)
     operation = args.operation
@@ -3417,8 +3108,10 @@ def command_prepare_helper(args: argparse.Namespace) -> dict[str, Any]:
 
     sequence = state["helper_sequence"] + 1
     request_id = f"HREQ-{sequence:06d}"
-    request_relative = f".agentic-pipeline/helper-requests/{request_id}.json"
-    base = f".agentic-pipeline/helper-results/{request_id}"
+    request_relative = (
+        f"{state['workflow_path']}/helper-requests/{request_id}.json"
+    )
+    base = f"{state['workflow_path']}/helper-results/{request_id}"
     artifacts = {
         "helper_report_path": f"{base}.report.md",
         "coverage_path": f"{base}.coverage.json",
@@ -3479,7 +3172,7 @@ def command_prepare_helper(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_preflight_helper_output(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root, persist_migration=False)
+    state = load_state(root, args.feature)
     ensure_helper_state(state)
     active = state.get("active_helper_request")
     if not isinstance(active, dict):
@@ -3621,7 +3314,7 @@ def _replay_rejected_helper_result(
             "helper-result rejection replay is forbidden after state drift"
         )
 
-    request_path = f".agentic-pipeline/helper-requests/{request_id}.json"
+    request_path = f"{state['workflow_path']}/helper-requests/{request_id}.json"
     request = validate_helper_request(
         root,
         state,
@@ -3668,7 +3361,7 @@ def _replay_rejected_helper_result(
 
 def command_reject_helper_result(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root, persist_migration=False)
+    state = load_state(root, args.feature)
     request_id = args.request_id
     reason = args.reason
     if (
@@ -3790,7 +3483,7 @@ def command_reject_helper_result(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_record_helper_result(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     require_bound_recovery_continuation(root, state)
     ensure_helper_state(state)
     active = state.get("active_helper_request")
@@ -3884,7 +3577,7 @@ def helper_evidence_for_acceptance(
 
 def command_accept_spec(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     require_bound_recovery_continuation(root, state)
     if state["status"] not in {"needs_generation", "reviewing", "awaiting_accept"}:
         raise SpecificationStateError(f"cannot accept specification in {state['status']}")
@@ -3938,7 +3631,7 @@ def command_accept_spec(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_start_cycle(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     require_bound_recovery_continuation(root, state)
     require_no_active_helper_request(state)
     if state["status"] != "reviewing":
@@ -3994,7 +3687,7 @@ def command_start_cycle(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_record_proofread(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     if state["status"] != "reviewing":
         raise SpecificationStateError(f"cannot record Proofreader result in {state['status']}")
     require_bound_recovery_continuation(root, state)
@@ -4032,6 +3725,17 @@ def command_record_proofread(args: argparse.Namespace) -> dict[str, Any]:
         )
     if not args.report_path or not args.report_path.strip():
         raise SpecificationStateError("Proofreader result requires a report path")
+    report_path = workflow_artifact_path(
+        root, state, args.report_path.strip(), "Proofreader report"
+    )
+    expected_reports_root = workflow_path(root, state["feature"]) / "proofreader-reports"
+    try:
+        report_path.relative_to(expected_reports_root)
+    except ValueError as error:
+        raise SpecificationStateError(
+            "Proofreader report must stay inside the selected workflow's "
+            "proofreader-reports directory"
+        ) from error
     wave["proofread"] = {
         "critical": args.critical,
         "major": args.major,
@@ -4039,7 +3743,7 @@ def command_record_proofread(args: argparse.Namespace) -> dict[str, Any]:
         "questions": question_counts,
         "minors_engineer_resolvable": args.minors_engineer_resolvable,
         "coverage_complete": args.coverage_complete,
-        "report_path": args.report_path,
+        "report_path": report_path.relative_to(root).as_posix(),
         "finding_ids": finding_ids,
         "question_ids": question_ids,
         "recorded_at": utc_now(),
@@ -4063,7 +3767,7 @@ def close_active_wave(state: dict[str, Any], outcome: str, spec_hash: str) -> No
 
 def command_complete_cycle(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     if state["status"] != "reviewing":
         raise SpecificationStateError(f"cannot complete cycle in {state['status']}")
     require_bound_recovery_continuation(root, state)
@@ -4140,7 +3844,7 @@ def command_complete_cycle(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_confirm_ready(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     if state["status"] != "reviewing":
         raise SpecificationStateError(f"cannot confirm readiness in {state['status']}")
     require_bound_recovery_continuation(root, state)
@@ -4191,7 +3895,7 @@ def command_confirm_ready(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_handoff(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     require_bound_recovery_continuation(root, state)
     require_no_active_helper_request(state)
     if state["status"] != "spec_convergence_hold":
@@ -4239,10 +3943,13 @@ def command_handoff(args: argparse.Namespace) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", required=True)
+    parser.add_argument(
+        "--feature", required=True, type=require_slug,
+        help="lowercase feature slug selecting .agentic-pipeline/Workflows/<feature>",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init")
-    init.add_argument("--feature", required=True)
     init.add_argument("--prd", required=True)
     init.add_argument("--spec", required=True)
     init.add_argument("--architect-id", required=True)
@@ -4350,7 +4057,11 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.set_defaults(handler=command_handoff)
 
     status = commands.add_parser("status")
-    status.set_defaults(handler=lambda args: load_state(Path(args.project_root).resolve()))
+    status.set_defaults(
+        handler=lambda args: load_state(
+            Path(args.project_root).resolve(), args.feature
+        )
+    )
     return parser
 
 

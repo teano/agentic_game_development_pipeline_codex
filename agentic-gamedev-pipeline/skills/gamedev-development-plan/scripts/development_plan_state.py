@@ -100,13 +100,12 @@ if Path(_pipeline_v2_legacy.__file__).resolve() != (
     raise RuntimeError("Cannot load the canonical pipeline-v2 schema-10 importer")
 
 
-SCHEMA_VERSION = 1
-SPECIFICATION_STATE_SCHEMA_VERSION = 2
-STATE_RELATIVE_PATH = Path(".agentic-pipeline/development-plan-state.json")
-SPEC_STATE_RELATIVE_PATH = Path(".agentic-pipeline/specification-state.json")
-RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline/state.json")
-RUNTIME_FINDINGS_RELATIVE_PATH = Path(".agentic-pipeline/findings.json")
-V2_RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline-v2/state.json")
+SCHEMA_VERSION = 2
+SPECIFICATION_STATE_SCHEMA_VERSION = 3
+WORKFLOWS_RELATIVE_PATH = Path(".agentic-pipeline/Workflows")
+STATE_FILENAME = "development-plan-state.json"
+SPEC_STATE_FILENAME = "specification-state.json"
+RUNTIME_STATE_FILENAME = "pipeline-state.json"
 SCHEMA10_UNSUPPORTED_MESSAGE = _pipeline_v2_legacy.SCHEMA10_UNSUPPORTED_MESSAGE
 MODES = {"single_owner", "sequential_slices"}
 REQUIRED_GLOBAL_SECTIONS = {
@@ -175,6 +174,27 @@ def require_slug(feature: str) -> str:
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", feature):
         raise DevelopmentPlanError("feature must be a lowercase hyphen slug")
     return feature
+
+
+def workflow_relative_path(feature: str) -> Path:
+    return WORKFLOWS_RELATIVE_PATH / require_slug(feature)
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    )
+
+
+def workflow_path(root: Path, feature: str) -> Path:
+    root = root.resolve()
+    candidate = root / workflow_relative_path(feature)
+    for existing in (root / ".agentic-pipeline", root / WORKFLOWS_RELATIVE_PATH, candidate):
+        if existing.exists() and _is_link_or_junction(existing):
+            raise DevelopmentPlanError(
+                f"workflow path must not be a link or junction: {existing}"
+            )
+    return candidate
 
 
 def parse_frontmatter(path: Path, label: str) -> tuple[dict[str, str], str]:
@@ -288,8 +308,8 @@ def authority_trace(
     return result
 
 
-def state_path(root: Path) -> Path:
-    return root / STATE_RELATIVE_PATH
+def state_path(root: Path, feature: str) -> Path:
+    return workflow_path(root, feature) / STATE_FILENAME
 
 
 def load_json(path: Path, label: str) -> dict[str, Any]:
@@ -315,15 +335,28 @@ def load_valid_v2_runtime(path: Path) -> dict[str, Any]:
     return runtime
 
 
-def load_state(root: Path) -> dict[str, Any]:
-    state = load_json(state_path(root), "development-plan state")
+def load_state(root: Path, feature: str) -> dict[str, Any]:
+    feature = require_slug(feature)
+    state = load_json(state_path(root, feature), "development-plan state")
     if state.get("schema_version") != SCHEMA_VERSION:
         raise DevelopmentPlanError("unsupported development-plan state schema")
+    if (
+        state.get("feature") != feature
+        or state.get("workflow_path") != workflow_relative_path(feature).as_posix()
+    ):
+        raise DevelopmentPlanError(
+            "development-plan state feature/workflow binding does not match --feature"
+        )
     return state
 
 
 def save_state(root: Path, state: dict[str, Any]) -> None:
-    path = state_path(root)
+    feature = require_slug(state.get("feature", ""))
+    if state.get("workflow_path") != workflow_relative_path(feature).as_posix():
+        raise DevelopmentPlanError(
+            "development-plan state workflow_path does not match its feature"
+        )
+    path = state_path(root, feature)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -374,14 +407,22 @@ def require_sources(
     }:
         raise DevelopmentPlanError("specification does not trace the exact current approved PRD")
 
-    specification_state = load_json(root / SPEC_STATE_RELATIVE_PATH, "specification state")
+    specification_state = load_json(
+        workflow_path(root, feature) / SPEC_STATE_FILENAME,
+        "specification state",
+    )
     if specification_state.get("schema_version") != SPECIFICATION_STATE_SCHEMA_VERSION:
         raise DevelopmentPlanError(
             "specification state must use the current schema; reconverge specification "
             "authority before planning"
         )
     ready = specification_state.get("ready") or {}
-    if specification_state.get("feature") != feature or specification_state.get("status") != "spec_ready":
+    if (
+        specification_state.get("feature") != feature
+        or specification_state.get("workflow_path")
+        != workflow_relative_path(feature).as_posix()
+        or specification_state.get("status") != "spec_ready"
+    ):
         raise DevelopmentPlanError("specification state is not SPEC_READY for this feature")
     if (
         specification_state.get("prd", {}).get("path") != expected_prd_path
@@ -1039,10 +1080,8 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         .relative_to(root)
         .as_posix(),
     )
-    if state_path(root).is_file():
-        state = load_state(root)
-        if state["feature"] != feature:
-            raise DevelopmentPlanError("development-plan state already belongs to another feature")
+    if state_path(root, feature).is_file():
+        state = load_state(root, feature)
         recorded_paths = (
             state["prd"]["path"],
             state["specification"]["path"],
@@ -1071,6 +1110,7 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
     state = {
         "schema_version": SCHEMA_VERSION,
         "feature": feature,
+        "workflow_path": workflow_relative_path(feature).as_posix(),
         "status": "analyzing",
         "analyst_id": args.analyst_id,
         "prd": sources["prd"],
@@ -1091,7 +1131,7 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     if state.get("revision_reopen"):
         raise DevelopmentPlanError(
             "cannot reinitialize while an approved-plan revision transition is pending"
@@ -1184,6 +1224,7 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
     prior_plan_sha256 = prior_approval.get("approved_sha256")
     authorization = require_runtime_unbound(
         root,
+        feature=state["feature"],
         recovery_token=getattr(args, "recovery_token", None),
         reason=getattr(args, "reason", None),
         prior_plan_sha256=prior_plan_sha256,
@@ -1203,7 +1244,7 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
         {
             key: value
             for key, value in state.items()
-            if key not in {"schema_version", "feature", "history"}
+            if key not in {"schema_version", "feature", "workflow_path", "history"}
         }
     )
     if pending_recovery:
@@ -1229,6 +1270,7 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
     renewed = {
         "schema_version": SCHEMA_VERSION,
         "feature": state["feature"],
+        "workflow_path": state["workflow_path"],
         "status": "analyzing",
         "analyst_id": args.analyst_id,
         "prd": sources["prd"],
@@ -1251,7 +1293,7 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_accept_analysis(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     require_bound_recovery_continuation(root, state)
     if state["status"] != "analyzing":
         raise DevelopmentPlanError(f"cannot accept analysis in {state['status']}")
@@ -1282,7 +1324,7 @@ def command_accept_analysis(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_validate(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     require_bound_recovery_continuation(root, state)
     if not state.get("analysis"):
         raise DevelopmentPlanError("Planning Analyst decision has not been accepted")
@@ -1297,7 +1339,7 @@ def command_validate(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_submit(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     require_bound_recovery_continuation(root, state)
     if state["status"] != "drafting" and state["status"] not in APPROVAL_WAITING_STATES:
         raise DevelopmentPlanError(f"cannot submit plan in {state['status']}")
@@ -1437,51 +1479,28 @@ def require_retired_schema10_lineage(
     raise DevelopmentPlanError(SCHEMA10_UNSUPPORTED_MESSAGE)
 
 
-def discover_v2_runtime_states(root: Path) -> list[Path]:
-    """Find direct current-schema runtime states without treating other JSON as state."""
-    directory = root / V2_RUNTIME_STATE_RELATIVE_PATH.parent
-    if not directory.exists():
+def discover_v2_runtime_states(root: Path, feature: str) -> list[Path]:
+    """Return only this feature's exact runtime state; never scan siblings."""
+    candidate = workflow_path(root, feature) / RUNTIME_STATE_FILENAME
+    if not runtime_path_exists(candidate):
         return []
     try:
-        stat = directory.lstat()
+        stat = candidate.lstat()
     except OSError as error:
-        raise DevelopmentPlanError(f"cannot inspect v2 runtime directory: {error}") from error
+        raise DevelopmentPlanError(f"cannot inspect runtime state: {error}") from error
     if (
-        not directory.is_dir() or directory.is_symlink()
+        not candidate.is_file() or candidate.is_symlink()
         or bool(getattr(stat, "st_file_attributes", 0) & 0x400)
     ):
-        raise DevelopmentPlanError("v2 runtime directory must be a canonical confined directory")
-    candidates = []
-    for path in sorted(directory.glob("*.json"), key=lambda item: item.name):
-        try:
-            child_stat = path.lstat()
-        except OSError as error:
-            raise DevelopmentPlanError(f"cannot inspect v2 runtime JSON: {error}") from error
-        if (
-            not path.is_file() or path.is_symlink()
-            or bool(getattr(child_stat, "st_file_attributes", 0) & 0x400)
-        ):
-            raise DevelopmentPlanError("v2 runtime JSON must be a canonical confined file")
-        if path.name == V2_RUNTIME_STATE_RELATIVE_PATH.name:
-            candidates.append(path)
-            continue
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if (
-            isinstance(value, dict)
-            and value.get("schema") == _pipeline_v2_model.SCHEMA
-            and "project_root" in value and "authority" in value
-        ):
-            candidates.append(path)
-    return candidates
+        raise DevelopmentPlanError("runtime state must be one canonical confined file")
+    return [candidate]
 
 
 def require_v2_runtime_binding(
     root: Path,
     v2_path: Path,
     *,
+    feature: str,
     prior_plan_sha256: str | None,
     prior_plan_path: str | None,
 ) -> dict[str, Any]:
@@ -1492,6 +1511,9 @@ def require_v2_runtime_binding(
     if (
         runtime.get("schema") != _pipeline_v2_model.SCHEMA
         or Path(str(runtime.get("project_root", ""))).resolve() != root
+        or runtime.get("feature") != feature
+        or runtime.get("workflow_path")
+        != workflow_relative_path(feature).as_posix()
         or not isinstance(authority, dict)
         or set(authority) != {"items", "digest"}
         or set(items or {}) != {"requirements", "specification", "plan"}
@@ -1515,26 +1537,18 @@ def require_v2_runtime_binding(
 def runtime_recovery_authorization(
     root: Path,
     *,
+    feature: str,
     recovery_token: str | None,
     reason: str | None,
     prior_plan_sha256: str | None,
     prior_plan_path: str | None,
 ) -> dict[str, Any] | None:
-    v2_paths = discover_v2_runtime_states(root)
-    legacy_presence = [
-        runtime_path_exists(root / path)
-        for path in (RUNTIME_STATE_RELATIVE_PATH, RUNTIME_FINDINGS_RELATIVE_PATH)
-    ]
-    if any(legacy_presence):
-        raise DevelopmentPlanError(SCHEMA10_UNSUPPORTED_MESSAGE)
+    v2_paths = discover_v2_runtime_states(root, feature)
     if v2_paths:
-        if len(v2_paths) != 1:
-            raise DevelopmentPlanError(
-                "multiple v2 runtime state candidates exist; the ambiguous binding fails closed"
-            )
         require_v2_runtime_binding(
             root,
             v2_paths[0],
+            feature=feature,
             prior_plan_sha256=prior_plan_sha256,
             prior_plan_path=prior_plan_path,
         )
@@ -1553,6 +1567,7 @@ def runtime_recovery_authorization(
 def require_runtime_unbound(
     root: Path,
     *,
+    feature: str,
     recovery_token: str | None = None,
     reason: str | None = None,
     prior_plan_sha256: str | None = None,
@@ -1560,6 +1575,7 @@ def require_runtime_unbound(
 ) -> dict[str, Any] | None:
     return runtime_recovery_authorization(
         root,
+        feature=feature,
         recovery_token=recovery_token,
         reason=reason,
         prior_plan_sha256=prior_plan_sha256,
@@ -1601,6 +1617,7 @@ def require_bound_recovery_continuation(root: Path, state: dict[str, Any]) -> No
             prior_plan_sha256 = approved_sha256
     runtime_recovery_authorization(
         root,
+        feature=state["feature"],
         recovery_token=authorization.get("token"),
         reason=authorization.get("reason"),
         prior_plan_sha256=prior_plan_sha256,
@@ -1624,6 +1641,7 @@ def finalize_approved_revision_reopen(
         )
     authorization = require_runtime_unbound(
         root,
+        feature=state["feature"],
         recovery_token=getattr(args, "recovery_token", None),
         reason=args.reason,
         prior_plan_sha256=transition["prior_approved_sha256"],
@@ -1675,7 +1693,7 @@ def finalize_approved_revision_reopen(
 def command_revise_approved(args: argparse.Namespace) -> dict[str, Any]:
     """Open exact approved bytes as a new draft without carrying approval forward."""
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     if state["status"] == "revision_reopen_pending":
         return finalize_approved_revision_reopen(root, state, args)
     if state["status"] != "approved":
@@ -1704,6 +1722,7 @@ def command_revise_approved(args: argparse.Namespace) -> dict[str, Any]:
         )
     authorization = require_runtime_unbound(
         root,
+        feature=state["feature"],
         recovery_token=getattr(args, "recovery_token", None),
         reason=args.reason,
         prior_plan_sha256=prior_sha256,
@@ -1813,7 +1832,7 @@ def finalize_plan_approval(
 
 def command_approve(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     approval_actor = require_approval_actor(args.approved_by)
     if state["status"] == "approved":
         approval = state.get("approval") or {}
@@ -1853,7 +1872,7 @@ def command_approve(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_status(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
-    state = load_state(root)
+    state = load_state(root, args.feature)
     drift = source_drift(root, state)
     if drift and state["status"] in {"approval_pending", "revision_reopen_pending"}:
         state["drift"] = drift
@@ -1870,10 +1889,13 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", required=True)
+    parser.add_argument(
+        "--feature", required=True, type=require_slug,
+        help="lowercase feature slug selecting .agentic-pipeline/Workflows/<feature>",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init")
-    init.add_argument("--feature", required=True)
     init.add_argument("--prd", required=True)
     init.add_argument("--spec", required=True)
     init.add_argument("--plan", required=True)

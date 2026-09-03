@@ -10,7 +10,7 @@ from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-SCHEMA = 3
+SCHEMA = 4
 CHECKOUT_MODEL = "git-tree-v1"
 PHASES = ("plan", "slice", "engineering", "review", "qa", "docs", "ready")
 NEXT_PHASE = dict(zip(PHASES, PHASES[1:]))
@@ -94,12 +94,14 @@ _ARTIFACT_SHAPES = {
     ),
 }
 STATE_FIELDS = {
-    "schema", "run_id", "generation", "project_root", "authority", "phase",
+    "schema", "run_id", "feature", "workflow_path", "generation",
+    "project_root", "authority", "phase",
     "active_assignment", "slices", "artifacts", "questions", "history",
     "checkout_model", "base_tree_oid", "pipeline_runtime_digest",
 }
 HEX64 = set("0123456789abcdef")
-ASSIGNMENT_OUTPUT_DIR = ".agentic-pipeline/outputs"
+WORKFLOWS_DIR = ".agentic-pipeline/Workflows"
+PIPELINE_STATE_FILENAME = "pipeline-state.json"
 SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?\Z")
 
 
@@ -201,7 +203,21 @@ def safe_identifier(value: Any, label: str = "run_id") -> str:
     return value
 
 
-def assignment_output_path(assignment: dict[str, Any] | str) -> str:
+def feature_slug(value: Any) -> str:
+    if not isinstance(value, str) or re.fullmatch(
+        r"[a-z0-9]+(?:-[a-z0-9]+)*", value
+    ) is None:
+        raise PipelineError("feature must be a lowercase hyphen slug")
+    return value
+
+
+def workflow_relative_path(feature: str) -> str:
+    return f"{WORKFLOWS_DIR}/{feature_slug(feature)}"
+
+
+def assignment_output_path(
+    assignment: dict[str, Any] | str, feature: str
+) -> str:
     """Derive one collision-resistant, project-relative artifact path."""
     assignment_id = assignment.get("id") if isinstance(assignment, dict) else assignment
     if not isinstance(assignment_id, str) or not assignment_id:
@@ -214,7 +230,7 @@ def assignment_output_path(assignment: dict[str, Any] | str) -> str:
         if prefix.split(".", 1)[0].casefold() in reserved:
             prefix = f"assignment-{prefix}"
         safe = f"{prefix}-{hashlib.sha256(assignment_id.encode()).hexdigest()[:12]}"
-    return f"{ASSIGNMENT_OUTPUT_DIR}/{safe}.json"
+    return f"{workflow_relative_path(feature)}/outputs/{safe}.json"
 
 
 def artifact_schema(phase: str, role: str | None = None) -> dict[str, Any]:
@@ -531,11 +547,15 @@ def all_slices_completed(state: dict[str, Any]) -> bool:
 
 
 def new_state(
-    *, run_id: str, project_root: str, authority: dict[str, Any],
+    *, run_id: str, feature: str, workflow_path: str, project_root: str,
+    authority: dict[str, Any],
     slices: list[dict[str, Any]], base_tree_oid: str,
     pipeline_runtime_digest: str,
 ) -> dict[str, Any]:
     run_id = safe_identifier(run_id)
+    feature = feature_slug(feature)
+    if workflow_path != workflow_relative_path(feature):
+        raise PipelineError("workflow_path does not match feature")
     if not isinstance(project_root, str) or not project_root:
         raise PipelineError("project_root is required")
     state = {
@@ -544,6 +564,8 @@ def new_state(
         "base_tree_oid": base_tree_oid,
         "pipeline_runtime_digest": pipeline_runtime_digest,
         "run_id": run_id,
+        "feature": feature,
+        "workflow_path": workflow_path,
         "generation": 0,
         "project_root": project_root,
         "authority": authority_record(authority.get("items", authority)),
@@ -725,7 +747,9 @@ def reconfiguration_action(
         "kind": "command", "command": "init",
         "command_id": f"reconfigure-g{state['generation']}-{token}",
         "expected_generation": state["generation"],
-        "run_id": state["run_id"], "project_root": state["project_root"],
+        "run_id": state["run_id"], "feature": state["feature"],
+        "workflow_path": state["workflow_path"],
+        "project_root": state["project_root"],
         "authority": {
             name: item["path"] for name, item in authority["items"].items()
         },
@@ -931,7 +955,7 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
         "task": identity["task"],
         "access": {"read": read, "write": write},
         "checks": checks,
-        "output_path": assignment_output_path(assignment_id),
+        "output_path": assignment_output_path(assignment_id, state["feature"]),
     }
     if target is not None:
         assignment["context"] = {"review_target": target}
@@ -948,7 +972,7 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
             "command_id": _action_id(state, "complete"),
             "expected_generation": generation,
             "assignment_id": active["id"],
-            "artifact_path": assignment_output_path(active),
+            "artifact_path": assignment_output_path(active, state["feature"]),
         }
     record = state.get("artifacts", {}).get(state.get("phase"))
     worker = record.get("worker") if isinstance(record, dict) else None
@@ -1009,8 +1033,8 @@ def validate_state(state: dict[str, Any]) -> None:
         extra = sorted(set(state) - STATE_FIELDS) if isinstance(state, dict) else []
         missing = sorted(STATE_FIELDS - set(state)) if isinstance(state, dict) else sorted(STATE_FIELDS)
         raise PipelineError(f"invalid state fields; missing={missing}, extra={extra}")
-    if len(state) != 14 or state["schema"] != SCHEMA:
-        raise PipelineError("state must use the compact schema-3 shape")
+    if len(state) != 16 or state["schema"] != SCHEMA:
+        raise PipelineError("state must use the compact schema-4 shape")
     if state["checkout_model"] != CHECKOUT_MODEL:
         raise PipelineError("state must use the git-tree-v1 checkout model")
     if not is_git_oid(state["base_tree_oid"]):
@@ -1018,6 +1042,9 @@ def validate_state(state: dict[str, Any]) -> None:
     if not is_digest(state["pipeline_runtime_digest"]):
         raise PipelineError("state pipeline_runtime_digest is malformed")
     safe_identifier(state["run_id"])
+    feature_slug(state["feature"])
+    if state["workflow_path"] != workflow_relative_path(state["feature"]):
+        raise PipelineError("state workflow_path does not match feature")
     if not isinstance(state["project_root"], str) or not state["project_root"]:
         raise PipelineError("project_root is required")
     if not is_generation(state["generation"]):
@@ -1122,7 +1149,7 @@ def validate_state(state: dict[str, Any]) -> None:
             raise PipelineError("active assignment is not bound to the current phase/role")
         if not all(isinstance(active[key], str) and active[key] for key in ("id", "role", "worker_id", "task", "status")):
             raise PipelineError("active_assignment text fields are invalid")
-        if "output_path" in active and active["output_path"] != assignment_output_path(active):
+        if "output_path" in active and active["output_path"] != assignment_output_path(active, state["feature"]):
             raise PipelineError("active_assignment output path is not controller-derived")
         if "artifact_schema" in active and active["artifact_schema"] != artifact_schema(active["phase"], active["role"]):
             raise PipelineError("active_assignment artifact schema is not controller-derived")
@@ -1179,7 +1206,7 @@ def _active_assignment_view(
         "access": deepcopy(active["access"]),
         "checks": deepcopy(active["commands"]),
         "context": context,
-        "output_path": assignment_output_path(active),
+        "output_path": assignment_output_path(active, state["feature"]),
         "artifact_schema": artifact_schema(active["phase"], active["role"]),
     }
 
@@ -1189,6 +1216,8 @@ def status_view(state: dict[str, Any]) -> dict[str, Any]:
     active = state["active_assignment"]
     return {
         "run_id": state["run_id"],
+        "feature": state["feature"],
+        "workflow_path": state["workflow_path"],
         "generation": state["generation"],
         "phase": state["phase"],
         "active_assignment": _active_assignment_view(state, active) if active else None,

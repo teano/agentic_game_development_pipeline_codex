@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .checkout import safe_path
-from .model import PipelineError, canonical_command, validate_state
+from .model import (
+    PIPELINE_STATE_FILENAME,
+    PipelineError,
+    canonical_command,
+    feature_slug,
+    validate_state,
+    workflow_relative_path,
+)
 from .reducer import (
     _precondition_proof,
     _reduce_prechecked,
@@ -44,19 +51,18 @@ class StateStore:
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         self._lock_token: object | None = None
 
-    def validate_project_location(self, project_root: Path) -> None:
-        """Require one direct JSON state under the project's canonical v2 directory."""
+    def validate_project_location(self, project_root: Path, feature: str) -> None:
+        """Require the exact state path owned by one selected feature."""
         root = safe_path(Path(project_root), None, "project root", strict=True)
-        directory = safe_path(root, ".agentic-pipeline-v2", "v2 state directory")
+        feature = feature_slug(feature)
+        directory = safe_path(
+            root, workflow_relative_path(feature), "feature workflow directory"
+        )
         candidate = safe_path(root, self.path, "v2 state path")
-        if (
-            candidate.parent != directory
-            or candidate.suffix != ".json"
-            or not candidate.stem
-        ):
+        if candidate != directory / PIPELINE_STATE_FILENAME:
             raise PipelineError(
-                "v2 state path must be a direct .json child of "
-                "<project-root>/.agentic-pipeline-v2"
+                "pipeline state path must equal "
+                "<project-root>/.agentic-pipeline/Workflows/<feature>/pipeline-state.json"
             )
 
     def load(self, *, required: bool = True) -> dict[str, Any] | None:

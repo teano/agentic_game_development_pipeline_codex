@@ -36,6 +36,7 @@ from .model import (
     current_candidate,
     default_assignment,
     digest,
+    feature_slug,
     is_digest,
     is_generation,
     is_git_oid,
@@ -46,6 +47,7 @@ from .model import (
     slices_are_read_sealed,
     status_view,
     validate_state,
+    workflow_relative_path,
 )
 from .process_tree import run_process_tree
 from .reducer import (
@@ -100,17 +102,26 @@ def _unsealed_projection(value: Any) -> list[dict[str, Any]]:
 
 
 def seal_slices_from_approved_plan(
-    root: Path, plan_path: str, slices: Any,
+    root: Path, plan_path: str, slices: Any, feature: str,
 ) -> list[dict[str, Any]]:
     """Bind caller-authored write slices to controller-parsed approved read scopes."""
     caller = _caller_slices(slices)
     plan = safe_path(root, plan_path, "approved development plan", strict=True)
     try:
+        plan_text = plan.read_text(encoding="utf-8")
         read_by_id = _PLAN_CONTRACT.parse_slice_read_paths(
-            plan.read_text(encoding="utf-8"), label=str(plan_path),
+            plan_text, label=str(plan_path),
         )
     except (OSError, UnicodeError, _PLAN_CONTRACT.PlanContractError) as exc:
         raise PipelineError(f"cannot seal approved plan read scopes: {exc}") from exc
+    frontmatter = re.match(r"\A---\n(.*?)\n---(?:\n|\Z)", plan_text, re.S)
+    bound_features = (
+        re.findall(r"(?m)^feature:\s*(\S+)\s*$", frontmatter.group(1))
+        if frontmatter is not None
+        else []
+    )
+    if bound_features != [feature_slug(feature)]:
+        raise PipelineError("approved plan feature does not match selected workflow")
     caller_ids = [item["id"] for item in caller]
     plan_ids = list(read_by_id)
     missing = [slice_id for slice_id in caller_ids if slice_id not in read_by_id]
@@ -200,7 +211,7 @@ class Controller:
         state = self.store.load() if state is None else state
         validate_state(state)
         root = canonical_project_root(state["project_root"])
-        self.store.validate_project_location(root)
+        self.store.validate_project_location(root, state["feature"])
         if pipeline_runtime_digest() != state["pipeline_runtime_digest"]:
             raise PipelineError(
                 "pipeline runtime changed during the run; stop and perform a fresh init"
@@ -217,7 +228,7 @@ class Controller:
         state = self.store.load()
         validate_state(state)
         root = canonical_project_root(state["project_root"])
-        self.store.validate_project_location(root)
+        self.store.validate_project_location(root, state["feature"])
 
     @staticmethod
     def _latest_controller_tree(state: dict[str, Any]) -> str | None:
@@ -298,7 +309,7 @@ class Controller:
             state = self.store.load()
             validate_state(state)
             root = canonical_project_root(state["project_root"])
-            self.store.validate_project_location(root)
+            self.store.validate_project_location(root, state["feature"])
             if pipeline_runtime_digest() != state["pipeline_runtime_digest"]:
                 raise PipelineError(
                     "pipeline runtime changed during the run; stop and perform a fresh init"
@@ -316,6 +327,7 @@ class Controller:
                 proposed_slices = seal_slices_from_approved_plan(
                     root, observed["plan"]["path"],
                     _unsealed_projection(state["slices"]),
+                    state["feature"],
                 )
                 scope_changed = proposed_slices != state["slices"]
             current = candidate_tree_oid(root)
@@ -423,8 +435,11 @@ class Controller:
         """Apply init to an existing run, deriving any active-work interruption proof."""
         _require_expected_generation(command.get("expected_generation"))
         safe_identifier(command.get("run_id"))
+        feature = feature_slug(command.get("feature"))
+        if command.get("workflow_path") != workflow_relative_path(feature):
+            raise PipelineError("init workflow_path does not match feature")
         proposed_root = canonical_project_root(command["project_root"])
-        self.store.validate_project_location(proposed_root)
+        self.store.validate_project_location(proposed_root, feature)
         with self.store.transaction():
             state = self.store.load(required=False)
             value = deepcopy(command)
@@ -464,11 +479,13 @@ class Controller:
             if state is None:
                 value["slices"] = seal_slices_from_approved_plan(
                     root, proposed_items["plan"]["path"], value.get("slices"),
+                    feature,
                 )
             else:
                 base_slices = _unsealed_projection(state["slices"])
                 proposed_slices = seal_slices_from_approved_plan(
                     root, proposed_items["plan"]["path"], base_slices,
+                    feature,
                 )
                 supplied_slices = value.get("slices")
                 if supplied_slices not in (base_slices, proposed_slices):
@@ -564,7 +581,7 @@ class Controller:
             else:
                 assignment_id = active["id"]
                 assignment_phase = active["phase"]
-            assigned_relative = assignment_output_path(assignment_id)
+            assigned_relative = assignment_output_path(assignment_id, state["feature"])
             assigned = safe_path(root, assigned_relative, "assigned artifact", strict=True)
             supplied = assigned if artifact_path is None else safe_path(root, artifact_path, "artifact path", strict=True)
             if supplied != assigned:
@@ -580,6 +597,7 @@ class Controller:
                 artifact["slices"] = seal_slices_from_approved_plan(
                     root, state["authority"]["items"]["plan"]["path"],
                     artifact["slices"],
+                    state["feature"],
                 )
             intent = {"name": "complete", "id": command_id, "artifact": artifact}
             command = {

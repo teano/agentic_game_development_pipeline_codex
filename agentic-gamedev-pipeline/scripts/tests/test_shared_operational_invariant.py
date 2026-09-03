@@ -178,11 +178,14 @@ class SharedOperationalInvariantTests(unittest.TestCase):
             "only after every changed upstream controller reports readiness", protocol
         )
         self.assertIn("unsanctioned drift must be restored", protocol)
-        self.assertIn(".agentic-pipeline-v2/state.json", plan_contract)
+        self.assertIn(
+            ".agentic-pipeline/Workflows/<feature>/pipeline-state.json",
+            plan_contract,
+        )
         self.assertIn("status", plan_contract)
         self.assertIn("`init` reconfiguration", plan_contract)
         self.assertIn(
-            'V2_RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline-v2/state.json")',
+            'RUNTIME_STATE_FILENAME = "pipeline-state.json"',
             plan_controller,
         )
 
