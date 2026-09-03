@@ -1,4 +1,4 @@
-"""Nine thin CLI commands for the v2 reducer."""
+"""Eight thin CLI commands for the v2 reducer."""
 
 from __future__ import annotations
 
@@ -80,8 +80,6 @@ def parser() -> argparse.ArgumentParser:
     complete.add_argument("--id", required=True); complete.add_argument("--expected-generation", type=int); complete.add_argument("--artifact", type=Path)
     answer = commands.add_parser("answer", help="Record a conservative controller decision for one open question.")
     answer.add_argument("--id", required=True); answer.add_argument("--expected-generation", type=int, required=True); answer.add_argument("--question-id", required=True); answer.add_argument("--text", required=True)
-    resume = commands.add_parser("resume", help="Close one gate and route to a fresh bounded assignment.")
-    resume.add_argument("--id", required=True); resume.add_argument("--expected-generation", type=int, required=True); resume.add_argument("--gate-id", required=True); resume.add_argument("--resolution", required=True); resume.add_argument("--run", action="append", default=[])
     accept = commands.add_parser("accept", help="Accept current passing phase evidence and advance.")
     accept.add_argument("--id", required=True); accept.add_argument("--expected-generation", type=int, required=True)
     migrate = commands.add_parser(
@@ -114,8 +112,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         state = Controller(store).complete(command_id=args.id, artifact_path=args.artifact, expected_generation=args.expected_generation)
     elif args.command == "answer":
         state = Controller(store).transition({"name": "answer", "id": args.id, "expected_generation": args.expected_generation, "question_id": args.question_id, "answer": args.text})
-    elif args.command == "resume":
-        state = Controller(store).transition({"name": "resume", "id": args.id, "expected_generation": args.expected_generation, "gate_id": args.gate_id, "resolution": args.resolution, "commands": _commands(args.run)})
     elif args.command == "accept":
         state = Controller(store).transition({"name": "accept", "id": args.id, "expected_generation": args.expected_generation})
     elif args.command == "migrate":

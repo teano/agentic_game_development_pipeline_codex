@@ -32,7 +32,6 @@ from .model import (
     PipelineError,
     assignment_identity,
     assignment_output_path,
-    candidate_record_valid,
     canonical_command,
     current_candidate,
     default_assignment,
@@ -51,7 +50,6 @@ from .model import (
 from .process_tree import run_process_tree
 from .reducer import (
     _engineering_candidate_diff_base,
-    _newer_nonpassing_engineering_tree,
     _worker_artifact,
 )
 from .transaction import StateStore
@@ -222,38 +220,6 @@ class Controller:
         self.store.validate_project_location(root)
 
     @staticmethod
-    def _remediation_candidate(state: dict[str, Any]) -> dict[str, Any] | None:
-        if state.get("phase") != "engineering" or state.get("active_assignment") is not None:
-            return None
-        retained = current_candidate(state)
-        retained_generation = (
-            retained.get("generation", -1) if isinstance(retained, dict) else -1
-        )
-        last_completed_slice_generation = max(
-            (
-                item["generation"] for item in state["history"]
-                if isinstance(item.get("completed_slice_id"), str)
-                and is_generation(item.get("generation"))
-            ),
-            default=-1,
-        )
-        candidates = [
-            (item["candidate_base"]["generation"], key, item["candidate_base"])
-            for key, item in state["gates"].items()
-            if isinstance(item, dict) and item.get("status") == "closed"
-            and item.get("kind") in {"worker_result", "controller_result"}
-            and item.get("reason") == "fail"
-            and item.get("phase") in {"review", "qa"}
-            and candidate_record_valid(
-                item.get("candidate_base"), state["authority"]["digest"],
-                state["pipeline_runtime_digest"],
-            )
-            and item["candidate_base"]["generation"]
-            > max(last_completed_slice_generation, retained_generation)
-        ]
-        return max(candidates, default=(0, "", None))[-1]
-
-    @staticmethod
     def _latest_controller_tree(state: dict[str, Any]) -> str | None:
         completed_generation = {
             item["assignment_id"]: item["generation"]
@@ -297,15 +263,7 @@ class Controller:
                     if path_identity(path) not in authority_paths
                 ]
             return violations(changes, active["access"]["write"])
-        remediation = self._remediation_candidate(state)
-        expected = (
-            _newer_nonpassing_engineering_tree(state, remediation)
-            if isinstance(remediation, dict) else None
-        )
-        if expected is None and isinstance(remediation, dict):
-            expected = remediation["candidate_tree_oid"]
-        if expected is None:
-            expected = self._latest_controller_tree(state)
+        expected = self._latest_controller_tree(state)
         if expected is None:
             candidate = current_candidate(state)
             expected = candidate.get("candidate_tree_oid") if isinstance(candidate, dict) else None

@@ -10,7 +10,7 @@ from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-SCHEMA = 2
+SCHEMA = 3
 CHECKOUT_MODEL = "git-tree-v1"
 PHASES = ("plan", "slice", "engineering", "review", "qa", "docs", "ready")
 NEXT_PHASE = dict(zip(PHASES, PHASES[1:]))
@@ -95,7 +95,7 @@ _ARTIFACT_SHAPES = {
 }
 STATE_FIELDS = {
     "schema", "run_id", "generation", "project_root", "authority", "phase",
-    "active_assignment", "slices", "artifacts", "questions", "gates", "history",
+    "active_assignment", "slices", "artifacts", "questions", "history",
     "checkout_model", "base_tree_oid", "pipeline_runtime_digest",
 }
 HEX64 = set("0123456789abcdef")
@@ -277,60 +277,16 @@ def _bounded_context_records(
 
 
 def compact_assignment_context(source: dict[str, Any], bound_candidate: Any) -> dict[str, Any]:
-    """Keep worker context semantic, deterministic, and bounded across retries."""
+    """Keep worker context semantic, deterministic, and bounded."""
     context: dict[str, Any] = {}
     if isinstance(source.get("current_slice"), dict):
         context["current_slice"] = deepcopy(source["current_slice"])
     if isinstance(source.get("review_target"), dict):
         context["review_target"] = deepcopy(source["review_target"])
 
-    remediation_source = source.get("remediation", [])
-    if not isinstance(remediation_source, list):
-        remediation_source = []
-    if "remediation_history" not in source:
-        remediation_source = [
-            {
-                key: deepcopy(item[key])
-                for key in (
-                    "gate_id", "phase", "reason", "slice_id", "worker_artifact",
-                    "controller_failure", "resolution",
-                )
-                if key in item
-            }
-            for item in remediation_source
-            if isinstance(item, dict) and item.get("candidate_base") == bound_candidate
-        ]
-    remediation, remediation_history = _bounded_context_records(
-        remediation_source, source.get("remediation_history"),
-    )
-    if remediation:
-        context["remediation"] = remediation
-        context["remediation_history"] = remediation_history
-
-    migration_source = source.get("migration_audit", [])
-    if not isinstance(migration_source, list):
-        migration_source = []
-    if "migration_history" not in source:
-        projected_migration = []
-        for item in migration_source:
-            if not isinstance(item, dict):
-                continue
-            projected = {
-                key: deepcopy(item[key])
-                for key in ("gate_id", "phase", "reason", "resolution", "migration")
-                if key in item
-            }
-            legacy = item.get("legacy_context")
-            if isinstance(legacy, dict) and isinstance(legacy.get("migration"), dict):
-                projected["migration"] = deepcopy(legacy["migration"])
-            projected_migration.append(projected)
-        migration_source = projected_migration
-    migration, migration_history = _bounded_context_records(
-        migration_source, source.get("migration_history"),
-    )
-    if migration:
-        context["migration_audit"] = migration
-        context["migration_history"] = migration_history
+    failure = source.get("verification_failure")
+    if isinstance(failure, dict) and failure.get("candidate") == bound_candidate:
+        context["verification_failure"] = _bounded_context_value(failure)
 
     decision_source = source.get("decisions", [])
     if not isinstance(decision_source, list):
@@ -596,7 +552,6 @@ def new_state(
         "slices": slice_records(slices),
         "artifacts": {},
         "questions": {},
-        "gates": {},
         "history": [],
     }
     validate_state(state)
@@ -619,6 +574,8 @@ def current_candidate(state: dict[str, Any]) -> dict[str, Any] | None:
     )
     for phase in ("engineering", "docs"):
         item = artifacts.get(phase)
+        worker = item.get("worker") if isinstance(item, dict) else None
+        controller = item.get("controller") if isinstance(item, dict) else None
         candidate = item.get("candidate") if isinstance(item, dict) else None
         assignment_generation = max(
             (
@@ -633,6 +590,12 @@ def current_candidate(state: dict[str, Any]) -> dict[str, Any] | None:
             candidate_record_valid(
                 candidate, state.get("authority", {}).get("digest"),
                 state.get("pipeline_runtime_digest"),
+            )
+            and isinstance(worker, dict) and worker.get("outcome") == "pass"
+            and isinstance(controller, dict)
+            and all(
+                isinstance(result, dict) and result.get("returncode") == 0
+                for result in controller.get("commands", [])
             )
             and assignment_generation > epoch_generation
         ):
@@ -700,15 +663,6 @@ def passing_artifact(state: dict[str, Any], phase: str) -> dict[str, Any] | None
                 state.get("pipeline_runtime_digest"),
             )
             or candidate["generation"] <= accepted_generation
-            or any(
-                gate.get("status") == "closed"
-                and gate.get("kind") in {"worker_result", "controller_result"}
-                and gate.get("reason") == "fail"
-                and gate.get("phase") in {"review", "qa"}
-                and gate.get("candidate_base") == candidate
-                for gate in state.get("gates", {}).values()
-                if isinstance(gate, dict)
-            )
         ):
             return None
     return record
@@ -734,7 +688,7 @@ def production_ready(state: dict[str, Any]) -> bool:
         and controller["candidate_tree_oid"] == candidate.get("candidate_tree_oid")
         and controller["pipeline_runtime_digest"] == state.get("pipeline_runtime_digest")
         and all_slices_completed(state)
-        and not pending(state.get("questions", {})) and not pending(state.get("gates", {}))
+        and not pending(state.get("questions", {}))
     )
 
 
@@ -996,6 +950,18 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
             "assignment_id": active["id"],
             "artifact_path": assignment_output_path(active),
         }
+    record = state.get("artifacts", {}).get(state.get("phase"))
+    worker = record.get("worker") if isinstance(record, dict) else None
+    if (
+        isinstance(worker, dict) and worker.get("outcome") == "blocked"
+        and record.get("assignment_id") != "controller-checkout-baseline"
+    ):
+        return {
+            "kind": "terminal", "result": "user_input_required",
+            "phase": state["phase"], "user_input_required": True,
+            "blocker": worker["blocker"], "required_action": worker["required_action"],
+            "recovery": "Archive this terminal run and perform a fresh init after the prerequisite changes.",
+        }
     open_questions = pending(state["questions"])
     if open_questions:
         question_id = open_questions[0]
@@ -1007,25 +973,6 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
             "prompt": prompt, "user_input_required": False,
             "decision_policy": "Choose the safest reversible interpretation consistent with approved authority.",
         }
-    open_gates = pending(state["gates"])
-    if open_gates:
-        gate_id = open_gates[0]
-        gate = state["gates"][gate_id]
-        reason = gate.get("reason", "blocked")
-        action = {
-            "kind": "command", "command": "resume",
-            "command_id": _action_id(state, "resume"),
-            "expected_generation": generation, "gate_id": gate_id,
-            "resume_reason": f"Controller revalidated {gate['phase']} gate: {reason}.",
-            "user_input_required": False,
-        }
-        public_gate = {
-            key: deepcopy(value)
-            for key, value in gate.items()
-            if key in {"phase", "kind", "reason", "slice_id", "controller_failure"}
-        }
-        action["gate"] = {"id": gate_id, **public_gate}
-        return action
     if production_ready(state):
         return {"kind": "terminal", "result": "production_ready_candidate"}
     phase = state["phase"]
@@ -1055,15 +1002,15 @@ def validate_state(state: dict[str, Any]) -> None:
         and state.get("checkout_model") != CHECKOUT_MODEL
     ):
         raise PipelineError(
-            "legacy filesystem-inventory schema-2 state is unsupported; "
+            "legacy filesystem-inventory state is unsupported; "
             "remove the old state and run a fresh init"
         )
     if not isinstance(state, dict) or set(state) != STATE_FIELDS:
         extra = sorted(set(state) - STATE_FIELDS) if isinstance(state, dict) else []
         missing = sorted(STATE_FIELDS - set(state)) if isinstance(state, dict) else sorted(STATE_FIELDS)
         raise PipelineError(f"invalid state fields; missing={missing}, extra={extra}")
-    if len(state) > 15 or state["schema"] != SCHEMA:
-        raise PipelineError("state must use the compact schema-2 shape")
+    if len(state) != 14 or state["schema"] != SCHEMA:
+        raise PipelineError("state must use the compact schema-3 shape")
     if state["checkout_model"] != CHECKOUT_MODEL:
         raise PipelineError("state must use the git-tree-v1 checkout model")
     if not is_git_oid(state["base_tree_oid"]):
@@ -1082,7 +1029,7 @@ def validate_state(state: dict[str, Any]) -> None:
         raise PipelineError("authority has an invalid shape")
     if authority_record(authority.get("items", {})) != authority:
         raise PipelineError("authority digest does not match its items")
-    for key in ("artifacts", "questions", "gates"):
+    for key in ("artifacts", "questions"):
         if not isinstance(state[key], dict):
             raise PipelineError(f"{key} must be an object")
     for phase, item in state["artifacts"].items():
@@ -1100,41 +1047,8 @@ def validate_state(state: dict[str, Any]) -> None:
             candidate, authority["digest"], state["pipeline_runtime_digest"],
         ):
             raise PipelineError("artifact candidate is malformed")
-    if slice_records(state["slices"]) != state["slices"] or not isinstance(state["history"], list):
-        raise PipelineError("slices and history are malformed")
-    for name, item in state["questions"].items():
-        if (
-            not isinstance(name, str) or not isinstance(item, dict)
-            or item.get("status") not in {"open", "answered"}
-            or item.get("phase") not in PHASES[:-1]
-            or not isinstance(item.get("prompt"), str)
-            or (item.get("status") == "answered" and not isinstance(item.get("answer"), str))
-        ):
-            raise PipelineError("question has an invalid shape")
-    for name, item in state["gates"].items():
-        candidate_base = item.get("candidate_base") if isinstance(item, dict) else None
-        if (
-            not isinstance(name, str) or not isinstance(item, dict)
-            or item.get("status") not in {"open", "closed"}
-            or item.get("phase") not in PHASES[:-1]
-            or not isinstance(item.get("kind"), str)
-        ):
-            raise PipelineError("gate has an invalid shape")
-        if candidate_base is not None and not candidate_record_valid(
-            candidate_base, authority["digest"], state["pipeline_runtime_digest"],
-        ):
-            raise PipelineError("gate candidate_base is malformed")
-        if item.get("kind") == "controller_result" and (
-            item.get("reason") != "fail"
-            or not is_strict_integer(item.get("command_index"))
-            or item["command_index"] < 1
-            or type(item.get("returncode")) is not int
-            or item["returncode"] == 0
-            or "worker_artifact" in item
-        ):
-            raise PipelineError("controller-result gate is malformed")
         failure = item.get("controller_failure")
-        if item.get("kind") == "controller_result" or failure is not None:
+        if failure is not None:
             core_fields = {
                 "command_index", "returncode", "stdout_sha256", "stderr_sha256",
                 "unexecuted_count",
@@ -1144,7 +1058,6 @@ def validate_state(state: dict[str, Any]) -> None:
             }
             if (
                 not isinstance(failure, dict)
-                or item.get("kind") not in {"worker_result", "controller_result"}
                 or frozenset(failure) not in {
                     frozenset(core_fields), frozenset(core_fields | excerpt_fields),
                 }
@@ -1152,13 +1065,6 @@ def validate_state(state: dict[str, Any]) -> None:
                 or failure["command_index"] < 1
                 or type(failure.get("returncode")) is not int
                 or failure["returncode"] == 0
-                or (
-                    item.get("kind") == "controller_result"
-                    and (
-                        failure["command_index"] != item["command_index"]
-                        or failure["returncode"] != item["returncode"]
-                    )
-                )
                 or not is_digest(failure.get("stdout_sha256"))
                 or not is_digest(failure.get("stderr_sha256"))
                 or not is_strict_integer(failure.get("unexecuted_count"))
@@ -1174,6 +1080,17 @@ def validate_state(state: dict[str, Any]) -> None:
                 )
             ):
                 raise PipelineError("controller failure capsule is malformed")
+    if slice_records(state["slices"]) != state["slices"] or not isinstance(state["history"], list):
+        raise PipelineError("slices and history are malformed")
+    for name, item in state["questions"].items():
+        if (
+            not isinstance(name, str) or not isinstance(item, dict)
+            or item.get("status") not in {"open", "answered"}
+            or item.get("phase") not in PHASES[:-1]
+            or not isinstance(item.get("prompt"), str)
+            or (item.get("status") == "answered" and not isinstance(item.get("answer"), str))
+        ):
+            raise PipelineError("question has an invalid shape")
     for item in state["history"]:
         if (
             not isinstance(item, dict) or not isinstance(item.get("id"), str)
@@ -1277,7 +1194,6 @@ def status_view(state: dict[str, Any]) -> dict[str, Any]:
         "active_assignment": _active_assignment_view(state, active) if active else None,
         "candidate": current_candidate(state),
         "open_questions": pending(state["questions"]),
-        "open_gates": pending(state["gates"]),
         "ready": production_ready(state),
         "next_action": next_action(state),
     }

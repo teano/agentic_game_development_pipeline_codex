@@ -37,7 +37,7 @@ from .model import (
     validate_state,
 )
 
-COMMANDS = {"init", "status", "next", "complete", "answer", "resume", "accept", "migrate", "ready"}
+COMMANDS = {"init", "status", "next", "complete", "answer", "accept", "migrate", "ready"}
 WORKER_FORBIDDEN_KEYS = {
     "authority_digest", "base_checkout_sha256", "current_checkout_sha256", "checkout",
     "controller", "diff", "diff_sha256", "inventory", "commands", "tests", "receipts",
@@ -57,17 +57,6 @@ def _require_expected_generation(command: dict[str, Any]) -> None:
     value = command.get("expected_generation")
     if value is not None and not is_strict_integer(value):
         raise PipelineError("expected generation must be an integer")
-
-
-def _command_list(value: Any) -> list[list[str]]:
-    if not isinstance(value, list):
-        raise PipelineError("commands must be a list of argv lists")
-    clean = []
-    for argv in value:
-        if not isinstance(argv, list) or not argv or any(not isinstance(x, str) or not x for x in argv):
-            raise PipelineError("each planned command must be a non-empty argv list")
-        clean.append(list(argv))
-    return clean
 
 
 def _contains_forbidden(value: Any) -> str | None:
@@ -313,12 +302,9 @@ del _proof_protocol
 
 
 def _latest_remediation_candidate(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the newest artifact-bound, noncredit candidate for Engineering."""
     if state.get("phase") != "engineering" or state.get("active_assignment") is not None:
         return None
-    retained = current_candidate(state)
-    retained_generation = (
-        retained.get("generation", -1) if isinstance(retained, dict) else -1
-    )
     last_completed_slice_generation = max(
         (
             item["generation"] for item in state["history"]
@@ -327,25 +313,74 @@ def _latest_remediation_candidate(state: dict[str, Any]) -> dict[str, Any] | Non
         ),
         default=-1,
     )
-    candidates = []
-    for gate_id, item in state["gates"].items():
-        candidate = item.get("candidate_base") if isinstance(item, dict) else None
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    for phase in ("engineering", "review", "qa"):
+        item = state["artifacts"].get(phase)
+        worker = item.get("worker") if isinstance(item, dict) else None
+        candidate = (
+            item.get("candidate") if phase == "engineering" and isinstance(item, dict)
+            else item.get("candidate_binding") if isinstance(item, dict) else None
+        )
+        noncredit = (
+            phase == "engineering"
+            and isinstance(worker, dict)
+            and (
+                worker.get("outcome") != "pass"
+                or isinstance(item.get("controller_failure"), dict)
+            )
+        ) or (
+            phase in {"review", "qa"}
+            and isinstance(worker, dict)
+            and (
+                worker.get("outcome") == "fail"
+                or isinstance(item.get("controller_failure"), dict)
+            )
+        )
         if (
+            noncredit
+            and
             candidate_record_valid(
                 candidate, state["authority"]["digest"],
                 state["pipeline_runtime_digest"],
             )
-            and candidate["generation"]
-            > max(last_completed_slice_generation, retained_generation)
-            and item.get("status") == "closed"
-            and item.get("kind") in {"worker_result", "controller_result"}
-            and item.get("reason") == "fail"
-            and item.get("phase") in {"review", "qa"}
+            and candidate["generation"] > last_completed_slice_generation
         ):
-            candidates.append((candidate["generation"], gate_id, candidate))
+            candidates.append((candidate["generation"], PHASES.index(phase), candidate))
     if not candidates:
         return None
     return deepcopy(max(candidates, key=lambda value: (value[0], value[1]))[2])
+
+
+def _verification_failure_context(
+    state: dict[str, Any], candidate: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Project only deterministic verification evidence, never remediation prose."""
+    if not isinstance(candidate, dict):
+        return None
+    failures = []
+    for phase in ("review", "qa"):
+        record = state["artifacts"].get(phase)
+        worker = record.get("worker") if isinstance(record, dict) else None
+        if (
+            isinstance(worker, dict)
+            and record.get("candidate_binding") == candidate
+            and (
+                worker.get("outcome") == "fail"
+                or isinstance(record.get("controller_failure"), dict)
+            )
+        ):
+            item = {
+                "phase": phase, "candidate": deepcopy(candidate),
+                "outcome": worker.get("outcome"),
+            }
+            if phase == "review":
+                item["findings"] = deepcopy(worker.get("findings", []))
+            else:
+                item["checks"] = deepcopy(worker.get("checks", []))
+            if isinstance(record.get("controller_failure"), dict):
+                item["controller_failure"] = deepcopy(record["controller_failure"])
+            failures.append((candidate["generation"], PHASES.index(phase), item))
+    return max(failures, default=(0, 0, None))[-1]
 
 
 def _engineering_candidate_diff_base(
@@ -355,116 +390,7 @@ def _engineering_candidate_diff_base(
     execution_base = active["base"]["candidate_tree_oid"]
     if active.get("phase") != "engineering":
         return execution_base
-    slice_id = current_slice(state)["id"]
     binding = active.get("capsule", {}).get("candidate")
-    for gate in state["gates"].values():
-        if (
-            gate.get("status") == "closed"
-            and gate.get("slice_id") == slice_id
-            and gate.get("reason") == "fail"
-            and gate.get("phase") in {"review", "qa"}
-            and gate.get("candidate_base") == binding
-            and candidate_record_valid(
-                binding, state["authority"]["digest"],
-                state["pipeline_runtime_digest"],
-            )
-        ):
-            return binding["base_tree_oid"]
-    engineering_gates = [
-        gate for gate in state["gates"].values()
-        if gate.get("status") == "closed"
-        and gate.get("slice_id") == slice_id
-        and gate.get("phase") == "engineering"
-        and gate.get("reason") in {"blocked", "fail"}
-    ]
-    for gate in engineering_gates:
-        candidate = gate.get("candidate_base")
-        if candidate_record_valid(
-            candidate, state["authority"]["digest"],
-            state["pipeline_runtime_digest"],
-        ):
-            return candidate["candidate_tree_oid"]
-    if engineering_gates:
-        return state["base_tree_oid"]
-    return execution_base
-
-
-def _newer_nonpassing_engineering_tree(
-    state: dict[str, Any], candidate: dict[str, Any],
-) -> str | None:
-    if state.get("phase") != "engineering" or state.get("active_assignment") is not None:
-        return None
-    record = state["artifacts"].get("engineering")
-    worker = record.get("worker") if isinstance(record, dict) else None
-    controller = record.get("controller") if isinstance(record, dict) else None
-    assignment_id = record.get("assignment_id") if isinstance(record, dict) else None
-    commands = controller.get("commands") if isinstance(controller, dict) else None
-    failures = [
-        (index, item)
-        for index, item in enumerate(commands, 1)
-        if isinstance(item, dict) and type(item.get("returncode")) is int
-        and item["returncode"] != 0
-    ] if isinstance(commands, list) else []
-    controller_gate = (
-        state["gates"].get(f"{assignment_id}-controller-result")
-        if isinstance(assignment_id, str) else None
-    )
-    controller_nonpassing = (
-        isinstance(worker, dict) and worker.get("outcome") == "pass"
-        and len(failures) == 1 and failures[0][0] == len(commands)
-        and isinstance(controller_gate, dict)
-        and controller_gate.get("kind") == "controller_result"
-        and controller_gate.get("phase") == "engineering"
-        and controller_gate.get("reason") == "fail"
-        and controller_gate.get("command_index") == failures[0][0]
-        and controller_gate.get("returncode") == failures[0][1]["returncode"]
-    )
-    required_controller = {
-        "authority_digest", "pipeline_runtime_digest", "base_tree_oid",
-        "candidate_tree_oid", "changed_paths", "violations", "commands",
-    }
-    paths = controller.get("changed_paths") if isinstance(controller, dict) else None
-    slice_record = current_slice(state)
-    allowed_paths = slice_record.get("allowed_paths", []) if isinstance(slice_record, dict) else []
-    if (
-        not isinstance(worker, dict)
-        or (
-            worker.get("outcome") not in {"blocked", "fail"}
-            and not controller_nonpassing
-        )
-        or record.get("candidate_binding") != candidate
-        or not isinstance(assignment_id, str)
-        or not isinstance(controller, dict)
-        or set(controller) != required_controller
-        or controller.get("authority_digest") != state["authority"]["digest"]
-        or controller.get("pipeline_runtime_digest") != state["pipeline_runtime_digest"]
-        or controller.get("base_tree_oid") != candidate.get("candidate_tree_oid")
-        or not is_git_oid(controller.get("candidate_tree_oid"))
-        or not literal_paths_valid(paths)
-        or (
-            (candidate.get("base_tree_oid") == controller.get("candidate_tree_oid"))
-            != (not paths)
-        )
-        or controller.get("violations") != diff_violations(paths, allowed_paths)
-        or controller.get("violations") != []
-    ):
-        return None
-    completed_generation = max(
-        (
-            item["generation"] for item in state["history"]
-            if item.get("command") == "complete"
-            and item.get("assignment_id") == assignment_id
-            and item.get("phase") == "engineering"
-            and item.get("result") == assignment_id
-            and is_generation(item.get("generation"))
-        ),
-        default=-1,
-    )
-    if not candidate_record_valid(
-        candidate, state["authority"]["digest"], state["pipeline_runtime_digest"],
-    ):
-        return None
-    candidate_generation = candidate["generation"]
     last_completed_slice_generation = max(
         (
             item["generation"] for item in state["history"]
@@ -474,10 +400,13 @@ def _newer_nonpassing_engineering_tree(
         default=-1,
     )
     if (
-        completed_generation <= max(candidate_generation, last_completed_slice_generation)
+        candidate_record_valid(
+            binding, state["authority"]["digest"], state["pipeline_runtime_digest"],
+        )
+        and binding["generation"] > last_completed_slice_generation
     ):
-        return None
-    return controller["candidate_tree_oid"]
+        return binding["base_tree_oid"]
+    return execution_base
 
 
 def _validate_interrupted_assignment(state: dict[str, Any], evidence: Any) -> dict[str, Any]:
@@ -578,7 +507,7 @@ def _reduce_prechecked(
 def _reduce_command(
     state: dict[str, Any] | None, command: dict[str, Any], proof: object | None,
 ) -> dict[str, Any]:
-    """Return the next state for one of the nine commands."""
+    """Return the next state for one of the eight commands."""
     if not isinstance(command, dict) or command.get("name") not in COMMANDS:
         raise PipelineError("unknown command")
     _require_expected_generation(command)
@@ -634,7 +563,6 @@ def _reduce_command(
                 "candidate": audit_candidate,
                 "artifact_phases": sorted(state["artifacts"]),
                 "question_ids": sorted(state["questions"]),
-                "gate_ids": sorted(state["gates"]),
             }
             active = state["active_assignment"]
             if active is not None:
@@ -652,10 +580,6 @@ def _reduce_command(
                 prior["open_questions"] = {
                     key: deepcopy(state["questions"][key]) for key in pending(state["questions"])
                 }
-            if pending(state["gates"]):
-                prior["open_gates"] = {
-                    key: deepcopy(state["gates"][key]) for key in pending(state["gates"])
-                }
             retained_artifacts = _retained_candidate_evidence(
                 state, proposed["authority"]["digest"],
             )
@@ -668,7 +592,7 @@ def _reduce_command(
                 "pipeline_runtime_digest": proposed["pipeline_runtime_digest"],
                 "active_assignment": None, "slices": proposed["slices"],
                 "artifacts": retained_artifacts,
-                "questions": {}, "gates": {},
+                "questions": {},
             })
             work = _record(work, command, "authority_scope_reconfigured")
             work["history"][-1]["prior"] = prior
@@ -705,8 +629,15 @@ def _reduce_command(
     if name == "next":
         if work["phase"] == "ready" or work["active_assignment"] is not None:
             raise PipelineError("no next assignment is available")
-        if pending(work["questions"]) or pending(work["gates"]):
-            raise PipelineError("questions or gates must be resolved first")
+        if pending(work["questions"]):
+            raise PipelineError("questions must be resolved first")
+        current_record = work["artifacts"].get(work["phase"])
+        current_worker = current_record.get("worker") if isinstance(current_record, dict) else None
+        if (
+            isinstance(current_worker, dict) and current_worker.get("outcome") == "blocked"
+            and current_record.get("assignment_id") != "controller-checkout-baseline"
+        ):
+            raise PipelineError("blocked is terminal; archive this run and perform a fresh init")
         spec = command.get("assignment")
         if not isinstance(spec, dict):
             raise PipelineError("assignment is required")
@@ -745,19 +676,10 @@ def _reduce_command(
         ):
             raise PipelineError("next requires a controller-derived Git candidate base")
         candidate = current_candidate(work)
-        engineering_tree = None
         if phase == "engineering":
             remediation_candidate = _latest_remediation_candidate(work)
             candidate = remediation_candidate or candidate
-            engineering_tree = (
-                _newer_nonpassing_engineering_tree(work, remediation_candidate)
-                if remediation_candidate is not None else None
-            )
-        engineering_base_tree = (
-            engineering_tree
-            if engineering_tree is not None else candidate.get("candidate_tree_oid")
-            if candidate is not None else None
-        )
+        engineering_base_tree = candidate.get("candidate_tree_oid") if candidate is not None else None
         if (
             phase == "engineering" and candidate is not None
             and engineering_base_tree != base["candidate_tree_oid"]
@@ -781,16 +703,9 @@ def _reduce_command(
         context["current_slice"] = current_slice(work)
         if phase == "review":
             context["review_target"] = deepcopy(canonical["context"]["review_target"])
-        context["remediation"] = [
-            {"gate_id": key, **deepcopy(item)}
-            for key, item in sorted(work["gates"].items())
-            if item.get("status") == "closed"
-            and item.get("kind") in {"worker_result", "controller_result"}
-        ]
-        context["migration_audit"] = [
-            {"gate_id": key, **deepcopy(item)} for key, item in sorted(work["gates"].items())
-            if item.get("status") == "closed" and item.get("kind") == "migration_audit"
-        ]
+        verification_failure = _verification_failure_context(work, candidate)
+        if verification_failure is not None:
+            context["verification_failure"] = verification_failure
         context["decisions"] = [
             {"id": key, "phase": item["phase"], "prompt": item["prompt"], "answer": item["answer"]}
             for key, item in sorted(work["questions"].items())
@@ -843,13 +758,10 @@ def _reduce_command(
         questions = artifact.get("questions", [])
         record = {"assignment_id": active["id"], "worker": deepcopy(artifact), "controller": evidence}
         record["candidate_binding"] = deepcopy(active["capsule"].get("candidate"))
-        if (
-            (
-                active["phase"] == "engineering"
-                and artifact["outcome"] == "pass"
-            )
-            or (active["phase"] == "docs" and evidence["changed_paths"])
-        ) and controller_failure is None:
+        if active["phase"] == "engineering" or (
+            active["phase"] == "docs" and evidence["changed_paths"]
+            and artifact["outcome"] == "pass" and controller_failure is None
+        ):
             record["candidate"] = {
                 "base_tree_oid": _engineering_candidate_diff_base(work, active),
                 "candidate_tree_oid": evidence["candidate_tree_oid"],
@@ -858,35 +770,15 @@ def _reduce_command(
                 "pipeline_runtime_digest": work["pipeline_runtime_digest"],
                 "generation": work["generation"] + 1,
             }
+        if failure_capsule is not None:
+            record["controller_failure"] = failure_capsule
         work["artifacts"][active["phase"]] = record
-        for index, prompt in enumerate(questions, 1):
+        for index, prompt in enumerate(questions if artifact["outcome"] == "pass" else [], 1):
             question_id = f"question-{work['generation'] + 1}-{index}"
             work["questions"][question_id] = {
                 "status": "open",
                 "phase": active["phase"],
                 "prompt": _require_text(prompt, "question"),
-            }
-        if artifact["outcome"] != "pass":
-            gate_id = f"{active['id']}-result"
-            gate = {
-                "status": "open", "phase": active["phase"], "kind": "worker_result",
-                "reason": artifact["outcome"], "worker_artifact": deepcopy(artifact),
-                "candidate_base": deepcopy(active["capsule"].get("candidate")),
-                "slice_id": current_slice(work)["id"],
-            }
-            if failure_capsule is not None:
-                gate["controller_failure"] = failure_capsule
-            work["gates"][gate_id] = gate
-        elif controller_failure is not None:
-            gate_id = f"{active['id']}-controller-result"
-            work["gates"][gate_id] = {
-                "status": "open", "phase": active["phase"],
-                "kind": "controller_result", "reason": "fail",
-                "command_index": controller_failure["index"],
-                "returncode": controller_failure["returncode"],
-                "controller_failure": failure_capsule,
-                "candidate_base": deepcopy(active["capsule"].get("candidate")),
-                "slice_id": current_slice(work)["id"],
             }
         if active["phase"] == "engineering":
             for stale in ("review", "qa", "docs", "ready"):
@@ -894,6 +786,16 @@ def _reduce_command(
         elif active["phase"] == "docs" and evidence["changed_paths"]:
             for stale in ("review", "qa", "ready"):
                 work["artifacts"].pop(stale, None)
+        if (
+            active["phase"] in {"review", "qa"}
+            and artifact["outcome"] != "blocked"
+            and (artifact["outcome"] == "fail" or controller_failure is not None)
+        ):
+            failed_phase = active["phase"]
+            for stale in ("engineering", "review", "qa", "docs", "ready"):
+                if stale != failed_phase:
+                    work["artifacts"].pop(stale, None)
+            work["phase"] = "engineering"
         work["active_assignment"] = None
         return _record(work, command, active["id"], completed_actor={
             "actor_id": active["worker_id"], "phase": active["phase"],
@@ -912,40 +814,10 @@ def _reduce_command(
         work["phase"] = phase
         return _record(work, command, question_id)
 
-    if name == "resume":
-        gate_id = _require_text(command.get("gate_id"), "gate id")
-        item = work["gates"].get(gate_id)
-        if not item or item["status"] != "open":
-            raise PipelineError("gate is not open")
-        if item["kind"] == "migration_command_plan":
-            active = work["active_assignment"]
-            if active is None:
-                raise PipelineError("migrated assignment is missing")
-            active["commands"] = _command_list(command.get("commands"))
-            if active["phase"] in {"engineering", "qa"} and not active["commands"]:
-                raise PipelineError("migration resume requires controller commands")
-        else:
-            source_phase = item["phase"]
-            if (
-                item.get("reason") == "fail"
-                and source_phase in {"review", "qa"}
-                and item.get("kind") in {"worker_result", "controller_result"}
-            ):
-                candidate = item.get("candidate_base")
-                if not isinstance(candidate, dict):
-                    raise PipelineError("failed verification gate lost its candidate base")
-                for stale in ("review", "qa", "docs", "ready"):
-                    work["artifacts"].pop(stale, None)
-                work["phase"] = "engineering"
-            else:
-                work["phase"] = source_phase
-        item.update({"status": "closed", "resolution": _require_text(command.get("resolution"), "resolution")})
-        return _record(work, command, gate_id)
-
     if name == "accept":
         phase = work["phase"]
-        if work["active_assignment"] is not None or pending(work["questions"]) or pending(work["gates"]):
-            raise PipelineError("cannot accept with active work, questions, or gates")
+        if work["active_assignment"] is not None or pending(work["questions"]):
+            raise PipelineError("cannot accept with active work or questions")
         record = passing_artifact(work, phase)
         if record is None:
             raise PipelineError("current phase has no passing artifact")
@@ -997,7 +869,7 @@ def _reduce_command(
     if name == "ready":
         if work["phase"] != "ready" or work["active_assignment"] is not None:
             raise PipelineError("pipeline has not reached ready")
-        if pending(work["questions"]) or pending(work["gates"]):
+        if pending(work["questions"]):
             raise PipelineError("ready is blocked")
         if not all_slices_completed(work):
             raise PipelineError("ready requires Engineering, Review, and QA for every approved slice")

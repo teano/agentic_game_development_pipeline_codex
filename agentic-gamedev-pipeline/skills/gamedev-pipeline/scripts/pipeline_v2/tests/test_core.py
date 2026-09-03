@@ -92,8 +92,94 @@ class PipelineV2CoreTests(unittest.TestCase):
         exclude.write_text("/.gitattributes\n", encoding="utf-8")
         (self.root / ".gitattributes").write_text("* text=auto\n", encoding="utf-8")
 
-        with self.assertRaisesRegex(PipelineError, "policy files.*committed"):
+        with self.assertRaisesRegex(
+            PipelineError, r"policy files.*committed.*\.gitattributes",
+        ):
             require_clean_head(self.root)
+
+    def test_init_policy_preflight_writes_state_only_after_bound_clean_tree(self) -> None:
+        store = StateStore(self.root / ".agentic-pipeline-v2" / "policy-init.json")
+        controller = Controller(store)
+        command = {
+            "name": "init", "id": "INIT-POLICY-ATOMIC", "run_id": "RUN-POLICY",
+            "project_root": str(self.root),
+            "authority_paths": {
+                "requirements": "requirements.md",
+                "specification": "specification.md", "plan": "plan.md",
+            },
+            "slices": self.slices,
+        }
+        exclude = self.root / ".git" / "info" / "exclude"
+        exclude.write_text("/.gitattributes\n", encoding="utf-8")
+        policy = self.root / ".gitattributes"
+        policy.write_text("* text=auto\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(PipelineError, r"\.gitattributes"):
+            controller.reconfigure(command)
+        self.assertFalse(store.path.exists())
+
+        policy.unlink()
+        exclude.write_text("", encoding="utf-8")
+        state = controller.reconfigure(command)
+
+        self.assertTrue(store.path.is_file())
+        self.assertEqual(candidate_tree_oid(self.root), state["base_tree_oid"])
+
+    def test_clean_init_excludes_tracked_controller_history_from_candidate(self) -> None:
+        control_paths = [
+            ".agentic-pipeline/history.json",
+            ".agentic-pipeline/deleted-history.json",
+            ".agentic-pipeline/.gitignore",
+            ".agentic-pipeline-v2/state.json.lock",
+        ]
+        control_files = [self.root / path for path in control_paths]
+        for path in control_files:
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("committed controller history\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", "-f", "--", *control_paths],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-qm", "tracked controller history"],
+            check=True,
+        )
+
+        raw_head = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD^{tree}"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(control_files[3], self.store.lock_path)
+        with self.store.transaction():
+            baseline = require_clean_head(self.root)
+            self.assertEqual(baseline, candidate_tree_oid(self.root))
+        self.assertNotEqual(raw_head, baseline)
+        projected_control_paths = subprocess.run(
+            [
+                "git", "-C", str(self.root), "ls-tree", "-r", "--name-only",
+                baseline, "--", ".agentic-pipeline", ".agentic-pipeline-v2",
+            ],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        self.assertEqual([], projected_control_paths)
+
+        control_files[0].write_text("updated controller history\n", encoding="utf-8")
+        control_files[1].unlink()
+        control_files[2].write_text("updated controller policy\n", encoding="utf-8")
+        untracked_controls = [
+            self.root / ".agentic-pipeline" / "live-history.json",
+            self.root / ".agentic-pipeline-v2" / ".gitattributes",
+        ]
+        for path in untracked_controls:
+            path.write_text("untracked controller bytes\n", encoding="utf-8")
+        with self.store.transaction():
+            self.assertEqual(baseline, require_clean_head(self.root))
+            self.assertEqual(baseline, candidate_tree_oid(self.root))
+
+        (self.root / "game.txt").write_text("unsafe product drift\n", encoding="utf-8")
+        with self.store.transaction():
+            with self.assertRaisesRegex(PipelineError, "clean Git checkout"):
+                require_clean_head(self.root)
 
     def test_runtime_digest_manifest_includes_delegated_worker_contracts(self) -> None:
         with mock.patch(
@@ -113,6 +199,26 @@ class PipelineV2CoreTests(unittest.TestCase):
         ):
             with self.subTest(suffix=suffix):
                 self.assertTrue(any(path.endswith(suffix) for path in paths), suffix)
+        engineer_contract = (
+            SCRIPTS.parents[1] / "gamedev-engineer" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        for phrase in (
+            "Do not run or rerun the assignment's planned checks",
+            "interactive, background, long-lived, callback-driven, service, or already-running external mutator",
+        ):
+            self.assertIn(phrase, engineer_contract)
+        ownership_phrase = (
+            "interactive, background, long-lived, callback-driven, service, "
+            "or already-running external mutator"
+        )
+        for relative in (
+            Path("gamedev-pipeline/SKILL.md"),
+            Path("gamedev-engineer/SKILL.md"),
+            Path("gamedev-pipeline/references/pipeline-protocol.md"),
+            Path("gamedev-pipeline/references/stage-handoff-invariant.md"),
+        ):
+            text = (SCRIPTS.parents[1] / relative).read_text(encoding="utf-8")
+            self.assertIn(ownership_phrase, text)
 
     def test_nested_repository_policy_names_force_fresh_init(self) -> None:
         base = candidate_tree_oid(self.root)
@@ -143,6 +249,31 @@ class PipelineV2CoreTests(unittest.TestCase):
 
         with self.assertRaisesRegex(PipelineError, "policy files.*committed"):
             require_clean_head(self.root)
+
+    def test_policy_inside_already_ignored_editor_subtree_is_outside_candidate(self) -> None:
+        root_ignore = self.root / ".gitignore"
+        root_ignore.write_text(
+            root_ignore.read_text(encoding="utf-8") + "/.idea/\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", ".gitignore"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-qm", "ignore editor state"],
+            check=True,
+        )
+        editor = self.root / ".idea" / ".idea.PinBall" / ".idea"
+        editor.mkdir(parents=True)
+        (editor / ".gitignore").write_text(
+            "/workspace.xml\n/httpRequests/\n", encoding="utf-8",
+        )
+        (editor / "workspace.xml").write_text("local editor state\n", encoding="utf-8")
+
+        baseline = require_clean_head(self.root)
+
+        self.assertEqual(baseline, candidate_tree_oid(self.root))
+        self.assertEqual([], changed_paths(self.root, baseline, candidate_tree_oid(self.root)))
 
     def test_default_controller_timeout_covers_bounded_large_project_checks(self) -> None:
         self._reach_engineering("-large-project-timeout")
@@ -530,7 +661,7 @@ class PipelineV2CoreTests(unittest.TestCase):
 
     def _resume_after_changed_docs_review_failure(
         self,
-    ) -> tuple[dict, dict, dict, str]:
+    ) -> tuple[dict, dict, dict, None]:
         retained_candidate = self._reach_candidate()
         self._review_pass("reviewer-before-docs-change")
         self._qa_pass("qa-before-docs-change")
@@ -563,18 +694,10 @@ class PipelineV2CoreTests(unittest.TestCase):
                 }],
             },
         )
-        gate_id = next(
-            key for key, item in failed["gates"].items() if item["status"] == "open"
-        )
-        resumed = self.controller.transition({
-            "name": "resume", "id": "RESUME-review-after-docs-change-fail",
-            "expected_generation": failed["generation"], "gate_id": gate_id,
-            "resolution": "Add the missing release evidence",
-        })
-        self.assertEqual("engineering", resumed["phase"])
-        self.assertEqual(retained_candidate, current_candidate(resumed))
-        self.assertEqual(docs_candidate, resumed["gates"][gate_id]["candidate_base"])
-        return resumed, retained_candidate, docs_candidate, gate_id
+        self.assertEqual("engineering", failed["phase"])
+        self.assertIsNone(current_candidate(failed))
+        self.assertEqual(docs_candidate, failed["artifacts"]["review"]["candidate_binding"])
+        return failed, retained_candidate, docs_candidate, None
 
     def _resume_after_verification_and_nonpassing_engineering(
         self, verification_phase: str, engineering_outcome: str,
@@ -598,14 +721,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                     }],
                 },
             )
-        verification_gate = next(
-            key for key, item in failed["gates"].items() if item["status"] == "open"
-        )
-        self.controller.transition({
-            "name": "resume", "id": "RESUME-verification-before-nonpassing-engineering",
-            "expected_generation": failed["generation"], "gate_id": verification_gate,
-            "resolution": "Repair the verification failure",
-        })
+        self.assertEqual("engineering", failed["phase"])
         self.controller.next(
             command_id="NEXT-first-nonpassing-engineering",
             assignment={
@@ -622,23 +738,12 @@ class PipelineV2CoreTests(unittest.TestCase):
             {
                 "outcome": engineering_outcome,
                 "summary": f"Engineering {engineering_outcome} after allowed edits",
-                **({
-                    "blocker": "Required engineering capability is unavailable.",
-                    "required_action": "Provide the required engineering capability.",
-                } if engineering_outcome == "blocked" else {}),
             },
         )
-        engineering_gate = next(
-            key for key, item in completed["gates"].items() if item["status"] == "open"
-        )
-        resumed = self.controller.transition({
-            "name": "resume", "id": "RESUME-first-nonpassing-engineering",
-            "expected_generation": completed["generation"], "gate_id": engineering_gate,
-            "resolution": "Continue from the controller-validated allowed edits",
-        })
-        self.assertEqual("engineering", resumed["phase"])
-        self.assertIsNone(resumed["active_assignment"])
-        return resumed, candidate
+        self.assertEqual("fail", engineering_outcome)
+        self.assertEqual("engineering", completed["phase"])
+        self.assertIsNone(completed["active_assignment"])
+        return completed, candidate
 
     def _reach_candidate(self) -> dict:
         self._reach_engineering()
@@ -657,8 +762,156 @@ class PipelineV2CoreTests(unittest.TestCase):
     def test_normal_run_reaches_ready_with_git_tree_state_fields(self) -> None:
         self._reach_candidate()
         ready = self._finish_ready("reviewer-1", "qa-1", "docs-1")
-        self.assertEqual(15, len(ready))
-        self.assertEqual(7, len(PHASES)); self.assertEqual(9, len(COMMANDS))
+        self.assertEqual(14, len(ready))
+        self.assertNotIn("gates", ready)
+        self.assertEqual(7, len(PHASES)); self.assertEqual(8, len(COMMANDS))
+
+    def test_schema3_blocked_is_terminal_replay_safe_and_fresh_init_only(self) -> None:
+        self._reach_engineering("-terminal-block")
+        self.controller.next(command_id="NEXT-terminal-block")
+        (self.root / "game.txt").write_text("partial blocked change\n", encoding="utf-8")
+        artifact = self._write_artifact({
+            "outcome": "blocked", "summary": "External capability is unavailable",
+            "blocker": "A user-owned capability is unavailable.",
+            "required_action": "Provide the capability outside this run.",
+        })
+        completed = self.controller.complete(
+            command_id="COMPLETE-terminal-block", artifact_path=artifact,
+        )
+        action = status_view(completed)["next_action"]
+
+        self.assertNotIn("gates", completed)
+        self.assertEqual("terminal", action["kind"])
+        self.assertEqual("user_input_required", action["result"])
+        self.assertIs(True, action["user_input_required"])
+        self.assertEqual(completed, self.controller.complete(
+            command_id="COMPLETE-terminal-block", artifact_path=artifact,
+        ))
+        with self.assertRaisesRegex(PipelineError, "blocked is terminal"):
+            reduce(completed, {
+                "name": "next", "id": "FORGED-NEXT-AFTER-BLOCK",
+                "expected_generation": completed["generation"],
+                "assignment": default_assignment(completed),
+            })
+        with self.assertRaisesRegex(PipelineError, "unknown command"):
+            reduce(completed, {
+                "name": "resume", "id": "FORGED-RESUME",
+                "expected_generation": completed["generation"],
+            })
+        schema2 = deepcopy(completed)
+        schema2["schema"] = 2
+        with self.assertRaises(PipelineError):
+            validate_state(schema2)
+
+    def test_review_fail_routes_directly_to_engineering_with_bounded_evidence(self) -> None:
+        candidate = self._reach_candidate()
+        failed = self._complete_readonly("review", "reviewer-direct-fail", {
+            "outcome": "fail",
+            "findings": [{"text": "Fix the bounded defect.", "severity": "high", "kind": "correctness"}],
+        })
+
+        self.assertEqual("engineering", failed["phase"])
+        self.assertNotIn("gates", failed)
+        self.assertIsNone(current_candidate(failed))
+        issued = self.controller.next(command_id="NEXT-direct-remediation")
+        active = issued["active_assignment"]
+        self.assertEqual(candidate, active["capsule"]["candidate"])
+        failure = active["capsule"]["context"]["verification_failure"]
+        self.assertEqual("review", failure["phase"])
+        self.assertEqual(candidate, failure["candidate"])
+        encoded = json.dumps(active["capsule"]["context"], sort_keys=True)
+        self.assertNotIn("blocker", encoded)
+        self.assertNotIn("required_action", encoded)
+        self.assertNotIn("resolution", encoded)
+
+    def test_engineering_controller_failure_is_noncredit_and_retries_deterministically(self) -> None:
+        failing = [sys.executable, "-c", "raise SystemExit(23)"]
+        self.slices = [{
+            "id": "SLICE-CONTROLLER-FAIL", "allowed_paths": ["game.txt"],
+            "planned_commands": [failing],
+        }]
+        state = self.store.load()
+        self.store.dispatch({
+            "name": "init", "id": "CONFIGURE-CONTROLLER-FAIL",
+            "expected_generation": state["generation"], "run_id": state["run_id"],
+            "project_root": state["project_root"], "authority": state["authority"],
+            "slices": self._sealed(self.slices), **self._reconfigure_evidence(state),
+        })
+        self._reach_engineering("-controller-fail")
+        self.controller.next(command_id="NEXT-controller-fail")
+        (self.root / "game.txt").write_text("candidate despite failed check\n", encoding="utf-8")
+        completed = self._complete(
+            "COMPLETE-controller-fail", {"outcome": "pass", "summary": "Implemented"},
+        )
+
+        self.assertEqual("engineering", completed["phase"])
+        self.assertIsNone(current_candidate(completed))
+        self.assertIn("candidate", completed["artifacts"]["engineering"])
+        self.assertEqual(23, completed["artifacts"]["engineering"]["controller_failure"]["returncode"])
+        action = status_view(completed)["next_action"]
+        self.assertEqual("next", action["command"])
+        issued = self.controller.next(command_id=action["command_id"])
+        self.assertEqual(
+            completed["artifacts"]["engineering"]["candidate"],
+            issued["active_assignment"]["capsule"]["candidate"],
+        )
+
+    def test_qa_fail_routes_directly_to_engineering_without_resume(self) -> None:
+        candidate = self._reach_candidate()
+        self._review_pass("reviewer-before-qa-fail")
+        failed = self._complete_readonly(
+            "qa", "qa-direct-fail", {"outcome": "fail", "checks": ["acceptance: fail"]},
+        )
+
+        self.assertEqual("engineering", failed["phase"])
+        self.assertIsNone(current_candidate(failed))
+        self.assertEqual(candidate, failed["artifacts"]["qa"]["candidate_binding"])
+        action = status_view(failed)["next_action"]
+        self.assertEqual("next", action["command"])
+
+    def test_qa_controller_failure_routes_to_engineering_as_noncredit_evidence(self) -> None:
+        candidate = self._reach_candidate()
+        self._review_pass("reviewer-before-qa-controller-fail")
+        self.controller.next(command_id="NEXT-qa-controller-fail")
+        self._write_artifact({"outcome": "pass", "checks": ["acceptance: claimed pass"]})
+        failed_process = ProcessEvidence(
+            29, digest("qa-out"), digest("qa-err"), b"qa controller check failed",
+        )
+        with mock.patch.object(runner_module, "run_process_tree", return_value=failed_process):
+            failed = self.controller.complete(command_id="COMPLETE-qa-controller-fail")
+
+        self.assertEqual("engineering", failed["phase"])
+        self.assertIsNone(current_candidate(failed))
+        record = failed["artifacts"]["qa"]
+        self.assertEqual(candidate, record["candidate_binding"])
+        self.assertEqual(29, record["controller_failure"]["returncode"])
+        issued = self.controller.next(command_id="NEXT-after-qa-controller-fail")
+        failure = issued["active_assignment"]["capsule"]["context"]["verification_failure"]
+        self.assertEqual("qa", failure["phase"])
+        self.assertEqual(29, failure["controller_failure"]["returncode"])
+
+    def test_post_complete_delta_invalidates_credit_before_next_transition(self) -> None:
+        self._reach_engineering("-post-complete-delta")
+        completed = self._engineer("engineer-post-complete-delta", "sealed candidate\n")
+        self.assertIsNotNone(current_candidate(completed))
+        before = self.store.path.read_bytes()
+
+        (self.root / "game.txt").write_text("late worker delta\n", encoding="utf-8")
+        view = self.controller.status()
+        self.assertEqual("terminal", view["next_action"]["kind"])
+        self.assertEqual("checkout_recovery_required", view["next_action"]["result"])
+        self.assertEqual(before, self.store.path.read_bytes())
+
+    def test_completed_empty_transport_cannot_hide_controller_state(self) -> None:
+        self._reach_engineering("-transport-independent")
+        completed = self._engineer("engineer-transport-independent", "transport independent\n")
+        persisted = self.store.path.read_bytes()
+
+        fresh_controller = _CanonicalTestController(StateStore(self.store.path), timeout=10)
+        view = fresh_controller.status()
+        self.assertEqual(completed["generation"], view["generation"])
+        self.assertEqual("accept", view["next_action"]["command"])
+        self.assertEqual(persisted, self.store.path.read_bytes())
 
     def test_public_dispatch_rejects_mapping_subclass_before_controller_guard(self) -> None:
         class GuardBypass(dict):
@@ -898,7 +1151,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                 self.assertFalse(store.path.exists())
                 self.assertFalse(store.lock_path.exists())
 
-    def test_blocked_precandidate_phases_retain_environment_resolution_in_retry_capsule(self) -> None:
+    def _schema2_removed_blocked_precandidate_retry_capsule(self) -> None:
         for phase in ("plan", "slice", "engineering"):
             with self.subTest(phase=phase):
                 harness = PipelineV2CoreTests("runTest")
@@ -1020,21 +1273,16 @@ class PipelineV2CoreTests(unittest.TestCase):
             "outcome": "fail",
             "findings": [{"text": "repair slice one", "severity": "high", "kind": "correctness"}],
         })
-        first_gate = next(key for key, item in failed_first_review["gates"].items() if item["status"] == "open")
-        self.store.dispatch({
-            "name": "resume", "id": "RESUME-S1-REVIEW",
-            "expected_generation": failed_first_review["generation"],
-            "gate_id": first_gate, "resolution": "repair the first slice",
-        })
+        self.assertEqual("engineering", failed_first_review["phase"])
         self._engineer_slice("engineer-s1-fix", "candidate one repaired\n", slice_index=0, target="slice-one.txt")
         self._accept("engineering-s1-fix")
         self._review_pass("reviewer-s1")
         after_first_qa = self._qa_pass("qa-s1")
 
         self.assertEqual("engineering", after_first_qa["phase"])
-        self.assertEqual(15, len(after_first_qa))
+        self.assertEqual(14, len(after_first_qa))
         self.assertNotIn("current_slice", after_first_qa)
-        self.assertEqual(7, len(PHASES)); self.assertEqual(9, len(COMMANDS))
+        self.assertEqual(7, len(PHASES)); self.assertEqual(8, len(COMMANDS))
 
         self._engineer_slice("engineer-s2", "candidate two\n", slice_index=1, target="slice-two.txt")
         self._accept("engineering-s2")
@@ -1042,22 +1290,12 @@ class PipelineV2CoreTests(unittest.TestCase):
             "outcome": "fail",
             "findings": [{"text": "repair slice two", "severity": "high", "kind": "correctness"}],
         })
-        review_gate = next(key for key, item in failed_review["gates"].items() if item["status"] == "open")
-        resumed_review = self.store.dispatch({
-            "name": "resume", "id": "RESUME-S2-REVIEW", "expected_generation": failed_review["generation"],
-            "gate_id": review_gate, "resolution": "repair the second slice",
-        })
-        self.assertEqual("SLICE-2", current_slice(resumed_review)["id"])
+        self.assertEqual("SLICE-2", current_slice(failed_review)["id"])
         self._engineer_slice("engineer-s2-review-fix", "review fixed\n", slice_index=1, target="slice-two.txt")
         self._accept("engineering-s2-review-fix")
         self._review_pass("reviewer-s2-pass")
         failed_qa = self._complete_readonly("qa", "qa-s2-fail", {"outcome": "fail", "checks": ["runtime: fail"]})
-        qa_gate = next(key for key, item in failed_qa["gates"].items() if item["status"] == "open")
-        resumed_qa = self.store.dispatch({
-            "name": "resume", "id": "RESUME-S2-QA", "expected_generation": failed_qa["generation"],
-            "gate_id": qa_gate, "resolution": "repair the second slice again",
-        })
-        self.assertEqual("SLICE-2", current_slice(resumed_qa)["id"])
+        self.assertEqual("SLICE-2", current_slice(failed_qa)["id"])
         self._engineer_slice("engineer-s2-qa-fix", "qa fixed\n", slice_index=1, target="slice-two.txt")
         self._accept("engineering-s2-qa-fix")
         self._review_pass("reviewer-s2-final")
@@ -1065,7 +1303,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         terminal = self._docs_no_change("docs-multi")
         ready = self.controller.ready(command_id="READY-MULTI", expected_generation=terminal["generation"])
         self.assertTrue(status_view(ready)["ready"])
-        self.assertEqual(15, len(ready))
+        self.assertEqual(14, len(ready))
 
     def test_next_slice_rejects_tampering_with_the_accepted_slice_surface(self) -> None:
         self._configure_two_slices()
@@ -1377,7 +1615,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             })
         self.assertFalse(self.store.path.exists())
 
-    def test_blocked_stale_assignment_publicly_resumes_with_fresh_cumulative_read(self) -> None:
+    def _schema2_removed_blocked_stale_assignment_resume(self) -> None:
         (self.root / "src").mkdir()
         (self.root / "tests" / "foundation").mkdir(parents=True)
         (self.root / "src" / "levels.js").write_text("sealed\n", encoding="utf-8")
@@ -1457,7 +1695,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual(["src/config.js"], fresh["access"]["write"])
         self.assertEqual([failing_check], fresh["checks"])
 
-    def test_nonzero_planned_check_with_pass_persists_controller_gate_without_credit(self) -> None:
+    def _schema2_removed_nonzero_pass_controller_gate(self) -> None:
         failing_check = [sys.executable, "-c", "raise SystemExit(19)"]
         self.slices = [{
             "id": "SLICE-FAILING-PASS",
@@ -1518,7 +1756,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual("engineering", resumed["phase"])
         self.assertEqual("next", status_view(resumed)["next_action"]["command"])
 
-    def test_nonzero_planned_check_with_fail_persists_gate_and_resumes(self) -> None:
+    def _schema2_removed_nonzero_fail_gate_resume(self) -> None:
         failing_check = [sys.executable, "-c", "raise SystemExit(19)"]
         self.slices = [{
             "id": "SLICE-FAILING-OUTCOME",
@@ -1559,7 +1797,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual("engineering", resumed["phase"])
         self.assertIsNone(resumed["active_assignment"])
 
-    def test_nonzero_qa_fail_routes_to_engineering_rework(self) -> None:
+    def _schema2_removed_nonzero_qa_worker_gate(self) -> None:
         failing_check = [sys.executable, "-c", "raise SystemExit(29)"]
         self.slices = [{
             "id": "SLICE-QA-FAIL",
@@ -1598,7 +1836,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertNotIn("review", resumed["artifacts"])
         self.assertNotIn("qa", resumed["artifacts"])
 
-    def test_nonzero_qa_check_with_worker_pass_routes_to_engineering_rework(self) -> None:
+    def _schema2_removed_nonzero_qa_controller_gate(self) -> None:
         failing_check = [sys.executable, "-c", "raise SystemExit(37)"]
         self.slices = [{
             "id": "SLICE-QA-CONTROLLER-FAIL",
@@ -1681,7 +1919,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             retried["active_assignment"]["base"]["candidate_tree_oid"],
         )
 
-    def test_fail_fast_runs_only_through_first_failure_or_the_full_success_plan(self) -> None:
+    def _schema2_removed_fail_fast_gate_assertions(self) -> None:
         cases = (
             ("first", [31, 0, 0], [31]),
             ("second", [0, 23, 0], [0, 23]),
@@ -1747,7 +1985,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                 finally:
                     harness.tearDown()
 
-    def test_reducer_rejects_forged_command_prefixes_and_accepts_legacy_failure_shape(self) -> None:
+    def _schema2_removed_legacy_failure_gate_shape(self) -> None:
         self.slices = [{
             "id": "SLICE-FORGED-PREFIX",
             "allowed_paths": ["game.txt"],
@@ -1812,7 +2050,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         legacy_controller = Controller(StateStore(legacy_path))
         self.assertEqual("resume", legacy_controller.status()["next_action"]["command"])
 
-    def test_newer_blocked_engineering_tree_recovers_old_remediation_candidate(self) -> None:
+    def _schema2_removed_blocked_engineering_remediation_candidate(self) -> None:
         self._reach_candidate()
         failed_review = self._complete_readonly(
             "review", "reviewer-old-candidate",
@@ -1874,7 +2112,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual("engineering", resumed["phase"])
         self.assertIsNone(resumed["active_assignment"])
 
-    def test_nonpassing_engineering_never_creates_or_publishes_a_candidate(self) -> None:
+    def _schema2_removed_nonpassing_engineering_gate_candidate(self) -> None:
         cases = (
             ("blocked", [sys.executable, "-c", "raise SystemExit(23)"]),
             ("fail", self.command),
@@ -1961,7 +2199,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                 finally:
                     harness.tearDown()
 
-    def test_nonpassing_engineering_is_not_captured_as_reconfiguration_audit_candidate(self) -> None:
+    def test_nonpassing_engineering_is_retained_only_as_reconfiguration_audit_evidence(self) -> None:
         self._reach_engineering("-audit")
         self.controller.next(command_id="NEXT-FAIL-AUDIT", assignment={
             "id": "ASSIGN-FAIL-AUDIT", "worker_id": "engineer-fail-audit",
@@ -1982,7 +2220,11 @@ class PipelineV2CoreTests(unittest.TestCase):
             "slices": self._sealed(revised_slices),
             **self._reconfigure_evidence(failed),
         })
-        self.assertIsNone(reconfigured["history"][-1]["prior"]["candidate"])
+        self.assertEqual(
+            failed["artifacts"]["engineering"]["candidate"],
+            reconfigured["history"][-1]["prior"]["candidate"],
+        )
+        self.assertIsNone(current_candidate(reconfigured))
 
     def test_passing_engineering_still_persists_and_publishes_the_exact_candidate(self) -> None:
         completed = self._reach_candidate()
@@ -2050,7 +2292,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             self.assertEqual(resumed, persisted)
             self.assertEqual(completed["generation"] + 1, persisted["generation"])
             self.assertEqual("slice", persisted["phase"])
-            self.assertEqual(15, len(persisted))
+            self.assertEqual(14, len(persisted))
         finally:
             for child in (resumer, holder):
                 if child is not None and child.poll() is None:
@@ -2333,7 +2575,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual(completed_bytes, self.store.path.read_bytes())
         self.assertEqual("run\n", marker.read_text(encoding="utf-8"))
 
-    def test_launch_error_has_distinct_technical_return_code_and_blocked_gate(self) -> None:
+    def _schema2_removed_launch_error_gate(self) -> None:
         missing = str(self.root / "definitely-missing-planned-command.exe")
         self.slices = [{
             "id": "SLICE-LAUNCH-ERROR",
@@ -2470,7 +2712,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             )
             self.assertEqual(1, invoked.call_count)
 
-    def test_public_failure_capsule_is_bounded_redacted_and_reaches_remediation(self) -> None:
+    def _schema2_removed_failure_capsule_gate_remediation(self) -> None:
         secret = "PIPELINE_SECRET_SENTINEL_7F42"
         bearer = "BEARER_SENTINEL_28A1"
         password = "PASSWORD_SENTINEL_19C3"
@@ -2618,7 +2860,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                 sentinel, json.dumps(assignment_context, ensure_ascii=False),
             )
 
-    def test_nonpassing_worker_keeps_one_worker_gate_with_safe_controller_failure(self) -> None:
+    def _schema2_removed_nonpassing_worker_gate(self) -> None:
         for outcome in ("fail", "blocked"):
             with self.subTest(outcome=outcome):
                 harness = PipelineV2CoreTests("runTest")
@@ -2765,7 +3007,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                 finally:
                     harness.tearDown()
 
-    def test_worker_result_without_controller_failure_keeps_legacy_gate_shape(self) -> None:
+    def _schema2_removed_worker_gate_shape(self) -> None:
         for case in ("no-checks", "all-pass"):
             with self.subTest(case=case):
                 harness = PipelineV2CoreTests("runTest")
@@ -3098,7 +3340,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         completed = self._complete("GEN67-REVIEW-COMPLETE", {"outcome": "pass", "findings": []})
         self.assertEqual(68, completed["generation"])
 
-    def test_failed_review_routes_to_writable_engineering_and_fresh_verification(self) -> None:
+    def _schema2_removed_failed_review_resume_route(self) -> None:
         candidate = self._reach_candidate()
         failed = self._complete_readonly("review", "reviewer-1", {
             "outcome": "fail",
@@ -3142,7 +3384,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         )
         self._finish_ready("reviewer-2", "qa-2", "docs-2")
 
-    def test_failed_qa_invalidates_engineering_and_review_then_reaches_ready(self) -> None:
+    def _schema2_removed_failed_qa_resume_route(self) -> None:
         candidate = self._reach_candidate()
         self._review_pass("reviewer-1")
         failed = self._complete_readonly("qa", "qa-1", {"outcome": "fail", "checks": ["launch: product failure"]})
@@ -3159,7 +3401,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self._accept("engineering-2")
         self._finish_ready("reviewer-2", "qa-2", "docs-2")
 
-    def test_multiple_failed_gates_use_newest_candidate_independent_of_gate_order(self) -> None:
+    def _schema2_removed_multiple_failed_gates(self) -> None:
         first_candidate = self._reach_candidate()
         review_failed = self._complete_readonly("review", "z-reviewer-1", {
             "outcome": "fail",
@@ -3229,7 +3471,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         ready = self._finish_ready("reviewer-3", "qa-2", "docs-2")
         self.assertTrue(status_view(ready)["ready"])
 
-    def test_reconfigure_after_verification_rework_audits_latest_failed_candidate_only(self) -> None:
+    def _schema2_removed_reconfigure_gate_audit(self) -> None:
         first_candidate = self._reach_candidate()
         review_failed = self._complete_readonly("review", "reviewer-reconfigure-fail", {
             "outcome": "fail",
@@ -3288,7 +3530,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             self.store.dispatch(stale)
         self.assertEqual(persisted_bytes, self.store.path.read_bytes())
 
-    def test_blocked_qa_resumes_qa_but_retry_session_must_be_fresh(self) -> None:
+    def _schema2_removed_blocked_qa_resume(self) -> None:
         self._reach_candidate()
         self._review_pass("reviewer-1")
         blocked = self._complete_readonly("qa", "qa-1", {
@@ -3313,7 +3555,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         )
         self.assertEqual(expected["worker_id"], issued["active_assignment"]["worker_id"])
 
-    def test_blocked_engineering_short_circuits_checks_and_exact_replay(self) -> None:
+    def _schema2_removed_blocked_engineering_gate_replay(self) -> None:
         self._reach_engineering("-blocked-short-circuit")
         issued = self.controller.next(
             command_id="NEXT-BLOCKED-SHORT-CIRCUIT", assignment={},
@@ -3373,7 +3615,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             ["game.txt"], review["context"]["review_target"]["candidate_changes"],
         )
 
-    def test_blocked_engineering_retry_accumulates_changes_from_both_attempts(self) -> None:
+    def _schema2_removed_blocked_engineering_cumulative_retry(self) -> None:
         self._reach_engineering("-blocked-cumulative")
         self.controller.next(command_id="NEXT-BLOCKED-CUMULATIVE", assignment={})
         (self.root / "game.txt").write_text("first attempt\n", encoding="utf-8")
@@ -3506,7 +3748,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             with self.subTest(slices=slices), self.assertRaises(PipelineError):
                 validate_state(malformed)
 
-    def test_generation_fields_reject_booleans_and_floats_before_status_mutation(self) -> None:
+    def _schema2_removed_gate_generation_fields(self) -> None:
         resumed, _, _, gate_id = self._resume_after_changed_docs_review_failure()
         base = deepcopy(resumed)
 
@@ -3541,7 +3783,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                     self.assertEqual(persisted, self.store.path.read_bytes())
         self.store._write(base)
 
-    def test_candidate_and_gate_candidate_base_require_the_exact_bound_shape(self) -> None:
+    def _schema2_removed_gate_candidate_bound_shape(self) -> None:
         resumed, _, _, gate_id = self._resume_after_changed_docs_review_failure()
         targets = {
             "artifact candidate": lambda state: state["artifacts"]["engineering"]["candidate"],
@@ -3987,7 +4229,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ConflictError, "stale generation"):
             reduce(resumed, stale)
 
-    def test_post_docs_remediation_candidate_is_authority_strict_and_slice_bounded(self) -> None:
+    def _schema2_removed_post_docs_gate_authority(self) -> None:
         resumed, retained, docs_candidate, gate_id = self._resume_after_changed_docs_review_failure()
         completed_event = next(
             item for item in reversed(resumed["history"])
@@ -4054,7 +4296,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                 "controller_base": self._controller_base(),
             })
 
-    def test_equal_or_older_remediation_gate_never_overrides_retained_candidate(self) -> None:
+    def _schema2_removed_equal_old_remediation_gate(self) -> None:
         retained = self._reach_candidate()
         failed = self._complete_readonly(
             "review", "reviewer-equal-gate",
@@ -4102,11 +4344,8 @@ class PipelineV2CoreTests(unittest.TestCase):
 
     def test_newer_nonpassing_engineering_tree_is_the_next_base_for_all_verification_failures(self) -> None:
         for verification_phase in ("review", "qa"):
-            for engineering_outcome in ("blocked", "fail"):
-                with self.subTest(
-                    verification_phase=verification_phase,
-                    engineering_outcome=engineering_outcome,
-                ):
+            for engineering_outcome in ("fail",):
+                with self.subTest(verification_phase=verification_phase):
                     harness = PipelineV2CoreTests("runTest")
                     harness.setUp()
                     try:
@@ -4151,7 +4390,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                             issued["active_assignment"]["base"]["candidate_tree_oid"],
                         )
                         self.assertEqual(
-                            candidate,
+                            resumed["artifacts"]["engineering"]["candidate"],
                             issued["active_assignment"]["capsule"]["candidate"],
                         )
                         issued_bytes = harness.store.path.read_bytes()
@@ -4167,73 +4406,16 @@ class PipelineV2CoreTests(unittest.TestCase):
                     finally:
                         harness.tearDown()
 
-    def test_nonpassing_engineering_tree_baseline_is_strict_and_trusted(self) -> None:
+    def test_nonpassing_engineering_candidate_is_artifact_only_and_trusted(self) -> None:
         resumed, candidate = self._resume_after_verification_and_nonpassing_engineering(
-            "review", "blocked",
+            "review", "fail",
         )
-        trusted_tree = reducer_module._newer_nonpassing_engineering_tree(
-            resumed, candidate,
-        )
-        self.assertEqual(candidate_tree_oid(self.root), trusted_tree)
-
         record = resumed["artifacts"]["engineering"]
-        assignment_id = record["assignment_id"]
-        cases = {}
-
-        authority_mismatch = deepcopy(resumed)
-        authority_mismatch["artifacts"]["engineering"]["controller"]["authority_digest"] = (
-            digest("foreign authority")
+        self.assertIsNone(current_candidate(resumed))
+        self.assertEqual(
+            record["candidate"], reducer_module._latest_remediation_candidate(resumed),
         )
-        cases["authority mismatch"] = authority_mismatch
-
-        digest_mismatch = deepcopy(resumed)
-        digest_mismatch["artifacts"]["engineering"]["controller"]["candidate_tree_oid"] = (
-            "not-a-tree-oid"
-        )
-        cases["malformed tree"] = digest_mismatch
-
-        malformed = deepcopy(resumed)
-        malformed["artifacts"]["engineering"]["controller"]["changed_paths"] = ["bad/../path"]
-        cases["malformed changed paths"] = malformed
-
-        untrusted = deepcopy(resumed)
-        untrusted["artifacts"]["engineering"]["candidate_binding"] = None
-        cases["untrusted binding"] = untrusted
-
-        for label, generation in (
-            ("equal completion", candidate["generation"]),
-            ("older completion", candidate["generation"] - 1),
-        ):
-            state = deepcopy(resumed)
-            completion = next(
-                item for item in state["history"]
-                if item.get("command") == "complete"
-                and item.get("assignment_id") == assignment_id
-            )
-            completion["generation"] = generation
-            cases[label] = state
-
-        for label, state in cases.items():
-            with self.subTest(label=label):
-                validate_state(state)
-                remediation = Controller._remediation_candidate(state)
-                self.assertEqual(candidate, remediation)
-                self.assertIsNone(
-                    reducer_module._newer_nonpassing_engineering_tree(state, remediation),
-                )
-                action = status_view(state)["next_action"]
-                with self.assertRaisesRegex(PipelineError, "retained base|retained candidate base"):
-                    reduce(state, {
-                        "name": "next", "id": action["command_id"],
-                        "expected_generation": action["expected_generation"],
-                        "assignment": action["assignment"],
-                        "controller_base": self._controller_base(),
-                    })
-                self.store._write(state)
-                self.assertEqual(
-                    "checkout_recovery_required",
-                    self.controller.status()["next_action"]["result"],
-                )
+        self.assertEqual(candidate_tree_oid(self.root), record["candidate"]["candidate_tree_oid"])
 
     def test_forbidden_changes_fail_closed(self) -> None:
         self._reach_engineering()
@@ -4347,15 +4529,14 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual({"engineering", "plan"}, set(reconfigured["artifacts"]))
         self.assertIsNone(reconfigured["active_assignment"])
         self.assertFalse(any(item["status"] == "open" for item in reconfigured["questions"].values()))
-        self.assertFalse(any(item["status"] == "open" for item in reconfigured["gates"].values()))
         self.assertEqual(before["history"], reconfigured["history"][:len(before["history"])])
         audit_json = json.dumps(
-            {"history": reconfigured["history"], "gates": reconfigured["gates"]},
+            {"history": reconfigured["history"]},
             ensure_ascii=False, sort_keys=True,
         )
         self.assertIn(json.dumps(candidate, ensure_ascii=False, sort_keys=True), audit_json)
-        self.assertEqual(15, len(reconfigured))
-        self.assertEqual(7, len(PHASES)); self.assertEqual(9, len(COMMANDS))
+        self.assertEqual(14, len(reconfigured))
+        self.assertEqual(7, len(PHASES)); self.assertEqual(8, len(COMMANDS))
 
         replay = deepcopy(command); replay["expected_generation"] = -1
         self.assertEqual(reconfigured, self.store.dispatch(replay))
@@ -4389,13 +4570,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             "question_id": question_id, "answer": "Use the approved option",
         })
         self._complete_readonly("plan", "planner-status-2", {"outcome": "fail", "summary": "Retry"})
-        views["resume"] = public_status()
-        gate_id = views["resume"]["open_gates"][0]
-        state = self.store.load()
-        self.store.dispatch({
-            "name": "resume", "id": "RESUME-STATUS", "expected_generation": state["generation"],
-            "gate_id": gate_id, "resolution": "Retry the failed plan",
-        })
+        views["retry"] = public_status()
         self._complete_readonly("plan", "planner-status-3", {"outcome": "pass", "summary": "Plan confirmed"})
         views["accept"] = public_status()
         self._accept("status-plan")
@@ -4423,15 +4598,13 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual("complete", views["complete"]["next_action"]["command"])
         self.assertEqual(issued["active_assignment"]["id"], views["complete"]["next_action"]["assignment_id"])
         self.assertEqual("accept", views["accept"]["next_action"]["command"])
-        self.assertEqual("resume", views["resume"]["next_action"]["command"])
-        self.assertEqual(gate_id, views["resume"]["next_action"]["gate_id"])
-        self.assertTrue(views["resume"]["next_action"]["resume_reason"])
+        self.assertEqual("next", views["retry"]["next_action"]["command"])
         self.assertEqual("answer", views["decision"]["next_action"]["command"])
         self.assertEqual("controller_decision", views["decision"]["next_action"]["route"])
         self.assertEqual(question_id, views["decision"]["next_action"]["question_id"])
         self.assertEqual("ready", views["ready"]["next_action"]["command"])
         self.assertEqual("terminal", views["terminal"]["next_action"]["kind"])
-        for route in ("next", "complete", "accept", "resume", "decision", "ready"):
+        for route in ("next", "complete", "accept", "retry", "decision", "ready"):
             action = views[route]["next_action"]
             self.assertTrue(action["command_id"])
             self.assertEqual(views[route]["generation"], action["expected_generation"])
@@ -4805,7 +4978,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual(initialized["generation"] + 1, reconfigured["generation"])
         self.assertEqual("plan", reconfigured["phase"])
 
-    def test_answer_and_blocked_engineering_resume_replays_verify_checkout_baseline(self) -> None:
+    def _schema2_removed_answer_blocked_resume_baseline(self) -> None:
         self._reach_engineering("-answer-baseline")
         self.controller.next(command_id="NEXT-ANSWER-BASELINE", assignment={
             "id": "ASSIGN-ANSWER-BASELINE", "worker_id": "engineer-answer-baseline",
@@ -4887,17 +5060,6 @@ class PipelineV2CoreTests(unittest.TestCase):
             "answer": "Use the approved option",
         }
         self.controller.transition(answer)
-        failed = self._complete_readonly(
-            "plan", "planner-authority-replay-fail",
-            {"outcome": "fail", "summary": "Retry"},
-        )
-        gate_id = next(key for key, item in failed["gates"].items() if item["status"] == "open")
-        resume = {
-            "name": "resume", "id": "RESUME-AUTHORITY-REPLAY",
-            "expected_generation": failed["generation"], "gate_id": gate_id,
-            "resolution": "Retry plan",
-        }
-        self.controller.transition(resume)
         passed = self._complete_readonly(
             "plan", "planner-authority-replay-pass",
             {"outcome": "pass", "summary": "Plan confirmed"},
@@ -4926,7 +5088,6 @@ class PipelineV2CoreTests(unittest.TestCase):
                 expected_generation=next_action["expected_generation"],
             ),
             "answer": lambda: self.controller.transition(answer),
-            "resume": lambda: self.controller.transition(resume),
             "accept": lambda: self.controller.transition(accept),
             "ready": lambda: self.controller.ready(
                 command_id="READY-AUTHORITY-REPLAY",

@@ -136,17 +136,11 @@ def _control_pathspecs() -> list[str]:
     return result
 
 
-def _require_untracked_control_paths(root: Path) -> None:
-    tracked = _git(
-        root,
-        ["--literal-pathspecs", "ls-files", "-z", "--", *CONTROL_PATHS],
-        label="controller path ownership check",
+def _is_control_path(path: str) -> bool:
+    return any(
+        path == control or path.startswith(f"{control}/")
+        for control in CONTROL_PATHS
     )
-    if tracked:
-        names = [item.decode("utf-8", errors="replace") for item in tracked.split(b"\0") if item]
-        raise PipelineError(
-            "controller directories must not be Git-tracked: " + ", ".join(names[:8])
-        )
 
 
 def _require_no_gitlinks(root: Path) -> None:
@@ -161,25 +155,57 @@ def _require_no_gitlinks(root: Path) -> None:
         )
 
 
-def _repository_policy_files(root: Path) -> list[str]:
+def _git_path_is_ignored(root: Path, path: str) -> bool:
+    """Return whether Git excludes one existing path from candidate traversal."""
+    result = subprocess.run(
+        ["git", "-C", str(root), "check-ignore", "--quiet", "--no-index", "--", path],
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if result.returncode in {0, 1}:
+        return result.returncode == 0
+    detail = result.stderr.decode("utf-8", errors="replace").strip()
+    if len(detail) > 512:
+        detail = detail[-512:]
+    raise PipelineError(
+        "Git candidate traversal check failed: "
+        + (detail or f"return code {result.returncode}")
+    )
+
+
+def _repository_policy_files(root: Path, candidate_paths: bytes) -> list[str]:
+    """Classify policy paths through the same effective candidate boundary."""
     pathspecs = [
         pathspec
         for name in REPOSITORY_POLICY_NAMES
         for pathspec in (name, f":(glob)**/{name}")
     ]
-    records = []
-    for args in (
-        ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-        ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
-    ):
-        records.extend(
+    try:
+        visible = [
+            item.decode("utf-8")
+            for item in candidate_paths.split(b"\0")
+            if item and item.rsplit(b"/", 1)[-1].decode("utf-8") in REPOSITORY_POLICY_NAMES
+        ]
+        ignored = [
             item.decode("utf-8")
             for item in _git(
-                root, [*args, "--", *pathspecs],
+                root,
+                [
+                    "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
+                    "--", *pathspecs, *_control_pathspecs(),
+                ],
                 label="Git repository-policy discovery",
             ).split(b"\0")
             if item
-        )
+        ]
+    except UnicodeError as exc:
+        raise PipelineError("Git repository-policy paths must be valid UTF-8") from exc
+    records = [path for path in visible if not _is_control_path(path)]
+    for path in ignored:
+        if _is_control_path(path):
+            continue
+        parent = path.rpartition("/")[0]
+        if not parent or not _git_path_is_ignored(root, parent):
+            records.append(path)
     return sorted(dict.fromkeys(records))
 
 
@@ -197,7 +223,6 @@ def head_tree_oid(root: Path) -> str:
 def require_clean_head(root: Path) -> str:
     """Require a committed, clean versioned baseline; ignored files stay invisible."""
     root = require_repository_root(root)
-    _require_untracked_control_paths(root)
     _require_no_gitlinks(root)
     status = _git(
         root,
@@ -211,49 +236,82 @@ def require_clean_head(root: Path) -> str:
         raise PipelineError(
             "init requires a clean Git checkout with no tracked or non-ignored changes"
         )
-    head = head_tree_oid(root)
-    if candidate_tree_oid(root) != head:
+    raw_head = head_tree_oid(root)
+    head = _projected_tree_oid(root, raw_head, include_worktree=False)
+    live = _projected_tree_oid(root, raw_head, include_worktree=True)
+    if live != head:
+        policy = repository_policy_changed(root, head, live)
+        detail = f": {', '.join(policy)}" if policy else ""
         raise PipelineError(
             "init requires repository policy files to be committed and match HEAD"
+            + detail
         )
     return head
 
 
-def candidate_tree_oid(root: Path) -> str:
-    """Write the live tracked plus non-ignored worktree into an external temporary index."""
-    root = require_repository_root(root)
-    _require_untracked_control_paths(root)
+def _projected_tree_oid(root: Path, base_tree_oid: str, *, include_worktree: bool) -> str:
+    """Project a Git tree through the controller-path boundary in a temporary index."""
     with tempfile.TemporaryDirectory(prefix="agentic-pipeline-git-index-") as temporary:
         index = Path(temporary) / "index"
         index_env = {"GIT_INDEX_FILE": str(index)}
-        _git(root, ["read-tree", "HEAD"], env=index_env, label="temporary Git index initialization")
         _git(
-            root,
-            ["add", "-A"],
-            env=index_env,
-            label="Git candidate staging",
+            root, ["read-tree", base_tree_oid], env=index_env,
+            label="temporary Git index initialization",
         )
         _git(
             root,
             ["--literal-pathspecs", "rm", "-r", "--cached", "--ignore-unmatch", "--", *CONTROL_PATHS],
             env=index_env,
-            label="controller path exclusion",
+            label="controller path baseline exclusion",
         )
-        policy_files = _repository_policy_files(root)
-        if policy_files:
+        if include_worktree:
+            candidate_paths = _git(
+                root,
+                [
+                    "ls-files", "--cached", "--others", "--exclude-standard", "-z",
+                    "--", ".", *_control_pathspecs(),
+                ],
+                env=index_env,
+                label="Git candidate path discovery",
+            )
+            pathspec_file = Path(temporary) / "candidate-paths"
+            pathspec_file.write_bytes(candidate_paths)
             _git(
                 root,
-                ["--literal-pathspecs", "add", "-f", "--", *policy_files],
+                [
+                    "--literal-pathspecs", "add", "-A",
+                    f"--pathspec-from-file={pathspec_file}", "--pathspec-file-nul",
+                ],
                 env=index_env,
-                label="Git repository-policy staging",
+                label="Git candidate staging",
             )
+            _git(
+                root,
+                ["--literal-pathspecs", "rm", "-r", "--cached", "--ignore-unmatch", "--", *CONTROL_PATHS],
+                env=index_env,
+                label="controller path exclusion",
+            )
+            policy_files = _repository_policy_files(root, candidate_paths)
+            if policy_files:
+                _git(
+                    root,
+                    ["--literal-pathspecs", "add", "-f", "--", *policy_files],
+                    env=index_env,
+                    label="Git repository-policy staging",
+                )
         try:
-            value = _git(root, ["write-tree"], env=index_env, label="Git candidate tree").decode("ascii").strip()
+            value = _git(root, ["write-tree"], env=index_env, label="Git projected tree").decode("ascii").strip()
         except UnicodeError as exc:
-            raise PipelineError("Git returned a malformed candidate tree OID") from exc
+            raise PipelineError("Git returned a malformed projected tree OID") from exc
     if not is_git_oid(value):
-        raise PipelineError("Git returned a malformed candidate tree OID")
+        raise PipelineError("Git returned a malformed projected tree OID")
     return value
+
+
+def candidate_tree_oid(root: Path) -> str:
+    """Write the live tracked plus non-ignored worktree into an external temporary index."""
+    root = require_repository_root(root)
+    return _projected_tree_oid(root, head_tree_oid(root), include_worktree=True)
 
 
 def changed_paths(root: Path, base_tree_oid: str, candidate_tree_oid_value: str) -> list[str]:
