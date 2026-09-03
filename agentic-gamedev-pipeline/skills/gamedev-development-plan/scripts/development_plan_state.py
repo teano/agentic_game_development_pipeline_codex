@@ -1438,7 +1438,7 @@ def require_retired_schema10_lineage(
 
 
 def discover_v2_runtime_states(root: Path) -> list[Path]:
-    """Find direct schema-2 runtime states without treating other JSON as state."""
+    """Find direct current-schema runtime states without treating other JSON as state."""
     directory = root / V2_RUNTIME_STATE_RELATIVE_PATH.parent
     if not directory.exists():
         return []
@@ -1470,7 +1470,8 @@ def discover_v2_runtime_states(root: Path) -> list[Path]:
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if (
-            isinstance(value, dict) and value.get("schema") == 2
+            isinstance(value, dict)
+            and value.get("schema") == _pipeline_v2_model.SCHEMA
             and "project_root" in value and "authority" in value
         ):
             candidates.append(path)
@@ -1489,7 +1490,7 @@ def require_v2_runtime_binding(
     items = authority.get("items") if isinstance(authority, dict) else None
     expected_digest = canonical_json_digest(items) if isinstance(items, dict) else None
     if (
-        runtime.get("schema") != 2
+        runtime.get("schema") != _pipeline_v2_model.SCHEMA
         or Path(str(runtime.get("project_root", ""))).resolve() != root
         or not isinstance(authority, dict)
         or set(authority) != {"items", "digest"}

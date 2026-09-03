@@ -7,15 +7,24 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-03
+
 ### Изменено
 
 - Pipeline v2 упрощён до schema 3: `blocked` завершает run с требованием fresh `init`, Review/QA failures напрямую возвращают Engineering без `resume` gates, а workers больше не запускают controller-owned checks или внешние интерактивные mutators.
 - Candidate boundary применяет единую Git-классификацию: tracked controller/history artifacts остаются в истории репозитория, но не входят в product candidate; repository policies остаются governed только там, где способны влиять на видимые candidate paths.
+- Plan и Specification проверяют bound runtime через текущую каноническую schema-модель; удалённая gate-модель больше не участвует в sanctioned revision и quiescence checks.
 
 ### Исправлено
 
-- Инициализация Specification безопасно архивирует завершённый `SPEC_READY` workflow другой feature в `.agentic-pipeline/Workflows/<feature>` и fail-closed отклоняет nonterminal, active, linked или неоднозначные источники и непустое место назначения.
+- Инициализация Specification безопасно архивирует завершённый `SPEC_READY` workflow другой feature в `.agentic-pipeline/Workflows/<feature>`, сначала валидирует новые входы и повторно проверяет prior acceptance; nonterminal, active, linked, внешние, неоднозначные источники и непустое место назначения отклоняются fail-closed.
 - Post-complete checkout drift теперь отзываeт устаревший candidate credit и возвращает точный `checkout_recovery_required` вместо сохранения ложного `ready` для изменившихся байтов.
+
+### Проверено
+
+- Shared operational invariant: 6/6 PASS.
+- Bound runtime schema-3 regressions для Development Plan: 5/5 PASS.
+- Specification archive и sanctioned revision regressions: 8/8 PASS.
 
 ## [0.11.0] - 2026-09-02
 
@@ -296,7 +305,8 @@
 - Полный набор из 97 тестов контроллеров, активации и межрежимных контрактов.
 - Валидация manifest плагина и всех восьми skill-пакетов.
 
-[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.9.0...v0.9.1

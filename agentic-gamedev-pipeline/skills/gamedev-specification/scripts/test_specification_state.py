@@ -490,7 +490,6 @@ approved_at: 2026-08-10T00:00:00Z
             controller._pipeline_v2_transaction.StateStore(runtime_path)
         ).status()
         self.assertIsNone(status["active_assignment"])
-        self.assertEqual([], status["open_gates"])
         self.assertEqual([], status["open_questions"])
         self.assertEqual("command", status["next_action"]["kind"])
         self.assertTrue(status["next_action"]["command_id"].startswith("next-plan-"))
@@ -2088,6 +2087,66 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertEqual(b"plan-state\n", unrelated_state.read_bytes())
         self.assertEqual(b"runtime-output\n", unrelated_output.read_bytes())
 
+    def test_init_preflights_malformed_new_spec_before_archiving_old_feature(self) -> None:
+        self.make_ready()
+        pipeline_root = self.root / ".agentic-pipeline"
+        before = {
+            path.relative_to(pipeline_root).as_posix(): path.read_bytes()
+            for path in pipeline_root.rglob("*")
+            if path.is_file()
+        }
+        arguments = self.other_feature_init_args()
+        other_spec = self.root / arguments.spec
+        other_spec.write_bytes(b"---\ndocument_type: technical-specification\n")
+
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError,
+            "frontmatter|technical specification",
+        ):
+            controller.command_init(arguments)
+
+        self.assertEqual(
+            before,
+            {
+                path.relative_to(pipeline_root).as_posix(): path.read_bytes()
+                for path in pipeline_root.rglob("*")
+                if path.is_file()
+            },
+        )
+        self.assertFalse(
+            (pipeline_root / "Workflows" / "sample-feature").exists()
+        )
+
+    def test_init_revalidates_preaccept_receipt_before_archiving_old_feature(self) -> None:
+        ready = self.make_ready()
+        pipeline_root = self.root / ".agentic-pipeline"
+        receipt = self.root / ready["acceptance"]["preaccept_receipt"]["path"]
+        receipt.unlink()
+        before = {
+            path.relative_to(pipeline_root).as_posix(): path.read_bytes()
+            for path in pipeline_root.rglob("*")
+            if path.is_file()
+        }
+
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError,
+            "pre-accept receipt",
+        ):
+            controller.command_init(self.other_feature_init_args())
+
+        self.assertEqual(
+            before,
+            {
+                path.relative_to(pipeline_root).as_posix(): path.read_bytes()
+                for path in pipeline_root.rglob("*")
+                if path.is_file()
+            },
+        )
+        self.assertFalse(receipt.exists())
+        self.assertFalse(
+            (pipeline_root / "Workflows" / "sample-feature").exists()
+        )
+
     def test_init_rejects_nonterminal_or_busy_other_feature_without_mutation(self) -> None:
         self.make_ready()
         state_file = self.root / controller.STATE_RELATIVE_PATH
@@ -2113,6 +2172,36 @@ PRD-REQ-001 is covered by the formatter and runner.
                 self.assertFalse(
                     (self.root / ".agentic-pipeline" / "Workflows" / "sample-feature").exists()
                 )
+
+    def test_init_rejects_draft_source_with_forged_terminal_receipts_without_mutation(
+        self,
+    ) -> None:
+        self.make_ready()
+        state_file = self.root / controller.STATE_RELATIVE_PATH
+        draft_bytes = self.spec.read_bytes().replace(
+            b"status: approved", b"status: draft", 1
+        )
+        self.spec.write_bytes(draft_bytes)
+        draft_sha = controller.sha256(self.spec)
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["specification"]["sha256"] = draft_sha
+        state["ready"]["spec_sha256"] = draft_sha
+        state["acceptance"]["specification_sha256"] = draft_sha
+        state["waves"][-1]["result_spec_sha256"] = draft_sha
+        controller.write_state_file(state_file, state)
+        before_state = state_file.read_bytes()
+
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError,
+            "incomplete or inconsistent terminal SPEC_READY evidence",
+        ):
+            controller.command_init(self.other_feature_init_args())
+
+        self.assertEqual(before_state, state_file.read_bytes())
+        self.assertEqual(draft_bytes, self.spec.read_bytes())
+        self.assertFalse(
+            (self.root / ".agentic-pipeline" / "Workflows" / "sample-feature").exists()
+        )
 
     def test_init_rejects_nonempty_other_feature_archive_without_mutation(self) -> None:
         self.make_ready()
@@ -3458,18 +3547,11 @@ PRD-REQ-001 is covered by the formatter and runner.
 
         self.assertEqual("proofreader-1", state["active_wave"]["proofreader_id"])
 
-    def test_v2_reopen_allows_closed_gate_and_answered_question_audit_history(self) -> None:
+    def test_v2_reopen_allows_answered_question_audit_history(self) -> None:
         ready = self.make_ready()
         runtime = self.bind_direct_v2(ready)
 
-        def add_closed_gate(value: dict) -> None:
-            value["gates"] = {
-                "closed-review-history": {
-                    "status": "closed",
-                    "phase": "review",
-                    "kind": "worker_result",
-                }
-            }
+        def add_answered_question(value: dict) -> None:
             value["questions"] = {
                 "answered-planning-history": {
                     "status": "answered",
@@ -3479,10 +3561,10 @@ PRD-REQ-001 is covered by the formatter and runner.
                 }
             }
 
-        self._rewrite_runtime(runtime, add_closed_gate)
+        self._rewrite_runtime(runtime, add_answered_question)
         reopened = controller.command_revise_ready(
             self.args(
-                reason="revise with retained closed gate evidence",
+                reason="revise with retained answered-question evidence",
                 architect_id="architect-2",
                 recovery_token=None,
                 specification_only=True,
@@ -3550,11 +3632,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             "prior specification SHA": lambda value: value["authority"]["items"][
                 "specification"
             ].update({"sha256": "c" * 64}),
-            "open gate": lambda value: value.update({
-                "gates": {
-                    "blocked": {"status": "open", "phase": "plan", "kind": "test"}
-                }
-            }),
             "open question": lambda value: value.update({
                 "questions": {
                     "question": {
@@ -3705,7 +3782,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             "status",
             return_value={
                 "active_assignment": {"id": "stale-plan-assignment"},
-                "open_gates": ["stale-gate"],
                 "open_questions": ["stale-question"],
                 "next_action": {
                     "kind": "command",
@@ -3734,7 +3810,6 @@ PRD-REQ-001 is covered by the formatter and runner.
         cases = {
             "non-init": {
                 "active_assignment": None,
-                "open_gates": [],
                 "open_questions": [],
                 "next_action": {
                     "kind": "command",
@@ -3744,7 +3819,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             },
             "user-input": {
                 "active_assignment": None,
-                "open_gates": [],
                 "open_questions": [],
                 "next_action": {
                     "kind": "command",
@@ -3754,7 +3828,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             },
             "recovery": {
                 "active_assignment": None,
-                "open_gates": [],
                 "open_questions": [],
                 "next_action": {
                     "kind": "terminal",
@@ -3763,7 +3836,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             },
             "unknown": {
                 "active_assignment": None,
-                "open_gates": [],
                 "open_questions": [],
                 "next_action": {"kind": "unknown-effect"},
             },
@@ -3845,7 +3917,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             "status",
             return_value={
                 "active_assignment": None,
-                "open_gates": [],
                 "open_questions": [],
                 "next_action": {"kind": "unknown-effect"},
             },

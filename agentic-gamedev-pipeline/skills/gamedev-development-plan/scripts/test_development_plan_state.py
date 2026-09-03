@@ -314,7 +314,7 @@ product_authority:
         }
         self.commit_fixture("v2 binding fixture")
         runtime = {
-            "schema": 2,
+            "schema": controller._pipeline_v2_model.SCHEMA,
             "checkout_model": "git-tree-v1",
             "base_tree_oid": pipeline_checkout.require_clean_head(self.root),
             "pipeline_runtime_digest": pipeline_checkout.pipeline_runtime_digest(),
@@ -334,7 +334,6 @@ product_authority:
             ],
             "artifacts": {},
             "questions": {},
-            "gates": {},
             "history": [],
         }
         runtime_path = self.root / ".agentic-pipeline-v2" / filename
@@ -1444,7 +1443,8 @@ Only the approved feature and named shared symbol are in scope.
             },
         }
         runtime = {
-            "schema": 2, "project_root": str(self.root),
+            "schema": controller._pipeline_v2_model.SCHEMA,
+            "project_root": str(self.root),
             "authority": {
                 "items": authority_items,
                 "digest": hashlib.sha256(

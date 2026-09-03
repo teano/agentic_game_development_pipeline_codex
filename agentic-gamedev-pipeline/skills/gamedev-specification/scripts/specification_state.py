@@ -1445,6 +1445,7 @@ def _require_archivable_completed_state(root: Path, state: dict[str, Any]) -> st
     prd, spec = require_source_unchanged(root, state)
     current_prd_sha = sha256(prd)
     current_spec_sha = sha256(spec)
+    current_specification_meta = parse_frontmatter(spec, "Specification")
     specification = state.get("specification")
     ready = state.get("ready")
     acceptance = state.get("acceptance")
@@ -1453,6 +1454,7 @@ def _require_archivable_completed_state(root: Path, state: dict[str, Any]) -> st
         not isinstance(specification, dict)
         or specification.get("sha256") != current_spec_sha
         or specification.get("status") != "approved"
+        or current_specification_meta.get("status") != "approved"
         or not isinstance(ready, dict)
         or ready.get("prd_sha256") != current_prd_sha
         or ready.get("spec_sha256") != current_spec_sha
@@ -1474,6 +1476,7 @@ def _require_archivable_completed_state(root: Path, state: dict[str, Any]) -> st
         raise SpecificationStateError(
             "another feature has incomplete or inconsistent terminal SPEC_READY evidence"
         )
+    require_current_preaccept_acceptance(root, state, prd, spec)
     proofread = waves[-1].get("proofread")
     questions = proofread.get("questions") if isinstance(proofread, dict) else None
     if (
@@ -1598,7 +1601,14 @@ def _specification_archive_files(
                 continue
             add(candidate, required=True)
     for supplied in _referenced_specification_artifact_paths(state):
-        add(Path(supplied))
+        candidate = Path(supplied)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            candidate.resolve().relative_to(pipeline_root.resolve())
+        except ValueError:
+            continue
+        add(candidate, required=True)
     return files
 
 
@@ -1851,7 +1861,8 @@ def runtime_recovery_authorization(
         requirements = items.get("requirements") if isinstance(items, dict) else None
         specification = items.get("specification") if isinstance(items, dict) else None
         if (
-            runtime.get("schema") != 2
+            runtime.get("schema")
+            != _development_plan_controller._pipeline_v2_model.SCHEMA
             or Path(str(runtime.get("project_root", ""))).resolve() != root
             or not isinstance(authority, dict)
             or set(authority) != {"items", "digest"}
@@ -1890,7 +1901,6 @@ def runtime_recovery_authorization(
             public_status_invalid = public_status_invalid or (
                 runtime.get("active_assignment") is not None
                 or view.get("active_assignment") is not None
-                or view.get("open_gates") != []
                 or view.get("open_questions") != []
             )
         else:
@@ -3227,10 +3237,11 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
     prd = resolve_project_path(root, args.prd, "approved PRD")
     spec = resolve_project_path(root, args.spec, "technical specification")
     validate_approved_prd_contract(prd)
+    existing_to_archive: dict[str, Any] | None = None
     if state_path(root).is_file():
         existing = load_state(root, persist_migration=False)
         if existing["feature"] != feature:
-            archive_completed_specification_state(root, existing)
+            existing_to_archive = existing
         else:
             existing = load_state(root)
             requested_paths = (
@@ -3297,6 +3308,8 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
     }
     if spec_meta and not drift:
         state["specification"]["status"] = spec_meta.get("status")
+    if existing_to_archive is not None:
+        archive_completed_specification_state(root, existing_to_archive)
     save_state(root, state)
     return state
 
