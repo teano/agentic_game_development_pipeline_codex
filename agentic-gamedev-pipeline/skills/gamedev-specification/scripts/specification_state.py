@@ -21,6 +21,18 @@ from typing import Any
 SCHEMA_VERSION = 2
 V2_RECOVERY_AUTHORIZATION_SCHEMA = 2
 STATE_RELATIVE_PATH = Path(".agentic-pipeline/specification-state.json")
+SPECIFICATION_ARCHIVE_ROOT_RELATIVE_PATH = Path(".agentic-pipeline/Workflows")
+SPECIFICATION_ARTIFACT_DIRECTORIES = (
+    "architect-receipts",
+    "helper-requests",
+    "helper-results",
+)
+NON_SPECIFICATION_PIPELINE_ARTIFACTS = {
+    "development-plan-state.json",
+    "findings.json",
+    "state.json",
+}
+NON_SPECIFICATION_PIPELINE_DIRECTORIES = {"outputs"}
 RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline/state.json")
 RUNTIME_FINDINGS_RELATIVE_PATH = Path(".agentic-pipeline/findings.json")
 V2_RUNTIME_STATE_RELATIVE_PATH = Path(".agentic-pipeline-v2/state.json")
@@ -1396,6 +1408,298 @@ def save_state(root: Path, state: dict[str, Any]) -> None:
     state["schema_version"] = SCHEMA_VERSION
     refresh_identity_history(state)
     write_state_file(state_path(root), state)
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    )
+
+
+def _require_archivable_completed_state(root: Path, state: dict[str, Any]) -> str:
+    feature_value = state.get("feature")
+    if not isinstance(feature_value, str):
+        raise SpecificationStateError("existing specification feature is invalid")
+    feature = require_slug(feature_value)
+    if state.get("status") != "spec_ready":
+        raise SpecificationStateError(
+            "another feature may be archived only from exact terminal SPEC_READY state"
+        )
+    for key, label in (
+        ("active_helper_request", "active helper request"),
+        ("active_wave", "active wave"),
+        ("hold", "active hold"),
+    ):
+        if state.get(key) is not None:
+            raise SpecificationStateError(
+                f"terminal SPEC_READY archive is blocked by an {label}"
+            )
+    if any(
+        state.get(key) is not None
+        for key in ("in_progress_revision", "ready_revision")
+    ):
+        raise SpecificationStateError(
+            "terminal SPEC_READY archive is blocked by a pending revision"
+        )
+
+    prd, spec = require_source_unchanged(root, state)
+    current_prd_sha = sha256(prd)
+    current_spec_sha = sha256(spec)
+    specification = state.get("specification")
+    ready = state.get("ready")
+    acceptance = state.get("acceptance")
+    waves = state.get("waves")
+    if (
+        not isinstance(specification, dict)
+        or specification.get("sha256") != current_spec_sha
+        or specification.get("status") != "approved"
+        or not isinstance(ready, dict)
+        or ready.get("prd_sha256") != current_prd_sha
+        or ready.get("spec_sha256") != current_spec_sha
+        or not isinstance(ready.get("architect_id"), str)
+        or not ready["architect_id"].strip()
+        or not isinstance(ready.get("proofreader_id"), str)
+        or not ready["proofreader_id"].strip()
+        or not isinstance(acceptance, dict)
+        or acceptance.get("prd_sha256") != current_prd_sha
+        or acceptance.get("specification_sha256") != current_spec_sha
+        or not isinstance(waves, list)
+        or not waves
+        or not isinstance(waves[-1], dict)
+        or waves[-1].get("outcome") != "spec_ready"
+        or waves[-1].get("result_spec_sha256") != current_spec_sha
+        or not same_actor(waves[-1].get("architect_id", ""), ready["architect_id"])
+        or not same_actor(waves[-1].get("proofreader_id", ""), ready["proofreader_id"])
+    ):
+        raise SpecificationStateError(
+            "another feature has incomplete or inconsistent terminal SPEC_READY evidence"
+        )
+    proofread = waves[-1].get("proofread")
+    questions = proofread.get("questions") if isinstance(proofread, dict) else None
+    if (
+        not isinstance(proofread, dict)
+        or not isinstance(questions, dict)
+        or proofread.get("critical") != 0
+        or proofread.get("major") != 0
+        or not proofread.get("coverage_complete")
+        or any(questions.values())
+        or (
+            proofread.get("minor", 0) != 0
+            and proofread.get("minors_engineer_resolvable") is not True
+        )
+    ):
+        raise SpecificationStateError(
+            "another feature lacks a clean terminal SPEC_READY proofreader result"
+        )
+    return feature
+
+
+def _specification_archive_file(
+    root: Path, candidate: Path, *, required: bool = False
+) -> tuple[str, bytes] | None:
+    pipeline_root = root / ".agentic-pipeline"
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()
+    try:
+        relative = resolved.relative_to(pipeline_root.resolve())
+    except ValueError:
+        if required:
+            raise SpecificationStateError(
+                f"specification archive source is outside .agentic-pipeline: {candidate}"
+            )
+        return None
+    if not relative.parts or relative.parts[0].casefold() == "workflows":
+        raise SpecificationStateError(
+            "specification archive source overlaps the workflow archive namespace"
+        )
+    relative_text = relative.as_posix()
+    if (
+        relative_text.casefold() in NON_SPECIFICATION_PIPELINE_ARTIFACTS
+        or relative.parts[0].casefold() in NON_SPECIFICATION_PIPELINE_DIRECTORIES
+    ):
+        raise SpecificationStateError(
+            f"specification archive cannot claim another controller artifact: {relative_text}"
+        )
+    if not candidate.exists():
+        if required:
+            raise SpecificationStateError(
+                f"required specification archive source does not exist: {candidate}"
+            )
+        return None
+    if _is_link_or_junction(candidate) or not candidate.is_file():
+        raise SpecificationStateError(
+            f"specification archive source must be a regular file: {candidate}"
+        )
+    return relative_text, candidate.read_bytes()
+
+
+def _referenced_specification_artifact_paths(state: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            report_path = value.get("report_path")
+            if isinstance(report_path, str) and report_path.strip():
+                paths.append(report_path.strip())
+            preaccept = value.get("preaccept_receipt")
+            if isinstance(preaccept, dict):
+                preaccept_path = preaccept.get("path")
+                if isinstance(preaccept_path, str) and preaccept_path.strip():
+                    paths.append(preaccept_path.strip())
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(state)
+    return paths
+
+
+def _specification_archive_files(
+    root: Path, state: dict[str, Any]
+) -> dict[str, bytes]:
+    pipeline_root = root / ".agentic-pipeline"
+    if _is_link_or_junction(pipeline_root) or not pipeline_root.is_dir():
+        raise SpecificationStateError(
+            ".agentic-pipeline must be a regular project-owned directory"
+        )
+    state_file = _specification_archive_file(root, state_path(root), required=True)
+    if state_file is None:
+        raise SpecificationStateError("specification archive lacks its source state")
+    files = {state_file[0]: state_file[1]}
+
+    def add(candidate: Path, *, required: bool = False) -> None:
+        artifact = _specification_archive_file(root, candidate, required=required)
+        if artifact is None:
+            return
+        relative, value = artifact
+        if relative in files and files[relative] != value:
+            raise SpecificationStateError(
+                f"specification archive source is ambiguous: {relative}"
+            )
+        files[relative] = value
+
+    for directory_name in SPECIFICATION_ARTIFACT_DIRECTORIES:
+        directory = pipeline_root / directory_name
+        if not directory.exists():
+            continue
+        if _is_link_or_junction(directory) or not directory.is_dir():
+            raise SpecificationStateError(
+                f"specification artifact namespace must be a regular directory: {directory}"
+            )
+        for candidate in directory.rglob("*"):
+            if candidate.is_dir():
+                if _is_link_or_junction(candidate):
+                    raise SpecificationStateError(
+                        f"specification artifact namespace contains a link: {candidate}"
+                    )
+                continue
+            add(candidate, required=True)
+    for supplied in _referenced_specification_artifact_paths(state):
+        add(Path(supplied))
+    return files
+
+
+def _remove_archived_specification_sources(
+    root: Path, archive_root: Path, files: dict[str, bytes]
+) -> None:
+    pipeline_root = root / ".agentic-pipeline"
+    state_relative = STATE_RELATIVE_PATH.name
+    parents: set[Path] = set()
+    for relative, expected_bytes in files.items():
+        if relative == state_relative:
+            continue
+        source = pipeline_root / relative
+        archived = archive_root / relative
+        if not archived.is_file() or archived.read_bytes() != expected_bytes:
+            raise SpecificationStateError(
+                f"published specification archive cannot verify cleanup source: {relative}"
+            )
+        if _is_link_or_junction(source) or not source.is_file():
+            raise SpecificationStateError(
+                f"specification archive cleanup source is not a regular file: {source}"
+            )
+        if source.read_bytes() != expected_bytes:
+            raise SpecificationStateError(
+                f"specification artifact changed after archive publication: {relative}"
+            )
+        source.unlink()
+        parents.add(source.parent)
+    for parent in sorted(parents, key=lambda item: len(item.parts), reverse=True):
+        current = parent
+        while current != pipeline_root:
+            if current == archive_root or current.parent == archive_root:
+                break
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
+
+    source_state = state_path(root)
+    expected_state = files[state_relative]
+    if not source_state.is_file() or source_state.read_bytes() != expected_state:
+        raise SpecificationStateError(
+            "specification state changed after archive publication"
+        )
+    source_state.unlink()
+
+
+def archive_completed_specification_state(
+    root: Path, state: dict[str, Any]
+) -> Path:
+    feature = _require_archivable_completed_state(root, state)
+    files = _specification_archive_files(root, state)
+    workflows_root = root / SPECIFICATION_ARCHIVE_ROOT_RELATIVE_PATH
+    if workflows_root.exists() and (
+        _is_link_or_junction(workflows_root) or not workflows_root.is_dir()
+    ):
+        raise SpecificationStateError(
+            "specification workflow archive root must be a regular directory"
+        )
+    workflows_root.mkdir(parents=True, exist_ok=True)
+    archive_root = workflows_root / feature
+    if archive_root.exists() and (
+        _is_link_or_junction(archive_root) or not archive_root.is_dir()
+    ):
+        raise SpecificationStateError(
+            "specification archive destination must be a regular directory"
+        )
+
+    if archive_root.exists() and any(archive_root.iterdir()):
+        raise SpecificationStateError(
+            "specification archive destination is non-empty and ambiguous"
+        )
+
+    staging_root = workflows_root / f".{feature}.specification-archive.tmp"
+    if staging_root.exists():
+        raise SpecificationStateError(
+            f"incomplete specification archive staging directory requires inspection: {staging_root}"
+        )
+    staging_root.mkdir()
+    for relative, value in sorted(files.items()):
+        write_new_bytes_atomically(
+            staging_root / relative,
+            value,
+            f"staged specification archive file {relative}",
+        )
+    for relative, value in files.items():
+        if (staging_root / relative).read_bytes() != value:
+            raise SpecificationStateError(
+                f"staged specification archive bytes changed: {relative}"
+            )
+    if archive_root.exists():
+        archive_root.rmdir()
+    os.replace(staging_root, archive_root)
+    for relative, value in files.items():
+        if (archive_root / relative).read_bytes() != value:
+            raise SpecificationStateError(
+                f"published specification archive bytes changed: {relative}"
+            )
+    _remove_archived_specification_sources(root, archive_root, files)
+    return archive_root
 
 
 def canonical_json_sha256(value: Any) -> str:
@@ -2924,24 +3228,24 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
     spec = resolve_project_path(root, args.spec, "technical specification")
     validate_approved_prd_contract(prd)
     if state_path(root).is_file():
-        existing = load_state(root)
+        existing = load_state(root, persist_migration=False)
         if existing["feature"] != feature:
-            raise SpecificationStateError(
-                "specification state already exists for another feature"
+            archive_completed_specification_state(root, existing)
+        else:
+            existing = load_state(root)
+            requested_paths = (
+                prd.relative_to(root).as_posix(),
+                spec.relative_to(root).as_posix(),
             )
-        requested_paths = (
-            prd.relative_to(root).as_posix(),
-            spec.relative_to(root).as_posix(),
-        )
-        recorded_paths = (
-            existing["prd"]["path"],
-            existing["specification"]["path"],
-        )
-        if requested_paths != recorded_paths:
-            raise SpecificationStateError(
-                "specification state already exists with different repository-owned paths"
+            recorded_paths = (
+                existing["prd"]["path"],
+                existing["specification"]["path"],
             )
-        return existing
+            if requested_paths != recorded_paths:
+                raise SpecificationStateError(
+                    "specification state already exists with different repository-owned paths"
+                )
+            return existing
     prd_meta = require_approved_prd(prd)
     spec_meta, drift = specification_trace(root, prd, spec)
     now = utc_now()

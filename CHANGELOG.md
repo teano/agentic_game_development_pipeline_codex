@@ -7,6 +7,16 @@
 
 ## [Unreleased]
 
+### Изменено
+
+- Pipeline v2 упрощён до schema 3: `blocked` завершает run с требованием fresh `init`, Review/QA failures напрямую возвращают Engineering без `resume` gates, а workers больше не запускают controller-owned checks или внешние интерактивные mutators.
+- Candidate boundary применяет единую Git-классификацию: tracked controller/history artifacts остаются в истории репозитория, но не входят в product candidate; repository policies остаются governed только там, где способны влиять на видимые candidate paths.
+
+### Исправлено
+
+- Инициализация Specification безопасно архивирует завершённый `SPEC_READY` workflow другой feature в `.agentic-pipeline/Workflows/<feature>` и fail-closed отклоняет nonterminal, active, linked или неоднозначные источники и непустое место назначения.
+- Post-complete checkout drift теперь отзываeт устаревший candidate credit и возвращает точный `checkout_recovery_required` вместо сохранения ложного `ready` для изменившихся байтов.
+
 ## [0.11.0] - 2026-09-02
 
 ### Добавлено

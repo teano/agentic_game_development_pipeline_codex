@@ -695,6 +695,20 @@ approved_at: 2026-08-10T00:00:00Z
             state = self.accept_spec()
         return state
 
+    def other_feature_init_args(self) -> Namespace:
+        feature_dir = self.root / "docs" / "Features" / "template" / "other-feature"
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        prd = feature_dir / "product-requirements.md"
+        prd.write_text(PRD, encoding="utf-8")
+        return self.args(
+            feature="other-feature",
+            prd=prd.relative_to(self.root).as_posix(),
+            spec=(feature_dir / "technical-specification.md")
+            .relative_to(self.root)
+            .as_posix(),
+            architect_id="architect-other",
+        )
+
     def start_and_record(self, number: int, **overrides: object) -> None:
         controller.command_start_cycle(
             self.args(architect_id="architect-1", proofreader_id=f"proofreader-{number}")
@@ -2023,6 +2037,101 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertEqual(state["active_architect_id"], "architect-1")
         self.assertEqual(state["total_cycles_completed"], 1)
         self.assertEqual(len(state["waves"]), 1)
+
+    def test_init_archives_completed_other_feature_specification_artifacts(self) -> None:
+        ready = self.make_ready()
+        pipeline_root = self.root / ".agentic-pipeline"
+        unrelated_state = pipeline_root / "development-plan-state.json"
+        unrelated_output = pipeline_root / "outputs" / "engineering.json"
+        unrelated_state.write_bytes(b"plan-state\n")
+        unrelated_output.parent.mkdir(parents=True, exist_ok=True)
+        unrelated_output.write_bytes(b"runtime-output\n")
+
+        archive_root = pipeline_root / "Workflows" / "sample-feature"
+        archive_root.mkdir(parents=True)
+        old_state_bytes = (self.root / controller.STATE_RELATIVE_PATH).read_bytes()
+        owned: dict[str, bytes] = {
+            "specification-state.json": old_state_bytes,
+        }
+        for directory in (
+            "architect-receipts",
+            "helper-requests",
+            "helper-results",
+        ):
+            source_root = pipeline_root / directory
+            for source in source_root.rglob("*"):
+                if source.is_file():
+                    owned[source.relative_to(pipeline_root).as_posix()] = source.read_bytes()
+        preaccept = (
+            pipeline_root.parent / ready["acceptance"]["preaccept_receipt"]["path"]
+        )
+        owned[preaccept.relative_to(pipeline_root).as_posix()] = preaccept.read_bytes()
+
+        initialized = controller.command_init(self.other_feature_init_args())
+
+        self.assertEqual("other-feature", initialized["feature"])
+        self.assertEqual("needs_generation", initialized["status"])
+        self.assertEqual(ready, json.loads(old_state_bytes.decode("utf-8")))
+        for relative, expected_bytes in owned.items():
+            with self.subTest(relative=relative):
+                self.assertEqual(expected_bytes, (archive_root / relative).read_bytes())
+                if relative != "specification-state.json":
+                    self.assertFalse((pipeline_root / relative).exists())
+        self.assertEqual(
+            set(owned),
+            {
+                path.relative_to(archive_root).as_posix()
+                for path in archive_root.rglob("*")
+                if path.is_file()
+            },
+        )
+        self.assertEqual(b"plan-state\n", unrelated_state.read_bytes())
+        self.assertEqual(b"runtime-output\n", unrelated_output.read_bytes())
+
+    def test_init_rejects_nonterminal_or_busy_other_feature_without_mutation(self) -> None:
+        self.make_ready()
+        state_file = self.root / controller.STATE_RELATIVE_PATH
+        pristine = json.loads(state_file.read_text(encoding="utf-8"))
+        unsafe_states = {
+            "not ready": {"status": "reviewing"},
+            "active helper": {"active_helper_request": {"request": "active"}},
+            "active wave": {"active_wave": {"number": 99}},
+            "active hold": {"hold": {"reason": "active"}},
+        }
+        for label, changes in unsafe_states.items():
+            with self.subTest(label=label):
+                state = json.loads(json.dumps(pristine))
+                state.update(changes)
+                controller.write_state_file(state_file, state)
+                before = state_file.read_bytes()
+                with self.assertRaisesRegex(
+                    controller.SpecificationStateError,
+                    "terminal SPEC_READY|active helper|active wave|active hold",
+                ):
+                    controller.command_init(self.other_feature_init_args())
+                self.assertEqual(before, state_file.read_bytes())
+                self.assertFalse(
+                    (self.root / ".agentic-pipeline" / "Workflows" / "sample-feature").exists()
+                )
+
+    def test_init_rejects_nonempty_other_feature_archive_without_mutation(self) -> None:
+        self.make_ready()
+        state_file = self.root / controller.STATE_RELATIVE_PATH
+        archive_root = (
+            self.root / ".agentic-pipeline" / "Workflows" / "sample-feature"
+        )
+        archive_root.mkdir(parents=True)
+        marker = archive_root / "foreign.txt"
+        marker.write_bytes(b"foreign\n")
+        before = state_file.read_bytes()
+
+        with self.assertRaisesRegex(
+            controller.SpecificationStateError, "archive destination.*non-empty|ambiguous"
+        ):
+            controller.command_init(self.other_feature_init_args())
+
+        self.assertEqual(before, state_file.read_bytes())
+        self.assertEqual(b"foreign\n", marker.read_bytes())
 
     def test_flat_source_prd_trace_remains_compatible(self) -> None:
         self.write_spec(nested_trace=False)
