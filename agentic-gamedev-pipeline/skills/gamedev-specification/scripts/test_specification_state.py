@@ -732,7 +732,10 @@ approved_at: 2026-08-10T00:00:00Z
             "public_contract_questions": 0,
             "minors_engineer_resolvable": False,
             "coverage_complete": True,
-            "report_path": f"proofreader-{number}.md",
+            "report_path": (
+                ".agentic-pipeline/Workflows/sample-feature/"
+                f"proofreader-reports/proofreader-{number}.md"
+            ),
             "finding_id": ["SPEC-FINDING-1"],
             "question_id": [],
         }
@@ -2326,10 +2329,12 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.spec.write_text(
             self.spec.read_text(encoding="utf-8")
             .replace("status: draft", "status: approved", 1)
+            .replace("revision: 1", "revision: 2", 1)
             + "\nPRD-REQ-001 correction applied.\n",
             encoding="utf-8",
         )
         corrected_sha256 = controller.sha256(self.spec)
+        self.assertEqual(2, controller.exact_positive_revision(self.spec, "corrected"))
         result_path = self.write_fake_helper_result()
         base = json.loads(result_path.read_text(encoding="utf-8"))
         state_path = controller.state_path(self.root, "sample-feature")
@@ -2368,6 +2373,39 @@ PRD-REQ-001 is covered by the formatter and runner.
         )
         recorded = controller.command_record_helper_result(self.args())
         self.assertIsNone(recorded["active_helper_request"])
+        self.assertEqual(1, recorded["acceptance"]["specification_revision"])
+        recorded_bytes = state_path.read_bytes()
+        state_mutations = {
+            "accepted specification revision": lambda value: value["acceptance"].update(
+                {"specification_revision": 2}
+            ),
+            "wave identity": lambda value: value["active_wave"].update(
+                {"architect_id": "architect-other"}
+            ),
+            "accepted helper provenance": lambda value: value["acceptance"]
+            ["helper_evidence"].update(
+                {"source_spec_sha256": "0" * 64}
+            ),
+        }
+        for label, mutate in state_mutations.items():
+            with self.subTest(label=label):
+                candidate = json.loads(recorded_bytes)
+                mutate(candidate)
+                state_path.write_text(
+                    json.dumps(candidate, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                state_before = state_path.read_bytes()
+                with self.assertRaises(controller.SpecificationStateError):
+                    controller.command_complete_cycle(
+                        self.args(
+                            architect_id="architect-1",
+                            resolution_note="Apply the recorded Major correction.",
+                            user_decision_note=None,
+                        )
+                    )
+                self.assertEqual(state_before, state_path.read_bytes())
+        state_path.write_bytes(recorded_bytes)
 
         completed = controller.command_complete_cycle(
             self.args(
@@ -2405,6 +2443,36 @@ PRD-REQ-001 is covered by the formatter and runner.
         )
         self.assertEqual("spec_ready", ready["status"])
         self.assertEqual(corrected_sha256, ready["ready"]["spec_sha256"])
+
+    def test_legacy_active_wave_correction_backfills_revision(self) -> None:
+        self.initialize()
+        self.start_and_record(1, major=1, coverage_complete=True)
+        state_path = controller.state_path(self.root, "sample-feature")
+        legacy = controller.load_state(self.root, "sample-feature")
+        self.assertEqual(1, legacy["active_wave"].pop("specification_revision"))
+        controller.save_state(self.root, legacy)
+
+        prepared = self.prepare_helper("correction", ["SPEC-FINDING-1"])
+        self.assertEqual(1, prepared["active_wave"]["specification_revision"])
+        self.spec.write_text(
+            self.spec.read_text(encoding="utf-8")
+            .replace("revision: 1", "revision: 2", 1)
+            + "\nPRD-REQ-001 legacy-wave correction applied.\n",
+            encoding="utf-8",
+        )
+        corrected_sha256 = controller.sha256(self.spec)
+        self.write_fake_helper_result()
+        controller.command_record_helper_result(self.args())
+
+        completed = controller.command_complete_cycle(
+            self.args(
+                architect_id="architect-1",
+                resolution_note="Apply the recorded Major correction.",
+                user_decision_note=None,
+            )
+        )
+        self.assertEqual("awaiting_accept", completed["status"])
+        self.assertEqual(corrected_sha256, completed["waves"][-1]["result_spec_sha256"])
 
     def test_ready_rejects_unresolved_product_question(self) -> None:
         self.initialize(with_spec=False)
@@ -2452,7 +2520,9 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertEqual(["F-001"], event["prior_active_wave"]["proofread"]["finding_ids"])
         self.assertEqual(["F-001"], event["prior_active_wave"]["proofread"]["question_ids"])
         self.assertEqual(
-            "proofreader-1.md", event["prior_active_wave"]["proofread"]["report_path"]
+            ".agentic-pipeline/Workflows/sample-feature/"
+            "proofreader-reports/proofreader-1.md",
+            event["prior_active_wave"]["proofread"]["report_path"],
         )
         self.assertFalse(event["prior_active_wave"]["proofread"]["coverage_complete"])
         self.assertIn("architect-1", reopened["identity_history"])

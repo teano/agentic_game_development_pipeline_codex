@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-04
+
+### Исправлено
+
+- Specification controller теперь определяет канонический JSON SHA-256, используемый путями authority `accept-spec`, что предотвращает воспроизведённый `NameError`.
+- Корректные correction cycles теперь допускают изменение байтов и revision, при этом принятая revision независимо привязана к входу active wave; подменённый acceptance при byte-noop отклоняется, а для уже активных wave schema 3 binding восстанавливается.
+
 ## [0.14.0] - 2026-09-04
 
 ### Изменено
@@ -338,7 +345,8 @@
 - Полный набор из 97 тестов контроллеров, активации и межрежимных контрактов.
 - Валидация manifest плагина и всех восьми skill-пакетов.
 
-[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/teano/agentic_game_development_pipeline_codex/compare/v0.11.0...v0.12.0

@@ -242,6 +242,14 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def external_helper_identity() -> dict[str, str]:
     codex_root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
     skill_root = (codex_root / "skills" / "skill-specification-pipeline").resolve()
@@ -1101,6 +1109,8 @@ def require_current_preaccept_acceptance(
     prd: Path,
     spec: Path,
     active_wave: dict[str, Any] | None = None,
+    *,
+    use_wave_specification_revision: bool = False,
 ) -> dict[str, Any]:
     acceptance = state.get("acceptance") or {}
     accepted_preaccept = acceptance.get("preaccept_receipt")
@@ -1111,6 +1121,33 @@ def require_current_preaccept_acceptance(
     accepted_spec_sha256 = (
         active_wave.get("spec_sha256") if active_wave is not None else sha256(spec)
     )
+    if use_wave_specification_revision:
+        accepted_specification_revision = (
+            active_wave.get("specification_revision") if active_wave else None
+        )
+        architect_id = active_wave.get("architect_id") if active_wave else None
+        proofreader_id = active_wave.get("proofreader_id") if active_wave else None
+        active_architect_id = state.get("active_architect_id")
+        if (
+            type(accepted_specification_revision) is not int
+            or accepted_specification_revision < 1
+            or not _is_exact_sha256(accepted_spec_sha256)
+            or not isinstance(architect_id, str)
+            or not architect_id.strip()
+            or not isinstance(proofreader_id, str)
+            or not proofreader_id.strip()
+            or not isinstance(active_architect_id, str)
+            or not active_architect_id.strip()
+            or not same_actor(architect_id, active_architect_id)
+            or same_actor(proofreader_id, architect_id)
+        ):
+            raise SpecificationStateError(
+                "active Proofreader wave does not preserve the accepted review authority"
+            )
+    else:
+        accepted_specification_revision = exact_positive_revision(
+            spec, "current specification"
+        )
     accepted_summary = accepted_preaccept.get("summary") or {}
     current_preaccept = validate_preaccept_receipt(
         root,
@@ -1133,9 +1170,7 @@ def require_current_preaccept_acceptance(
         "prd_revision": state["prd"]["revision"],
         "prd_sha256": sha256(prd),
         "specification_path": state["specification"]["path"],
-        "specification_revision": exact_positive_revision(
-            spec, "current specification"
-        ),
+        "specification_revision": accepted_specification_revision,
         "specification_sha256": accepted_spec_sha256,
         "accepted_by": state["active_architect_id"],
         "recovery_token": (state.get("recovery_authorization") or {}).get("token"),
@@ -2260,6 +2295,8 @@ def _canonical_ready_archive(event: dict[str, Any]) -> bool:
             if outcome == "spec_ready"
             else set()
         )
+        if "specification_revision" in wave:
+            expected_wave_keys.add("specification_revision")
         wave_architect_id = wave.get("architect_id")
         wave_proofreader_id = wave.get("proofreader_id")
         if (
@@ -2279,6 +2316,11 @@ def _canonical_ready_archive(event: dict[str, Any]) -> bool:
             or proofreader_id in proofreader_ids
             or proofreader_id in architect_ids
             or not _is_receipt_digest(wave.get("spec_sha256"))
+            or "specification_revision" in wave
+            and (
+                type(wave["specification_revision"]) is not int
+                or wave["specification_revision"] < 1
+            )
             or not _is_receipt_digest(wave.get("result_spec_sha256"))
             or not _is_receipt_timestamp(wave.get("started_at"))
             or not _is_receipt_timestamp(wave.get("completed_at"))
@@ -3094,6 +3136,10 @@ def command_prepare_helper(args: argparse.Namespace) -> dict[str, Any]:
                 raise SpecificationStateError(
                     "active-wave correction input does not match the reviewed SHA"
                 )
+            if "specification_revision" not in wave:
+                wave["specification_revision"] = exact_positive_revision(
+                    spec, "active-wave specification"
+                )
         elif state["status"] == "reviewing" and state.get("acceptance") is not None:
             raise SpecificationStateError(
                 "accepted specification corrections require a recorded Proofreader wave"
@@ -3673,6 +3719,9 @@ def command_start_cycle(args: argparse.Namespace) -> dict[str, Any]:
         "architect_id": architect["id"],
         "proofreader_id": proofreader_id,
         "spec_sha256": sha256(spec),
+        "specification_revision": exact_positive_revision(
+            spec, "active-wave specification"
+        ),
         "started_at": utc_now(),
         "proofread": None,
     }
@@ -3784,8 +3833,18 @@ def command_complete_cycle(args: argparse.Namespace) -> dict[str, Any]:
         )
     require_no_active_helper_request(state)
     prd, spec = require_source_unchanged(root, state)
-    require_current_preaccept_acceptance(root, state, prd, spec, wave)
     current_hash = sha256(spec)
+    if current_hash != wave["spec_sha256"]:
+        require_current_preaccept_acceptance(
+            root,
+            state,
+            prd,
+            spec,
+            wave,
+            use_wave_specification_revision=True,
+        )
+    else:
+        require_current_preaccept_acceptance(root, state, prd, spec, wave)
     wave["architect_response"] = args.resolution_note
     wave["user_decision"] = args.user_decision_note
     if current_hash != wave["spec_sha256"]:
