@@ -33,7 +33,7 @@ For each slice, use either one to three exact `RESEARCH-*` briefs or `research_n
 
 ## Draft, approve, and complete
 
-Write only the canonical plan path and use the contract/template fields. Keep `status: draft` until an authorized actor explicitly approves the exact submitted SHA. The user may approve directly or explicitly delegate technical/process approval to an agent; record the real actor and never relabel delegated approval as `user`. Delegation does not cover an unresolved product choice that remains user-owned.
+Write only the canonical plan path and use the contract/template fields. Every path semantically required to mutate must appear in ordered `Owned Paths` and the identical ordered `Scope Contract.editable_paths`; never rely on the validator to infer a write from specification prose. Keep disjoint `Expected Paths` inside the sealed Context Capsule read scope. Keep `status: draft` until an authorized actor explicitly approves the exact submitted SHA. The user may approve directly or explicitly delegate technical/process approval to an agent; record the real actor and never relabel delegated approval as `user`. Delegation does not cover an unresolved product choice that remains user-owned.
 
 Run `validate-plan`, then `submit`. Validation requires the exact union of all slice acceptance sets to cover the complete approved PRD inventory; cross-slice overlap is allowed only when each named slice genuinely contributes to that end-to-end criterion. Present decision, ordering, boundaries, ceilings, risks, and exact draft SHA. Every edit requires resubmission. Silence or upstream approval is not plan approval.
 

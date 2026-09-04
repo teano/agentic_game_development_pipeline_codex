@@ -416,10 +416,33 @@ class PipelineV2CoreTests(unittest.TestCase):
 
         normative_documentation = documentation_value(normative_documentation_policy)
         derived_documentation = documentation_value(derived_documentation_policy)
-        reads = reads or {item["id"]: item["allowed_paths"] for item in slices}
+        reads = deepcopy(
+            reads or {item["id"]: item["allowed_paths"] for item in slices}
+        )
+
+        def overlaps(left: str, right: str) -> bool:
+            if left == right:
+                return True
+            left_root = left[:-3].rstrip("/") if left.endswith("/**") else None
+            right_root = right[:-3].rstrip("/") if right.endswith("/**") else None
+            if left_root is not None:
+                return right == left_root or right.startswith(left_root + "/")
+            if right_root is not None:
+                return left == right_root or left.startswith(right_root + "/")
+            return False
+
         sections = []
         for item in slices:
-            paths = reads[item["id"]]
+            paths = list(reads[item["id"]])
+            expected_paths = [
+                path
+                for path in paths
+                if not any(overlaps(path, write) for write in item["allowed_paths"])
+            ]
+            if not expected_paths:
+                expected_paths = ["requirements.md"]
+                if "requirements.md" not in paths:
+                    paths.append("requirements.md")
             documentation = ""
             slice_normative, slice_derived = (
                 slice_documentation.get(
@@ -438,7 +461,13 @@ class PipelineV2CoreTests(unittest.TestCase):
                 )
             sections.append(
                 f"## Slice {item['id']}\n\n"
-                "### Context Capsule Budget\n\n"
+                "### Owned Paths\n\n"
+                + "".join(f"- {path}\n" for path in item["allowed_paths"])
+                + "\n### Expected Paths\n\n"
+                + "".join(f"- {path}\n" for path in expected_paths)
+                + "\n### Scope Contract\n\n"
+                + f"- editable_paths: {', '.join(item['allowed_paths'])}\n"
+                + "\n### Context Capsule Budget\n\n"
                 "- max_authority_files: 20\n"
                 "- max_evidence_files: 20\n"
                 "- max_total_files: 40\n"
@@ -1631,6 +1660,66 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual(action["slices"], sealed["slices"])
         self.assertEqual(sealed, self.controller.reconfigure(command))
         self.assertEqual(persisted, self.store.path.read_bytes())
+
+    def test_plan_write_scope_binding_rejects_narrower_broader_and_reordered_caller(self) -> None:
+        approved = [{
+            "id": "SLICE-1",
+            "allowed_paths": ["game.txt", "src/feature.lua", "tests/**"],
+            "planned_commands": [self.command],
+        }]
+        self._write_approved_plan(
+            approved,
+            reads={"SLICE-1": ["requirements.md"]},
+            revision=2,
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", "plan.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-qm", "bind plan write paths"],
+            check=True,
+        )
+        authority = {
+            "requirements": "requirements.md",
+            "specification": "specification.md",
+            "plan": "plan.md",
+        }
+        cases = (
+            ("narrower", ["game.txt", "src/feature.lua"]),
+            ("broader", ["game.txt", "src/feature.lua", "tests/**", "docs/**"]),
+            ("reordered", ["tests/**", "src/feature.lua", "game.txt"]),
+        )
+        for label, paths in cases:
+            with self.subTest(label=label):
+                self.store.path.unlink(missing_ok=True)
+                controller = _CanonicalTestController(self.store, timeout=10)
+                with self.assertRaisesRegex(
+                    PipelineError, "allowed_paths must exactly equal approved plan"
+                ):
+                    controller.reconfigure({
+                        "name": "init",
+                        "id": f"INIT-WRITE-SCOPE-{label}",
+                        "run_id": "RUN-TEST",
+                        "feature": self.feature,
+                        "workflow_path": self.workflow_path,
+                        "project_root": str(self.root),
+                        "authority_paths": authority,
+                        "slices": [{**approved[0], "allowed_paths": paths}],
+                    })
+                self.assertFalse(self.store.path.exists())
+
+        controller = _CanonicalTestController(self.store, timeout=10)
+        initialized = controller.reconfigure({
+            "name": "init",
+            "id": "INIT-WRITE-SCOPE-EXACT",
+            "run_id": "RUN-TEST",
+            "feature": self.feature,
+            "workflow_path": self.workflow_path,
+            "project_root": str(self.root),
+            "authority_paths": authority,
+            "slices": approved,
+        })
+        self.assertEqual(
+            approved[0]["allowed_paths"], initialized["slices"][0]["allowed_paths"]
+        )
 
     def test_controller_rejects_read_scope_smuggling_and_adversarial_plan_paths(self) -> None:
         self._complete_readonly(

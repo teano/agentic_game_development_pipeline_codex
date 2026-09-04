@@ -104,12 +104,12 @@ def _unsealed_projection(value: Any) -> list[dict[str, Any]]:
 def seal_slices_from_approved_plan(
     root: Path, plan_path: str, slices: Any, feature: str,
 ) -> list[dict[str, Any]]:
-    """Bind caller-authored write slices to controller-parsed approved read scopes."""
+    """Bind caller slices to controller-parsed approved write and read scopes."""
     caller = _caller_slices(slices)
     plan = safe_path(root, plan_path, "approved development plan", strict=True)
     try:
         plan_text = plan.read_text(encoding="utf-8")
-        read_by_id = _PLAN_CONTRACT.parse_slice_read_paths(
+        contracts_by_id = _PLAN_CONTRACT.parse_slice_path_contracts(
             plan_text, label=str(plan_path),
         )
     except (OSError, UnicodeError, _PLAN_CONTRACT.PlanContractError) as exc:
@@ -123,18 +123,24 @@ def seal_slices_from_approved_plan(
     if bound_features != [feature_slug(feature)]:
         raise PipelineError("approved plan feature does not match selected workflow")
     caller_ids = [item["id"] for item in caller]
-    plan_ids = list(read_by_id)
-    missing = [slice_id for slice_id in caller_ids if slice_id not in read_by_id]
+    plan_ids = list(contracts_by_id)
+    missing = [slice_id for slice_id in caller_ids if slice_id not in contracts_by_id]
     unknown = [slice_id for slice_id in plan_ids if slice_id not in caller_ids]
     if missing or unknown or plan_ids != caller_ids:
         raise PipelineError(
             "approved plan slice IDs must exactly match caller slices in order: "
             f"missing={missing} unknown={unknown}"
         )
-    return [
-        {**item, "read_paths": deepcopy(read_by_id[item["id"]])}
-        for item in caller
-    ]
+    sealed: list[dict[str, Any]] = []
+    for item in caller:
+        contract = contracts_by_id[item["id"]]
+        if item["allowed_paths"] != contract["write_paths"]:
+            raise PipelineError(
+                "caller allowed_paths must exactly equal approved plan write_paths "
+                f"in order for {item['id']}"
+            )
+        sealed.append({**item, "read_paths": deepcopy(contract["read_paths"])})
+    return sealed
 
 
 def _stream_digest(value: bytes) -> str:

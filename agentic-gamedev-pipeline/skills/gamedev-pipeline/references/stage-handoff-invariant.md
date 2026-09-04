@@ -22,6 +22,12 @@ Pipeline-observation workers report every issue observed within their assigned o
 
 The worker stops after returning its artifact. The Director validates it through the controller and decides the next transition. Only controller state records pipeline progress.
 
+## Director child-result consumption
+
+After spawning any phase worker, the Director owns that exact child until its terminal result and MUST wait using the available coordination primitive. The Director MUST NOT send a final response, claim `work continues asynchronously`, or otherwise relinquish the turn while that child is live.
+
+After the child reaches a terminal result, the Director MUST re-read public controller status, prove that the same active assignment owns the exact returned output artifact, execute that assignment's exact public controller `complete` action including for a blocked outcome, and re-read the resulting public controller status. The Director may final only when no child owns an active assignment and no completed child artifact remains unconsumed.
+
 ## Controller incident stop
 
 If any Director or worker suspects a defect in the pipeline controller, runtime, skill, protocol, or controller-owned state transition, it MUST immediately stop the product run. It reports the failing public action, phase/generation, bounded and redacted error evidence, observed versus expected behavior, candidate impact, and the exact recovery prerequisite. It MUST NOT edit, patch, bypass, monkeypatch, locally replace, or continue through the pipeline implementation, instructions, state, or checks.

@@ -266,36 +266,167 @@ def parse_context_capsule_read_paths(
     return combined
 
 
-def parse_slice_read_paths(
-    text: str, *, label: str = "approved development plan"
+def _path_list(section: str, *, label: str) -> list[str]:
+    """Parse one ordered, duplicate-free Markdown bullet list of path rules."""
+    paths: list[str] = []
+    for raw in section.splitlines():
+        if not raw.strip():
+            continue
+        match = re.fullmatch(r"\s*-\s*(\S(?:.*\S)?)\s*", raw)
+        if match is None:
+            raise PlanContractError(f"{label} contains a non-path row: {raw.strip()}")
+        path = _controller_read_path(match.group(1), label)
+        if path in paths:
+            raise PlanContractError(f"{label} repeats path: {path}")
+        paths.append(path)
+    if not paths:
+        raise PlanContractError(f"{label} must contain at least one path")
+    return paths
+
+
+def _editable_paths(section: str, *, label: str) -> list[str]:
+    values = re.findall(r"(?m)^\s*-\s*editable_paths:\s*(.*?)\s*$", section)
+    if len(values) != 1:
+        raise PlanContractError(f"{label} requires exactly one editable_paths field")
+    paths = [item.strip() for item in values[0].split(",")]
+    if any(not item for item in paths):
+        raise PlanContractError(
+            f"{label} editable_paths must be a non-empty comma-separated list"
+        )
+    canonical = [
+        _controller_read_path(path, f"{label} editable_paths") for path in paths
+    ]
+    if len(canonical) != len(set(canonical)):
+        raise PlanContractError(f"{label} editable_paths must be duplicate-free")
+    return canonical
+
+
+def _path_rule_covers(scope: str, target: str) -> bool:
+    if scope == target:
+        return True
+    if not scope.endswith("/**"):
+        return False
+    root = scope[:-3].rstrip("/")
+    target_root = target[:-3].rstrip("/") if target.endswith("/**") else target
+    return target_root == root or target_root.startswith(root + "/")
+
+
+def _path_rules_overlap(left: str, right: str) -> bool:
+    return _path_rule_covers(left, right) or _path_rule_covers(right, left)
+
+
+def parse_slice_path_contract(
+    *,
+    owned_section: str,
+    expected_section: str,
+    scope_section: str,
+    context_section: str,
+    label: str,
 ) -> dict[str, list[str]]:
-    """Return controller read scopes sealed from each slice Context Capsule."""
+    """Return one slice's exact approved write and read/integration surfaces."""
+    write_paths = _path_list(owned_section, label=f"{label} Owned Paths")
+    editable_paths = _editable_paths(scope_section, label=f"{label} Scope Contract")
+    if write_paths != editable_paths:
+        raise PlanContractError(
+            f"{label} Owned Paths must exactly equal Scope Contract editable_paths "
+            "in order"
+        )
+    expected_paths = _path_list(
+        expected_section, label=f"{label} Expected Paths"
+    )
+    overlap = [
+        path
+        for path in expected_paths
+        if any(_path_rules_overlap(path, write) for write in write_paths)
+    ]
+    if overlap:
+        raise PlanContractError(
+            f"{label} Expected Paths must be disjoint from write paths: "
+            + ", ".join(overlap)
+        )
+    read_paths = parse_context_capsule_read_paths(
+        context_section, label=f"{label} Context Capsule Budget"
+    )
+    missing = [
+        path
+        for path in expected_paths
+        if not any(_path_rule_covers(scope, path) for scope in read_paths)
+    ]
+    if missing:
+        raise PlanContractError(
+            f"{label} Expected Paths must be covered by sealed Context Capsule reads: "
+            + ", ".join(missing)
+        )
+    return {
+        "write_paths": write_paths,
+        "expected_paths": expected_paths,
+        "read_paths": read_paths,
+    }
+
+
+def parse_slice_path_contracts(
+    text: str, *, label: str = "approved development plan"
+) -> dict[str, dict[str, list[str]]]:
+    """Return exact per-slice write/read contracts from an approved plan."""
     meta, body = parse_development_plan_frontmatter(text, label=label)
     if meta["status"] != "approved":
-        raise PlanContractError(f"{label} must be approved before read scopes are sealed")
-    matches = list(re.finditer(r"(?m)^## Slice ([A-Za-z0-9][A-Za-z0-9._-]*)\s*$", body))
+        raise PlanContractError(f"{label} must be approved before scopes are sealed")
+    matches = list(
+        re.finditer(r"(?m)^## Slice ([A-Za-z0-9][A-Za-z0-9._-]*)\s*$", body)
+    )
     if len(matches) != int(meta["slice_count"]):
         raise PlanContractError(f"{label} slice_count does not match its Slice sections")
-    result: dict[str, list[str]] = {}
+    result: dict[str, dict[str, list[str]]] = {}
+    required = (
+        "Owned Paths",
+        "Expected Paths",
+        "Scope Contract",
+        "Context Capsule Budget",
+    )
     for index, match in enumerate(matches):
         slice_id = match.group(1)
         if slice_id in result:
             raise PlanContractError(f"{label} repeats slice ID: {slice_id}")
         end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
         block = body[match.end():end]
-        headings = list(re.finditer(r"(?m)^### Context Capsule Budget\s*$", block))
-        if len(headings) != 1:
-            raise PlanContractError(
-                f"{label} {slice_id} requires exactly one Context Capsule Budget"
+        headings = list(re.finditer(r"(?m)^### (\S(?:.*\S)?)\s*$", block))
+        sections: dict[str, str] = {}
+        for heading_index, heading in enumerate(headings):
+            name = heading.group(1)
+            section_end = (
+                headings[heading_index + 1].start()
+                if heading_index + 1 < len(headings)
+                else len(block)
             )
-        start = headings[0].end()
-        following = re.search(r"(?m)^#{2,3} ", block[start:])
-        section = block[start:start + following.start()] if following else block[start:]
-        result[slice_id] = parse_context_capsule_read_paths(
-            section,
-            label=f"{label} {slice_id} Context Capsule Budget",
+            if name in sections:
+                raise PlanContractError(
+                    f"{label} {slice_id} repeats section: {name}"
+                )
+            sections[name] = block[heading.end():section_end]
+        missing = [name for name in required if name not in sections]
+        if missing:
+            raise PlanContractError(
+                f"{label} {slice_id} lacks path-contract sections: {', '.join(missing)}"
+            )
+        result[slice_id] = parse_slice_path_contract(
+            owned_section=sections["Owned Paths"],
+            expected_section=sections["Expected Paths"],
+            scope_section=sections["Scope Contract"],
+            context_section=sections["Context Capsule Budget"],
+            label=f"{label} {slice_id}",
         )
     return result
+
+
+def parse_slice_read_paths(
+    text: str, *, label: str = "approved development plan"
+) -> dict[str, list[str]]:
+    """Return controller read scopes sealed from each slice Context Capsule."""
+    contracts = parse_slice_path_contracts(text, label=label)
+    return {
+        slice_id: contract["read_paths"]
+        for slice_id, contract in contracts.items()
+    }
 
 
 def parse_planned_material_permissions(

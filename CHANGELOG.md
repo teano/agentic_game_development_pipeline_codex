@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+### Изменено
+
+- После запуска phase worker Director обязан дождаться его terminal result, подтвердить через public controller status владение exact active assignment и returned output artifact, выполнить exact `complete`, включая `blocked`, и снова прочитать status; финальный ответ запрещён, пока child остаётся live или завершённый artifact не потреблён контроллером.
+- Write scope каждого slice теперь является единым ordered contract: `Owned Paths`, `Scope Contract.editable_paths` и runtime `allowed_paths` должны точно совпадать по составу и порядку. `Expected Paths` остаются отдельным read/integration context, не дают write authority, должны быть disjoint с write scope и покрываться sealed Context Capsule read scope.
+
+### Совместимость
+
+- Ранее принятые планы с несовпадающими или переставленными write scopes либо некорректными `Expected Paths` теперь отклоняются fail-closed и требуют исправления, повторной валидации и approval, а затем fresh runtime `init`.
+
 ## [0.13.0] - 2026-09-03
 
 ### Изменено

@@ -85,7 +85,7 @@ Define each `## Slice SLICE-NNN` with all of these non-empty sections:
 - `### Rollback and Recovery`;
 - `### Downstream Consumers`.
 
-Keep paths narrow and use symbols when a shared file is broader than the slice. `Owned Paths` are the expected writes; `Expected Paths` are read/integration surfaces. Shared touchpoints must state the permitted symbol and change kind. Forbidden scope must name adjacent systems and cleanup/refactor work excluded from the slice.
+Keep paths narrow and use symbols when a shared file is broader than the slice. `Owned Paths` is an ordered, duplicate-free list of every path that the slice is required to mutate and MUST exactly equal the ordered `Scope Contract.editable_paths`; omission, addition, invalid path syntax, or reordering is rejected. The validator never guesses required writes from the specification or prose. `Expected Paths` is a duplicate-free read/integration-only list, MUST be disjoint from `Owned Paths`, and every entry MUST be covered by the sealed Context Capsule `authority_paths` plus `evidence_paths`. Shared touchpoints must state the permitted symbol and change kind; existing cross-slice overlap rules still apply. Forbidden scope must name adjacent systems and cleanup/refactor work excluded from the slice.
 
 The Scope Contract is machine-readable. Use comma-separated repository-relative paths; a trailing `/**` authorizes a subtree and no other glob syntax is valid. Every shared boundary is a separate row:
 

@@ -432,7 +432,7 @@ documentation_state, and open_assumptions.
 - max_estimated_tokens: 40000
 - metric_scope: capsule_plus_referenced_files
 - authority_paths: docs/Features/template/{self.feature}/product-requirements.md, docs/Features/template/{self.feature}/technical-specification.md
-- evidence_paths: docs/Features/template/{self.feature}/technical-specification.md, tests/sample-feature/verification/SLICE-{number:03d}-planned.json
+- evidence_paths: docs/Features/template/{self.feature}/technical-specification.md, tests/sample-feature/verification/SLICE-{number:03d}-planned.json, src/contracts.lua
 
 ### Verification and Exit Criteria
 
@@ -829,6 +829,7 @@ Only the approved feature and named shared symbol are in scope.
                 f"docs/Features/template/{self.feature}/product-requirements.md",
                 f"docs/Features/template/{self.feature}/technical-specification.md",
                 "tests/sample-feature/verification/SLICE-001-planned.json",
+                "src/contracts.lua",
             ],
             runtime["slices"][0]["read_paths"],
         )
@@ -854,6 +855,91 @@ Only the approved feature and named shared symbol are in scope.
                 self.assertIn("Context Capsule Budget authority_paths", result.stderr)
                 self.temp.cleanup()
                 self.setUp()
+
+    def test_owned_editable_and_expected_read_paths_are_one_structural_contract(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = self.plan.read_text(encoding="utf-8")
+        text = text.replace(
+            "### Owned Paths\n\n- src/feature-1.lua",
+            "### Owned Paths\n\n"
+            "- src/feature-1.lua\n"
+            "- src/feature-1-enabled.lua\n"
+            "- src/feature-1-disabled.lua",
+            1,
+        ).replace(
+            "- editable_paths: src/feature-1.lua",
+            "- editable_paths: src/feature-1.lua, src/feature-1-enabled.lua, "
+            "src/feature-1-disabled.lua",
+            1,
+        )
+        self.plan.write_text(text, encoding="utf-8")
+        self.assertEqual(
+            ["SLICE-001"], controller.command_validate(self.args())["slice_ids"]
+        )
+
+        cases = (
+            (
+                "owned narrower",
+                "- src/feature-1-disabled.lua",
+                "",
+                "Owned Paths must exactly equal",
+            ),
+            (
+                "editable narrower",
+                ", src/feature-1-disabled.lua",
+                "",
+                "Owned Paths must exactly equal",
+            ),
+            (
+                "editable reordered",
+                "- editable_paths: src/feature-1.lua, src/feature-1-enabled.lua, src/feature-1-disabled.lua",
+                "- editable_paths: src/feature-1-disabled.lua, src/feature-1-enabled.lua, src/feature-1.lua",
+                "Owned Paths must exactly equal",
+            ),
+            (
+                "duplicate editable",
+                "src/feature-1-enabled.lua, src/feature-1-disabled.lua",
+                "src/feature-1-enabled.lua, src/feature-1-enabled.lua",
+                "editable_paths must be duplicate-free",
+            ),
+            (
+                "invalid editable",
+                "src/feature-1-enabled.lua, src/feature-1-disabled.lua",
+                "../feature-1-enabled.lua, src/feature-1-disabled.lua",
+                "canonical project-relative",
+            ),
+            (
+                "duplicate owned",
+                "- src/feature-1-enabled.lua",
+                "- src/feature-1-enabled.lua\n- src/feature-1-enabled.lua",
+                "Owned Paths repeats path",
+            ),
+            (
+                "invalid owned",
+                "- src/feature-1-enabled.lua",
+                "- ../feature-1-enabled.lua",
+                "safe|canonical project-relative",
+            ),
+            (
+                "expected overlaps write",
+                "- src/contracts.lua",
+                "- src/feature-1.lua",
+                "Expected Paths must be disjoint",
+            ),
+            (
+                "expected missing from reads",
+                "- src/contracts.lua",
+                "- src/missing-contract.lua",
+                "Expected Paths must be covered",
+            ),
+        )
+        valid = self.plan.read_text(encoding="utf-8")
+        for label, old, new, error in cases:
+            with self.subTest(label=label):
+                self.plan.write_text(valid.replace(old, new, 1), encoding="utf-8")
+                with self.assertRaisesRegex(controller.DevelopmentPlanError, error):
+                    controller.command_validate(self.args())
 
     def test_delegated_technical_approval_records_the_true_actor_and_revises(self) -> None:
         self.initialize()
@@ -2276,6 +2362,9 @@ Only the approved feature and named shared symbol are in scope.
         text = self.plan.read_text(encoding="utf-8").replace(
             "- editable_paths: src/feature-2.lua",
             "- editable_paths: src/feature-1.lua",
+        ).replace(
+            "### Owned Paths\n\n- src/feature-2.lua",
+            "### Owned Paths\n\n- src/feature-1.lua",
         )
         for number in (1, 2):
             text = text.replace(

@@ -108,6 +108,36 @@ class SharedOperationalInvariantTests(unittest.TestCase):
             with self.subTest(platform_default=platform_default):
                 self.assertNotIn(platform_default, template.lower())
 
+    def test_director_waits_for_and_consumes_each_child_result_before_final(self) -> None:
+        text = INVARIANT.read_text(encoding="utf-8")
+        required = (
+            "After spawning any phase worker",
+            "owns that exact child until its terminal result",
+            "MUST wait using the available coordination primitive",
+            "MUST NOT send a final response",
+            "`work continues asynchronously`",
+            "while that child is live",
+            "re-read public controller status",
+            "same active assignment",
+            "exact returned output artifact",
+            "exact public controller `complete` action",
+            "including for a blocked outcome",
+            "re-read the resulting public controller status",
+            "no child owns an active assignment",
+            "no completed child artifact remains unconsumed",
+        )
+        for phrase in required:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+        section = text.split("## Director child-result consumption", 1)[1].split(
+            "\n## ", 1
+        )[0]
+        self.assertNotRegex(
+            section,
+            r"(?i)\b(?:timeout|retry|retries|daemon|service|sleep)\b",
+        )
+
     def test_review_contract_keeps_target_separate_from_evidence_context(self) -> None:
         reviewer = (SKILLS / "gamedev-review" / "SKILL.md").read_text(encoding="utf-8")
         contract = (

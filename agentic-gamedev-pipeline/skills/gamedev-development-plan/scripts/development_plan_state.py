@@ -692,13 +692,19 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
 
     editable_paths_by_slice: dict[str, list[str]] = {}
     for slice_id, content in slices:
-        scope = section_map(content, 3).get("Scope Contract", "")
-        values = re.findall(r"(?m)^\s*-\s*editable_paths:\s*(.+?)\s*$", scope)
-        editable_paths_by_slice[slice_id] = (
-            [item.strip().replace("\\", "/") for item in values[0].split(",")]
-            if len(values) == 1
-            else []
-        )
+        sections = section_map(content, 3)
+        try:
+            path_contract = _plan_contract.parse_slice_path_contract(
+                owned_section=sections.get("Owned Paths", ""),
+                expected_section=sections.get("Expected Paths", ""),
+                scope_section=sections.get("Scope Contract", ""),
+                context_section=sections.get("Context Capsule Budget", ""),
+                label=slice_id,
+            )
+            editable_paths_by_slice[slice_id] = path_contract["write_paths"]
+        except _plan_contract.PlanContractError as exc:
+            errors.append(str(exc))
+            editable_paths_by_slice[slice_id] = []
 
     def editable_paths_overlap(left: str, right: str) -> bool:
         if left == right:
@@ -1021,13 +1027,6 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
         slice_context_budget = validate_context_budget(
             capsule_budget, f"{slice_id} Context Capsule Budget"
         )
-        try:
-            _plan_contract.parse_context_capsule_read_paths(
-                capsule_budget,
-                label=f"{slice_id} Context Capsule Budget",
-            )
-        except _plan_contract.PlanContractError as exc:
-            errors.append(str(exc))
         exceeded = sorted(
             key
             for key, value in slice_context_budget.items()
