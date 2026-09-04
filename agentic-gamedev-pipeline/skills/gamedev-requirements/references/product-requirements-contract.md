@@ -75,19 +75,29 @@ contain only non-blocking open questions.
 
 Record what the product must achieve and what observable behavior proves it. Exclude implementation plans, class structures, speculative architecture, agent activity, raw interview transcripts, and discarded ideas unless they become an explicit constraint or non-goal.
 
-Every semantic statement must be explicitly confirmed by the user through a direct statement, selection of one bounded option, an unambiguous `yes` to one immediately preceding proposal, or explicit approval of the exact PRD revision. Repository facts and inspected code may ground options and expose feasibility constraints, but they do not authorize product requirements. Existing draft text is not proof of confirmation.
+Only the user's direct answer or explicit selection becomes a requirement. An unambiguous `yes` confirms only one immediately preceding, explicitly worded proposal. Explicit approval applies only to the exact current PRD revision shown to the user. Proposals, inferences, assumed exclusions, risks, reviewer opinions, repository facts, inspected code, common practice, feasibility analysis, silence, permission to continue, and existing draft text are not decision authority and stay outside the PRD unless the user explicitly confirms their exact content.
 
-Do not write agent-originated proposals, assumptions, open questions, risks, exclusions, examples, inferred consequences, or candidate acceptance criteria anywhere in the PRD before the user confirms that exact content. Required sections may remain empty. A label does not make unconfirmed content admissible.
+Do not write agent-originated proposals, assumptions, open questions, risks, exclusions, examples, inferred consequences, or candidate acceptance criteria anywhere in the PRD before the user confirms that exact content. Demo, sample, fixture, example, and placeholder data is non-authoritative unless the user explicitly confirms it for this product. Required sections may remain empty. A label does not make unconfirmed content admissible.
 
 Faithful paraphrase, stable IDs, and a mechanically equivalent observable check are allowed only when they add no independently choosable semantics. New defaults, owners, APIs, supported-type lists, lifecycle/failure behavior, validation, edge cases, limits, platform mappings, or technical consequences require separate confirmation.
 
-If a short confirmation follows a bundled proposal, treat it as ambiguous and make no semantic edit. Ask separate questions with two or three mutually exclusive options and tradeoffs, one independently choosable decision per question.
+If a short confirmation follows a bundled proposal, treat it as ambiguous and make no semantic edit. Never guess through ambiguity or contradiction; ask the smallest question that can establish direct authority.
+
+## Evidence taxonomy
+
+Classify evidence by what was actually observed: static inspection, compilation or build, automated runtime execution, interactive editor or authoring-environment runtime execution, published or deployed execution, or manual observation. Record the applicable category and its current source precisely. One category does not prove a stronger or different category, and a successful structural validator proves document structure rather than user consent, semantic completeness, product behavior, or delivery feasibility.
+
+Evidence may ground questions, expose constraints, and support feasibility or testability assessment. It never turns an agent proposal, inferred behavior, review finding, or non-authoritative data into a requirement.
+
+Keep evidence-taxonomy entries in chat or read-only research evidence outside the canonical PRD unless the user explicitly confirms their exact product semantics. No source, reviewer, or risk evidence gains product authority from being classified, retained, or reported.
 
 ## Approval and changes
 
 - Keep the file in `draft` until the user explicitly approves it.
 - Before every semantic edit and before approval, audit each added or changed statement against the exact confirming user statement or selected option. Unsupported content keeps the PRD not ready.
-- Validate before and after approval.
+- Request approval only when the full current revision is semantically complete, feasible, and testable: all material product decisions are closed, confirmed requirements do not conflict with current known constraints, and observable acceptance plus the required evidence category can verify each material behavior.
+- `Approve after changes` and equivalent conditional approval do not approve unseen semantics. A semantic edit, or a change request accompanying an approval message, invalidates any prior or conditional approval.
+- After every semantic edit, show the final current revision and request fresh explicit approval. After that approval, modify only approval metadata, validate with `--require-approved`, and report readiness only for those same semantic bytes.
 - Record the exact-byte SHA-256 at handoff time; do not embed a self-referential hash inside the PRD.
 - Reopen an approved PRD before any semantic edit by incrementing `revision`, setting `status: draft`, and clearing `approved_at`.
 - Treat every technical specification built from an older PRD hash as stale.

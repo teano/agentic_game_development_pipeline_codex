@@ -13,46 +13,38 @@ Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-h
 
 Before creating, approving, or structurally editing a PRD, read [product-requirements-contract.md](references/product-requirements-contract.md). It is the canonical path, schema, content-boundary, and approval contract; do not restate or override it here.
 
-## Explicit-confirmation gate
-
-The PRD is a record of user-confirmed product decisions, not an agent-authored design draft. Except for required frontmatter, headings, stable IDs, and faithful wording/placement of confirmed content, write nothing semantic that the user has not explicitly confirmed.
-
-Treat a statement as confirmed only when the user:
-
-- states the decision directly;
-- selects one clearly bounded option;
-- answers `yes`/equivalent to exactly one immediately preceding, explicitly worded proposal; or
-- explicitly approves the exact current PRD revision.
-
-Repository evidence, common practice, feasibility analysis, an existing draft line, agent reasoning, silence, or permission to continue are not confirmation. A short `yes` after a message containing multiple independently choosable proposals is ambiguous and authorizes no semantic edit; split the bundle into separate questions.
-
-Before every semantic PRD write, perform an internal sentence-level confirmation audit. Each added or changed statement must map to the exact user statement or selected option that supports it. The mapping may justify a faithful paraphrase or a mechanically equivalent acceptance check, but never an added default, owner, API, type list, lifecycle rule, failure behavior, edge case, validation rule, limit, platform mapping, implementation detail, or other independently choosable consequence. If any part lacks support, leave it out of the PRD and ask the user.
-
-Agent-originated proposals, assumptions, open questions, risks, exclusions, examples, and candidate acceptance criteria stay in chat until the user explicitly confirms that exact content for the PRD. The required `Assumptions`, `Open Questions`, and `Risks` sections may remain empty. Labels such as `proposal`, `assumption`, `risk`, `optional`, or `PRD-OQ-*` never substitute for confirmation.
-
 ## Resolve product decisions
 
 1. Match the user's language. Resolve the project root, lowercase `FEATURE` slug, exact `WORKFLOW_PATH=.agentic-pipeline/Workflows/<feature>`, and canonical PRD through the contract. Requirements creates no state there and never inspects a sibling workflow. Ask one blocking path question only when resolution remains ambiguous.
 2. Read an existing PRD before interviewing. Preserve stable IDs and epistemic state; do not replace it without explicit approval.
 3. For authorized file-backed work with no PRD, copy [product-requirements.md](assets/product-requirements.md), set the language, and keep `status: draft`. For discussion-only work, write no file.
-4. Ask one compact round of one to five related highest-impact unanswered questions. Each numbered question resolves one independently choosable decision; never hide several decisions behind one yes/no prompt. Preserve and reuse every prior or partial answer, and do not repeat an unchanged answered question. The user may answer any subset or reply free-form; the next round asks only the still-material remainder. Cover only relevant outcome, audience, core loop, scope/non-goals, release/platform constraints, observable states/failures/recovery, UX/quality constraints, integrations/operations, risks, and build-verifiable acceptance.
-5. Whenever the agent has a proposal or recommendation, express it only as a question with two or three concise, mutually exclusive options and their tradeoffs. Put a grounded recommendation first when one exists, label it as a proposal, allow a free-form alternative, and state what evidence supports it. Do not invent an option, product fact, constraint, preference, or recommendation merely to fill the set. Do not write any option to the PRD before the user selects it.
-6. Separate confirmed requirements from all unconfirmed material in chat, not by storing agent-created uncertainty in the PRD. An unanswered question, unaccepted proposal, inferred risk, assumed exclusion, or suggested acceptance criterion remains outside the artifact. Surface contradictions before normative edits; keep architecture out unless the user confirms it as a product or delivery constraint.
-7. Update only affected sections. Preserve stable IDs. Repeating the stage with unchanged PRD bytes and no new user information must reproduce the same pending question round without a semantic edit, new IDs, or revision increment. Do not store transcripts, rejected ideas, or agent reasoning.
+4. Ground discovery strictly in the active task, the actual detected project stack, current repository instructions and conventions, the current PRD, and only the source evidence needed to ask or verify a material question. Do not run an abstract checklist, broaden discovery, or suggest patterns from a foreign stack.
+5. Ask one compact round of up to five related highest-impact unanswered questions. Five is a ceiling, not a quota. If the user asks for clarification, or one prerequisite or conflict blocks the remaining decisions, resolve that first, often with one question. Each numbered question resolves one independently choosable decision; never hide several decisions behind one yes/no prompt. Preserve every prior or partial answer, do not repeat an unchanged answered question, and ask only the still-material remainder.
+6. Parse each numbered answer independently. Free text applies only to its corresponding question and overrides shorthand for that question; it does not silently answer, amend, or approve another question. A request for clarification is not an answer or option selection; explain only that question and wait for its answer. For an ambiguous or contradictory answer, apply the contract's ambiguity rule only to that question, preserve unaffected answers, and ask its smallest blocking clarification before editing it.
+7. Express any proposal only as a question with concise options and their tradeoffs. If a current-project-grounded expert recommendation exists, place it first. Include only useful project-relevant best-practice alternatives or materially simpler alternatives that actually apply. Never invent a recommendation or alternatives to reach an option count. Do not force mutual exclusivity when valid choices can combine or treat any displayed option as authority until the user selects it.
+8. Update only affected sections under the contract. Preserve stable IDs. Repeating the stage with unchanged PRD bytes and no new user information must reproduce the same pending question round without a semantic edit, new IDs, or revision increment. Do not store transcripts, rejected ideas, or agent reasoning.
 
-Before a semantic edit to an approved PRD, increment `revision` once, set `status: draft`, and clear `approved_at`. Further edits in that draft keep the same revision.
+Stop discovery as soon as all material product decisions and the completeness, feasibility, and testability gate are closed. Do not continue looking for optional improvements.
+
+## Conditional read-only lanes
+
+Requirements sessions need not spawn subagents. Use persistent, reusable, read-only lanes only when nontrivial research or review is required or the user explicitly requests delegation. When such work is required and collaboration is available, offload it from the root context through the smallest useful set of lanes.
+
+Allow every started lane to finish or to checkpoint and hand off under the shared stage handoff invariant. Do not cancel and restart lanes per answer. The root must consume every terminal lane result before requesting approval or reporting readiness.
+
+The root Requirements agent alone interprets user decisions, edits the canonical PRD, and requests or records approval. Research and review results are evidence, not decision authority.
+
+For context checkpoint and handoff behavior, follow the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md) instead of restating its thresholds. A Requirements checkpoint adds only the canonical PRD path and current metadata, confirmed decisions already incorporated, pending blocking decisions, unconsumed lane results, and the exact next question or action needed to continue.
 
 ## Complete the stage
 
-Recommend approval only when the product outcome, core loop, release target, blocking scope/platform choices, and observable acceptance criteria are stable. Remaining questions must be explicitly non-blocking. Only the user may approve.
-
-Run `scripts/validate_product_requirements.py <path>` before approval. After explicit approval, set approved metadata, rerun with `--require-approved`, and record the exact-byte SHA-256. A later semantic PRD change invalidates downstream trace credit.
-
-The validator checks structure, not user consent. Before validation and again before approval, rerun the explicit-confirmation audit over every semantic line. If provenance is missing or one confirmation was expanded into additional decisions, keep `PRD_READY: no`, remove the unsupported additions from the proposed edit, and ask the next bounded option question.
+Apply the contract's semantic completeness and exact-current-revision approval gate. Run `scripts/validate_product_requirements.py <path>` before requesting approval, and use its post-approval same-byte procedure before reporting readiness.
 
 The validator requires exact canonical list declarations: `- PRD-REQ-001: plain-text description`, `- PRD-NFR-001: plain-text description`, `- PRD-OQ-001: plain-text description`, and `- PRD-AC-ID: plain-text description` in their respective authority sections. Alternate markers, missing list markers, non-exact delimiters, bare IDs, code-wrapped IDs, and empty or Markdown-rendered descriptions are invalid inventory; references outside those sections remain non-authoritative. Migrating an already approved legacy declaration is a controlled PRD revision: reopen and increment the PRD, obtain fresh PRD approval, then reconverge and freshly approve downstream SPEC/PLAN exact hashes before runtime.
 
-Return only:
+During discovery, report only concrete important new decisions, blockers, evidence, and the next material question. Do not require revision, ID, or SHA boilerplate in an interim response.
+
+At terminal handoff, return only:
 
 - `PRD_READY: yes|no`, canonical path, status, revision, and exact SHA-256 when ready;
 - exact `FEATURE` and `WORKFLOW_PATH=.agentic-pipeline/Workflows/<feature>`;
