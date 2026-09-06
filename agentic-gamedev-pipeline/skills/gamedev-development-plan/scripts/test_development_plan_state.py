@@ -305,7 +305,7 @@ product_authority:
         *,
         plan_path: str | None = None,
         plan_sha256: str | None = None,
-        filename: str = "state.json",
+        filename: str = "pipeline-state.json",
     ) -> Path:
         items = {
             "requirements": {
@@ -322,30 +322,22 @@ product_authority:
             },
         }
         self.commit_fixture("v2 binding fixture")
-        runtime = {
-            "schema": controller._pipeline_v2_model.SCHEMA,
-            "checkout_model": "git-tree-v1",
-            "base_tree_oid": pipeline_checkout.require_clean_head(self.root),
-            "pipeline_runtime_digest": pipeline_checkout.pipeline_runtime_digest(),
-            "run_id": f"{self.feature}-runtime",
-            "generation": 0,
-            "project_root": str(self.root),
-            "authority": {"items": items, "digest": self.canonical_digest(items)},
-            "phase": "plan",
-            "active_assignment": None,
-            "slices": [
-                {
-                    "id": "SLICE-001",
-                    "allowed_paths": ["src/example.txt"],
-                    "planned_commands": [["python", "-B", "-c", "pass"]],
-                    "read_paths": ["src/example.txt"],
-                }
-            ],
-            "artifacts": {},
-            "questions": {},
-            "history": [],
-        }
-        runtime_path = self.root / ".agentic-pipeline-v2" / filename
+        contracts = controller._plan_contract.parse_slice_path_contracts(
+            self.plan.read_text(encoding="utf-8"),
+        )
+        runtime = controller._pipeline_v2_model.new_state(
+            run_id=f"{self.feature}-runtime", feature=self.feature,
+            workflow_path=controller.workflow_relative_path(self.feature).as_posix(),
+            project_root=str(self.root), authority={"items": items},
+            base_tree_oid=pipeline_checkout.require_clean_head(self.root),
+            pipeline_runtime_digest=pipeline_checkout.pipeline_runtime_digest(),
+            slices=[{
+                "id": slice_id, "allowed_paths": contract["write_paths"],
+                "planned_commands": [[sys.executable, "-B", "-c", "pass"]],
+                "read_paths": contract["read_paths"],
+            } for slice_id, contract in contracts.items()],
+        )
+        runtime_path = controller.workflow_path(self.root, self.feature) / filename
         runtime_path.parent.mkdir(parents=True, exist_ok=True)
         runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
         return runtime_path
@@ -373,8 +365,8 @@ Exact reviewed base revision and evidence.
 
 ### Handoff Contract
 
-Controller-generated schema-2 handoff with decision_ids, coverage_state,
-documentation_state, and open_assumptions.
+Approved sources and decisions, completed slice work, verification evidence,
+and unresolved assumptions needed by the next assigned owner.
 
 ### Owned Paths
 
@@ -763,6 +755,35 @@ Only the approved feature and named shared symbol are in scope.
         )
         self.assert_init_rejected_direct_and_cli_without_mutation("current schema")
 
+    def test_handoff_accepts_semantic_inputs_without_retired_runtime_schema(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = self.plan.read_text(encoding="utf-8")
+        before, handoff_and_after = text.split("### Handoff Contract\n\n", 1)
+        _, after = handoff_and_after.split("### Owned Paths", 1)
+        self.plan.write_text(
+            before + "### Handoff Contract\n\n"
+            "The next writer receives the approved sources, completed slice result, "
+            "verification evidence, and unresolved assumptions.\n\n### Owned Paths" + after,
+            encoding="utf-8",
+        )
+        submitted = controller.command_submit(self.args())
+        self.assertEqual(submitted["status"], "awaiting_approval")
+        self.assertIsNone(submitted["approval"])
+
+    def test_handoff_content_remains_required(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = self.plan.read_text(encoding="utf-8")
+        before, handoff_and_after = text.split("### Handoff Contract\n\n", 1)
+        _, after = handoff_and_after.split("### Owned Paths", 1)
+        self.plan.write_text(
+            before + "### Handoff Contract\n\n### Owned Paths" + after,
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "empty required section"):
+            controller.command_validate(self.args())
+
     def test_single_owner_submit_and_explicit_approval(self) -> None:
         self.initialize()
         self.write_plan()
@@ -797,7 +818,7 @@ Only the approved feature and named shared symbol are in scope.
             / "gamedev-pipeline" / "scripts" / "pipeline_state.py"
         )
         self.commit_fixture("approved plan pipeline fixture")
-        runtime_state = self.root / ".agentic-pipeline-v2" / "state.json"
+        runtime_state = controller.workflow_path(self.root, self.feature) / controller.RUNTIME_STATE_FILENAME
         slice_record = json.dumps({
             "id": "SLICE-001",
             "allowed_paths": ["src/feature-1.lua"],
@@ -807,10 +828,9 @@ Only the approved feature and named shared symbol are in scope.
             [
                 sys.executable,
                 str(pipeline_launcher),
-                "--state", str(runtime_state),
+                "--root", str(self.root), "--feature", self.feature,
                 "init",
                 "--id", "INIT-COMMA-SPACE-READS",
-                "--root", str(self.root),
                 "--run-id", "sample-feature-comma-space",
                 "--authority", f"requirements={self.prd.relative_to(self.root).as_posix()}",
                 "--authority", f"specification={self.spec.relative_to(self.root).as_posix()}",
@@ -1574,7 +1594,7 @@ Only the approved feature and named shared symbol are in scope.
                         )
                     )
 
-    def test_approved_plan_revision_is_blocked_after_runtime_binding(self) -> None:
+    def test_approved_plan_revision_rejects_malformed_canonical_runtime(self) -> None:
         self.initialize()
         self.write_plan()
         controller.command_submit(self.args())
@@ -1589,7 +1609,7 @@ Only the approved feature and named shared symbol are in scope.
 
         with self.assertRaisesRegex(
             controller.DevelopmentPlanError,
-            re.escape(controller.SCHEMA10_UNSUPPORTED_MESSAGE),
+            "v2 runtime state is invalid",
         ):
             controller.command_revise_approved(
                 self.args(
@@ -1662,8 +1682,9 @@ Only the approved feature and named shared symbol are in scope.
         self.write_v2_runtime_binding(
             plan_path=alternate.relative_to(self.root).as_posix(),
             plan_sha256=controller.sha256(alternate),
-            filename="custom-state.json",
         )
+        custom = self.write_v2_runtime_binding(filename="custom-state.json")
+        custom_before = custom.read_bytes()
 
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "v2 runtime.*plan path"):
             controller.command_revise_approved(self.args(
@@ -1671,60 +1692,28 @@ Only the approved feature and named shared symbol are in scope.
                 reopened_by="director", analyst_id="planning-analyst-2",
             ))
 
+        self.assertEqual(custom_before, custom.read_bytes())
         self.assertEqual(plan_before, self.plan.read_bytes())
         self.assertEqual(state_before, controller.load_state(self.root, self.feature))
 
-    def test_multiple_v2_runtime_state_candidates_fail_closed_as_ambiguous(self) -> None:
-        self.initialize()
-        self.write_plan()
-        controller.command_submit(self.args())
-        controller.command_approve(
-            self.args(approved_by="user", approval_note="exact SHA approval")
-        )
-        state_before = controller.load_state(self.root, self.feature)
-        plan_before = self.plan.read_bytes()
-        authority_items = {
-            "requirements": {
-                "path": self.prd.relative_to(self.root).as_posix(),
-                "sha256": controller.sha256(self.prd),
-            },
-            "specification": {
-                "path": self.spec.relative_to(self.root).as_posix(),
-                "sha256": controller.sha256(self.spec),
-            },
-            "plan": {
-                "path": self.plan.relative_to(self.root).as_posix(),
-                "sha256": controller.sha256(self.plan),
-            },
-        }
-        runtime = {
-            "schema": controller._pipeline_v2_model.SCHEMA,
-            "project_root": str(self.root),
-            "authority": {
-                "items": authority_items,
-                "digest": hashlib.sha256(
-                    __import__("json").dumps(
-                        authority_items, ensure_ascii=False, sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                ).hexdigest(),
-            },
-        }
+    def test_unrelated_runtime_candidates_do_not_override_canonical_binding(self) -> None:
+        self.approve_current_plan()
+        canonical = self.write_v2_runtime_binding()
+        canonical_before = canonical.read_bytes()
         runtime_dir = self.root / ".agentic-pipeline-v2"
         runtime_dir.mkdir(parents=True, exist_ok=True)
+        unrelated = []
         for name in ("state.json", "custom-state.json"):
-            (runtime_dir / name).write_text(
-                __import__("json").dumps(runtime), encoding="utf-8",
-            )
-
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "multiple v2 runtime"):
-            controller.command_revise_approved(self.args(
-                reason="ambiguous runtime discovery must fail",
-                reopened_by="director", analyst_id="planning-analyst-2",
-            ))
-
-        self.assertEqual(plan_before, self.plan.read_bytes())
-        self.assertEqual(state_before, controller.load_state(self.root, self.feature))
+            path = runtime_dir / name
+            path.write_text('{"unrelated": true}', encoding="utf-8")
+            unrelated.append((path, path.read_bytes()))
+        reopened = controller.command_revise_approved(self.args(
+            reason="only the selected workflow grants runtime lineage",
+            reopened_by="director", analyst_id="planning-analyst-2",
+        ))
+        self.assertEqual("analyzing", reopened["status"])
+        self.assertEqual(canonical_before, canonical.read_bytes())
+        self.assertTrue(all(path.read_bytes() == before for path, before in unrelated))
 
     def test_revise_approved_help_marks_schema10_token_unsupported(self) -> None:
         parser = controller.build_parser()
@@ -1760,7 +1749,7 @@ Only the approved feature and named shared symbol are in scope.
         self.assertNotIn("recovery_authorization", reopened)
         self.assertEqual(runtime_before, runtime_path.read_bytes())
 
-    def test_legacy_recovery_hold_is_the_same_schema10_tombstone(self) -> None:
+    def test_unbound_legacy_recovery_token_rejected_without_state_mutation(self) -> None:
         self.approve_current_plan()
         runtime_dir = self.root / ".agentic-pipeline"
         (runtime_dir / "state.json").write_text(
@@ -1775,9 +1764,13 @@ Only the approved feature and named shared symbol are in scope.
             encoding="utf-8",
         )
 
+        before = {path: path.read_bytes() for path in (
+            self.plan, controller.state_path(self.root, self.feature),
+            runtime_dir / "state.json", runtime_dir / "findings.json",
+        )}
         with self.assertRaisesRegex(
             controller.DevelopmentPlanError,
-            re.escape(controller.SCHEMA10_UNSUPPORTED_MESSAGE),
+            "--recovery-token is invalid without a supported v2 runtime binding",
         ):
             controller.command_revise_approved(
                 self.args(
@@ -1787,6 +1780,8 @@ Only the approved feature and named shared symbol are in scope.
                     recovery_token="ARH-RETIRED",
                 )
             )
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+
     def test_interrupted_approved_plan_revision_resumes_fail_closed(self) -> None:
         self.initialize()
         self.write_plan()

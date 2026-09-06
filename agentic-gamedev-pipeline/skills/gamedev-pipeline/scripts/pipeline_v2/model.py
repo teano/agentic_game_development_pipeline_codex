@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import math
 import re
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+_PLAN_CONTRACT_PATH = Path(__file__).resolve().parents[4] / "scripts" / "development_plan_contract.py"
+_PLAN_CONTRACT_SPEC = importlib.util.spec_from_file_location("gamedev_runtime_plan_contract", _PLAN_CONTRACT_PATH)
+if _PLAN_CONTRACT_SPEC is None or _PLAN_CONTRACT_SPEC.loader is None:
+    raise RuntimeError("Cannot load the shared development-plan contract")
+_PLAN_CONTRACT = importlib.util.module_from_spec(_PLAN_CONTRACT_SPEC)
+_PLAN_CONTRACT_SPEC.loader.exec_module(_PLAN_CONTRACT)
 
 SCHEMA = 4
 CHECKOUT_MODEL = "git-tree-v1"
@@ -77,7 +85,14 @@ _ARTIFACT_SHAPES = {
         ("outcome", "checks", "blocker", "required_action", "questions"),
         ("outcome", "checks"),
         {
-            "checks[]": "non-empty string; at least one unless blocked",
+            "checks[]": {
+                "allowed_keys": ["id", "outcome", "evidence"],
+                "required_keys": ["id", "outcome", "evidence"],
+                "id": "one exact context.required_identity_ids entry, without duplicates",
+                "outcome": "pass|fail|not_run",
+                "evidence": "non-empty observed execution evidence; distinguish the actual integration from substitutes",
+            },
+            "checks": "pass requires the exact required identity set, all with outcome pass; blocked may contain partial observations",
             "blocker": "non-empty string only and always when blocked",
             "required_action": "non-empty string only and always when blocked",
             "questions[]": "non-empty string",
@@ -299,6 +314,8 @@ def compact_assignment_context(source: dict[str, Any], bound_candidate: Any) -> 
         context["current_slice"] = deepcopy(source["current_slice"])
     if isinstance(source.get("review_target"), dict):
         context["review_target"] = deepcopy(source["review_target"])
+    if isinstance(source.get("required_identity_ids"), list):
+        context["required_identity_ids"] = deepcopy(source["required_identity_ids"])
 
     failure = source.get("verification_failure")
     if isinstance(failure, dict) and failure.get("candidate") == bound_candidate:
@@ -495,6 +512,38 @@ def _integrated_slice_paths(state: dict[str, Any]) -> list[str]:
     ))
 
 
+def terminal_blocked_context(state: dict[str, Any]) -> dict[str, str] | None:
+    """Return one genuine inactive blocked result, excluding the init baseline."""
+    if state.get("active_assignment") is not None:
+        return None
+    record = state.get("artifacts", {}).get(state.get("phase"))
+    worker = record.get("worker") if isinstance(record, dict) else None
+    if (
+        not isinstance(worker, dict) or worker.get("outcome") != "blocked"
+        or record.get("assignment_id") == "controller-checkout-baseline"
+    ):
+        return None
+    return {
+        "phase": state["phase"],
+        "blocker": worker["blocker"],
+        "required_action": worker["required_action"],
+    }
+
+
+def retained_engineering_paths(state: dict[str, Any]) -> list[str]:
+    """Recover retained work from reconfiguration history, never phase credit."""
+    paths: set[str] = set()
+    for item in state["history"]:
+        if item.get("command") != "init" or item.get("result") != "authority_scope_reconfigured":
+            continue
+        prior = item.get("prior", {})
+        candidate = prior.get("candidate") or {}
+        for changes in (candidate.get("changed_paths", []), prior.get("interrupted_paths", [])):
+            if literal_paths_valid(changes):
+                paths.update(changes)
+    return sorted(paths)
+
+
 def review_target(
     state: dict[str, Any], *,
     selected: dict[str, Any] | None = None,
@@ -516,7 +565,7 @@ def review_target(
         and isinstance(docs, dict)
         and docs.get("candidate") == candidate
     ):
-        paths = changed_paths(docs)
+        paths = sorted(set(changed_paths(docs) + docs.get("review_paths", [])))
         if paths:
             return {
                 "kind": "documentation_changes",
@@ -524,15 +573,22 @@ def review_target(
                 "candidate_changes": paths,
             }
     engineering = state.get("artifacts", {}).get("engineering")
+    from .checkout import matches
+
+    paths = (
+        changed_paths(engineering)
+        if isinstance(engineering, dict) and engineering.get("candidate") == candidate
+        else []
+    )
+    paths = sorted(set(paths) | {
+        path for path in retained_engineering_paths(state)
+        if any(matches(path, rule) for rule in selected["allowed_paths"])
+    })
     return {
         "kind": "current_slice_implementation",
         "slice_id": selected["id"],
         "required_scope": deepcopy(selected["allowed_paths"]),
-        "candidate_changes": (
-            changed_paths(engineering)
-            if isinstance(engineering, dict) and engineering.get("candidate") == candidate
-            else []
-        ),
+        "candidate_changes": paths,
     }
 
 
@@ -641,6 +697,19 @@ def passing_artifact(state: dict[str, Any], phase: str) -> dict[str, Any] | None
         or worker.get("questions")
     ):
         return None
+    if phase == "qa" and not qa_credit_complete(record):
+        return None
+    if phase == "docs":
+        review = state.get("artifacts", {}).get("review", {})
+        if (
+            review.get("candidate_binding") == record.get("candidate")
+            and review.get("review_target", {}).get("kind") == "documentation_changes"
+            and (
+                review.get("worker", {}).get("outcome") == "fail"
+                or isinstance(review.get("controller_failure"), dict)
+            )
+        ):
+            return None
     assignment_generation = max(
         (
             item.get("generation", -1) for item in state.get("history", [])
@@ -690,7 +759,37 @@ def passing_artifact(state: dict[str, Any], phase: str) -> dict[str, Any] | None
     return record
 
 
-def production_ready(state: dict[str, Any]) -> bool:
+def qa_coverage_complete(record: Any) -> bool:
+    """Check the assignment-bound mandatory result set, not the truth of observations."""
+    if not isinstance(record, dict):
+        return False
+    expected = record.get("required_identity_ids")
+    worker = record.get("worker", {})
+    checks = worker.get("checks") if isinstance(worker, dict) else None
+    if (
+        not isinstance(worker, dict) or worker.get("outcome") != "pass"
+        or not isinstance(expected, list) or not expected
+        or any(not isinstance(item, str) or not item for item in expected)
+        or len(expected) != len(set(expected))
+        or not isinstance(checks, list)
+        or any(
+            not isinstance(item, dict) or set(item) != {"id", "outcome", "evidence"}
+            or not isinstance(item.get("id"), str)
+            or item.get("outcome") != "pass"
+            or not isinstance(item.get("evidence"), str) or not item["evidence"].strip()
+            for item in checks
+        )
+    ):
+        return False
+    return len(checks) == len(expected) and {item["id"] for item in checks} == set(expected)
+
+
+def qa_credit_complete(record: Any) -> bool:
+    """Complete coverage may ask a technical question, but cannot yet grant credit."""
+    return qa_coverage_complete(record) and not record["worker"].get("questions")
+
+
+def production_ready(state: dict[str, Any], *, require_qa: bool = True) -> bool:
     """Derive readiness from the exact controller-sealed terminal record."""
     if not isinstance(state, dict) or state.get("phase") != "ready" or state.get("active_assignment") is not None:
         return False
@@ -711,15 +810,16 @@ def production_ready(state: dict[str, Any]) -> bool:
         and controller["pipeline_runtime_digest"] == state.get("pipeline_runtime_digest")
         and all_slices_completed(state)
         and not pending(state.get("questions", {}))
+        and (not require_qa or qa_credit_complete(artifacts.get("qa")))
     )
 
 
 _PHASE_TASKS = {
     "plan": "Confirm the approved authority and identify only unresolved product decisions.",
     "slice": "Confirm a bounded implementation slice from the approved plan.",
-    "engineering": "Implement the current approved slice and report the semantic outcome.",
+    "engineering": "Implement the approved slice using exposed editor tools or computer control as needed; persistent writes stay inside assignment write paths. Verify the authorized session and report the semantic outcome.",
     "review": "Independently review the current candidate and report actionable findings.",
-    "qa": "Independently verify the current candidate against the approved acceptance boundary.",
+    "qa": "Verify approved acceptance using exposed computer control or editor/player tools for temporary play, input, UI, and console checks. Keep persistent product files read-only, verify session ownership, and restore only test-owned temporary state.",
     "docs": "Bring supporting documentation in sync with the verified candidate.",
 }
 
@@ -732,7 +832,7 @@ def _action_id(state: dict[str, Any], verb: str) -> str:
 def reconfiguration_action(
     state: dict[str, Any], authority_items: dict[str, dict[str, Any]],
     slices: list[dict[str, Any]] | None = None,
-    *, candidate_tree_oid: str,
+    *, candidate_tree_oid: str, pipeline_runtime_digest: str | None = None,
 ) -> dict[str, Any]:
     """Bind the public init capability to the exact controller observation."""
     if not is_git_oid(candidate_tree_oid):
@@ -742,6 +842,7 @@ def reconfiguration_action(
     token = digest([
         state["run_id"], state["generation"], authority["digest"],
         digest(proposed_slices), candidate_tree_oid,
+        pipeline_runtime_digest or state["pipeline_runtime_digest"],
     ])[:10]
     return {
         "kind": "command", "command": "init",
@@ -754,7 +855,7 @@ def reconfiguration_action(
             name: item["path"] for name, item in authority["items"].items()
         },
         "slices": proposed_slices,
-        "reason": "approved authority or scope binding changed; restart at plan and re-slice",
+        "reason": "approved authority, scope, or runtime binding changed; restart at plan and re-slice",
         "user_input_required": False,
     }
 
@@ -959,7 +1060,20 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
     }
     if target is not None:
         assignment["context"] = {"review_target": target}
+    if phase == "qa":
+        assignment["context"] = {"required_identity_ids": required_qa_identity_ids(state)}
     return assignment
+
+
+def required_qa_identity_ids(state: dict[str, Any]) -> list[str]:
+    """Derive QA scope from the existing immutable approved plan, not caller prose."""
+    try:
+        path = state["authority"]["items"]["plan"]["path"]
+        text = (Path(state["project_root"]) / path).read_text(encoding="utf-8")
+        contracts = _PLAN_CONTRACT.parse_slice_path_contracts(text, include_qa=True)
+        return contracts[current_slice(state)["id"]]["mandatory_identity_ids"]
+    except (KeyError, OSError, UnicodeError, _PLAN_CONTRACT.PlanContractError) as exc:
+        raise PipelineError(f"QA requires the exact approved mandatory identity inventory: {exc}") from exc
 
 
 def next_action(state: dict[str, Any]) -> dict[str, Any]:
@@ -974,17 +1088,14 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
             "assignment_id": active["id"],
             "artifact_path": assignment_output_path(active, state["feature"]),
         }
-    record = state.get("artifacts", {}).get(state.get("phase"))
-    worker = record.get("worker") if isinstance(record, dict) else None
-    if (
-        isinstance(worker, dict) and worker.get("outcome") == "blocked"
-        and record.get("assignment_id") != "controller-checkout-baseline"
-    ):
+    blocked = terminal_blocked_context(state)
+    if blocked is not None:
         return {
             "kind": "terminal", "result": "user_input_required",
-            "phase": state["phase"], "user_input_required": True,
-            "blocker": worker["blocker"], "required_action": worker["required_action"],
-            "recovery": "Archive this terminal run and perform a fresh init after the prerequisite changes.",
+            **blocked, "user_input_required": True,
+            "recovery": (
+                "After the prerequisite changes, read public status and execute its exact init action."
+            ),
         }
     open_questions = pending(state["questions"])
     if open_questions:
@@ -1063,7 +1174,7 @@ def validate_state(state: dict[str, Any]) -> None:
         if phase not in PHASES or not isinstance(item, dict):
             raise PipelineError("artifact has an invalid shape")
         if phase == "ready":
-            if not production_ready(state):
+            if not production_ready(state, require_qa=False):
                 raise PipelineError("ready artifact is not current controller evidence")
             continue
         worker = item.get("worker")

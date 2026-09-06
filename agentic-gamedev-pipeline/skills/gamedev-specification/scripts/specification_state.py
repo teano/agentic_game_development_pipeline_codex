@@ -522,7 +522,9 @@ def require_no_active_helper_request(state: dict[str, Any]) -> None:
     if state.get("active_helper_request") is not None:
         raise SpecificationStateError(
             "an external helper request is active; record its exact result before "
-            "another specification transition"
+            "another specification transition. If approved PRD authority changed, "
+            "first confirm helper termination and use reject-helper-result with "
+            "--helper-status and --helper-evidence"
         )
 
 
@@ -532,6 +534,7 @@ def validate_helper_request(
     supplied_path: str | None,
     *,
     require_current_identity: bool,
+    require_current_prd: bool = True,
 ) -> dict[str, Any]:
     label = "controller-issued helper request"
     path, request_bytes, request = _read_helper_json(root, supplied_path, label)
@@ -624,7 +627,9 @@ def validate_helper_request(
             "controller-issued helper request PRD authority is stale or foreign"
         )
     prd = resolve_project_path(root, approved_prd["path"], "helper request PRD")
-    if not prd.is_file() or sha256(prd) != approved_prd["sha256"]:
+    if require_current_prd and (
+        not prd.is_file() or sha256(prd) != approved_prd["sha256"]
+    ):
         raise SpecificationStateError(
             "controller-issued helper request PRD bytes changed"
         )
@@ -649,7 +654,10 @@ def validate_helper_request(
             "controller-issued helper request input/target operation is invalid"
         )
 
-    language = require_approved_prd(prd).get("language")
+    language = (
+        require_approved_prd(prd).get("language")
+        if require_current_prd else request.get("expected_user_language")
+    )
     if (
         not isinstance(language, str)
         or not language.strip()
@@ -1644,14 +1652,13 @@ def runtime_recovery_authorization(
         else:
             public_status_invalid = public_status_invalid or (
                 next_action.get("command") != "init"
-                or next_action.get("user_input_required") is not False
             )
         if public_status_invalid:
             raise SpecificationStateError(
                 "bound v2 public status is not a safe specification-reopen boundary: "
                 "the specification-only route is not quiescent, the PRD-change route "
-                "does not expose tokenless init with user_input_required=false, status "
-                "is terminal or requires checkout recovery, an effect is unknown, or "
+                "does not expose tokenless init, status "
+                "exposes a terminal action (including checkout recovery), an effect is unknown, or "
                 "the runtime changed during authorization"
             )
         authorization = {
@@ -1785,6 +1792,46 @@ def require_source_unchanged(root: Path, state: dict[str, Any]) -> tuple[Path, P
     return prd, spec
 
 
+def require_superseding_prd(
+    state: dict[str, Any], prd: Path
+) -> tuple[dict[str, str], str, dict[str, Any]]:
+    validation = validate_approved_prd_contract(prd, label="new PRD")
+    authority_bound_at = utc_timestamp(state["created_at"], "specification initialization")
+    last = (state.get("history") or [{}])[-1]
+    superseded_acceptance = (
+        (last.get("prior_convergence", {}).get("acceptance") or {})
+        if last.get("event") == "superseded_helper_request_rejected" else {}
+    )
+    for timestamp in (
+        state["prd"].get("approved_at"),
+        (state.get("acceptance") or {}).get("accepted_at"),
+        superseded_acceptance.get("accepted_at"),
+    ):
+        if timestamp:
+            authority_bound_at = max(
+                authority_bound_at, utc_timestamp(timestamp, "prior authority approval/acceptance")
+            )
+    new_prd_meta = require_approved_prd(prd)
+    new_prd_sha = sha256(prd)
+    try:
+        old_revision = int(state["prd"]["revision"])
+        new_revision = int(new_prd_meta["revision"])
+    except (TypeError, ValueError) as exc:
+        raise SpecificationStateError("PRD revisions must be positive integers") from exc
+    if new_prd_sha == state["prd"]["sha256"] or new_revision <= old_revision:
+        raise SpecificationStateError(
+            "revise-in-progress requires a newly approved higher PRD revision and changed SHA"
+        )
+    prd_approved_at = utc_timestamp(
+        new_prd_meta["approved_at"], "new PRD approved_at"
+    )
+    if prd_approved_at <= authority_bound_at:
+        raise SpecificationStateError(
+            "new PRD approval must be fresh after prior authority initialization/acceptance"
+        )
+    return new_prd_meta, new_prd_sha, validation
+
+
 def finalize_in_progress_revision(
     root: Path, state: dict[str, Any], args: argparse.Namespace
 ) -> dict[str, Any]:
@@ -1802,8 +1849,16 @@ def finalize_in_progress_revision(
         raise SpecificationStateError("pending in-progress revision found changed PRD bytes")
     validate_approved_prd_contract(prd, label="new PRD")
     spec = root / transition["specification_path"]
-    current_sha = sha256(spec)
-    if current_sha == transition["prior_spec_sha256"]:
+    current_sha = sha256(spec) if spec.is_file() else None
+    resume_generation = transition.get("resume_generation", False)
+    if resume_generation:
+        if current_sha != transition["prior_spec_sha256"] or (
+            current_sha is None and spec.exists()
+        ):
+            raise SpecificationStateError(
+                "pending in-progress revision found unexpected generation input bytes"
+            )
+    elif current_sha == transition["prior_spec_sha256"]:
         draft_bytes, prior_revision, next_revision = reopened_specification_bytes(
             spec,
             transition["new_prd"]["path"],
@@ -1828,13 +1883,22 @@ def finalize_in_progress_revision(
     state.setdefault("history", []).append(event)
     now = transition["opened_at"]
     state["prd"] = copy.deepcopy(transition["new_prd"])
-    state["specification"] = {
-        "path": transition["specification_path"],
-        "sha256": transition["draft_sha256"],
-        "status": "draft",
-        "trace_errors": [],
-    }
-    state["status"] = "awaiting_accept"
+    if resume_generation:
+        state["specification"] = {
+            "path": transition["specification_path"],
+            "sha256": None,
+            "generation_input_sha256": current_sha,
+            "trace_errors": ["generation input requires the new PRD authority"],
+        }
+        state["status"] = "needs_generation"
+    else:
+        state["specification"] = {
+            "path": transition["specification_path"],
+            "sha256": transition["draft_sha256"],
+            "status": "draft",
+            "trace_errors": [],
+        }
+        state["status"] = "awaiting_accept"
     state["active_architect_id"] = transition["new_architect_id"]
     state["architects"] = [
         {
@@ -1852,7 +1916,9 @@ def finalize_in_progress_revision(
     state["hold_history"] = []
     state["ready"] = None
     state["acceptance"] = None
-    reset_helper_chain(state, transition["draft_sha256"])
+    reset_helper_chain(
+        state, current_sha if resume_generation else transition["draft_sha256"]
+    )
     state.pop("in_progress_revision", None)
     state["updated_at"] = now
     save_state(root, state)
@@ -1867,10 +1933,12 @@ def command_revise_in_progress(args: argparse.Namespace) -> dict[str, Any]:
         return finalize_in_progress_revision(root, state, args)
     if state.get("status") == "spec_ready":
         raise SpecificationStateError("spec_ready authority must use revise-ready")
-    if state.get("status") != "reviewing":
-        raise SpecificationStateError("revise-in-progress requires exact reviewing state")
+    if state.get("status") not in {
+        "needs_generation", "reviewing", "awaiting_accept", "spec_convergence_hold"
+    }:
+        raise SpecificationStateError("revise-in-progress requires an unfinished specification")
     if state.get("ready") is not None:
-        raise SpecificationStateError("reviewing state must not retain SPEC_READY evidence")
+        raise SpecificationStateError("unfinished state must not retain SPEC_READY evidence")
     reason = args.reason.strip()
     architect_id = args.architect_id.strip()
     if not reason or not architect_id:
@@ -1889,30 +1957,37 @@ def command_revise_in_progress(args: argparse.Namespace) -> dict[str, Any]:
         or spec.relative_to(root).as_posix() != state["specification"]["path"]
     ):
         raise SpecificationStateError("in-progress authority paths are not canonical")
-    validation = validate_approved_prd_contract(prd, label="new PRD")
-    if not spec.is_file():
-        raise SpecificationStateError("in-progress specification does not exist")
-    current_spec_sha = sha256(spec)
-    if current_spec_sha != state["specification"].get("sha256"):
+    resume_generation = (
+        state["status"] == "needs_generation"
+        and not state.get("helper_evidence", {}).get("results")
+    )
+    current_spec_sha = sha256(spec) if spec.is_file() else None
+    expected_spec_sha = state["specification"].get(
+        "generation_input_sha256" if resume_generation else "sha256"
+    )
+    if (
+        current_spec_sha != expected_spec_sha
+        or (current_spec_sha is None and (not resume_generation or spec.exists()))
+    ):
         raise SpecificationStateError(
             "in-progress specification bytes do not equal controller-recorded SHA"
         )
     active_wave = state.get("active_wave")
-    if not isinstance(active_wave, dict) or not isinstance(
-        active_wave.get("proofread"), dict
+    if active_wave is not None and not isinstance(active_wave, dict):
+        raise SpecificationStateError(
+            "in-progress active wave is malformed"
+        )
+    if active_wave is not None and (
+        state["status"] != "reviewing" or not state.get("acceptance")
     ):
         raise SpecificationStateError(
-            "revise-in-progress requires an active wave with a recorded Proofreader result"
+            "active Proofreader wave requires its prior accept-spec receipt"
         )
-    if active_wave.get("spec_sha256") != current_spec_sha:
-        raise SpecificationStateError(
-            "active Proofreader wave does not reference the current specification SHA"
-        )
-    meta = parse_frontmatter(spec, "in-progress specification")
+    meta = {} if resume_generation else parse_frontmatter(spec, "in-progress specification")
     prior_prd_trace = {
         key: state["prd"].get(key) for key in ("path", "revision", "sha256")
     }
-    if (
+    if not resume_generation and (
         meta.get("document_type") != "technical-specification"
         or product_authority_trace(meta) != prior_prd_trace
     ):
@@ -1920,53 +1995,52 @@ def command_revise_in_progress(args: argparse.Namespace) -> dict[str, Any]:
             "in-progress specification frontmatter does not match prior PRD authority"
         )
     acceptance = state.get("acceptance") or {}
+    accepted_spec_sha = (
+        active_wave["spec_sha256"] if active_wave else current_spec_sha
+    )
+    accepted_revision = (
+        active_wave.get("specification_revision") if active_wave else None
+    )
+    if acceptance and accepted_revision is None:
+        accepted_revision = exact_positive_revision(spec, "in-progress specification")
     expected_acceptance = {
         "prd_path": state["prd"]["path"],
         "prd_revision": state["prd"]["revision"],
         "prd_sha256": state["prd"]["sha256"],
         "specification_path": state["specification"]["path"],
-        "specification_revision": exact_positive_revision(
-            spec, "in-progress specification"
-        ),
-        "specification_sha256": current_spec_sha,
-        "accepted_by": state["active_architect_id"],
+        "specification_revision": accepted_revision,
+        "specification_sha256": accepted_spec_sha,
         "recovery_token": None,
     }
-    if (
-        not acceptance.get("accepted_at")
+    if acceptance and (
+        resume_generation
+        or not acceptance.get("accepted_at")
         or any(acceptance.get(key) != value for key, value in expected_acceptance.items())
+        or not any(
+            same_actor(acceptance.get("accepted_by", ""), item["id"])
+            for item in state["architects"]
+        )
     ):
         raise SpecificationStateError(
             "revise-in-progress requires the exact prior accept-spec receipt"
         )
-    accepted_at = utc_timestamp(
-        acceptance["accepted_at"], "in-progress acceptance"
-    )
-    new_prd_meta = require_approved_prd(prd)
-    new_prd_sha = sha256(prd)
-    try:
-        old_revision = int(state["prd"]["revision"])
-        new_revision = int(new_prd_meta["revision"])
-    except (TypeError, ValueError) as exc:
-        raise SpecificationStateError("PRD revisions must be positive integers") from exc
-    if new_prd_sha == state["prd"]["sha256"] or new_revision <= old_revision:
-        raise SpecificationStateError(
-            "revise-in-progress requires a newly approved higher PRD revision and changed SHA"
+    if active_wave and accepted_spec_sha != current_spec_sha:
+        if _helper_evidence_output(state["helper_evidence"]) != current_spec_sha:
+            raise SpecificationStateError(
+                "changed active-wave specification requires recorded helper output"
+            )
+    new_prd_meta, new_prd_sha, validation = require_superseding_prd(state, prd)
+    prior_revision = next_revision = draft_sha256 = None
+    if not resume_generation:
+        draft_bytes, prior_revision, next_revision = reopened_specification_bytes(
+            spec,
+            state["prd"]["path"],
+            new_prd_meta["revision"],
+            new_prd_sha,
         )
-    prd_approved_at = utc_timestamp(
-        new_prd_meta["approved_at"], "new PRD approved_at"
-    )
-    if prd_approved_at <= accepted_at:
-        raise SpecificationStateError(
-            "new PRD approval must be fresh after in-progress specification acceptance"
-        )
-    draft_bytes, prior_revision, next_revision = reopened_specification_bytes(
-        spec,
-        state["prd"]["path"],
-        new_prd_meta["revision"],
-        new_prd_sha,
-    )
+        draft_sha256 = hashlib.sha256(draft_bytes).hexdigest()
     opened_at = utc_now()
+    prior_status = state["status"]
     state["status"] = "in_progress_revision_pending"
     state["in_progress_revision"] = {
         "opened_at": opened_at,
@@ -1977,8 +2051,9 @@ def command_revise_in_progress(args: argparse.Namespace) -> dict[str, Any]:
         "prior_revision": prior_revision,
         "next_revision": next_revision,
         "prior_spec_sha256": current_spec_sha,
-        "draft_sha256": hashlib.sha256(draft_bytes).hexdigest(),
-        "prior_status": "reviewing",
+        "draft_sha256": draft_sha256,
+        "resume_generation": resume_generation,
+        "prior_status": prior_status,
         "prior_prd": copy.deepcopy(state["prd"]),
         "new_prd": {
             "path": state["prd"]["path"],
@@ -1989,6 +2064,7 @@ def command_revise_in_progress(args: argparse.Namespace) -> dict[str, Any]:
         },
         "prior_specification": copy.deepcopy(state["specification"]),
         "prior_acceptance": copy.deepcopy(state.get("acceptance")),
+        "prior_helper_evidence": copy.deepcopy(state.get("helper_evidence")),
         "prior_ready": copy.deepcopy(state.get("ready")),
         "prior_architects": copy.deepcopy(state.get("architects", [])),
         "prior_waves": copy.deepcopy(state.get("waves", [])),
@@ -2166,6 +2242,47 @@ def _is_canonical_prd_receipt(value: Any) -> bool:
     )
 
 
+def _canonical_wave_corrections(wave: dict[str, Any]) -> bool:
+    """Check archived consumed corrections without reopening historical helper files."""
+    if "helper_correction_results" not in wave:
+        return True
+    results = wave["helper_correction_results"]
+    if wave.get("outcome") != "revised" or not isinstance(results, list) or not results:
+        return False
+    previous = wave.get("spec_sha256")
+    for item in results:
+        if not isinstance(item, dict) or set(item) != {"request", "result"}:
+            return False
+        for record in item.values():
+            if (
+                not isinstance(record, dict) or set(record) != {"path", "sha256", "summary"}
+                or not isinstance(record["path"], str) or not record["path"].strip()
+                or not _is_receipt_digest(record["sha256"])
+                or not isinstance(record["summary"], dict)
+            ):
+                return False
+        request = item["request"]["summary"]
+        result = item["result"]["summary"]
+        specification = request.get("specification")
+        output = result.get("output_specification")
+        if (
+            request.get("operation") != "correction" or result.get("operation") != "correction"
+            or result.get("outcome") != "PASS"
+            or not isinstance(specification, dict) or not isinstance(output, dict)
+            or specification.get("input") != {"kind": "sha256", "sha256": previous}
+            or not isinstance(request.get("request_id"), str) or not request["request_id"]
+            or result.get("request") != {
+                "id": request["request_id"], "sha256": item["request"]["sha256"],
+            }
+            or output.get("path") != specification.get("path")
+            or not _is_receipt_digest(output.get("sha256"))
+            or output["sha256"] == previous
+        ):
+            return False
+        previous = output["sha256"]
+    return previous == wave.get("result_spec_sha256")
+
+
 def _canonical_ready_archive(event: dict[str, Any]) -> bool:
     prior_ready = event.get("prior_ready")
     prior_specification = event.get("prior_specification")
@@ -2297,6 +2414,8 @@ def _canonical_ready_archive(event: dict[str, Any]) -> bool:
         )
         if "specification_revision" in wave:
             expected_wave_keys.add("specification_revision")
+        if "helper_correction_results" in wave:
+            expected_wave_keys.add("helper_correction_results")
         wave_architect_id = wave.get("architect_id")
         wave_proofreader_id = wave.get("proofreader_id")
         if (
@@ -2309,6 +2428,7 @@ def _canonical_ready_archive(event: dict[str, Any]) -> bool:
         proofread = wave.get("proofread")
         if (
             set(wave) != expected_wave_keys
+            or not _canonical_wave_corrections(wave)
             or not _is_receipt_count(wave.get("number"))
             or wave["number"] != index + 1
             or actor_id not in wave_counts
@@ -2325,7 +2445,8 @@ def _canonical_ready_archive(event: dict[str, Any]) -> bool:
             or not _is_receipt_timestamp(wave.get("started_at"))
             or not _is_receipt_timestamp(wave.get("completed_at"))
             or not isinstance(proofread, dict)
-            or set(proofread) != proofread_keys
+            or set(proofread) not in (proofread_keys, proofread_keys | {"report_sha256"})
+            or "report_sha256" in proofread and not _is_receipt_digest(proofread["report_sha256"])
         ):
             return False
         wave_counts[actor_id] += 1
@@ -2962,6 +3083,8 @@ def command_revise_ready(args: argparse.Namespace) -> dict[str, Any]:
             else "revoked_by_prd_revision"
         ),
     }
+    if not _canonical_ready_archive(state["ready_revision"]):
+        raise SpecificationStateError("ready revision receipt is not canonical")
     state["updated_at"] = opened_at
     save_state(root, state)
     return finalize_ready_revision(root, state, args)
@@ -3418,6 +3541,8 @@ def command_reject_helper_result(args: argparse.Namespace) -> dict[str, Any]:
         raise SpecificationStateError("helper-result rejection request ID is invalid")
     if not isinstance(reason, str) or reason != reason.strip() or not reason:
         raise SpecificationStateError("helper-result rejection reason is required")
+    if getattr(args, "helper_status", None) is not None or getattr(args, "helper_evidence", None) is not None:
+        return reject_superseded_helper_request(root, state, args)
 
     active = state.get("active_helper_request")
     if not isinstance(active, dict):
@@ -3523,6 +3648,98 @@ def command_reject_helper_result(args: argparse.Namespace) -> dict[str, Any]:
         "post_state_sha256": _helper_rejection_state_sha256(state),
     }
     state["history"].append(receipt)
+    save_state(root, state)
+    return state
+
+
+def reject_superseded_helper_request(
+    root: Path, state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
+    """Archive stopped old-authority work; never accept its result or edit its output.
+
+    Helper liveness belongs to the Director's actual coordination tool. These
+    explicit inputs record that observed terminal handoff, not machine proof of it.
+    """
+    if args.helper_status not in {"completed", "stopped"} or (
+        not isinstance(args.helper_evidence, str) or not args.helper_evidence.strip()
+    ):
+        raise SpecificationStateError(
+            "superseded helper rejection requires completed/stopped status and terminal tool evidence"
+        )
+    require_no_runtime_binding(root, state["feature"])
+    prd = resolve_project_path(root, state["prd"]["path"], "canonical PRD")
+    _, new_prd_sha, _ = require_superseding_prd(state, prd)
+    request_path = f"{state['workflow_path']}/helper-requests/{args.request_id}.json"
+    request = validate_helper_request(
+        root, state, request_path, require_current_identity=False,
+        require_current_prd=False,
+    )
+    active = state.get("active_helper_request")
+    terminal = {
+        "status": args.helper_status, "evidence": args.helper_evidence.strip()
+    }
+
+    def output_hashes() -> dict[str, str | None]:
+        result = {}
+        for relative in request["summary"]["allowed_write_paths"]:
+            path = resolve_project_path(root, relative, "superseded helper output")
+            if path.exists() and not path.is_file():
+                raise SpecificationStateError("superseded helper output is not a file")
+            result[relative] = sha256(path) if path.is_file() else None
+        return result
+
+    outputs = output_hashes()
+    if active is None:
+        last = (state.get("history") or [{}])[-1]
+        if (
+            last.get("event") != "superseded_helper_request_rejected"
+            or last.get("request") != request
+            or last.get("reason") != args.reason
+            or last.get("helper_terminal") != terminal
+            or last.get("superseding_prd_sha256") != new_prd_sha
+            or last.get("preserved_outputs") != outputs
+            or last.get("post_state_sha256") != _helper_rejection_state_sha256(state)
+        ):
+            raise SpecificationStateError(
+                "superseded helper rejection replay requires exact inputs and unchanged state/output"
+            )
+        return state
+    if request != active:
+        raise SpecificationStateError("active controller-issued helper request changed after preparation")
+    if state.get("status") not in {"needs_generation", "reviewing", "awaiting_accept"}:
+        raise SpecificationStateError("superseded helper requires unfinished specification work")
+    # A second read detects writes overlapping the Director's terminal assertion.
+    if output_hashes() != outputs or sha256(prd) != new_prd_sha:
+        raise SpecificationStateError("helper output or PRD changed during superseded rejection")
+    prior = {
+        key: copy.deepcopy(state.get(key))
+        for key in ("status", "specification", "acceptance", "active_wave", "waves",
+                    "hold", "hold_history", "ready", "helper_evidence")
+    }
+    spec_path = state["specification"]["path"]
+    reset_helper_chain(state, outputs[spec_path])
+    state["specification"] = {
+        "path": spec_path, "sha256": None,
+        "generation_input_sha256": outputs[spec_path],
+        "trace_errors": ["helper authority superseded; run revise-in-progress"],
+    }
+    state["status"] = "needs_generation"
+    for key in ("acceptance", "active_wave", "hold", "ready"):
+        state[key] = None
+    state["waves"] = []
+    state["hold_history"] = []
+    state["updated_at"] = utc_now()
+    state.setdefault("history", []).append({
+        "event": "superseded_helper_request_rejected",
+        "reason": args.reason,
+        "request": request,
+        "helper_terminal": terminal,
+        "superseding_prd_sha256": new_prd_sha,
+        "preserved_outputs": outputs,
+        "prior_convergence": prior,
+        "rejected_at": state["updated_at"],
+        "post_state_sha256": _helper_rejection_state_sha256(state),
+    })
     save_state(root, state)
     return state
 
@@ -3640,6 +3857,11 @@ def command_accept_spec(args: argparse.Namespace) -> dict[str, Any]:
     meta, drift = specification_trace(root, prd, spec)
     if drift:
         raise SpecificationStateError("cannot accept stale specification: " + "; ".join(drift))
+    if meta.get("status") != "approved":
+        raise SpecificationStateError(
+            "finalize specification status as approved through the existing pre-accept "
+            "helper correction before accept-spec and obtain its exact-SHA Architect receipt"
+        )
     preaccept_receipt = validate_preaccept_receipt(
         root,
         state,
@@ -3734,6 +3956,112 @@ def command_start_cycle(args: argparse.Namespace) -> dict[str, Any]:
     return state
 
 
+def read_proofreader_report(
+    root: Path, state: dict[str, Any], wave: dict[str, Any], relative: str,
+) -> dict[str, Any]:
+    """Consume the existing worker report, rather than a second caller summary."""
+    if not isinstance(relative, str) or not relative.strip():
+        raise SpecificationStateError("Proofreader result requires a report path")
+    report_path = workflow_artifact_path(root, state, relative, "Proofreader report")
+    expected_root = workflow_path(root, state["feature"]) / "proofreader-reports"
+    try:
+        report_path.relative_to(expected_root)
+    except ValueError as error:
+        raise SpecificationStateError(
+            "Proofreader report must stay inside the selected workflow's proofreader-reports directory"
+        ) from error
+    try:
+        report_bytes = report_path.read_bytes()
+        text = report_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise SpecificationStateError("Proofreader report must be a readable UTF-8 file") from error
+    scalar_keys = {
+        "PROOFREADER_ID", "PRD_SHA256", "SPEC_SHA256", "COVERAGE_COMPLETE",
+        "UNRESOLVED", "MINORS_ENGINEER_RESOLVABLE", "VERDICT",
+    }
+    fields: dict[str, str] = {}
+    findings: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        key, separator, value = line.partition(":")
+        value = value.strip()
+        if not separator or not value or key not in scalar_keys | {"FINDINGS"}:
+            raise SpecificationStateError("Proofreader report contains an invalid field")
+        if key == "FINDINGS":
+            findings.append(value)
+        elif key in fields:
+            raise SpecificationStateError(f"Proofreader report repeats {key}")
+        else:
+            fields[key] = value
+    if set(fields) != scalar_keys or not findings:
+        raise SpecificationStateError("Proofreader report is missing required fields")
+    if not same_actor(fields["PROOFREADER_ID"], wave["proofreader_id"]):
+        raise SpecificationStateError("Proofreader report identity does not match the active wave")
+    if fields["PRD_SHA256"] != state["prd"]["sha256"] or fields["SPEC_SHA256"] != wave["spec_sha256"]:
+        raise SpecificationStateError("Proofreader report does not match the immutable PRD/spec SHA")
+    for key in ("COVERAGE_COMPLETE", "MINORS_ENGINEER_RESOLVABLE"):
+        if fields[key] not in {"yes", "no"}:
+            raise SpecificationStateError(f"Proofreader report {key} must be yes or no")
+    counts = {"critical": 0, "major": 0, "minor": 0}
+    finding_ids: list[str] = []
+    if findings != ["none"]:
+        for finding in findings:
+            parts = [part.strip() for part in finding.split("|", 5)]
+            if len(parts) != 6 or not all(parts) or parts[1].lower() not in counts:
+                raise SpecificationStateError("Proofreader finding requires ID, severity, category, requirements, evidence, resolution")
+            finding_id, severity = parts[:2]
+            if finding_id in finding_ids:
+                raise SpecificationStateError("Proofreader finding IDs must be unique")
+            finding_ids.append(finding_id)
+            counts[severity.lower()] += 1
+    question_keys = {"product", "scope", "boundary", "ownership", "public-contract"}
+    questions: dict[str, int] = {}
+    question_ids: list[str] = []
+    for declaration in fields["UNRESOLVED"].split("|"):
+        category, separator, ids = declaration.strip().partition("=")
+        ids = ids.strip()
+        if not separator or category not in question_keys or category.replace("-", "_") in questions or not ids:
+            raise SpecificationStateError("Proofreader UNRESOLVED requires each question category once")
+        current_ids = [] if ids == "none" else [item.strip() for item in ids.split(",")]
+        if any(not item or item == "none" for item in current_ids) or len(set(question_ids + current_ids)) != len(question_ids + current_ids):
+            raise SpecificationStateError("Proofreader question IDs must be non-empty and unique")
+        questions[category.replace("-", "_")] = len(current_ids)
+        question_ids.extend(current_ids)
+    if set(questions) != {key.replace("-", "_") for key in question_keys}:
+        raise SpecificationStateError("Proofreader UNRESOLVED is missing a question category")
+    coverage = fields["COVERAGE_COMPLETE"] == "yes"
+    minors_resolvable = fields["MINORS_ENGINEER_RESOLVABLE"] == "yes"
+    expected_verdict = (
+        "user-gate" if question_ids else "revise"
+        if counts["critical"] or counts["major"] or not coverage or counts["minor"] and not minors_resolvable
+        else "pass"
+    )
+    if fields["VERDICT"] != expected_verdict:
+        raise SpecificationStateError("Proofreader verdict conflicts with its findings, questions, or coverage")
+    return {
+        **counts, "questions": questions,
+        "minors_engineer_resolvable": minors_resolvable, "coverage_complete": coverage,
+        "report_path": report_path.relative_to(root).as_posix(),
+        "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+        "finding_ids": sorted(finding_ids), "question_ids": sorted(question_ids),
+    }
+
+
+def require_consumed_proofreader_report(
+    root: Path, state: dict[str, Any], wave: dict[str, Any],
+) -> None:
+    proofread = wave.get("proofread") or {}
+    if not proofread.get("report_sha256"):
+        raise SpecificationStateError(
+            "Proofreader result has no consumed report; close this wave with complete-cycle "
+            "and record a fresh Proofreader report before readiness"
+        )
+    observed = read_proofreader_report(root, state, wave, proofread.get("report_path"))
+    if any(proofread.get(key) != value for key, value in observed.items()):
+        raise SpecificationStateError("consumed Proofreader report changed after recording")
+
+
 def command_record_proofread(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.project_root).resolve()
     state = load_state(root, args.feature)
@@ -3751,50 +4079,8 @@ def command_record_proofread(args: argparse.Namespace) -> dict[str, Any]:
     current_hash = sha256(spec)
     if current_hash != wave["spec_sha256"]:
         raise SpecificationStateError("specification changed during read-only proofreading")
-    if min(args.critical, args.major, args.minor) < 0:
-        raise SpecificationStateError("finding counts cannot be negative")
-    question_counts = {
-        "product": args.product_questions,
-        "scope": args.scope_questions,
-        "boundary": args.boundary_questions,
-        "ownership": args.ownership_questions,
-        "public_contract": args.public_contract_questions,
-    }
-    if min(question_counts.values()) < 0:
-        raise SpecificationStateError("question counts cannot be negative")
-    finding_ids = sorted(set(args.finding_id))
-    question_ids = sorted(set(args.question_id))
-    if len(finding_ids) != args.critical + args.major + args.minor:
-        raise SpecificationStateError(
-            "Proofreader finding counts must match distinct --finding-id values"
-        )
-    if len(question_ids) != sum(question_counts.values()):
-        raise SpecificationStateError(
-            "Proofreader question counts must match distinct --question-id values"
-        )
-    if not args.report_path or not args.report_path.strip():
-        raise SpecificationStateError("Proofreader result requires a report path")
-    report_path = workflow_artifact_path(
-        root, state, args.report_path.strip(), "Proofreader report"
-    )
-    expected_reports_root = workflow_path(root, state["feature"]) / "proofreader-reports"
-    try:
-        report_path.relative_to(expected_reports_root)
-    except ValueError as error:
-        raise SpecificationStateError(
-            "Proofreader report must stay inside the selected workflow's "
-            "proofreader-reports directory"
-        ) from error
     wave["proofread"] = {
-        "critical": args.critical,
-        "major": args.major,
-        "minor": args.minor,
-        "questions": question_counts,
-        "minors_engineer_resolvable": args.minors_engineer_resolvable,
-        "coverage_complete": args.coverage_complete,
-        "report_path": report_path.relative_to(root).as_posix(),
-        "finding_ids": finding_ids,
-        "question_ids": question_ids,
+        **read_proofreader_report(root, state, wave, args.report_path),
         "recorded_at": utc_now(),
     }
     state["updated_at"] = utc_now()
@@ -3845,6 +4131,8 @@ def command_complete_cycle(args: argparse.Namespace) -> dict[str, Any]:
         )
     else:
         require_current_preaccept_acceptance(root, state, prd, spec, wave)
+    if wave["proofread"].get("report_sha256"):
+        require_consumed_proofreader_report(root, state, wave)
     wave["architect_response"] = args.resolution_note
     wave["user_decision"] = args.user_decision_note
     if current_hash != wave["spec_sha256"]:
@@ -3917,6 +4205,7 @@ def command_confirm_ready(args: argparse.Namespace) -> dict[str, Any]:
         raise SpecificationStateError("Architect readiness confirmation is required")
     prd, spec = require_source_unchanged(root, state)
     require_current_preaccept_acceptance(root, state, prd, spec, wave)
+    require_consumed_proofreader_report(root, state, wave)
     proofread = wave["proofread"]
     blockers: list[str] = []
     if proofread["critical"] or proofread["major"]:
@@ -3957,8 +4246,21 @@ def command_handoff(args: argparse.Namespace) -> dict[str, Any]:
     state = load_state(root, args.feature)
     require_bound_recovery_continuation(root, state)
     require_no_active_helper_request(state)
-    if state["status"] != "spec_convergence_hold":
-        raise SpecificationStateError("Architect handoff is allowed only from spec_convergence_hold")
+    early_handoff = (
+        state["status"] in {"needs_generation", "reviewing", "awaiting_accept"}
+        and state.get("acceptance") is None
+        and state.get("active_wave") is None
+        and state.get("ready") is None
+        and state.get("hold") is None
+        and not state.get("hold_history")
+        and not state.get("waves")
+        and state.get("total_cycles_completed") == 0
+        and all(owner.get("cycles_completed") == 0 for owner in state["architects"])
+    )
+    if state["status"] != "spec_convergence_hold" and not early_handoff:
+        raise SpecificationStateError(
+            "Architect handoff requires spec_convergence_hold or an unaccepted zero-cycle specification"
+        )
     new_architect_id = args.new_architect_id.strip()
     if normalized_actor_id(new_architect_id) in historical_worker_ids(state):
         raise SpecificationStateError(
@@ -3968,11 +4270,46 @@ def command_handoff(args: argparse.Namespace) -> dict[str, Any]:
         raise SpecificationStateError(
             "Architect handoff requires a fresh identity and recorded rationale"
         )
-    require_source_unchanged(root, state)
+    if early_handoff:
+        require_no_runtime_binding(root, state["feature"])
+        prd = resolve_project_path(root, state["prd"]["path"], "canonical PRD")
+        spec = resolve_project_path(root, state["specification"]["path"], "canonical specification")
+        if (
+            prd.relative_to(root).as_posix() != state["prd"]["path"]
+            or spec.relative_to(root).as_posix() != state["specification"]["path"]
+        ):
+            raise SpecificationStateError("Architect handoff authority paths are not canonical")
+        validate_approved_prd_contract(prd)
+        if sha256(prd) != state["prd"]["sha256"]:
+            raise SpecificationStateError("PRD changed before Architect handoff")
+        generation_input = (
+            state["status"] == "needs_generation"
+            and not state["helper_evidence"]["results"]
+        )
+        expected_sha = state["specification"].get(
+            "generation_input_sha256" if generation_input else "sha256"
+        )
+        current_sha = sha256(spec) if spec.is_file() else None
+        if current_sha != expected_sha or (current_sha is None and (not generation_input or spec.exists())):
+            raise SpecificationStateError("specification bytes changed before Architect handoff")
+        if not generation_input:
+            require_source_unchanged(root, state)
+        revalidate_helper_evidence(root, state, prd, state["helper_evidence"], current_sha)
+    else:
+        require_source_unchanged(root, state)
     now = utc_now()
     old = active_architect(state)
     old["ended_at"] = now
     old["handoff_reason"] = args.decision_note
+    if early_handoff:
+        state["history"].append({
+            "event": "preaccept_architect_handoff",
+            "prior_architects": copy.deepcopy(state["architects"]),
+            "new_architect_id": new_architect_id,
+            "decision_note": args.decision_note,
+            "at": now,
+        })
+        state["architects"] = []
     state["architects"].append(
         {
             "id": new_architect_id,
@@ -3983,17 +4320,18 @@ def command_handoff(args: argparse.Namespace) -> dict[str, Any]:
         }
     )
     state["active_architect_id"] = new_architect_id
-    state["status"] = "reviewing"
-    state.setdefault("hold_history", []).append(
-        {
-            **(state.get("hold") or {}),
-            "resolved_by": "handoff-architect",
-            "new_architect_id": new_architect_id,
-            "decision_note": args.decision_note,
-            "resolved_at": now,
-        }
-    )
-    state["hold"] = None
+    if not early_handoff:
+        state["status"] = "awaiting_accept"
+        state.setdefault("hold_history", []).append(
+            {
+                **(state.get("hold") or {}),
+                "resolved_by": "handoff-architect",
+                "new_architect_id": new_architect_id,
+                "decision_note": args.decision_note,
+                "resolved_at": now,
+            }
+        )
+        state["hold"] = None
     state["updated_at"] = now
     save_state(root, state)
     return state
@@ -4031,6 +4369,14 @@ def build_parser() -> argparse.ArgumentParser:
     reject_helper = commands.add_parser("reject-helper-result")
     reject_helper.add_argument("--request-id", required=True)
     reject_helper.add_argument("--reason", required=True)
+    reject_helper.add_argument(
+        "--helper-status", choices=("completed", "stopped"),
+        help="superseded-PRD rejection only: observed terminal helper status after wait/stop",
+    )
+    reject_helper.add_argument(
+        "--helper-evidence",
+        help="superseded-PRD rejection only: exact terminal coordination evidence; not a liveness probe",
+    )
     reject_helper.set_defaults(handler=command_reject_helper_result)
 
     accept = commands.add_parser("accept-spec")
@@ -4040,8 +4386,8 @@ def build_parser() -> argparse.ArgumentParser:
     revise_in_progress = commands.add_parser(
         "revise-in-progress",
         help=(
-            "replace stale PRD authority during an active reviewed wave before runtime "
-            "binding, archive that wave, and require fresh acceptance and convergence"
+            "replace stale PRD authority before runtime binding, archive unfinished "
+            "generation/review evidence, and require fresh acceptance and convergence"
         ),
     )
     revise_in_progress.add_argument("--reason", required=True)
@@ -4050,10 +4396,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     revise_ready_help = (
         "revoke exact SPEC_READY bytes for a sanctioned specification revision or "
-        "a newly approved PRD revision; a legacy bound runtime requires an exact "
-        "authority_recovery_hold token, while proven v2 revisions are tokenless and "
-        "a PRD change requires public status to expose init with "
-        "user_input_required=false"
+        "a newly approved PRD revision; legacy runtime migration is unsupported. "
+        "Proven v2 revisions are tokenless; a PRD change requires public status "
+        "to expose init while preserving any product-resumption blocker"
     )
     revise_ready = commands.add_parser(
         "revise-ready",
@@ -4066,8 +4411,8 @@ def build_parser() -> argparse.ArgumentParser:
     revise_ready.add_argument(
         "--recovery-token",
         help=(
-            "required only for an exact legacy authority_recovery_hold; "
-            "all v2 specification and PRD revisions are tokenless"
+            "retained for fail-closed compatibility only; tokens are rejected. "
+            "All v2 specification and PRD revisions are tokenless"
         ),
     )
     revise_ready.add_argument(
@@ -4084,19 +4429,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     proofread = commands.add_parser("record-proofread")
     proofread.add_argument("--proofreader-id", required=True)
-    proofread.add_argument("--critical", type=int, required=True)
-    proofread.add_argument("--major", type=int, required=True)
-    proofread.add_argument("--minor", type=int, required=True)
-    proofread.add_argument("--product-questions", type=int, default=0)
-    proofread.add_argument("--scope-questions", type=int, default=0)
-    proofread.add_argument("--boundary-questions", type=int, default=0)
-    proofread.add_argument("--ownership-questions", type=int, default=0)
-    proofread.add_argument("--public-contract-questions", type=int, default=0)
-    proofread.add_argument("--minors-engineer-resolvable", action="store_true")
-    proofread.add_argument("--coverage-complete", action="store_true")
-    proofread.add_argument("--report-path")
-    proofread.add_argument("--finding-id", action="append", default=[])
-    proofread.add_argument("--question-id", action="append", default=[])
+    proofread.add_argument("--report-path", required=True)
     proofread.set_defaults(handler=command_record_proofread)
 
     complete = commands.add_parser("complete-cycle")

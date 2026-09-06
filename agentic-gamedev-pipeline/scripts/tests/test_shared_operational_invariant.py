@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -11,6 +13,11 @@ from pathlib import Path
 BUNDLE = Path(__file__).resolve().parents[2]
 SKILLS = BUNDLE / "skills"
 INVARIANT = SKILLS / "gamedev-pipeline" / "references" / "stage-handoff-invariant.md"
+sys.path.insert(0, str(SKILLS / "gamedev-pipeline" / "scripts"))
+
+from pipeline_v2.model import PipelineError, ROLES, artifact_schema
+from pipeline_v2.reducer import _worker_artifact
+from pipeline_v2.runner import _caller_slices
 
 
 class SharedOperationalInvariantTests(unittest.TestCase):
@@ -123,8 +130,8 @@ class SharedOperationalInvariantTests(unittest.TestCase):
             "exact public controller `complete` action",
             "including for a blocked outcome",
             "re-read the resulting public controller status",
-            "no child owns an active assignment",
-            "no completed child artifact remains unconsumed",
+            "no child owning an active assignment",
+            "no completed child artifact remaining unconsumed",
         )
         for phrase in required:
             with self.subTest(phrase=phrase):
@@ -138,6 +145,60 @@ class SharedOperationalInvariantTests(unittest.TestCase):
             r"(?i)\b(?:timeout|retry|retries|daemon|service|sleep)\b",
         )
 
+    def test_minimal_role_examples_pass_the_actual_semantic_validator(self) -> None:
+        examples = (
+            ("plan", "gamedev-pipeline/references/pipeline-protocol.md"),
+            ("slice", "gamedev-pipeline/references/pipeline-protocol.md"),
+            ("engineering", "gamedev-pipeline/references/semantic-write-packet.md"),
+            ("review", "gamedev-review/references/review-output-contract.md"),
+            ("qa", "gamedev-qa/references/qa-output-contract.md"),
+        )
+        for phase, relative in examples:
+            with self.subTest(phase=phase):
+                text = (SKILLS / relative).read_text(encoding="utf-8")
+                blocks = re.findall(r"```json\n(.*?)\n```", text, re.DOTALL)
+                self.assertEqual(1, len(blocks), "one minimal example per contract")
+                value = json.loads(blocks[0])
+                schema = artifact_schema(phase, ROLES[phase])
+                self.assertEqual(set(schema["required_keys"]), set(value))
+                self.assertEqual(value, _worker_artifact(value, phase, ROLES[phase]))
+
+    def test_observed_format_errors_still_fail_without_weakening_validation(self) -> None:
+        cases = (
+            ("plan", {"outcome": "pass", "summary": "Confirmed.",
+                      "blocker": "", "required_action": ""},
+             {"outcome": "pass", "summary": "Confirmed."}),
+            ("review", {"outcome": "pass", "findings": [], "summary": "Reviewed."},
+             {"outcome": "pass", "findings": []}),
+            ("qa", {"outcome": "blocked", "checks": ["Assigned scenario failed."],
+                    "source_revision": "old", "source_scope_sha256": "old",
+                    "blocker": "A test failed.", "required_action": "Repair the defect."},
+             {"outcome": "fail", "checks": [{"id": "MANUAL-FEATURE-RUNTIME", "outcome": "fail", "evidence": "Assigned scenario failed."}]}),
+            ("engineering", {"outcome": "pass", "summary": "Implemented.",
+                             "checks": ["build"], "not_run": ["runtime"]},
+             {"outcome": "pass", "summary": "Implemented; runtime remains unverified."}),
+        )
+        for phase, malformed, corrected in cases:
+            with self.subTest(phase=phase):
+                before = json.dumps(malformed, sort_keys=True)
+                with self.assertRaises(PipelineError):
+                    _worker_artifact(malformed, phase, ROLES[phase])
+                self.assertEqual(before, json.dumps(malformed, sort_keys=True))
+                self.assertEqual(corrected, _worker_artifact(corrected, phase, ROLES[phase]))
+
+        # Slice semantic parsing also accepts sealed records; the caller boundary
+        # is what rejected the session's leaked read_paths. Keep the slice intact.
+        corrected_slice = {"id": "SLICE-001", "allowed_paths": ["src/a.py"],
+                           "planned_commands": [["python", "-c", "pass"]]}
+        malformed_slices = [{**corrected_slice, "read_paths": ["src/a.py"]}]
+        before = json.dumps(malformed_slices, sort_keys=True)
+        with self.assertRaisesRegex(PipelineError, "exactly id, allowed_paths, and planned_commands"):
+            _caller_slices(malformed_slices)
+        self.assertEqual(before, json.dumps(malformed_slices, sort_keys=True))
+        self.assertEqual([corrected_slice], _caller_slices([corrected_slice]))
+        corrected = {"outcome": "pass", "summary": "Slice confirmed.", "slices": [corrected_slice]}
+        self.assertEqual(corrected, _worker_artifact(corrected, "slice", ROLES["slice"]))
+
     def test_review_contract_keeps_target_separate_from_evidence_context(self) -> None:
         reviewer = (SKILLS / "gamedev-review" / "SKILL.md").read_text(encoding="utf-8")
         contract = (
@@ -147,17 +208,27 @@ class SharedOperationalInvariantTests(unittest.TestCase):
             SKILLS / "gamedev-pipeline" / "references" / "pipeline-protocol.md"
         ).read_text(encoding="utf-8")
 
-        for text in (reviewer, contract, protocol):
-            self.assertIn("evidence context", text)
-            self.assertIn("documentation_changes", text)
-            self.assertIn("candidate_changes", text)
-            self.assertIn("direct regression", text)
-            self.assertIn("missing mandatory implementation", text)
-            self.assertIn("current-candidate evidence", text)
-            self.assertIn("simpler sufficient implementation", text)
+        # Semantic policy has one canonical owner; linked summaries need not
+        # duplicate exact sentences to satisfy a phrase-presence test.
+        self.assertIn("references/review-output-contract.md", reviewer)
+        self.assertIn("linked role contracts", protocol)
+        for phrase in (
+            "evidence context", "documentation_changes", "candidate_changes",
+            "direct regression", "missing mandatory implementation",
+            "current-candidate evidence", "simpler sufficient implementation",
+        ):
+            self.assertIn(phrase, contract)
         self.assertIn("no suggestions or backlog", contract)
-        self.assertIn("direct authority contradiction that changes the verdict", contract)
+        self.assertIn("reversible technical clarification consistent with approved authority", contract)
+        self.assertIn("An authority contradiction affecting product behavior or scope is `blocked`", contract)
         self.assertIn("mandatory assigned input or capability", contract)
+
+    def test_dispatch_instructions_name_fresh_context_and_existing_role_paths(self) -> None:
+        skill = (SKILLS / "gamedev-pipeline" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn('fork_turns: "none"', skill)
+        self.assertIn("self-contained packet", skill)
+        for relative in re.findall(r"\]\((\.\./[^)]+/SKILL\.md)\)", skill):
+            self.assertTrue((SKILLS / "gamedev-pipeline" / relative).is_file(), relative)
 
     def test_pipeline_defect_is_an_instruction_only_incident_stop(self) -> None:
         pipeline_skill = (SKILLS / "gamedev-pipeline" / "SKILL.md").read_text(
@@ -213,7 +284,6 @@ class SharedOperationalInvariantTests(unittest.TestCase):
             plan_contract,
         )
         self.assertIn("status", plan_contract)
-        self.assertIn("`init` reconfiguration", plan_contract)
         self.assertIn(
             'RUNTIME_STATE_FILENAME = "pipeline-state.json"',
             plan_controller,

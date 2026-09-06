@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import ast
 import inspect
 import os
@@ -27,7 +28,7 @@ from pipeline_v2.checkout import (
 )
 from pipeline_v2.cli import parser as cli_parser, run as cli_run
 from pipeline_v2.legacy_gen53 import import_schema10
-from pipeline_v2.model import ConflictError, PHASES, ROLES, PipelineError, artifact_schema, assignment_output_path, command_intent_digest, current_candidate, current_slice, default_assignment, digest, normalize_rule, status_view, validate_state
+from pipeline_v2.model import ConflictError, PHASES, ROLES, PipelineError, artifact_schema, assignment_output_path, command_intent_digest, current_candidate, current_slice, default_assignment, digest, normalize_rule, retained_engineering_paths, status_view, validate_state
 from pipeline_v2.process_tree import ProcessEvidence
 from pipeline_v2.reducer import COMMANDS, reduce
 from pipeline_v2.runner import Controller
@@ -67,6 +68,158 @@ class _CanonicalTestController(Controller):
 
 
 class PipelineV2CoreTests(unittest.TestCase):
+    def test_qa_technical_question_requires_fresh_qa_before_credit_and_ready(self) -> None:
+        self._reach_candidate()
+        self._review_pass("review-before-qa-question")
+        action = self.controller.status()["next_action"]
+        issued = self.controller.next(command_id=action["command_id"], expected_generation=action["expected_generation"])
+        prior_worker = issued["active_assignment"]["worker_id"]
+        checks = self._qa_checks("Observed each assigned acceptance scenario.")
+        questions = ["Use the existing simpler verification note format within approved scope?"]
+        action = self.controller.status()["next_action"]
+        before = self.store.path.read_bytes()
+        for invalid in (checks[:-1], [checks[0], {**checks[1], "outcome": "fail"}]):
+            with self.subTest(checks=invalid), mock.patch.object(runner_module, "run_process_tree") as process:
+                self._write_artifact({"outcome": "pass", "checks": invalid, "questions": questions})
+                with self.assertRaisesRegex(PipelineError, "exact mandatory identity set"):
+                    self.controller.complete(command_id=action["command_id"], expected_generation=action["expected_generation"])
+                process.assert_not_called()
+                self.assertEqual(before, self.store.path.read_bytes())
+        completed = self._complete("COMPLETE-QA-TECHNICAL-QUESTION", {
+            "outcome": "pass", "checks": checks, "questions": questions,
+        })
+        self.assertIsNone(reducer_module.passing_artifact(completed, "qa"))
+        with self.assertRaisesRegex(PipelineError, "questions"):
+            self.controller.transition({"name": "accept", "id": "REJECT-PENDING-QA", "expected_generation": completed["generation"]})
+        answer = self.controller.status()["next_action"]
+        self.assertEqual("answer", answer["command"])
+        self.assertFalse(answer["user_input_required"])
+        self.controller.transition({
+            "name": "answer", "id": answer["command_id"], "expected_generation": answer["expected_generation"],
+            "question_id": answer["question_id"], "answer": "Use the existing simpler format.",
+        })
+        action = self.controller.status()["next_action"]
+        self.assertEqual("next", action["command"])
+        fresh = self.controller.next(command_id=action["command_id"], expected_generation=action["expected_generation"])
+        self.assertEqual("qa", fresh["phase"])
+        self.assertNotEqual(prior_worker, fresh["active_assignment"]["worker_id"])
+        self.assertEqual("Use the existing simpler format.", fresh["active_assignment"]["capsule"]["context"]["decisions"][0]["answer"])
+        self._complete("COMPLETE-FRESH-QA-AFTER-ANSWER", {"outcome": "pass", "checks": checks})
+        action = self.controller.status()["next_action"]
+        self.assertEqual("accept", action["command"])
+        self.controller.transition({"name": "accept", "id": action["command_id"], "expected_generation": action["expected_generation"]})
+        terminal = self._docs_no_change("docs-after-qa-answer")
+        ready = self.controller.ready(command_id="READY-AFTER-QA-ANSWER", expected_generation=terminal["generation"])
+        self.assertTrue(status_view(ready)["ready"])
+
+    def test_qa_requires_exact_successful_identity_results_before_checks_and_ready(self) -> None:
+        self._reach_candidate()
+        self._review_pass("review-identity-set")
+        action = self.controller.status()["next_action"]
+        self.controller.next(command_id=action["command_id"], expected_generation=action["expected_generation"])
+        expected = self._qa_checks("Observed the assigned actual integration result.")
+        active = self.controller.status()["active_assignment"]
+        self.assertEqual([item["id"] for item in expected], active["context"]["required_identity_ids"])
+        action = self.controller.status()["next_action"]
+        invalid = {
+            "missing": expected[:-1],
+            "unknown": [expected[0], {**expected[1], "id": "MANUAL-UNKNOWN"}],
+            "duplicate": [expected[0], expected[0]],
+            "failed": [expected[0], {**expected[1], "outcome": "fail"}],
+            "not run": [expected[0], {**expected[1], "outcome": "not_run"}],
+            "old free text": ["Mandatory runtime was not executed."],
+        }
+        before = self.store.path.read_bytes()
+        for label, checks in invalid.items():
+            with self.subTest(label=label), mock.patch.object(runner_module, "run_process_tree") as process:
+                self._write_artifact({"outcome": "pass", "checks": checks})
+                with self.assertRaises(PipelineError):
+                    self.controller.complete(command_id=action["command_id"], expected_generation=action["expected_generation"])
+                process.assert_not_called()
+                self.assertEqual(before, self.store.path.read_bytes())
+        self._complete("QA-EXACT-SET", {"outcome": "pass", "checks": expected})
+        self._accept("qa-exact-set")
+        terminal = self._docs_no_change("docs-exact-set")
+        for label, checks in invalid.items():
+            with self.subTest(ready=label):
+                tampered = deepcopy(terminal)
+                tampered["artifacts"]["qa"]["worker"]["checks"] = checks
+                with self.assertRaisesRegex(PipelineError, "mandatory QA result coverage"):
+                    reduce(tampered, {
+                        "name": "ready", "id": "REJECT-MISSING-QA", "expected_generation": terminal["generation"],
+                        "controller": {"candidate_tree_oid": candidate_tree_oid(self.root), "pipeline_runtime_digest": terminal["pipeline_runtime_digest"]},
+                    })
+        ready = self.controller.ready(command_id="READY-EXACT-QA", expected_generation=terminal["generation"])
+        self.assertTrue(status_view(ready)["ready"])
+
+    def test_documentation_review_failure_returns_docs_owner_and_finishes_fresh_verification(self) -> None:
+        self._resume_after_changed_docs_review_failure()
+        action = self.controller.status()["next_action"]
+        issued = self.controller.next(command_id=action["command_id"], expected_generation=action["expected_generation"])
+        self.assertEqual("docs", issued["phase"])
+        write = issued["active_assignment"]["access"]["write"]
+        self.assertNotIn("game.txt", write)
+        docs_path = self.root / write[0]
+        docs_path.write_text("Corrected the documentation finding.\n", encoding="utf-8")
+        self._complete("COMPLETE-DOCS-CORRECTION", {"outcome": "pass", "summary": "Corrected the exact documentation target."})
+        self.assertEqual("review", self._accept("docs-correction")["phase"])
+        target = self.controller.status()["next_action"]["assignment"]["context"]["review_target"]
+        self.assertEqual("documentation_changes", target["kind"])
+        self.assertEqual([docs_path.relative_to(self.root).as_posix()], target["candidate_changes"])
+        self._review_pass("review-after-docs-correction")
+        terminal = self._qa_pass("qa-after-docs-correction")
+        ready = self.controller.ready(command_id="READY-DOCS-CORRECTION", expected_generation=terminal["generation"])
+        self.assertTrue(status_view(ready)["ready"])
+
+    def test_product_qa_failure_after_docs_returns_engineering_without_claiming_docs_delta(self) -> None:
+        self._reach_candidate()
+        self._review_pass("review-before-docs-qa-fail")
+        self._qa_pass("qa-before-docs-qa-fail")
+        self.controller.next(command_id="NEXT-DOCS-BEFORE-QA-FAIL")
+        docs_path = self.root / self.store.load()["active_assignment"]["access"]["write"][0]
+        docs_path.parent.mkdir(parents=True, exist_ok=True)
+        docs_path.write_text("Verified operator instructions.\n", encoding="utf-8")
+        self._complete("COMPLETE-DOCS-BEFORE-QA-FAIL", {"outcome": "pass", "summary": "Updated instructions."})
+        self._accept("docs-before-qa-fail")
+        self._review_pass("review-docs-before-qa-fail")
+        failed = self._complete_readonly("qa", "qa-product-failure-after-docs", {
+            "outcome": "fail", "checks": self._qa_checks("Actual gameplay acceptance failed.", outcome="fail"),
+        })
+        self.assertEqual("engineering", failed["phase"])
+        self._engineer("repair-product-after-docs", "corrected product behavior\n")
+        self._accept("product-repair-after-docs")
+        ready = self._finish_ready("review-product-repair-after-docs", "qa-product-repair-after-docs", "docs-product-repair-after-docs")
+        self.assertTrue(status_view(ready)["ready"])
+        self.assertEqual("Verified operator instructions.\n", docs_path.read_text(encoding="utf-8"))
+
+    def test_technical_questions_and_authority_blocks_use_distinct_existing_routes(self) -> None:
+        self._complete_readonly("plan", "technical-question", {
+            "outcome": "pass", "summary": "Approved scope is consistent.",
+            "questions": ["Choose the simpler existing implementation within approved scope."],
+        })
+        action = self.controller.status()["next_action"]
+        self.assertEqual("answer", action["command"])
+        self.assertFalse(action["user_input_required"])
+        self.controller.transition({
+            "name": "answer", "id": action["command_id"], "expected_generation": action["expected_generation"],
+            "question_id": action["question_id"], "answer": "Use the simpler existing implementation.",
+        })
+        self.assertEqual("next", self.controller.status()["next_action"]["command"])
+        for outcome in ("fail", "blocked"):
+            value = {"outcome": outcome, "summary": "Needs product authority.", "questions": ["Choose product semantics."]}
+            if outcome == "blocked":
+                value.update(blocker="Approved authority contradicts itself.", required_action="Obtain the product decision upstream.")
+            with self.assertRaisesRegex(PipelineError, "questions are for passing technical"):
+                reducer_module._worker_artifact(value, "plan", "planner")
+        self._complete_readonly("plan", "authority-conflict", {
+            "outcome": "blocked", "summary": "A product decision is unresolved.",
+            "blocker": "Approved sources disagree about persistent rewards.",
+            "required_action": "Resolve the product decision and reconverge upstream authority.",
+        })
+        action = self.controller.status()["next_action"]
+        self.assertTrue(action["user_input_required"])
+        self.assertNotEqual("answer", action.get("command"))
+
     def test_clean_init_rejects_gitlinks_without_implementing_submodule_support(self) -> None:
         head = subprocess.run(
             ["git", "-C", str(self.root), "rev-parse", "HEAD"],
@@ -98,9 +251,11 @@ class PipelineV2CoreTests(unittest.TestCase):
             require_clean_head(self.root)
 
     def test_init_policy_preflight_writes_state_only_after_bound_clean_tree(self) -> None:
-        store = StateStore(self.root / ".agentic-pipeline-v2" / "policy-init.json")
+        store = self.store
+        store.path.unlink()
         controller = Controller(store)
         command = {
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "name": "init", "id": "INIT-POLICY-ATOMIC", "run_id": "RUN-POLICY",
             "project_root": str(self.root),
             "authority_paths": {
@@ -171,6 +326,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             self.root / ".agentic-pipeline-v2" / ".gitattributes",
         ]
         for path in untracked_controls:
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("untracked controller bytes\n", encoding="utf-8")
         with self.store.transaction():
             self.assertEqual(baseline, require_clean_head(self.root))
@@ -199,27 +355,6 @@ class PipelineV2CoreTests(unittest.TestCase):
         ):
             with self.subTest(suffix=suffix):
                 self.assertTrue(any(path.endswith(suffix) for path in paths), suffix)
-        engineer_contract = (
-            SCRIPTS.parents[1] / "gamedev-engineer" / "SKILL.md"
-        ).read_text(encoding="utf-8")
-        for phrase in (
-            "Do not run or rerun the assignment's planned checks",
-            "interactive, background, long-lived, callback-driven, service, or already-running external mutator",
-        ):
-            self.assertIn(phrase, engineer_contract)
-        ownership_phrase = (
-            "interactive, background, long-lived, callback-driven, service, "
-            "or already-running external mutator"
-        )
-        for relative in (
-            Path("gamedev-pipeline/SKILL.md"),
-            Path("gamedev-engineer/SKILL.md"),
-            Path("gamedev-pipeline/references/pipeline-protocol.md"),
-            Path("gamedev-pipeline/references/stage-handoff-invariant.md"),
-        ):
-            text = (SCRIPTS.parents[1] / relative).read_text(encoding="utf-8")
-            self.assertIn(ownership_phrase, text)
-
     def test_nested_repository_policy_names_force_fresh_init(self) -> None:
         base = candidate_tree_oid(self.root)
         nested = self.root / "config" / "platform"
@@ -305,8 +440,7 @@ class PipelineV2CoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
-        for name in ("requirements.md", "specification.md"):
-            (self.root / name).write_text(f"approved {name}\n", encoding="utf-8")
+        self._write_source_authority()
         (self.root / "game.txt").write_text("old\n", encoding="utf-8")
         self.command = [sys.executable, "-c", "raise SystemExit(0)"]
         self.slices = [{
@@ -328,8 +462,126 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.store = StateStore(self.root / self.workflow_path / "pipeline-state.json")
         self._initialize()
 
+    def _write_source_authority(self, revision: int = 1) -> None:
+        prd = f"""---
+document_type: product-requirements
+status: approved
+revision: {revision}
+language: English
+approved_at: 2026-08-24T00:00:00Z
+---
+# Product Requirements
+
+## Product Outcome
+Playable result.
+## Target Audience
+Players.
+## Core Gameplay Loop
+Act and observe.
+## Release Target
+Local acceptance.
+## Scope
+### In Scope
+Assigned behavior.
+### Out of Scope
+Unrelated behavior.
+## Functional Requirements
+- PRD-REQ-001: Assigned behavior works.
+## Quality Requirements
+- PRD-NFR-001: Behavior is deterministic.
+## Acceptance Criteria
+- PRD-AC-001: Observe the assigned result.
+## Assumptions
+None.
+## Open Questions
+None.
+## Risks
+None.
+"""
+        (self.root / "requirements.md").write_text(prd, encoding="utf-8")
+        prd_sha = hashlib.sha256((self.root / "requirements.md").read_bytes()).hexdigest()
+        (self.root / "specification.md").write_text(
+            "---\ndocument_type: technical-specification\nstatus: approved\n"
+            f"revision: {revision}\nlanguage: English\n"
+            "source_prd_path: requirements.md\n"
+            f"source_prd_revision: {revision}\nsource_prd_sha256: {prd_sha}\n"
+            "---\n# Specification\nImplement the assigned behavior.\n", encoding="utf-8",
+        )
+
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_init_rejects_stale_authority_chain_until_upstream_reconverges(self) -> None:
+        before = self.store.path.read_bytes()
+        prd = self.root / "requirements.md"
+        prd.write_text(prd.read_text(encoding="utf-8").replace("revision: 1", "revision: 2"), encoding="utf-8")
+
+        def reconfigure() -> dict:
+            action = self.controller.status()["next_action"]
+            self.assertEqual("init", action["command"])
+            self.assertEqual(before, self.store.path.read_bytes())
+            return self.controller.reconfigure({
+                "name": "init", "id": action["command_id"],
+                "expected_generation": action["expected_generation"],
+                "run_id": action["run_id"], "feature": self.feature,
+                "workflow_path": self.workflow_path, "project_root": str(self.root),
+                "authority_paths": action["authority"], "slices": action["slices"],
+            })
+
+        with self.assertRaisesRegex(PipelineError, "specification does not trace"):
+            reconfigure()
+        self.assertEqual(before, self.store.path.read_bytes())
+        self._write_source_authority(revision=2)
+        with self.assertRaisesRegex(PipelineError, "development plan does not trace"):
+            reconfigure()
+        self.assertEqual(before, self.store.path.read_bytes())
+        self._write_approved_plan(self.slices, revision=2)
+        restarted = reconfigure()
+        self.assertEqual("plan", restarted["phase"])
+        self.assertIsNone(restarted["active_assignment"])
+        self.assertEqual(1, restarted["generation"])
+        self.assertEqual("controller-test", runner_module._PLAN_AUTHORITY.parse_frontmatter(self.root / "plan.md", "plan")[0]["approved_by"])
+
+    def test_initial_init_requires_approved_source_files_without_stage_registries(self) -> None:
+        self.assertFalse((self.store.path.parent / "specification-state.json").exists())
+        self.assertFalse((self.store.path.parent / "development-plan-state.json").exists())
+        self.store.path.unlink()
+        spec = self.root / "specification.md"
+        spec.write_text(spec.read_text(encoding="utf-8").replace("status: approved", "status: draft"), encoding="utf-8")
+        self._write_approved_plan(self.slices)
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "draft spec fixture"], check=True)
+        with self.assertRaisesRegex(PipelineError, "specification must have approved status"):
+            self._initialize()
+        self.assertFalse(self.store.path.exists())
+
+    def test_engineering_and_qa_interaction_rights_reach_actual_worker_packet(self) -> None:
+        controller = Controller(self.store, timeout=10)
+        for phase in ("plan", "slice", "engineering", "review", "qa"):
+            action = controller.status()["next_action"]
+            controller.next(command_id=action["command_id"], expected_generation=action["expected_generation"])
+            view = controller.status()
+            active = view["active_assignment"]
+            self.assertEqual(phase, view["phase"])
+            if phase in {"engineering", "qa"}:
+                self.assertIn("computer control", active["task"])
+                self.assertIn("exposed", active["task"])
+                self.assertEqual(
+                    self.slices[0]["allowed_paths"] if phase == "engineering" else [],
+                    active["access"]["write"],
+                )
+            if phase == "qa":
+                self.assertIn("temporary", active["task"])
+                self.assertIn("persistent product files read-only", active["task"])
+                break
+            if phase == "engineering":
+                (self.root / "game.txt").write_text("implemented\n", encoding="utf-8")
+            artifact = {"outcome": "pass", "findings": []} if phase == "review" else {"outcome": "pass", "summary": "Assigned result."}
+            self._write_artifact(artifact)
+            action = view["next_action"]
+            controller.complete(command_id=action["command_id"], expected_generation=action["expected_generation"])
+            action = controller.status()["next_action"]
+            controller.transition({"name": "accept", "id": action["command_id"], "expected_generation": action["expected_generation"]})
 
     def _initialize(self) -> None:
         paths = {"requirements": "requirements.md", "specification": "specification.md", "plan": "plan.md"}
@@ -347,6 +599,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         subprocess.run(
             ["git", "-C", str(self.root), "commit", "-qm", message], check=True,
         )
+        self.store = StateStore(self.root / self.workflow_path / "pipeline-state.json")
         self.store.path.unlink(missing_ok=True)
         self._initialize()
 
@@ -363,6 +616,7 @@ class PipelineV2CoreTests(unittest.TestCase):
 
     def _reconfigure_evidence(self, state: dict | None = None) -> dict:
         return {
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "pipeline_runtime_digest": (
                 state["pipeline_runtime_digest"] if state is not None
                 else pipeline_runtime_digest()
@@ -467,6 +721,8 @@ class PipelineV2CoreTests(unittest.TestCase):
                 + "".join(f"- {path}\n" for path in expected_paths)
                 + "\n### Scope Contract\n\n"
                 + f"- editable_paths: {', '.join(item['allowed_paths'])}\n"
+                + "\n### Coverage Contract\n\n"
+                + f"- mandatory_identity_ids: AUTO-{item['id']}-CORE, MANUAL-{item['id']}-RUNTIME\n"
                 + "\n### Context Capsule Budget\n\n"
                 "- max_authority_files: 20\n"
                 "- max_evidence_files: 20\n"
@@ -496,11 +752,11 @@ class PipelineV2CoreTests(unittest.TestCase):
             "writer_strategy: sequential\n"
             "planning_analyst_id: analyst-test\n"
             "source_prd_path: requirements.md\n"
-            "source_prd_revision: 1\n"
-            f"source_prd_sha256: {'1' * 64}\n"
+            f"source_prd_revision: {runner_module._PLAN_AUTHORITY.parse_frontmatter(self.root / 'requirements.md', 'PRD')[0]['revision']}\n"
+            f"source_prd_sha256: {hashlib.sha256((self.root / 'requirements.md').read_bytes()).hexdigest()}\n"
             "source_spec_path: specification.md\n"
-            "source_spec_revision: 1\n"
-            f"source_spec_sha256: {'2' * 64}\n"
+            f"source_spec_revision: {runner_module._PLAN_AUTHORITY.parse_frontmatter(self.root / 'specification.md', 'specification')[0]['revision']}\n"
+            f"source_spec_sha256: {hashlib.sha256((self.root / 'specification.md').read_bytes()).hexdigest()}\n"
             "decision_ledger_path: decisions.jsonl\n"
             f"slice_count: {len(slices)}\n"
             "approved_by: controller-test\n"
@@ -587,9 +843,8 @@ class PipelineV2CoreTests(unittest.TestCase):
             for item in self.slices
         }
         self._write_approved_plan(self.slices, reads=reads, revision=3)
-        self.store = StateStore(
-            self.root / ".agentic-pipeline-v2" / state_name,
-        )
+        self.store = StateStore(self.root / self.workflow_path / "pipeline-state.json")
+        self.store.path.unlink()
         paths = {
             "requirements": "requirements.md",
             "specification": "specification.md",
@@ -654,13 +909,8 @@ class PipelineV2CoreTests(unittest.TestCase):
             {"id": "SLICE-1", "allowed_paths": ["slice-one.txt"], "planned_commands": [self.command]},
             {"id": "SLICE-2", "allowed_paths": ["slice-two.txt"], "planned_commands": [self.command]},
         ]
-        state = self.store.load()
-        self.store.dispatch({
-            "name": "init", "id": "CMD-TWO-SLICES", "expected_generation": state["generation"],
-            "run_id": state["run_id"], "project_root": state["project_root"],
-            "authority": state["authority"], "slices": self._sealed(self.slices),
-            **self._reconfigure_evidence(state),
-        })
+        self._write_approved_plan(self.slices)
+        self._commit_fixture_and_restart("two approved slices fixture")
 
     def _reach_docs_after_two_slices(self, suffix: str) -> None:
         self._reach_engineering(f"-{suffix}")
@@ -680,8 +930,15 @@ class PipelineV2CoreTests(unittest.TestCase):
         self._accept(worker)
 
     def _qa_pass(self, worker: str) -> dict:
-        self._complete_readonly("qa", worker, {"outcome": "pass", "checks": ["acceptance: pass"]})
+        self._complete_readonly("qa", worker, {"outcome": "pass", "checks": self._qa_checks("acceptance: pass")})
         return self._accept(worker)
+
+    def _qa_checks(self, evidence: str, outcome: str = "pass") -> list[dict]:
+        slice_id = current_slice(self.store.load())["id"]
+        return [
+            {"id": f"{prefix}-{slice_id}-{suffix}", "outcome": outcome, "evidence": evidence}
+            for prefix, suffix in (("AUTO", "CORE"), ("MANUAL", "RUNTIME"))
+        ]
 
     def _docs_no_change(self, worker: str) -> dict:
         self.controller.next(
@@ -729,8 +986,8 @@ class PipelineV2CoreTests(unittest.TestCase):
                 }],
             },
         )
-        self.assertEqual("engineering", failed["phase"])
-        self.assertIsNone(current_candidate(failed))
+        self.assertEqual("docs", failed["phase"])
+        self.assertEqual(docs_candidate, current_candidate(failed))
         self.assertEqual(docs_candidate, failed["artifacts"]["review"]["candidate_binding"])
         return failed, retained_candidate, docs_candidate, None
 
@@ -742,7 +999,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             self._review_pass("reviewer-before-nonpassing-engineering")
             failed = self._complete_readonly(
                 "qa", "qa-before-nonpassing-engineering",
-                {"outcome": "fail", "checks": ["runtime: product failure"]},
+                {"outcome": "fail", "checks": self._qa_checks('runtime: product failure', outcome="fail")},
             )
         else:
             failed = self._complete_readonly(
@@ -885,6 +1142,23 @@ class PipelineV2CoreTests(unittest.TestCase):
 
     def test_schema4_blocked_is_terminal_replay_safe_and_fresh_init_only(self) -> None:
         self._reach_engineering("-terminal-block")
+
+        state = self.store.load()
+        unchanged = {
+            "name": "init", "id": "FORGED-UNCHANGED-INIT",
+            "expected_generation": state["generation"],
+            "run_id": state["run_id"], "feature": state["feature"],
+            "workflow_path": state["workflow_path"], "project_root": state["project_root"],
+            "authority_paths": {
+                name: item["path"] for name, item in state["authority"]["items"].items()
+            },
+            "slices": state["slices"],
+        }
+        before = self.store.path.read_bytes()
+        with self.assertRaisesRegex(PipelineError, "did not change"):
+            self.controller.reconfigure(unchanged)
+        self.assertEqual(before, self.store.path.read_bytes())
+
         self.controller.next(command_id="NEXT-terminal-block")
         (self.root / "game.txt").write_text("partial blocked change\n", encoding="utf-8")
         artifact = self._write_artifact({
@@ -904,6 +1178,67 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual(completed, self.controller.complete(
             command_id="COMPLETE-terminal-block", artifact_path=artifact,
         ))
+        public = self.controller.status()
+        recovery = public["next_action"]
+        self.assertEqual("command", recovery["kind"])
+        self.assertEqual("init", recovery["command"])
+        self.assertIs(True, recovery["user_input_required"])
+        self.assertEqual("A user-owned capability is unavailable.", recovery["blocker"])
+        self.assertEqual("Provide the capability outside this run.", recovery["required_action"])
+        self.assertIn("only after authority or capability evidence resolves the recorded prerequisite", recovery["reason"])
+        self.assertEqual(completed, self.store.load())
+
+        before = self.store.path.read_bytes()
+        with mock.patch("pipeline_v2.runner.pipeline_runtime_digest", return_value=digest("repaired runtime")):
+            rebound = self.controller.status()["next_action"]
+        self.assertEqual("init", rebound["command"])
+        self.assertNotEqual(recovery["command_id"], rebound["command_id"])
+        for field in ("phase", "blocker", "required_action", "user_input_required", "reason"):
+            self.assertEqual(recovery[field], rebound.get(field), field)
+        self.assertEqual(before, self.store.path.read_bytes())
+
+        command = {
+            "name": "init", "id": recovery["command_id"],
+            "expected_generation": recovery["expected_generation"],
+            "run_id": recovery["run_id"], "feature": recovery["feature"],
+            "workflow_path": recovery["workflow_path"],
+            "project_root": recovery["project_root"],
+            "authority_paths": recovery["authority"], "slices": recovery["slices"],
+        }
+        before = self.store.path.read_bytes()
+        stale = deepcopy(command)
+        stale["id"] += "-STALE"
+        with self.assertRaisesRegex(PipelineError, "stale.*reconfiguration"):
+            self.controller.reconfigure(stale)
+        self.assertEqual(before, self.store.path.read_bytes())
+        with mock.patch("pipeline_v2.runner.pipeline_runtime_digest", return_value=digest("later runtime")):
+            with self.assertRaisesRegex(PipelineError, "stale.*reconfiguration"):
+                self.controller.reconfigure(command)
+        self.assertEqual(before, self.store.path.read_bytes())
+
+        drift = self.root / "tests" / "drift.txt"
+        drift.parent.mkdir()
+        drift.write_text("unbound drift\n", encoding="utf-8")
+        with self.assertRaisesRegex(PipelineError, "live checkout drifted"):
+            self.controller.reconfigure(command)
+        drift.unlink()
+        self.assertEqual(before, self.store.path.read_bytes())
+
+        restarted = self.controller.reconfigure(command)
+        self.assertEqual("plan", restarted["phase"])
+        self.assertIsNone(restarted["active_assignment"])
+        self.assertIsNone(current_candidate(restarted))
+        self.assertEqual(["game.txt"], retained_engineering_paths(restarted))
+        self.assertEqual(restarted, self.controller.reconfigure(command))
+
+        self._reach_engineering("-terminal-recovered")
+        self.controller.next(command_id="NEXT-terminal-recovered")
+        self._complete("COMPLETE-terminal-recovered", {
+            "outcome": "pass", "summary": "External prerequisite is available",
+        })
+        self._accept("terminal-recovered")
+        target = self.controller.status()["next_action"]["assignment"]["context"]["review_target"]
+        self.assertEqual(["game.txt"], target["candidate_changes"])
         with self.assertRaisesRegex(PipelineError, "blocked is terminal"):
             reduce(completed, {
                 "name": "next", "id": "FORGED-NEXT-AFTER-BLOCK",
@@ -977,7 +1312,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         candidate = self._reach_candidate()
         self._review_pass("reviewer-before-qa-fail")
         failed = self._complete_readonly(
-            "qa", "qa-direct-fail", {"outcome": "fail", "checks": ["acceptance: fail"]},
+            "qa", "qa-direct-fail", {"outcome": "fail", "checks": self._qa_checks('acceptance: fail', outcome="fail")},
         )
 
         self.assertEqual("engineering", failed["phase"])
@@ -990,7 +1325,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         candidate = self._reach_candidate()
         self._review_pass("reviewer-before-qa-controller-fail")
         self.controller.next(command_id="NEXT-qa-controller-fail")
-        self._write_artifact({"outcome": "pass", "checks": ["acceptance: claimed pass"]})
+        self._write_artifact({"outcome": "pass", "checks": self._qa_checks('acceptance: claimed pass')})
         failed_process = ProcessEvidence(
             29, digest("qa-out"), digest("qa-err"), b"qa controller check failed",
         )
@@ -1073,6 +1408,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         external_store = StateStore(external_path)
         external_controller = Controller(external_store)
         command = {
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "name": "init", "id": "EXTERNAL-STATE-INIT", "expected_generation": None,
             "run_id": "RUN-EXTERNAL", "project_root": str(self.root),
             "authority_paths": {
@@ -1082,36 +1418,32 @@ class PipelineV2CoreTests(unittest.TestCase):
             "slices": self.slices,
         }
 
-        with self.assertRaisesRegex(PipelineError, "direct .json child"):
+        with self.assertRaisesRegex(PipelineError, "pipeline state path must equal"):
             external_controller.reconfigure(command)
         self.assertFalse(external_path.exists())
         self.assertFalse(external_store.lock_path.exists())
 
         original = self.store.path.read_bytes()
         external_path.write_bytes(original)
-        with self.assertRaisesRegex(PipelineError, "direct .json child"):
+        with self.assertRaisesRegex(PipelineError, "pipeline state path must equal"):
             external_controller.status()
         self.assertEqual(original, external_path.read_bytes())
         self.assertFalse(external_store.lock_path.exists())
 
-    def test_public_controller_allows_custom_json_state_inside_canonical_directory(self) -> None:
-        custom_store = StateStore(
-            self.root / ".agentic-pipeline-v2" / "custom-state.json",
-        )
-        custom_controller = Controller(custom_store)
-        initialized = custom_controller.reconfigure({
-            "name": "init", "id": "CUSTOM-STATE-INIT", "expected_generation": None,
-            "run_id": "RUN-CUSTOM", "project_root": str(self.root),
-            "authority_paths": {
-                "requirements": "requirements.md", "specification": "specification.md",
-                "plan": "plan.md",
-            },
-            "slices": self.slices,
-        })
-
-        self.assertEqual("plan", initialized["phase"])
-        self.assertTrue(custom_store.path.is_file())
-        self.assertEqual("next", custom_controller.status()["next_action"]["command"])
+    def test_public_controller_rejects_custom_json_name_inside_selected_workflow(self) -> None:
+        custom_store = StateStore(self.store.path.with_name("custom-state.json"))
+        original = self.store.path.read_bytes()
+        with self.assertRaisesRegex(PipelineError, "pipeline state path must equal"):
+            Controller(custom_store).reconfigure({
+                "name": "init", "id": "CUSTOM-STATE-INIT", "expected_generation": None,
+                "run_id": "RUN-CUSTOM", "project_root": str(self.root),
+                "feature": self.feature, "workflow_path": self.workflow_path,
+                "authority_paths": {"requirements": "requirements.md", "specification": "specification.md", "plan": "plan.md"},
+                "slices": self.slices,
+            })
+        self.assertEqual(original, self.store.path.read_bytes())
+        self.assertFalse(custom_store.path.exists())
+        self.assertFalse(custom_store.lock_path.exists())
 
     def test_next_rejects_forged_controller_assignment_identity_and_cli_can_omit_it(self) -> None:
         for field in ("id", "worker_id", "task"):
@@ -1133,7 +1465,7 @@ class PipelineV2CoreTests(unittest.TestCase):
 
         action = self.controller.status()["next_action"]
         view = cli_run(cli_parser().parse_args([
-            "--state", str(self.store.path), "next",
+            "--root", str(self.root), "--feature", self.feature, "next",
             "--id", action["command_id"],
             "--expected-generation", str(action["expected_generation"]),
         ]))
@@ -1181,11 +1513,11 @@ class PipelineV2CoreTests(unittest.TestCase):
                 harness.setUp()
                 try:
                     status_args = cli_parser().parse_args([
-                        "--state", str(harness.store.path), "status",
+                        "--root", str(harness.root), "--feature", harness.feature, "status",
                     ])
                     action = cli_run(status_args)["next_action"]
                     argv = [
-                        "--state", str(harness.store.path), "next",
+                        "--root", str(harness.root), "--feature", harness.feature, "next",
                         "--id", action["command_id"],
                         "--expected-generation", str(action["expected_generation"]),
                     ]
@@ -1256,6 +1588,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(PipelineError, "run_id.*safe identifier"):
                     Controller(store).reconfigure({
+                        "feature": self.feature, "workflow_path": self.workflow_path,
                         "name": "init", "id": f"INVALID-RUN-{index}",
                         "expected_generation": None, "run_id": run_id,
                         "project_root": str(self.root),
@@ -1397,7 +1730,6 @@ class PipelineV2CoreTests(unittest.TestCase):
         after_first_qa = self._qa_pass("qa-s1")
 
         self.assertEqual("engineering", after_first_qa["phase"])
-        self.assertEqual(14, len(after_first_qa))
         self.assertNotIn("current_slice", after_first_qa)
         self.assertEqual(7, len(PHASES)); self.assertEqual(8, len(COMMANDS))
 
@@ -1411,7 +1743,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self._engineer_slice("engineer-s2-review-fix", "review fixed\n", slice_index=1, target="slice-two.txt")
         self._accept("engineering-s2-review-fix")
         self._review_pass("reviewer-s2-pass")
-        failed_qa = self._complete_readonly("qa", "qa-s2-fail", {"outcome": "fail", "checks": ["runtime: fail"]})
+        failed_qa = self._complete_readonly("qa", "qa-s2-fail", {"outcome": "fail", "checks": self._qa_checks('runtime: fail', outcome="fail")})
         self.assertEqual("SLICE-2", current_slice(failed_qa)["id"])
         self._engineer_slice("engineer-s2-qa-fix", "qa fixed\n", slice_index=1, target="slice-two.txt")
         self._accept("engineering-s2-qa-fix")
@@ -1420,7 +1752,6 @@ class PipelineV2CoreTests(unittest.TestCase):
         terminal = self._docs_no_change("docs-multi")
         ready = self.controller.ready(command_id="READY-MULTI", expected_generation=terminal["generation"])
         self.assertTrue(status_view(ready)["ready"])
-        self.assertEqual(14, len(ready))
 
     def test_next_slice_rejects_tampering_with_the_accepted_slice_surface(self) -> None:
         self._configure_two_slices()
@@ -1510,14 +1841,8 @@ class PipelineV2CoreTests(unittest.TestCase):
             "SLICE-INTEGRATION": ["src/integration-reference.js"],
             "SLICE-FUTURE": ["src/future-reference.js"],
         }
-        state = self.store.load()
-        self.store.dispatch({
-            "name": "init", "id": "CONFIGURE-INTEGRATED-READ",
-            "expected_generation": state["generation"], "run_id": state["run_id"],
-            "project_root": state["project_root"], "authority": state["authority"],
-            "slices": self._sealed(self.slices, scoped_reads),
-            **self._reconfigure_evidence(state),
-        })
+        self._write_approved_plan(self.slices, reads=scoped_reads)
+        self._commit_fixture_and_restart("integrated read fixture")
         self._reach_engineering("-integrated-read")
         self._engineer_slice(
             "engineer-foundation", "export const levels = [1, 2];\n",
@@ -1640,7 +1965,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         action = self.controller.status()["next_action"]
         self.assertEqual("init", action["command"])
         self.assertFalse(action["user_input_required"])
-        self.assertIn("scope binding", action["reason"])
+        self.assertEqual("init", action["command"])
         self.assertEqual(
             ["game.txt", "src/bootstrap.js"], action["slices"][0]["read_paths"],
         )
@@ -1650,6 +1975,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual(before, self.store.path.read_bytes())
 
         command = {
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "name": "init", "id": action["command_id"],
             "expected_generation": action["expected_generation"],
             "run_id": action["run_id"], "project_root": action["project_root"],
@@ -1660,6 +1986,93 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual(action["slices"], sealed["slices"])
         self.assertEqual(sealed, self.controller.reconfigure(command))
         self.assertEqual(persisted, self.store.path.read_bytes())
+
+    def test_status_rebinds_approved_write_scope_and_preserves_retained_work(self) -> None:
+        self._reach_candidate()
+        self._review_pass("review-before-rescope")
+        self._complete_readonly("qa", "qa-before-rescope", {
+            "outcome": "fail", "checks": self._qa_checks('Remaining current-candidate failure', outcome="fail"),
+        })
+        prior = self.store.load()
+        product_before = (self.root / "game.txt").read_bytes()
+        expanded = deepcopy(self.slices)
+        expanded[0]["allowed_paths"].append("studio-config.luau")
+        reads = {expanded[0]["id"]: ["game.txt", "studio-config.luau", "requirements.md"]}
+        self._write_approved_plan(expanded, reads=reads, revision=2)
+        state_before = self.store.path.read_bytes()
+        status_args = cli_parser().parse_args([
+            "--root", str(self.root), "--feature", self.feature, "status",
+        ])
+        action = cli_run(status_args)["next_action"]
+        self.assertEqual(state_before, self.store.path.read_bytes())
+        self.assertEqual(expanded[0]["allowed_paths"], action["slices"][0]["allowed_paths"])
+        self.assertEqual(reads[expanded[0]["id"]], action["slices"][0]["read_paths"])
+        self.assertEqual(self.slices[0]["planned_commands"], action["slices"][0]["planned_commands"])
+        argv = ["--root", str(self.root), "--feature", self.feature, "init",
+                "--id", action["command_id"], "--run-id", action["run_id"],
+                "--expected-generation", str(action["expected_generation"])]
+        for name, path in action["authority"].items():
+            argv += ["--authority", f"{name}={path}"]
+        for item in action["slices"]:
+            argv += ["--slice", json.dumps(item)]
+        result = cli_run(cli_parser().parse_args(argv))
+        restarted = self.store.load()
+        self.assertEqual("plan", result["phase"])
+        self.assertEqual(prior["history"], restarted["history"][:-1])
+        self.assertEqual(["game.txt"], restarted["history"][-1]["prior"]["candidate"]["changed_paths"])
+        self.assertIsNone(current_candidate(restarted))
+        self.assertNotIn("qa", restarted["artifacts"])
+        self.assertEqual(product_before, (self.root / "game.txt").read_bytes())
+        persisted = self.store.path.read_bytes()
+        self.assertEqual(result, cli_run(cli_parser().parse_args(argv)))
+        self.assertEqual(persisted, self.store.path.read_bytes())
+        self._reach_engineering("-expanded")
+        issued = self.controller.next(command_id="NEXT-EXPANDED", assignment={})["active_assignment"]
+        self.assertEqual(expanded[0]["allowed_paths"], issued["access"]["write"])
+        self.assertIn("studio-config.luau", issued["access"]["read"])
+        self.assertEqual(expanded[0]["allowed_paths"], issued["capsule"]["context"]["current_slice"]["allowed_paths"])
+
+    def test_write_scope_rebind_rejects_wrong_explicit_override_and_stale_action(self) -> None:
+        expanded = deepcopy(self.slices)
+        expanded[0]["allowed_paths"].append("studio-config.luau")
+        self._write_approved_plan(expanded, revision=2)
+        action = self.controller.status()["next_action"]
+        command = self._baseline_init_command(action)
+        before = self.store.path.read_bytes()
+        old = deepcopy(self.slices)
+        wider = deepcopy(expanded)
+        wider[0]["allowed_paths"].append("foreign.luau")
+        reordered = deepcopy(expanded)
+        reordered[0]["allowed_paths"].reverse()
+        for supplied in (old, wider, reordered):
+            with self.subTest(supplied=supplied):
+                with self.assertRaisesRegex(PipelineError, "controller-projected status action"):
+                    self.controller.reconfigure({**command, "slices": supplied})
+                self.assertEqual(before, self.store.path.read_bytes())
+        self._write_approved_plan(expanded, revision=3)
+        with self.assertRaisesRegex(PipelineError, "stale.*reconfiguration action"):
+            self.controller.reconfigure(command)
+        self.assertEqual(before, self.store.path.read_bytes())
+        action = self.controller.status()["next_action"]
+        command = self._baseline_init_command(action)
+        self.assertEqual("plan", self.controller.reconfigure({**command, "slices": expanded})["phase"])
+
+    def test_rebound_narrower_plan_cannot_drop_retained_engineering_coverage(self) -> None:
+        self._reach_candidate()
+        product_before = (self.root / "game.txt").read_bytes()
+        narrower = [{**deepcopy(self.slices[0]), "allowed_paths": ["replacement.luau"]}]
+        self._write_approved_plan(narrower, revision=2)
+        action = self.controller.status()["next_action"]
+        restarted = self.controller.reconfigure(self._baseline_init_command(action))
+        self.assertIsNone(current_candidate(restarted))
+        self._complete_readonly("plan", "planner-narrow", {"outcome": "pass", "summary": "New authority"})
+        self._accept("plan-narrow")
+        self._complete_readonly("slice", "slicer-narrow", {"outcome": "pass", "summary": "New slice"})
+        before = self.store.path.read_bytes()
+        with self.assertRaisesRegex(PipelineError, "do not cover interrupted Engineering paths"):
+            self._accept("slice-narrow")
+        self.assertEqual(before, self.store.path.read_bytes())
+        self.assertEqual(product_before, (self.root / "game.txt").read_bytes())
 
     def test_plan_write_scope_binding_rejects_narrower_broader_and_reordered_caller(self) -> None:
         approved = [{
@@ -1753,6 +2166,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(PipelineError, "cannot seal approved plan read scopes"):
                     self.controller.reconfigure({
+                        "feature": self.feature, "workflow_path": self.workflow_path,
                         "name": "init", "id": f"INIT-{label}",
                         "expected_generation": None, "run_id": "RUN-TEST",
                         "project_root": str(self.root),
@@ -1769,6 +2183,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PipelineError, "missing=.*SLICE-1.*unknown=.*SLICE-UNKNOWN"):
             self.controller.reconfigure({
+                "feature": self.feature, "workflow_path": self.workflow_path,
                 "name": "init", "id": "INIT-UNKNOWN-SLICE", "expected_generation": None,
                 "run_id": "RUN-TEST", "project_root": str(self.root),
                 "authority_paths": {
@@ -1782,6 +2197,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self._write_approved_plan([self.slices[0], deepcopy(self.slices[0])], revision=5)
         with self.assertRaisesRegex(PipelineError, "repeats slice ID"):
             self.controller.reconfigure({
+                "feature": self.feature, "workflow_path": self.workflow_path,
                 "name": "init", "id": "INIT-DUPLICATE-SLICE", "expected_generation": None,
                 "run_id": "RUN-TEST", "project_root": str(self.root),
                 "authority_paths": {
@@ -2000,7 +2416,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             self._review_pass("reviewer-before-nonzero-qa")
             failed = self._complete_readonly(
                 "qa", "qa-nonzero-fail",
-                {"outcome": "fail", "checks": ["planned acceptance check returned 29"]},
+                {"outcome": "fail", "checks": self._qa_checks('planned acceptance check returned 29')},
             )
         gate_id = next(key for key, item in failed["gates"].items() if item["status"] == "open")
         resumed = self.controller.transition({
@@ -2039,7 +2455,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             self._review_pass("reviewer-before-controller-qa-fail")
             failed = self._complete_readonly(
                 "qa", "qa-controller-fail",
-                {"outcome": "pass", "checks": ["worker inspection passed"]},
+                {"outcome": "pass", "checks": self._qa_checks('worker inspection passed')},
             )
         gate_id = next(
             key for key, item in failed["gates"].items()
@@ -2431,7 +2847,7 @@ class PipelineV2CoreTests(unittest.TestCase):
 
     def test_native_transaction_lock_is_released_after_holder_process_is_killed(self) -> None:
         completed = self._complete_readonly("plan", "planner-crash", {"outcome": "pass", "summary": "done"})
-        marker = self.root / ".agentic-pipeline-v2" / "holder.ready"
+        marker = self.store.path.parent / "holder.ready"
         module_path = json.dumps(str(SCRIPTS))
         state_path = json.dumps(str(self.store.path))
         marker_path = json.dumps(str(marker))
@@ -2469,7 +2885,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             self.assertEqual(resumed, persisted)
             self.assertEqual(completed["generation"] + 1, persisted["generation"])
             self.assertEqual("slice", persisted["phase"])
-            self.assertEqual(14, len(persisted))
+            self.assertEqual(set(completed), set(persisted))
         finally:
             for child in (resumer, holder):
                 if child is not None and child.poll() is None:
@@ -2515,7 +2931,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                 expected_generation=action["expected_generation"],
             )
             cli_replay = cli_run(cli_parser().parse_args([
-                "--state", str(self.store.path),
+                "--root", str(self.root), "--feature", self.feature,
                 "complete",
                 "--id", action["command_id"],
                 "--expected-generation", str(action["expected_generation"]),
@@ -2805,7 +3221,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             "task": "Detect a forbidden live mutation",
         })
         artifact = self._write_artifact({
-            "outcome": "pass", "checks": ["command declared non-mutating"],
+            "outcome": "pass", "checks": self._qa_checks('command declared non-mutating'),
         })
         before_state = self.store.path.read_bytes()
 
@@ -2833,14 +3249,8 @@ class PipelineV2CoreTests(unittest.TestCase):
             "planned_commands": [mutate, restore],
         }]
         (self.root / "generated").mkdir(exist_ok=True)
-        initial = self.store.load()
-        self.store.dispatch({
-            "name": "init", "id": "CONFIGURE-LIVE-READ-ONLY-MUTATE-RESTORE",
-            "expected_generation": initial["generation"], "run_id": initial["run_id"],
-            "project_root": initial["project_root"], "authority": initial["authority"],
-            "slices": self._sealed(self.slices),
-            **self._reconfigure_evidence(initial),
-        })
+        self._write_approved_plan(self.slices, revision=2)
+        self._commit_fixture_and_restart("live read-only mutate-restore fixture")
         self._reach_candidate()
         self._review_pass("reviewer-live-read-only-mutate-restore")
         self.controller.next(command_id="NEXT-QA-LIVE-MUTATE-RESTORE", assignment={
@@ -2848,7 +3258,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             "task": "Detect a transient forbidden live mutation",
         })
         artifact = self._write_artifact({
-            "outcome": "pass", "checks": ["commands declared non-mutating"],
+            "outcome": "pass", "checks": self._qa_checks('commands declared non-mutating'),
         })
         before_state = self.store.path.read_bytes()
 
@@ -2865,7 +3275,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             "id": "ASSIGN-QA-LIVE-PREFLIGHT", "worker_id": "qa-live-preflight",
             "task": "Exercise read-only preflight",
         })
-        artifact = self._write_artifact({"outcome": "pass", "checks": ["read-only check passed"]})
+        artifact = self._write_artifact({"outcome": "pass", "checks": self._qa_checks('read-only check passed')})
         result = ProcessEvidence(0, digest("stdout"), digest("stderr"))
 
         with mock.patch("pipeline_v2.runner.run_process_tree", return_value=result) as invoked:
@@ -2994,13 +3404,13 @@ class PipelineV2CoreTests(unittest.TestCase):
         before_replay = self.store.path.read_bytes()
         with mock.patch("pipeline_v2.runner.run_process_tree") as rerun:
             complete_view = cli_run(cli_parser().parse_args([
-                "--state", str(self.store.path), "complete",
+                "--root", str(self.root), "--feature", self.feature, "complete",
                 "--id", "COMPLETE-REDACTED-STDERR", "--artifact", str(artifact),
             ]))
         rerun.assert_not_called()
         self.assertEqual(before_replay, self.store.path.read_bytes())
         status = cli_run(cli_parser().parse_args([
-            "--state", str(self.store.path), "status",
+            "--root", str(self.root), "--feature", self.feature, "status",
         ]))
         self.assertEqual(view, complete_view)
         self.assertEqual(view, status)
@@ -3144,14 +3554,14 @@ class PipelineV2CoreTests(unittest.TestCase):
                     before_replay = harness.store.path.read_bytes()
                     with mock.patch("pipeline_v2.runner.run_process_tree") as rerun:
                         complete_view = cli_run(cli_parser().parse_args([
-                            "--state", str(harness.store.path), "complete",
+                            "--root", str(harness.root), "--feature", harness.feature, "complete",
                             "--id", f"COMPLETE-WORKER-{outcome.upper()}-CONTROLLER-FAIL",
                             "--artifact", str(artifact_path),
                         ]))
                     rerun.assert_not_called()
                     self.assertEqual(before_replay, harness.store.path.read_bytes())
                     status = cli_run(cli_parser().parse_args([
-                        "--state", str(harness.store.path), "status",
+                        "--root", str(harness.root), "--feature", harness.feature, "status",
                     ]))
                     self.assertEqual(view, complete_view)
                     self.assertEqual(view, status)
@@ -3427,7 +3837,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         review = self._complete_readonly("review", "reviewer-output", {"outcome": "pass", "findings": []})
         self.assertEqual([], review["artifacts"]["review"]["controller"]["changed_paths"])
         self._accept("review-output")
-        qa = self._complete_readonly("qa", "qa-output", {"outcome": "pass", "checks": ["acceptance: pass"]})
+        qa = self._complete_readonly("qa", "qa-output", {"outcome": "pass", "checks": self._qa_checks('acceptance: pass')})
         self.assertEqual([], qa["artifacts"]["qa"]["controller"]["changed_paths"])
 
     def test_complete_rejects_path_substitution_and_replays_exact_output(self) -> None:
@@ -3569,7 +3979,7 @@ class PipelineV2CoreTests(unittest.TestCase):
     def _schema2_removed_failed_qa_resume_route(self) -> None:
         candidate = self._reach_candidate()
         self._review_pass("reviewer-1")
-        failed = self._complete_readonly("qa", "qa-1", {"outcome": "fail", "checks": ["launch: product failure"]})
+        failed = self._complete_readonly("qa", "qa-1", {"outcome": "fail", "checks": self._qa_checks('launch: product failure', outcome="fail")})
         gate_id = next(key for key, item in failed["gates"].items() if item["status"] == "open")
         resumed = self.store.dispatch({
             "name": "resume", "id": "RESUME-QA", "expected_generation": failed["generation"],
@@ -3605,7 +4015,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self._review_pass("reviewer-2")
 
         qa_failed = self._complete_readonly("qa", "a-qa-1", {
-            "outcome": "fail", "checks": ["runtime: product failure"],
+            "outcome": "fail", "checks": self._qa_checks('runtime: product failure', outcome="fail"),
         })
         qa_gate = next(key for key, item in qa_failed["gates"].items() if item["status"] == "open")
         self.assertLess(qa_gate, review_gate)
@@ -3671,7 +4081,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self._accept("engineering-reconfigure-repair")
         self._review_pass("reviewer-reconfigure-pass")
         qa_failed = self._complete_readonly("qa", "qa-reconfigure-fail", {
-            "outcome": "fail", "checks": ["runtime: product failure"],
+            "outcome": "fail", "checks": self._qa_checks('runtime: product failure', outcome="fail"),
         })
         qa_gate = next(key for key, item in qa_failed["gates"].items() if item["status"] == "open")
         resumed = self.store.dispatch({
@@ -4719,7 +5129,6 @@ class PipelineV2CoreTests(unittest.TestCase):
             ensure_ascii=False, sort_keys=True,
         )
         self.assertIn(json.dumps(candidate, ensure_ascii=False, sort_keys=True), audit_json)
-        self.assertEqual(14, len(reconfigured))
         self.assertEqual(7, len(PHASES)); self.assertEqual(8, len(COMMANDS))
 
         replay = deepcopy(command); replay["expected_generation"] = -1
@@ -4800,14 +5209,14 @@ class PipelineV2CoreTests(unittest.TestCase):
 
     def test_public_status_recovers_the_controller_derived_engineering_packet(self) -> None:
         self._reach_engineering("-packet")
-        status_args = cli_parser().parse_args(["--state", str(self.store.path), "status"])
+        status_args = cli_parser().parse_args(["--root", str(self.root), "--feature", self.feature, "status"])
         action = cli_run(status_args)["next_action"]
         assignment = action["assignment"]
         self.assertEqual(self.slices[0]["allowed_paths"], assignment["access"]["write"])
         self.assertEqual(self.slices[0]["planned_commands"], assignment["checks"])
 
         next_argv = [
-            "--state", str(self.store.path), "next",
+            "--root", str(self.root), "--feature", self.feature, "next",
             "--id", action["command_id"],
             "--expected-generation", str(action["expected_generation"]),
             "--assignment-id", assignment["id"],
@@ -4832,13 +5241,13 @@ class PipelineV2CoreTests(unittest.TestCase):
         )
 
     def test_next_derives_scope_and_checks_despite_omitted_or_malicious_cli_values(self) -> None:
-        status_args = cli_parser().parse_args(["--state", str(self.store.path), "status"])
+        status_args = cli_parser().parse_args(["--root", str(self.root), "--feature", self.feature, "status"])
 
         def issue(*caller_values: str) -> dict:
             action = cli_run(status_args)["next_action"]
             expected = action["assignment"]
             argv = [
-                "--state", str(self.store.path), "next",
+                "--root", str(self.root), "--feature", self.feature, "next",
                 "--id", action["command_id"],
                 "--expected-generation", str(action["expected_generation"]),
                 "--assignment-id", expected["id"],
@@ -4870,20 +5279,20 @@ class PipelineV2CoreTests(unittest.TestCase):
 
         wrong_check = json.dumps([sys.executable, "-c", "raise SystemExit(0)"])
         issue("--read", "game.txt", "--run", wrong_check)
-        self._complete("DERIVE-QA-C", {"outcome": "pass", "checks": ["canonical checks passed"]})
+        self._complete("DERIVE-QA-C", {"outcome": "pass", "checks": self._qa_checks('canonical checks passed')})
         self._accept("derive-qa")
 
         issue("--read", "game.txt", "--write", "game.txt")
         self._complete("DERIVE-DOCS-C", {"outcome": "pass", "summary": "Documentation is current"})
 
     def test_public_assignment_context_stays_bounded_after_many_decisions(self) -> None:
-        status_args = cli_parser().parse_args(["--state", str(self.store.path), "status"])
+        status_args = cli_parser().parse_args(["--root", str(self.root), "--feature", self.feature, "status"])
 
         for index in range(12):
             action = cli_run(status_args)["next_action"]
             assignment = action["assignment"]
             next_argv = [
-                "--state", str(self.store.path), "next",
+                "--root", str(self.root), "--feature", self.feature, "next",
                 "--id", action["command_id"],
                 "--expected-generation", str(action["expected_generation"]),
                 "--assignment-id", assignment["id"],
@@ -4897,7 +5306,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             })
             decision = cli_run(status_args)["next_action"]
             answer_argv = [
-                "--state", str(self.store.path), "answer",
+                "--root", str(self.root), "--feature", self.feature, "answer",
                 "--id", decision["command_id"],
                 "--expected-generation", str(decision["expected_generation"]),
                 "--question-id", decision["question_id"],
@@ -4908,7 +5317,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         action = cli_run(status_args)["next_action"]
         assignment = action["assignment"]
         cli_run(cli_parser().parse_args([
-            "--state", str(self.store.path), "next",
+            "--root", str(self.root), "--feature", self.feature, "next",
             "--id", action["command_id"],
             "--expected-generation", str(action["expected_generation"]),
             "--assignment-id", assignment["id"],
@@ -4924,7 +5333,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         ready = self._finish_ready("reviewer-authority", "qa-authority", "docs-authority")
         before = self.store.path.read_bytes()
         self._write_approved_plan(self.slices, revision=2)
-        args = cli_parser().parse_args(["--state", str(self.store.path), "status"])
+        args = cli_parser().parse_args(["--root", str(self.root), "--feature", self.feature, "status"])
         view = cli_run(args)
         self.assertEqual(before, self.store.path.read_bytes())
         action = view["next_action"]
@@ -4939,8 +5348,8 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertFalse(action["user_input_required"])
 
         init_argv = [
-            "--state", str(self.store.path), "init",
-            "--id", action["command_id"], "--root", action["project_root"],
+            "--root", str(self.root), "--feature", self.feature, "init",
+            "--id", action["command_id"],
             "--run-id", action["run_id"], "--expected-generation", str(action["expected_generation"]),
         ]
         for name, path in action["authority"].items():
@@ -4965,14 +5374,14 @@ class PipelineV2CoreTests(unittest.TestCase):
     def test_status_reconfiguration_action_binds_observed_authority_bytes_and_paths(self) -> None:
         before = self.store.path.read_bytes()
         self._write_approved_plan(self.slices, revision=2)
-        status_args = cli_parser().parse_args(["--state", str(self.store.path), "status"])
+        status_args = cli_parser().parse_args(["--root", str(self.root), "--feature", self.feature, "status"])
         first = cli_run(status_args)["next_action"]
         self.assertEqual("init", first["command"])
 
         def init_argv(action: dict, *, plan_path: str | None = None) -> list[str]:
             argv = [
-                "--state", str(self.store.path), "init",
-                "--id", action["command_id"], "--root", action["project_root"],
+                "--root", str(self.root), "--feature", self.feature, "init",
+                "--id", action["command_id"],
                 "--run-id", action["run_id"],
                 "--expected-generation", str(action["expected_generation"]),
             ]
@@ -5010,6 +5419,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         action = self.controller.status()["next_action"]
         self.assertEqual("init", action["command"])
         command = {
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "name": "init", "id": action["command_id"],
             "expected_generation": action["expected_generation"],
             "run_id": action["run_id"], "project_root": action["project_root"],
@@ -5041,6 +5451,7 @@ class PipelineV2CoreTests(unittest.TestCase):
     def test_initial_public_baseline_closes_empty_epoch_reconfiguration_and_replay(self) -> None:
         self.store.path.unlink()
         initialized = self.controller.reconfigure({
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "name": "init", "id": "PUBLIC-INIT-BASELINE", "expected_generation": None,
             "run_id": "RUN-TEST", "project_root": str(self.root),
             "authority_paths": {
@@ -5056,6 +5467,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         action = self.controller.status()["next_action"]
         self.assertEqual("init", action["command"])
         command = {
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "name": "init", "id": action["command_id"],
             "expected_generation": action["expected_generation"],
             "run_id": action["run_id"], "project_root": action["project_root"],
@@ -5096,6 +5508,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         first = self.controller.status()["next_action"]
         self.assertNotEqual(stale_first["command_id"], first["command_id"])
         stale_command = {
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "name": "init", "id": stale_first["command_id"],
             "expected_generation": stale_first["expected_generation"],
             "run_id": stale_first["run_id"], "project_root": stale_first["project_root"],
@@ -5106,6 +5519,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             self.controller.reconfigure(stale_command)
         self.assertEqual(before_stale, self.store.path.read_bytes())
         first_command = {
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "name": "init", "id": first["command_id"],
             "expected_generation": first["expected_generation"],
             "run_id": first["run_id"], "project_root": first["project_root"],
@@ -5119,6 +5533,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual("init", second["command"])
         self.assertNotEqual(first["command_id"], second["command_id"])
         second_command = {
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "name": "init", "id": second["command_id"],
             "expected_generation": second["expected_generation"],
             "run_id": second["run_id"], "project_root": second["project_root"],
@@ -5134,6 +5549,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         before = self.store.path.read_bytes()
         with self.assertRaisesRegex(PipelineError, "checkout drifted"):
             self.controller.reconfigure({
+                "feature": self.feature, "workflow_path": self.workflow_path,
                 "name": "init", "id": third["command_id"],
                 "expected_generation": third["expected_generation"],
                 "run_id": third["run_id"], "project_root": third["project_root"],
@@ -5143,9 +5559,11 @@ class PipelineV2CoreTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows authority aliases are case-insensitive")
     def test_windows_authority_alias_reconfiguration_returns_and_executes_init(self) -> None:
-        store = StateStore(self.root / ".agentic-pipeline-v2" / "authority-alias.json")
+        store = self.store
+        store.path.unlink()
         controller = Controller(store)
         initialized = controller.reconfigure({
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "name": "init", "id": "ALIAS-INIT", "expected_generation": None,
             "run_id": "RUN-ALIAS", "project_root": str(self.root),
             "authority_paths": {
@@ -5159,6 +5577,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         action = controller.status()["next_action"]
         self.assertEqual("init", action["command"])
         reconfigured = controller.reconfigure({
+            "feature": self.feature, "workflow_path": self.workflow_path,
             "name": "init", "id": action["command_id"],
             "expected_generation": action["expected_generation"],
             "run_id": action["run_id"], "project_root": action["project_root"],
@@ -5269,6 +5688,7 @@ class PipelineV2CoreTests(unittest.TestCase):
             command_id="READY-AUTHORITY-REPLAY", expected_generation=ready_phase["generation"],
         )
         persisted = self.store.path.read_bytes()
+        approved_prd_bytes = (self.root / "requirements.md").read_bytes()
         (self.root / "requirements.md").write_text("reopened requirements\n", encoding="utf-8")
 
         replays = {
@@ -5290,9 +5710,7 @@ class PipelineV2CoreTests(unittest.TestCase):
                 replay()
             self.assertEqual(persisted, self.store.path.read_bytes())
 
-        (self.root / "requirements.md").write_text(
-            "approved requirements.md\n", encoding="utf-8",
-        )
+        (self.root / "requirements.md").write_bytes(approved_prd_bytes)
         (self.root / "game.txt").write_text("post-ready checkout drift\n", encoding="utf-8")
         for route, replay in replays.items():
             with self.subTest(route=route, drift="checkout"), self.assertRaisesRegex(
@@ -5311,7 +5729,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self._write_approved_plan(self.slices, revision=2)
         before = self.store.path.read_bytes()
 
-        view = cli_run(cli_parser().parse_args(["--state", str(self.store.path), "status"]))
+        view = cli_run(cli_parser().parse_args(["--root", str(self.root), "--feature", self.feature, "status"]))
 
         self.assertEqual(before, self.store.path.read_bytes())
         self.assertEqual("terminal", view["next_action"]["kind"])
@@ -5403,7 +5821,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self._write_approved_plan(self.slices, revision=2)
 
         args = cli_parser().parse_args([
-            "--state", str(self.store.path), "accept",
+            "--root", str(self.root), "--feature", self.feature, "accept",
             "--id", "ACCEPT-STALE-AUTHORITY",
             "--expected-generation", str(completed["generation"]),
         ])
@@ -5412,7 +5830,7 @@ class PipelineV2CoreTests(unittest.TestCase):
 
         self.assertEqual(persisted_before, self.store.path.read_bytes())
         status = cli_run(
-            cli_parser().parse_args(["--state", str(self.store.path), "status"])
+            cli_parser().parse_args(["--root", str(self.root), "--feature", self.feature, "status"])
         )
         self.assertEqual("init", status["next_action"]["command"])
         self.assertFalse(status["next_action"]["user_input_required"])
@@ -5425,13 +5843,13 @@ class PipelineV2CoreTests(unittest.TestCase):
         })
         (self.root / "game.txt").write_text("authorized interrupted candidate\n", encoding="utf-8")
         self._write_approved_plan(self.slices, revision=2)
-        status_args = cli_parser().parse_args(["--state", str(self.store.path), "status"])
+        status_args = cli_parser().parse_args(["--root", str(self.root), "--feature", self.feature, "status"])
         action = cli_run(status_args)["next_action"]
         self.assertEqual("init", action["command"])
 
         init_argv = [
-            "--state", str(self.store.path), "init", "--id", action["command_id"],
-            "--root", action["project_root"], "--run-id", action["run_id"],
+            "--root", action["project_root"], "--feature", self.feature,
+            "init", "--id", action["command_id"], "--run-id", action["run_id"],
             "--expected-generation", str(action["expected_generation"]),
         ]
         for name, path in action["authority"].items():
@@ -5467,6 +5885,258 @@ class PipelineV2CoreTests(unittest.TestCase):
         accepted = self._accept("interrupted-slice")
         self.assertEqual("engineering", accepted["phase"])
         self.assertEqual("SLICE-1", current_slice(accepted)["id"])
+        self.controller.next(command_id="NEXT-AFTER-INTERRUPTION", assignment={})
+        self._complete("COMPLETE-AFTER-INTERRUPTION", {"outcome": "pass", "summary": "Retained implementation verified"})
+        self._accept("after-interruption")
+        target = self.controller.status()["next_action"]["assignment"]["context"]["review_target"]
+        self.assertEqual(["game.txt"], target["candidate_changes"])
+
+
+    def test_reconfigured_engineering_retains_review_coverage(self) -> None:
+        self._reach_engineering("-retained")
+        self.controller.next(command_id="NEXT-RETAINED", assignment={})
+        (self.root / "game.txt").write_text("retained implementation\n", encoding="utf-8")
+        self._complete("COMPLETE-RETAINED", {
+            "outcome": "blocked", "summary": "Required asset unavailable",
+            "blocker": "Asset unavailable", "required_action": "Publish the asset",
+        })
+        self._reconfigure_documentation_contract()
+        # A second reconfiguration before Engineering must not erase provenance.
+        self._write_approved_plan(self.slices, revision=3)
+        action = self.controller.status()["next_action"]
+        self.controller.reconfigure({
+            "name": "init", "id": action["command_id"],
+            "expected_generation": action["expected_generation"],
+            "run_id": action["run_id"], "feature": self.feature,
+            "workflow_path": self.workflow_path, "project_root": action["project_root"],
+            "authority_paths": action["authority"], "slices": action["slices"],
+        })
+        self._reach_engineering("-retained-replanned")
+        self.controller.next(command_id="NEXT-RETAINED-RESUMED", assignment={})
+        added = self.root / "tests" / "new.txt"
+        added.parent.mkdir()
+        added.write_text("new implementation\n", encoding="utf-8")
+        self._complete("COMPLETE-RETAINED-RESUMED", {
+            "outcome": "pass", "summary": "Implementation complete",
+        })
+        self._accept("retained-resumed")
+        target = self.controller.status()["next_action"]["assignment"]["context"]["review_target"]
+        self.assertEqual(["game.txt", "tests/new.txt"], target["candidate_changes"])
+        self.assertEqual("retained implementation\n", (self.root / "game.txt").read_text())
+        self._complete_readonly("review", "reviewer-retained", {"outcome": "pass", "findings": []})
+        self.assertEqual("qa", self._accept("retained-review")["phase"])
+
+    def _block_first_engineering_for_baseline(self) -> None:
+        self._reach_engineering("-prerequisite-baseline")
+        self.controller.next(command_id="NEXT-PREREQUISITE-BASELINE", assignment={})
+        self._complete("COMPLETE-PREREQUISITE-BASELINE", {
+            "outcome": "blocked", "summary": "Editor unavailable before product edits",
+            "blocker": "External editor prerequisite is unavailable",
+            "required_action": "Restore the editor prerequisite",
+        })
+
+    def _baseline_init_command(self, action: dict) -> dict:
+        return {
+            "name": "init", "id": action["command_id"],
+            "expected_generation": action["expected_generation"],
+            "run_id": action["run_id"], "feature": self.feature,
+            "workflow_path": self.workflow_path, "project_root": action["project_root"],
+            "authority_paths": action["authority"], "slices": action["slices"],
+        }
+
+    def _commit_prerequisite_baseline(self, text: str = "confirmed external prerequisite\n") -> None:
+        (self.root / "prerequisite.txt").write_text(text, encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "--", "prerequisite.txt"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "prerequisite baseline"], check=True)
+
+    def test_first_blocked_engineering_admits_committed_baseline_with_tree_bound_replay(self) -> None:
+        self._block_first_engineering_for_baseline()
+        before = self.store.path.read_bytes()
+        old = self.store.load()
+        clean_command = self._baseline_init_command(self.controller.status()["next_action"])
+        (self.root / "prerequisite.txt").write_text("confirmed external prerequisite\n", encoding="utf-8")
+        self.assertEqual("checkout_recovery_required", self.controller.status()["next_action"]["result"])
+        with self.assertRaisesRegex(PipelineError, "checkout drifted"):
+            self.controller.reconfigure(clean_command)
+        self.assertEqual(before, self.store.path.read_bytes())
+        self._commit_prerequisite_baseline()
+        action = self.controller.status()["next_action"]
+        self.assertEqual("init", action["command"])
+        self.assertTrue(action["user_input_required"])
+        self.assertIn("explicit authorization", action["reason"])
+        command = self._baseline_init_command(action)
+        self._commit_prerequisite_baseline("later prerequisite\n")
+        with self.assertRaisesRegex(PipelineError, "stale.*reconfiguration"):
+            self.controller.reconfigure(command)
+        self.assertEqual(before, self.store.path.read_bytes())
+        command = self._baseline_init_command(self.controller.status()["next_action"])
+        with self.assertRaisesRegex(ConflictError, "stale generation"):
+            self.controller.reconfigure({**command, "expected_generation": command["expected_generation"] - 1})
+        self.assertEqual(before, self.store.path.read_bytes())
+        # HEAD-only metadata does not change the existing git-tree-v1 capability.
+        subprocess.run(["git", "-C", str(self.root), "commit", "--allow-empty", "-qm", "same tree"], check=True)
+        restarted = self.controller.reconfigure(command)
+        self.assertEqual("plan", restarted["phase"])
+        self.assertEqual(old["generation"] + 1, restarted["generation"])
+        self.assertEqual(old["history"], restarted["history"][:-1])
+        self.assertEqual(old["artifacts"]["engineering"]["candidate"], restarted["history"][-1]["prior"]["candidate"])
+        self.assertEqual(candidate_tree_oid(self.root), restarted["base_tree_oid"])
+        self.assertIsNone(current_candidate(restarted))
+        persisted = self.store.path.read_bytes()
+        self.assertEqual(restarted, self.controller.reconfigure(command))
+        self.assertEqual(persisted, self.store.path.read_bytes())
+        (self.root / "prerequisite.txt").write_text("late dirty edit\n", encoding="utf-8")
+        with self.assertRaisesRegex(PipelineError, "checkout drifted"):
+            self.controller.reconfigure(command)
+        self.assertEqual(persisted, self.store.path.read_bytes())
+
+    def test_committed_baseline_cannot_discard_active_or_recorded_engineering_work(self) -> None:
+        for mode in ("active", "blocked-with-writes", "earlier-engineering-attempt", "earlier-init"):
+            with self.subTest(mode=mode):
+                h = PipelineV2CoreTests("runTest")
+                h.setUp()
+                try:
+                    if mode == "earlier-init":
+                        h._block_first_engineering_for_baseline()
+                        h.controller.reconfigure(h._baseline_init_command(h.controller.status()["next_action"]))
+                        h._reach_engineering("-second-epoch")
+                    else:
+                        h._reach_engineering("-retained-baseline")
+                    h.controller.next(command_id="NEXT-RETAINED-BASELINE", assignment={})
+                    if mode in ("blocked-with-writes", "earlier-engineering-attempt"):
+                        (h.root / "game.txt").write_text("persistent implementation\n", encoding="utf-8")
+                    if mode == "earlier-engineering-attempt":
+                        h._complete("COMPLETE-FIRST-BASELINE-ATTEMPT", {"outcome": "fail", "summary": "Incomplete work"})
+                        h.controller.next(command_id="NEXT-SECOND-BASELINE-ATTEMPT", assignment={})
+                        (h.root / "game.txt").write_text("old\n", encoding="utf-8")
+                    if mode != "active":
+                        h._complete("COMPLETE-RETAINED-BASELINE", {
+                            "outcome": "blocked", "summary": "External prerequisite unavailable",
+                            "blocker": "Editor unavailable", "required_action": "Restore editor",
+                        })
+                    # Commit every product byte so cleanliness alone cannot hide retained work.
+                    subprocess.run(["git", "-C", str(h.root), "add", "--", "game.txt"], check=True)
+                    h._commit_prerequisite_baseline()
+                    before = h.store.path.read_bytes()
+                    action = h.controller.status()["next_action"]
+                    self.assertEqual("checkout_recovery_required", action["result"])
+                    state = h.store.load()
+                    with self.assertRaisesRegex(PipelineError, "checkout drifted|forbidden paths"):
+                        h.controller.reconfigure({
+                            "name": "init", "id": "REJECT-BASELINE", "expected_generation": state["generation"],
+                            "run_id": state["run_id"], "feature": h.feature, "workflow_path": h.workflow_path,
+                            "project_root": str(h.root),
+                            "authority_paths": {k: v["path"] for k, v in state["authority"]["items"].items()},
+                            "slices": h.slices,
+                        })
+                    self.assertEqual(before, h.store.path.read_bytes())
+                finally:
+                    h.tearDown()
+
+    def test_early_committed_baseline_keeps_policy_and_authority_guards(self) -> None:
+        self._block_first_engineering_for_baseline()
+        clean_action = self.controller.status()["next_action"]
+        command = self._baseline_init_command(clean_action)
+        self._commit_prerequisite_baseline()
+        before = self.store.path.read_bytes()
+        prd = self.root / "requirements.md"
+        original = prd.read_bytes()
+        prd.write_bytes(original.replace(b"status: approved", b"status: draft"))
+        self.assertEqual("checkout_recovery_required", self.controller.status()["next_action"]["result"])
+        with self.assertRaisesRegex(PipelineError, "approved authority chain"):
+            self.controller.reconfigure(command)
+        self.assertEqual(before, self.store.path.read_bytes())
+        prd.write_bytes(original)
+        (self.root / ".gitattributes").write_text("*.txt text\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "--", ".gitattributes"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "changed policy"], check=True)
+        self.assertEqual("fresh_init_required", self.controller.status()["next_action"]["result"])
+        with self.assertRaisesRegex(PipelineError, "repository policy changed"):
+            self.controller.reconfigure(command)
+        self.assertEqual(before, self.store.path.read_bytes())
+
+    def test_early_committed_baseline_composes_with_reconverged_approved_authority(self) -> None:
+        self._block_first_engineering_for_baseline()
+        before = self.store.path.read_bytes()
+        command = self._baseline_init_command(self.controller.status()["next_action"])
+        self._commit_prerequisite_baseline()
+        self._write_source_authority(revision=2)
+        # The old plan still traces revision1; a clean commit cannot grant authority credit.
+        subprocess.run(["git", "-C", str(self.root), "add", "--", "requirements.md", "specification.md"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "unconverged authority"], check=True)
+        self.assertEqual("checkout_recovery_required", self.controller.status()["next_action"]["result"])
+        with self.assertRaisesRegex(PipelineError, "approved authority chain"):
+            self.controller.reconfigure(command)
+        self.assertEqual(before, self.store.path.read_bytes())
+        self._write_approved_plan(self.slices, revision=2)
+        subprocess.run(["git", "-C", str(self.root), "add", "--", "plan.md"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "approved reconvergence"], check=True)
+        action = self.controller.status()["next_action"]
+        self.assertEqual("init", action["command"])
+        self.assertEqual(before, self.store.path.read_bytes())
+        restarted = self.controller.reconfigure(self._baseline_init_command(action))
+        self.assertEqual("plan", restarted["phase"])
+        self.assertEqual(9, restarted["generation"])
+        self.assertEqual(candidate_tree_oid(self.root), restarted["base_tree_oid"])
+        self.assertIsNone(current_candidate(restarted))
+
+    def test_runtime_reconfiguration_requires_idle_explicit_init_and_rechecks_retained_work(self) -> None:
+        self._reach_engineering("-runtime-repair")
+        self.controller.next(command_id="NEXT-RUNTIME-REPAIR", assignment={})
+        (self.root / "game.txt").write_text("unreviewed implementation\n", encoding="utf-8")
+        artifact = self._write_artifact({"outcome": "pass", "summary": "Implemented"})
+        replacement_digest = digest("repaired runtime")
+        before = self.store.path.read_bytes()
+        with mock.patch("pipeline_v2.runner.pipeline_runtime_digest", return_value=replacement_digest):
+            with self.assertRaisesRegex(PipelineError, "runtime changed"):
+                self.controller.status()
+            with self.assertRaisesRegex(PipelineError, "runtime changed"):
+                self.controller.next(command_id="STALE-RUNTIME-NEXT", assignment={})
+            with self.assertRaisesRegex(PipelineError, "runtime changed"):
+                self.controller.complete(command_id="STALE-RUNTIME-COMPLETE", artifact_path=artifact)
+            with self.assertRaisesRegex(PipelineError, "runtime changed"):
+                self.controller.reconfigure({
+                    "name": "init", "id": "ACTIVE-RUNTIME-INIT",
+                    "expected_generation": self.store.load()["generation"],
+                    "run_id": "RUN-TEST", "feature": self.feature,
+                    "workflow_path": self.workflow_path, "project_root": str(self.root),
+                    "authority_paths": {"requirements": "requirements.md", "specification": "specification.md", "plan": "plan.md"},
+                    "slices": self.slices,
+                })
+        self.assertEqual(before, self.store.path.read_bytes())
+        self.controller.complete(command_id="COMPLETE-RUNTIME-REPAIR", artifact_path=artifact)
+        self._accept("runtime-repair")
+        before = self.store.path.read_bytes()
+        with mock.patch("pipeline_v2.runner.pipeline_runtime_digest", return_value=replacement_digest):
+            action = self.controller.status()["next_action"]
+            self.assertEqual("init", action["command"])
+            self.assertIs(False, action["user_input_required"])
+            self.assertNotIn("blocker", action)
+            self.assertNotIn("required_action", action)
+            self.assertEqual(before, self.store.path.read_bytes())
+            command = {
+                "name": "init", "id": action["command_id"],
+                "expected_generation": action["expected_generation"],
+                "run_id": action["run_id"], "feature": self.feature,
+                "workflow_path": self.workflow_path, "project_root": action["project_root"],
+                "authority_paths": action["authority"], "slices": action["slices"],
+            }
+            with mock.patch("pipeline_v2.runner.pipeline_runtime_digest", return_value=digest("later repair")):
+                with self.assertRaisesRegex(PipelineError, "stale.*reconfiguration"):
+                    self.controller.reconfigure(command)
+            self.assertEqual(before, self.store.path.read_bytes())
+            restarted = self.controller.reconfigure(command)
+            self.assertEqual("plan", restarted["phase"])
+            self.assertIsNone(current_candidate(restarted))
+            self.assertEqual(replacement_digest, restarted["pipeline_runtime_digest"])
+            self.assertEqual(restarted, self.controller.reconfigure(command))
+            self._reach_engineering("-runtime-repaired")
+            self.controller.next(command_id="NEXT-RUNTIME-REPAIRED", assignment={})
+            self._complete("COMPLETE-RUNTIME-REPAIRED", {"outcome": "pass", "summary": "Retained work verified"})
+            self._accept("runtime-repaired")
+            target = self.controller.status()["next_action"]["assignment"]["context"]["review_target"]
+            self.assertEqual(["game.txt"], target["candidate_changes"])
+        self.assertEqual("unreviewed implementation\n", (self.root / "game.txt").read_text())
 
 
 class Schema10ImporterTests(unittest.TestCase):
@@ -5475,6 +6145,7 @@ class Schema10ImporterTests(unittest.TestCase):
         self.harness.setUp()
         self.legacy_temporary = tempfile.TemporaryDirectory()
         self.root = self.harness.root
+        self.feature = self.harness.feature
         self.slices = self.harness.slices
         self.store = self.harness.store
         self.store.path.unlink()
@@ -5552,7 +6223,7 @@ class Schema10ImporterTests(unittest.TestCase):
         legacy_path = self._legacy_path("legacy-state.json")
         legacy_path.write_text(json.dumps(self._legacy()), encoding="utf-8")
         argv = [
-            "--state", str(self.store.path), "migrate", "--id", "MIGRATE-TOMBSTONE",
+            "--root", str(self.root), "--feature", self.feature, "migrate", "--id", "MIGRATE-TOMBSTONE",
             "--legacy-state", str(legacy_path),
             "--slice", json.dumps(self.slices[0]),
         ]

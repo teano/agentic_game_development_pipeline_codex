@@ -14,8 +14,26 @@ assert SPEC and SPEC.loader
 contract = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(contract)
 
+PLAN_MODULE = MODULE.with_name("development_plan_contract.py")
+PLAN_SPEC = importlib.util.spec_from_file_location("plan_contract_for_identity_tests", PLAN_MODULE)
+assert PLAN_SPEC and PLAN_SPEC.loader
+plan_contract = importlib.util.module_from_spec(PLAN_SPEC)
+PLAN_SPEC.loader.exec_module(plan_contract)
+
 
 class AcceptanceContractTests(unittest.TestCase):
+    def test_mandatory_qa_inventory_uses_explicit_unique_ids(self) -> None:
+        expected = ["AUTO-SLICE-001-CORE", "MANUAL-SLICE-001-RUNTIME"]
+        self.assertEqual(expected, plan_contract.parse_mandatory_identity_ids(
+            ", ".join(expected), label="slice QA",
+        ))
+        for value in (
+            "", "AUTO-SLICE-*", "MANUAL-SLICE-001, MANUAL-SLICE-001",
+            "derive from coverage", "AUTO-SLICE-001..AUTO-SLICE-003", "MANUAL-SLICE-001,",
+        ):
+            with self.subTest(value=value), self.assertRaises(plan_contract.PlanContractError):
+                plan_contract.parse_mandatory_identity_ids(value, label="slice QA")
+
     def test_comma_separated_fields_require_unique_literal_ids(self) -> None:
         self.assertEqual(
             ["PRD-AC-save-v2", "PRD-AC-002"],

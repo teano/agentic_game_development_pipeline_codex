@@ -29,7 +29,7 @@ Use `sequential_slices` only when every slice yields an observable end-to-end re
 
 Read only controller-provided closed remediation gates and accepted answers as dependency/risk context. They do not add scope. Pipeline v2 keeps findings, answers, and completed actor IDs inside controller state; planning does not invoke a Decision Recorder or deferred-findings handler. The Analyst returns a compact decision packet with mode, complexity/working-set estimate, seams/dependencies, rejected decompositions, risks, slices/milestones, context ceilings, coverage boundaries, documentation outputs, and whether each slice needs bounded research.
 
-For each slice, use either one to three exact `RESEARCH-*` briefs or `research_not_required | reason=<exact source-backed reason>`. Brief IDs and content selectors are runtime authority and must be unique. Never add a fake brief merely to satisfy structure.
+For each slice, use either one to three exact `RESEARCH-*` briefs or `research_not_required | reason=<exact source-backed reason>`. Brief IDs must be unique; their questions, sources, exclusions, and stop conditions are approved instructions for the assigned roles, not an automatically launched runtime research workflow. Never add a fake brief merely to satisfy structure.
 
 ## Draft, approve, and complete
 

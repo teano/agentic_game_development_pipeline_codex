@@ -425,6 +425,9 @@ def pipeline_runtime_digest() -> str:
         (runtime_dir / "runner.py", "pipeline_v2/runner.py"),
         (runtime_dir / "transaction.py", "pipeline_v2/transaction.py"),
         (bundle_root / "scripts" / "development_plan_contract.py", "scripts/development_plan_contract.py"),
+        (bundle_root / "scripts" / "acceptance_contract.py", "scripts/acceptance_contract.py"),
+        (skills_root / "gamedev-requirements" / "scripts" / "validate_product_requirements.py", "authority/validate_product_requirements.py"),
+        (skills_root / "gamedev-development-plan" / "scripts" / "development_plan_state.py", "authority/development_plan_state.py"),
     )
     records = []
     for path, label in manifest:

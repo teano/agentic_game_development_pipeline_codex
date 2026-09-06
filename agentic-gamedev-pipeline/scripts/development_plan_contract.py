@@ -365,7 +365,7 @@ def parse_slice_path_contract(
 
 
 def parse_slice_path_contracts(
-    text: str, *, label: str = "approved development plan"
+    text: str, *, label: str = "approved development plan", include_qa: bool = False,
 ) -> dict[str, dict[str, list[str]]]:
     """Return exact per-slice write/read contracts from an approved plan."""
     meta, body = parse_development_plan_frontmatter(text, label=label)
@@ -415,6 +415,16 @@ def parse_slice_path_contracts(
             context_section=sections["Context Capsule Budget"],
             label=f"{label} {slice_id}",
         )
+        if include_qa:
+            coverage = sections.get("Coverage Contract", "")
+            values = re.findall(r"(?m)^- mandatory_identity_ids: (\S(?:.*\S)?)\s*$", coverage)
+            if len(values) != 1:
+                raise PlanContractError(
+                    f"{label} {slice_id} requires exactly one mandatory_identity_ids row"
+                )
+            result[slice_id]["mandatory_identity_ids"] = parse_mandatory_identity_ids(
+                values[0], label=f"{label} {slice_id} mandatory_identity_ids",
+            )
     return result
 
 
@@ -538,13 +548,25 @@ def _identity_namespace(value: str, label: str, prefix: str) -> None:
         raise PlanContractError(f"{label} must be a canonical {prefix}-...-* namespace")
 
 
+def parse_mandatory_identity_ids(value: str, *, label: str) -> list[str]:
+    """Read the one approved exact QA inventory; prose and wildcards are not IDs."""
+    items = [item.strip() for item in value.split(",")]
+    if (
+        not items
+        or any(re.fullmatch(r"(?:AUTO|MANUAL)-[A-Z0-9]+(?:-[A-Z0-9]+)*", item) is None for item in items)
+        or len(items) != len(set(items))
+    ):
+        raise PlanContractError(f"{label} must be a duplicate-free comma-separated list of exact AUTO-/MANUAL- IDs")
+    return items
+
+
 def parse_coverage_strategy(section: str, *, label: str = "Coverage Strategy") -> dict[str, Any]:
     result = parse_exact_contract_rows(
         section,
         label=label,
         scalar_keys=COVERAGE_STRATEGY_KEYS,
-        list_keys={"gates"},
-        optional_keys={"manifest_path"},
+        list_keys=set(),
+        optional_keys={"manifest_path", "gates"},
     )
     if "manifest_path" in result:
         result["manifest_path"] = _repo_path(
@@ -553,12 +575,6 @@ def parse_coverage_strategy(section: str, *, label: str = "Coverage Strategy") -
     _identity_namespace(result["automated_identity_namespace"], f"{label} automated_identity_namespace", "AUTO")
     _identity_namespace(result["manual_identity_namespace"], f"{label} manual_identity_namespace", "MANUAL")
     _capability_ids(result["capability_prerequisites"], f"{label} capability_prerequisites")
-    gates = set(result["gates"])
-    if not {"plan-before-engineering", "finalize-after-code-freeze"}.issubset(gates) or not gates.issubset(COVERAGE_GATES):
-        raise PlanContractError(
-            f"{label} gates must contain plan-before-engineering and finalize-after-code-freeze, "
-            "with optional qa-updated"
-        )
     return result
 
 
@@ -572,6 +588,7 @@ def parse_slice_coverage_contract(section: str, *, label: str) -> dict[str, Any]
     _identity_namespace(result["automated_identity_namespace"], f"{label} automated_identity_namespace", "AUTO")
     _identity_namespace(result["manual_identity_namespace"], f"{label} manual_identity_namespace", "MANUAL")
     _capability_ids(result["capability_prerequisites"], f"{label} capability_prerequisites")
+    parse_mandatory_identity_ids(result["mandatory_identity_ids"], label=f"{label} mandatory_identity_ids")
     for key in ("planned_manifest", "finalized_manifest"):
         if key in result:
             result[key] = _repo_path(result[key], f"{label} {key}")

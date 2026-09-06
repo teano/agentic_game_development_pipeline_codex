@@ -42,10 +42,9 @@ Feature scope, non-goals, protected systems, and authorized shared boundaries.
 
 - automated_identity_namespace: AUTO-FEATURE-*
 - manual_identity_namespace: MANUAL-FEATURE-*
-- mandatory_rule: explicit identity registration mapped to approved PRD-AC IDs
+- mandatory_rule: each required check or scenario has an exact AUTO/MANUAL identity mapped to approved PRD-AC IDs
 - automation_feasibility: exact boundary
 - capability_prerequisites: project-runtime-capability
-- gates: plan-before-engineering, finalize-after-code-freeze, qa-updated
 
 ## Documentation Strategy
 
@@ -54,6 +53,8 @@ Feature scope, non-goals, protected systems, and authorized shared boundaries.
 - source_rule: active DEC/PRD/spec IDs and exact verified evidence only
 
 ## Context Budget
+
+Working-set estimates for the Director and workers; numeric validation does not measure or enforce actual runtime context.
 
 - max_authority_files: 12
 - max_evidence_files: 20
@@ -89,7 +90,7 @@ Exact input revision, assumptions, and prerequisite evidence.
 
 ### Handoff Contract
 
-Controller-generated schema-2 handoff with exact revisions/change evidence plus decision_ids, coverage_state, documentation_state, and open_assumptions.
+Relevant approved sources and decisions, completed work, verification evidence, and unresolved assumptions needed by the next assigned owner. Use the actual runtime assignment and candidate context; do not invent a generated handoff object.
 
 ### Owned Paths
 
@@ -127,7 +128,7 @@ For a legitimately isolated slice, replace both touchpoint rows above with the e
 - acceptance_ids: PRD-AC-001
 - automated_identity_namespace: AUTO-SLICE-001-*
 - manual_identity_namespace: MANUAL-SLICE-001-*
-- mandatory_identity_ids: exact IDs or controller-validated derivation source
+- mandatory_identity_ids: AUTO-SLICE-001-CORE, MANUAL-SLICE-001-RUNTIME
 - automation_feasibility: exact automated boundary
 - capability_prerequisites: project-runtime-capability
 - amendment_authorities: DEC-*, normalized finding IDs, or approved scope rebaseline only
@@ -152,7 +153,7 @@ For a legitimately isolated slice, replace both touchpoint rows above with the e
 
 ### Verification and Exit Criteria
 
-Checks, acceptance evidence, and sealing conditions.
+For every mandatory identity above, state the required check or scenario, execution method, expected result, and acceptance evidence. These examples must be replaced with the actual slice requirements.
 
 ### Rollback and Recovery
 

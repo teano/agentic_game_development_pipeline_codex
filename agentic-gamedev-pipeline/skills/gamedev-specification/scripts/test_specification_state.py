@@ -9,6 +9,7 @@ import hashlib
 import importlib
 import importlib.util
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -150,7 +151,7 @@ class SpecificationStateTests(unittest.TestCase):
 
     def write_spec(
         self,
-        status: str = "draft",
+        status: str = "approved",
         suffix: str = "",
         nested_trace: bool = True,
         revision: int = 1,
@@ -329,6 +330,8 @@ Implement the exact approved behavior.
                 str(Path(controller.__file__).resolve()),
                 "--project-root",
                 str(self.root),
+                "--feature",
+                "sample-feature",
                 *arguments,
             ],
             text=True,
@@ -444,6 +447,22 @@ approved_at: 2026-08-10T00:00:00Z
 
 ## Slice SLICE-001
 
+### Owned Paths
+
+- src/example.txt
+
+### Expected Paths
+
+- docs/context.md
+
+### Scope Contract
+
+- editable_paths: src/example.txt
+
+### Coverage Contract
+
+- mandatory_identity_ids: AUTO-SLICE-001-CORE, MANUAL-SLICE-001-RUNTIME
+
 ### Context Capsule Budget
 
 - max_authority_files: 2
@@ -505,12 +524,8 @@ approved_at: 2026-08-10T00:00:00Z
 
     def bind_schema10_residue(self, ready: dict) -> Path:
         runtime_path = self.bind_direct_v2(ready)
-        state_dir = self.root / ".agentic-pipeline"
-        (state_dir / "state.json").write_text(
+        runtime_path.write_text(
             json.dumps({"schema_version": 10}), encoding="utf-8",
-        )
-        (state_dir / "findings.json").write_text(
-            json.dumps({"schema_version": 10, "items": []}), encoding="utf-8",
         )
         return runtime_path
     def complete_fresh_v2_reopen(self, report_path: str) -> dict:
@@ -526,7 +541,7 @@ approved_at: 2026-08-10T00:00:00Z
             self.args(architect_id="architect-2", proofreader_id="proofreader-2")
         )
         controller.command_record_proofread(
-            self.args(
+            self.proofread_args(
                 proofreader_id="proofreader-2",
                 critical=0,
                 major=0,
@@ -626,9 +641,11 @@ approved_at: 2026-08-10T00:00:00Z
         runtime = self.bind_direct_v2(ready)
         value = json.loads(runtime.read_text(encoding="utf-8"))
         candidate = {
-            "checkout_sha256": self.canonical_digest("direct checkout"),
-            "diff_sha256": self.canonical_digest("direct diff"),
+            "base_tree_oid": value["base_tree_oid"],
+            "candidate_tree_oid": value["base_tree_oid"],
+            "changed_paths": [],
             "authority_digest": value["authority"]["digest"],
+            "pipeline_runtime_digest": value["pipeline_runtime_digest"],
             "generation": True,
         }
         if location == "top-level":
@@ -646,14 +663,6 @@ approved_at: 2026-08-10T00:00:00Z
                 "assignment_id": "boolean-generation-artifact",
                 "worker": {"outcome": "blocked", "summary": "audit only"},
                 "candidate": candidate,
-            }
-        elif location == "gate candidate_base":
-            value["gates"]["boolean-generation-gate"] = {
-                "status": "closed",
-                "phase": "review",
-                "kind": "worker_result",
-                "reason": "fail",
-                "candidate_base": candidate,
             }
         else:  # pragma: no cover - test helper contract
             raise AssertionError(location)
@@ -716,6 +725,50 @@ approved_at: 2026-08-10T00:00:00Z
             architect_id="architect-other",
         )
 
+    def proofread_args(self, **values: object) -> Namespace:
+        """Write a real worker report; fixture counters are not controller inputs."""
+        state = controller.load_state(self.root, "sample-feature")
+        wave = state["active_wave"]
+        relative = str(values["report_path"])
+        if "/" not in relative:
+            relative = f"{state['workflow_path']}/proofreader-reports/{relative}"
+        report = self.root / relative
+        report.parent.mkdir(parents=True, exist_ok=True)
+        coverage = bool(values.get("coverage_complete", True))
+        resolvable = bool(values.get("minors_engineer_resolvable", False))
+        lines = [
+            f"PROOFREADER_ID: {values['proofreader_id']}",
+            f"PRD_SHA256: {state['prd']['sha256']}",
+            f"SPEC_SHA256: {wave['spec_sha256']}",
+            f"COVERAGE_COMPLETE: {'yes' if coverage else 'no'}",
+        ]
+        finding_ids = iter(values.get("finding_id", []))
+        for severity in ("critical", "major", "minor"):
+            for index in range(int(values.get(severity, 0))):
+                finding_id = next(finding_ids, f"F-{severity}-{index}")
+                lines.append(f"FINDINGS: {finding_id} | {severity.title()} | correctness | PRD-REQ-001 | Concrete evidence. | Required resolution.")
+        if not any(line.startswith("FINDINGS:") for line in lines):
+            lines.append("FINDINGS: none")
+        question_ids = iter(values.get("question_id", []))
+        questions = []
+        has_questions = False
+        for key in ("product", "scope", "boundary", "ownership", "public_contract"):
+            count = int(values.get(f"{key}_questions", 0))
+            has_questions = has_questions or count > 0
+            ids = [next(question_ids, f"Q-{key}-{index}") for index in range(count)]
+            questions.append(f"{key.replace('_', '-')}={','.join(ids) if ids else 'none'}")
+        verdict = "user-gate" if has_questions else "revise" if (
+            values.get("critical", 0) or values.get("major", 0) or not coverage
+            or values.get("minor", 0) and not resolvable
+        ) else "pass"
+        lines.extend([
+            "UNRESOLVED: " + " | ".join(questions),
+            f"MINORS_ENGINEER_RESOLVABLE: {'yes' if resolvable else 'no'}",
+            f"VERDICT: {verdict}",
+        ])
+        report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return self.args(proofreader_id=values["proofreader_id"], report_path=relative)
+
     def start_and_record(self, number: int, **overrides: object) -> None:
         controller.command_start_cycle(
             self.args(architect_id="architect-1", proofreader_id=f"proofreader-{number}")
@@ -759,7 +812,7 @@ approved_at: 2026-08-10T00:00:00Z
             values["question_id"] = [
                 f"SPEC-QUESTION-{index}" for index in range(1, question_count + 1)
             ]
-        controller.command_record_proofread(self.args(**values))
+        controller.command_record_proofread(self.proofread_args(**values))
 
     def test_init_marks_missing_spec_for_generation(self) -> None:
         state = self.initialize(with_spec=False)
@@ -792,7 +845,6 @@ approved_at: 2026-08-10T00:00:00Z
 
                 cli = self.cli(
                     "init",
-                    "--feature", "sample-feature",
                     "--prd", self.prd.relative_to(self.root).as_posix(),
                     "--spec", self.spec.relative_to(self.root).as_posix(),
                     "--architect-id", "architect-1",
@@ -803,7 +855,7 @@ approved_at: 2026-08-10T00:00:00Z
                 self.temp.cleanup()
                 self.setUp()
 
-    def test_accept_spec_rejects_invalid_legacy_prd_before_migration_direct_and_cli(self) -> None:
+    def test_accept_spec_rejects_legacy_state_without_migration_direct_and_cli(self) -> None:
         self.initialize(with_spec=False)
         self.prd.write_text(
             PRD.replace(
@@ -824,7 +876,7 @@ approved_at: 2026-08-10T00:00:00Z
 
         with self.assertRaisesRegex(
             controller.SpecificationStateError,
-            "legacy state approved PRD.*full approved requirements contract",
+            "unsupported specification state schema",
         ):
             self.accept_spec()
         self.assertEqual(before, state_path.read_bytes())
@@ -833,7 +885,7 @@ approved_at: 2026-08-10T00:00:00Z
             "accept-spec", "--preaccept-receipt", "missing-preaccept.json"
         )
         self.assertEqual(2, cli.returncode)
-        self.assertIn("full approved requirements contract", cli.stderr)
+        self.assertIn("unsupported specification state schema", cli.stderr)
         self.assertEqual(before, state_path.read_bytes())
 
     def test_accept_spec_requires_exact_current_prd_trace(self) -> None:
@@ -990,7 +1042,7 @@ approved_at: 2026-08-10T00:00:00Z
         self,
     ) -> None:
         self.initialize(with_spec=False)
-        self.write_spec(nested_trace=False)
+        self.write_spec(status="draft", nested_trace=False)
         valid = self.spec.read_text(encoding="utf-8")
         state = controller.load_state(self.root, "sample-feature")
         request_path = self.root / state["active_helper_request"]["path"]
@@ -1590,7 +1642,7 @@ print(json.dumps({{
         self.spec.write_text(
             f"""---
 document_type: technical-specification
-status: draft
+status: approved
 revision: 1
 language: English
 source_prd_path: docs/Features/template/sample-feature/product-requirements.md
@@ -1757,7 +1809,7 @@ None.
         controller.save_state(self.root, legacy)
         spec_before = self.spec.read_bytes()
 
-        record_args = self.args(
+        record_args = self.proofread_args(
             proofreader_id="proofreader-legacy",
             critical=0,
             major=0,
@@ -1846,7 +1898,7 @@ None.
             controller.SpecificationStateError, "predates the current specification acceptance"
         ):
             controller.command_record_proofread(
-                self.args(
+                self.proofread_args(
                     proofreader_id="proofreader-time",
                     critical=0,
                     major=0,
@@ -2121,6 +2173,125 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertEqual(len(state["waves"]), 5)
         self.assertEqual(len(state["hold_history"]), 1)
 
+    def test_preaccept_handoff_preserves_inputs_and_reconverges_through_public_cli(self) -> None:
+        for point in ("missing", "stale", "existing", "consumed"):
+            with self.subTest(point=point):
+                fixture = SpecificationStateTests()
+                fixture.setUp()
+                try:
+                    def call(*args: str) -> dict:
+                        result = fixture.cli(*args)
+                        self.assertEqual(0, result.returncode, result.stderr)
+                        return json.loads(result.stdout)
+
+                    if point == "existing":
+                        fixture.write_spec()
+                    elif point == "stale":
+                        fixture.write_spec()
+                        fixture.spec.write_text(
+                            fixture.spec.read_text(encoding="utf-8").replace(controller.sha256(fixture.prd), "0" * 64),
+                            encoding="utf-8",
+                        )
+                    call("init", "--prd", str(fixture.prd), "--spec", str(fixture.spec), "--architect-id", "architect-old")
+                    if point == "consumed":
+                        call("prepare-helper", "--operation", "generation")
+                        fixture.write_spec()
+                        fixture.write_fake_helper_result()
+                        call("record-helper-result")
+                    prior = call("status")
+                    prior_prd = fixture.prd.read_bytes()
+                    prior_spec = fixture.spec.read_bytes() if fixture.spec.exists() else None
+                    if point in {"existing", "consumed"}:
+                        old_receipt = fixture.write_preaccept_receipt()
+                    handed = call("handoff-architect", "--new-architect-id", "architect-fresh", "--decision-note", "old worker stopped before assessment")
+                    for key in ("status", "specification", "prd", "helper_evidence", "helper_history", "total_cycles_completed", "waves", "acceptance", "hold_history"):
+                        self.assertEqual(prior[key], handed[key], key)
+                    self.assertEqual(prior_prd, fixture.prd.read_bytes())
+                    self.assertEqual(prior_spec, fixture.spec.read_bytes() if fixture.spec.exists() else None)
+                    self.assertEqual("architect-old", handed["history"][-1]["prior_architects"][0]["id"])
+                    self.assertIn("architect-old", handed["identity_history"])
+                    self.assertEqual(["architect-fresh"], [owner["id"] for owner in handed["architects"]])
+                    state_path = controller.state_path(fixture.root, "sample-feature")
+                    before = state_path.read_bytes()
+                    alias = fixture.cli("handoff-architect", "--new-architect-id", " ARCHITECT-OLD ", "--decision-note", "reuse retired identity")
+                    self.assertEqual(2, alias.returncode)
+                    self.assertEqual(before, state_path.read_bytes())
+                    if point in {"existing", "consumed"}:
+                        rejected = fixture.cli("accept-spec", "--preaccept-receipt", str(old_receipt))
+                        self.assertEqual(2, rejected.returncode)
+                        self.assertIn("identity does not match", rejected.stderr)
+                    else:
+                        call("prepare-helper", "--operation", "generation")
+                        fixture.write_spec()
+                        fixture.write_fake_helper_result()
+                        call("record-helper-result")
+                    receipt = fixture.write_preaccept_receipt()
+                    call("accept-spec", "--preaccept-receipt", str(receipt))
+                    call("start-cycle", "--architect-id", "architect-fresh", "--proofreader-id", "proofreader-fresh")
+                    report = fixture.proofread_args(proofreader_id="proofreader-fresh", report_path="fresh.md")
+                    call("record-proofread", "--proofreader-id", report.proofreader_id, "--report-path", report.report_path)
+                    ready = call("confirm-ready", "--architect-id", "architect-fresh", "--confirmation", "same SHA")
+                    self.assertEqual("spec_ready", ready["status"])
+                    reopened = call("revise-ready", "--specification-only", "--architect-id", "architect-after-ready", "--reason", "sanctioned specification correction")
+                    self.assertEqual("awaiting_accept", reopened["status"])
+                    self.assertIn("architect-old", reopened["identity_history"])
+                finally:
+                    fixture.tearDown()
+
+    def test_preaccept_handoff_guards_are_byte_noops(self) -> None:
+        self.initialize(with_spec=False)
+        path = controller.state_path(self.root, "sample-feature")
+        def refuse(actor: str = "architect-fresh", note: str = "worker stopped") -> None:
+            before = path.read_bytes()
+            result = self.cli("handoff-architect", "--new-architect-id", actor, "--decision-note", note)
+            self.assertEqual(2, result.returncode, result.stdout)
+            self.assertEqual(before, path.read_bytes())
+        refuse()  # Issued helper keeps the writer guard.
+        self.write_spec()
+        self.write_fake_helper_result()
+        self.assertEqual(0, self.cli("record-helper-result").returncode)
+        refuse(" ARCHITECT-1 ")
+        refuse(note=" ")
+        original = self.spec.read_bytes()
+        self.spec.write_bytes(original + b"\nchanged output\n")
+        refuse()
+        self.spec.write_bytes(original)
+        original_prd = self.prd.read_bytes()
+        self.prd.write_bytes(original_prd + b"\nchanged authority\n")
+        refuse()
+        self.prd.write_bytes(original_prd)
+        runtime = controller.workflow_path(self.root, "sample-feature") / controller.RUNTIME_STATE_FILENAME
+        runtime.write_text("{}\n", encoding="utf-8")
+        refuse()
+        runtime.unlink()
+        self.accept_spec()
+        refuse()  # Accepted work still uses the established hold route.
+
+    def test_consumed_helper_survives_controller_upgrade_and_preaccept_handoff(self) -> None:
+        # Copy only the plugin into a disposable root; mutate no checked-out source.
+        with tempfile.TemporaryDirectory() as temporary:
+            plugin = Path(temporary) / "agentic-gamedev-pipeline"
+            shutil.copytree(Path(controller.__file__).resolve().parents[3], plugin)
+            copied = plugin / "skills/gamedev-specification/scripts/specification_state.py"
+            def call(*args: str) -> dict:
+                result = subprocess.run([sys.executable, "-B", str(copied), "--project-root", str(self.root), "--feature", "sample-feature", *args], capture_output=True, text=True)
+                self.assertEqual(0, result.returncode, result.stderr)
+                return json.loads(result.stdout)
+            call("init", "--prd", str(self.prd), "--spec", str(self.spec), "--architect-id", "architect-old")
+            call("prepare-helper", "--operation", "generation")
+            self.write_spec()
+            self.write_fake_helper_result()
+            consumed = call("record-helper-result")
+            old_source_sha = controller.sha256(copied)
+            copied.write_bytes(copied.read_bytes() + b"\n# disposable controller upgrade\n")
+            self.assertNotEqual(old_source_sha, controller.sha256(copied))
+            handed = call("handoff-architect", "--new-architect-id", "architect-new", "--decision-note", "old worker stopped")
+            self.assertEqual(consumed["helper_evidence"], handed["helper_evidence"])
+            receipt = self.write_preaccept_receipt()
+            accepted = call("accept-spec", "--preaccept-receipt", str(receipt))
+            self.assertEqual("architect-new", accepted["acceptance"]["accepted_by"])
+            self.assertEqual(consumed["helper_evidence"], accepted["acceptance"]["helper_evidence"])
+
     def test_handoff_preserves_global_history_and_resets_only_new_owner(self) -> None:
         self.test_attempted_sixth_cycle_enters_hold()
         state = controller.command_handoff(
@@ -2132,6 +2303,18 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertEqual(state["architects"][0]["cycles_completed"], 5)
         self.assertEqual(state["architects"][1]["cycles_completed"], 0)
         self.assertEqual(state["hold_history"][-1]["resolved_by"], "handoff-architect")
+        self.assertEqual("awaiting_accept", state["status"])
+        with self.assertRaisesRegex(controller.SpecificationStateError, "awaiting_accept"):
+            controller.command_start_cycle(
+                self.args(architect_id="architect-2", proofreader_id="proofreader-7")
+            )
+        before = self.spec.read_bytes()
+        self.accept_spec()
+        resumed = controller.command_start_cycle(
+            self.args(architect_id="architect-2", proofreader_id="proofreader-7")
+        )
+        self.assertEqual(6, resumed["active_wave"]["number"])
+        self.assertEqual(before, self.spec.read_bytes())
 
     def test_proofreader_identity_must_be_fresh_across_all_cycles(self) -> None:
         self.initialize()
@@ -2157,7 +2340,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             )
         )
         controller.command_record_proofread(
-            self.args(
+            self.proofread_args(
                 proofreader_id="  ＰＲＯＯＦＲＥＡＤＥＲ－１  ",
                 critical=0,
                 major=0,
@@ -2210,30 +2393,271 @@ PRD-REQ-001 is covered by the formatter and runner.
                         )
                     )
 
-    def test_proofreader_counts_require_exact_ids_and_report(self) -> None:
-        self.initialize()
-        controller.command_start_cycle(
-            self.args(architect_id="architect-1", proofreader_id="proofreader-1")
+    def test_draft_metadata_finalizes_before_acceptance_and_one_proofreader_wave(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec(status="draft")
+        self.consume_fake_helper_result()
+        receipt = self.write_preaccept_receipt()
+        state_path = controller.state_path(self.root, "sample-feature")
+        before = {path: path.read_bytes() for path in (state_path, self.spec, receipt)}
+        with self.assertRaisesRegex(controller.SpecificationStateError, "pre-accept helper correction"):
+            controller.command_accept_spec(self.args(
+                preaccept_receipt=receipt.relative_to(self.root).as_posix(),
+            ))
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+        state = controller.load_state(self.root, "sample-feature")
+        self.assertIsNone(state["acceptance"])
+        self.assertIsNone(state["active_wave"])
+        self.assertEqual([], state["waves"])
+
+        # The existing pre-accept route must remain available after refusal.
+        self.prepare_helper("correction", ["FINALIZE-APPROVED-METADATA"])
+        approved_bytes = before[self.spec].replace(b"status: draft", b"status: approved", 1)
+        self.assertNotEqual(before[self.spec], approved_bytes)
+        self.spec.write_bytes(approved_bytes)
+        self.consume_fake_helper_result()
+        accepted = self.accept_spec()
+        self.assertEqual(controller.sha256(self.spec), accepted["acceptance"]["specification_sha256"])
+        self.start_and_record(1, major=0)
+        ready = controller.command_confirm_ready(self.args(
+            architect_id="architect-1", confirmation="approved exact bytes checked once",
+        ))
+        self.assertEqual("spec_ready", ready["status"])
+        self.assertEqual(1, len(ready["waves"]))
+        self.assertEqual(approved_bytes, self.spec.read_bytes())
+        ready_before = state_path.read_bytes()
+        status_args = controller.build_parser().parse_args([
+            "--project-root", str(self.root), "--feature", "sample-feature", "status",
+        ])
+        self.assertEqual(ready, status_args.handler(status_args))
+        self.assertEqual(ready_before, state_path.read_bytes())
+
+    def test_preexisting_accepted_draft_keeps_its_existing_correction_route(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec(status="draft")
+        self.consume_fake_helper_result()
+        real_trace = controller.specification_trace
+
+        def prior_acceptance_trace(*args: object) -> tuple[dict, list]:
+            # Construct the former accepted-draft record; not a production bypass.
+            meta, drift = real_trace(*args)
+            return {**meta, "status": "approved"}, drift
+
+        with mock.patch.object(controller, "specification_trace", side_effect=prior_acceptance_trace):
+            self.accept_spec()
+        legacy = controller.load_state(self.root, "sample-feature")
+        legacy["specification"]["status"] = "draft"
+        controller.save_state(self.root, legacy)
+        draft_bytes = self.spec.read_bytes()
+        self.start_and_record(1, major=0)
+        with self.assertRaisesRegex(controller.SpecificationStateError, "status must be approved"):
+            controller.command_confirm_ready(self.args(
+                architect_id="architect-1", confirmation="draft is not ready",
+            ))
+        self.prepare_helper("correction", ["FINALIZE-LEGACY-METADATA"])
+        self.spec.write_bytes(draft_bytes.replace(b"status: draft", b"status: approved", 1))
+        self.consume_fake_helper_result()
+        controller.command_complete_cycle(self.args(
+            architect_id="architect-1", resolution_note="metadata finalized through helper",
+            user_decision_note=None,
+        ))
+        self.accept_spec()
+        self.start_and_record(2, major=0)
+        ready = controller.command_confirm_ready(self.args(
+            architect_id="architect-1", confirmation="fresh approved receipt and report",
+        ))
+        self.assertEqual("spec_ready", ready["status"])
+        self.assertEqual(2, len(ready["waves"]))
+
+    def test_proofreader_consumes_report_and_rejects_missing_or_invalid_evidence(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec(status="approved")
+        self.accept_spec()
+        controller.command_start_cycle(self.args(architect_id="architect-1", proofreader_id="proofreader-1"))
+        relative = ".agentic-pipeline/Workflows/sample-feature/proofreader-reports/proofreader-1.md"
+        args = self.args(proofreader_id="proofreader-1", report_path=relative)
+        before = controller.state_path(self.root, "sample-feature").read_bytes()
+        with self.assertRaisesRegex(controller.SpecificationStateError, "readable UTF-8"):
+            controller.command_record_proofread(args)
+        self.assertEqual(before, controller.state_path(self.root, "sample-feature").read_bytes())
+        args = self.proofread_args(proofreader_id="proofreader-1", report_path=relative)
+        report = self.root / relative
+        valid = report.read_text(encoding="utf-8")
+        bad_reports = (
+            "",
+            valid.replace("PROOFREADER_ID: proofreader-1", "PROOFREADER_ID: foreign"),
+            valid.replace(controller.sha256(self.prd), "0" * 64),
+            valid.replace(controller.sha256(self.spec), "0" * 64),
+            valid.replace("COVERAGE_COMPLETE: yes", "COVERAGE_COMPLETE: no"),
+            valid.replace("VERDICT: pass", "VERDICT: revise"),
+            valid + "VERDICT: pass\n",
         )
-        with self.assertRaisesRegex(controller.SpecificationStateError, "finding counts"):
-            controller.command_record_proofread(
-                self.args(
-                    proofreader_id="proofreader-1",
-                    critical=0,
-                    major=1,
-                    minor=0,
-                    product_questions=0,
-                    scope_questions=0,
-                    boundary_questions=0,
-                    ownership_questions=0,
-                    public_contract_questions=0,
-                    minors_engineer_resolvable=False,
-                    coverage_complete=True,
-                    report_path="proofreader-1.md",
-                    finding_id=[],
-                    question_id=[],
-                )
+        for malformed in bad_reports:
+            with self.subTest(report=malformed[:80]):
+                report.write_text(malformed, encoding="utf-8")
+                with self.assertRaises(controller.SpecificationStateError):
+                    controller.command_record_proofread(args)
+                self.assertEqual(before, controller.state_path(self.root, "sample-feature").read_bytes())
+        report.write_text(valid, encoding="utf-8")
+        recorded = controller.command_record_proofread(args)
+        self.assertEqual(controller.sha256(report), recorded["active_wave"]["proofread"]["report_sha256"])
+        recorded_before = controller.state_path(self.root, "sample-feature").read_bytes()
+        report.write_text(valid + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(controller.SpecificationStateError, "changed after recording"):
+            controller.command_confirm_ready(self.args(architect_id="architect-1", confirmation="confirm"))
+        self.assertEqual(recorded_before, controller.state_path(self.root, "sample-feature").read_bytes())
+        report.write_text(valid, encoding="utf-8")
+        ready = controller.command_confirm_ready(self.args(architect_id="architect-1", confirmation="same report"))
+        self.assertEqual("spec_ready", ready["status"])
+
+    def test_legacy_uncaptured_proofread_closes_without_credit_then_fresh_report_is_ready(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec(status="approved")
+        self.accept_spec()
+        self.start_and_record(1, major=0)
+        state = controller.load_state(self.root, "sample-feature")
+        state["active_wave"]["proofread"].pop("report_sha256")
+        controller.save_state(self.root, state)
+        before = controller.state_path(self.root, "sample-feature").read_bytes()
+        with self.assertRaisesRegex(controller.SpecificationStateError, "no consumed report"):
+            controller.command_confirm_ready(self.args(architect_id="architect-1", confirmation="not enough"))
+        self.assertEqual(before, controller.state_path(self.root, "sample-feature").read_bytes())
+        spec_before = self.spec.read_bytes()
+        controller.command_complete_cycle(self.args(architect_id="architect-1", resolution_note="Fresh report required", user_decision_note=None))
+        self.start_and_record(2, major=0)
+        ready = controller.command_confirm_ready(self.args(architect_id="architect-1", confirmation="current report confirmed"))
+        self.assertEqual("spec_ready", ready["status"])
+        self.assertEqual(spec_before, self.spec.read_bytes())
+
+    def test_report_derives_finding_and_question_counts_and_rejects_duplicate_ids(self) -> None:
+        self.initialize()
+        controller.command_start_cycle(self.args(architect_id="architect-1", proofreader_id="proofreader-1"))
+        args = self.proofread_args(
+            proofreader_id="proofreader-1", report_path="findings.md",
+            major=1, minor=1, finding_id=["F-MAJOR", "F-MINOR"],
+            product_questions=1, scope_questions=1, question_id=["Q-PRODUCT", "Q-SCOPE"],
+        )
+        state = controller.load_state(self.root, "sample-feature")
+        report = self.root / args.report_path
+        valid = report.read_text(encoding="utf-8")
+        before = controller.state_path(self.root, "sample-feature").read_bytes()
+        for malformed in (
+            valid.replace("F-MINOR", "F-MAJOR"),
+            valid.replace("Q-SCOPE", "Q-PRODUCT"),
+            valid.replace("Major |", "Unknown |"),
+            valid.replace("scope=Q-SCOPE", "product=Q-SCOPE"),
+        ):
+            report.write_text(malformed, encoding="utf-8")
+            with self.assertRaises(controller.SpecificationStateError):
+                controller.command_record_proofread(args)
+            self.assertEqual(before, controller.state_path(self.root, "sample-feature").read_bytes())
+        report.write_text(valid, encoding="utf-8")
+        result = controller.command_record_proofread(args)["active_wave"]["proofread"]
+        self.assertEqual((0, 1, 1), (result["critical"], result["major"], result["minor"]))
+        self.assertEqual(["F-MAJOR", "F-MINOR"], result["finding_ids"])
+        self.assertEqual(["Q-PRODUCT", "Q-SCOPE"], result["question_ids"])
+        self.assertEqual(1, result["questions"]["product"])
+        self.assertEqual(1, result["questions"]["scope"])
+
+    def test_specification_only_cli_reopens_consumed_blocker_without_runtime_credit(self) -> None:
+        ready = self.make_ready()
+        runtime = self.bind_direct_v2(ready)
+        public = controller._pipeline_v2_runner.Controller(
+            controller._pipeline_v2_transaction.StateStore(runtime)
+        )
+        product = self.root / "src/example.txt"
+        for phase in ("plan", "slice", "engineering"):
+            action = public.status()["next_action"]
+            issued = public.next(
+                command_id=action["command_id"], assignment=action["assignment"],
+                expected_generation=action["expected_generation"],
             )
+            output = self.root / issued["active_assignment"]["output_path"]
+            output.parent.mkdir(parents=True, exist_ok=True)
+            artifact = {"outcome": "pass", "summary": "Approved fixture plan/slice"}
+            if phase == "engineering":
+                product.parent.mkdir(exist_ok=True)
+                product.write_text("Retained feature candidate\n", encoding="utf-8")
+                artifact = {
+                    "outcome": "blocked", "summary": "Shared owner requires specification revision",
+                    "blocker": "Shared owner outside approved paths",
+                    "required_action": "Revise specification and plan before runtime recovery",
+                }
+            output.write_text(json.dumps(artifact), encoding="utf-8")
+            action = public.status()["next_action"]
+            public.complete(command_id=action["command_id"], expected_generation=action["expected_generation"])
+            if phase != "engineering":
+                action = public.status()["next_action"]
+                public.transition({"name": action["command"], "id": action["command_id"],
+                                   "expected_generation": action["expected_generation"]})
+        runtime_cli = Path(controller.__file__).resolve().parents[2] / "gamedev-pipeline/scripts/pipeline_state.py"
+        status = subprocess.run([
+            sys.executable, "-B", str(runtime_cli), "--root", str(self.root),
+            "--feature", "sample-feature", "status",
+        ], capture_output=True, text=True, check=False)
+        self.assertEqual(0, status.returncode, status.stderr)
+        view = json.loads(status.stdout)
+        self.assertIsNone(view["active_assignment"])
+        self.assertEqual([], view["open_questions"])
+        self.assertEqual("init", view["next_action"]["command"])
+        self.assertIs(True, view["next_action"]["user_input_required"])
+        unchanged = {p: p.read_bytes() for p in (runtime, self.prd, product)}
+        command = ("revise-ready", "--reason", "Sanctioned shared-owner correction",
+                   "--architect-id", "architect-2", "--specification-only")
+        # Actual checkout drift still blocks authoring without touching any bound bytes.
+        foreign = self.root / "foreign.txt"
+        foreign.write_text("unassigned change\n", encoding="utf-8")
+        before = {p: p.read_bytes() for p in (*unchanged, self.spec, controller.state_path(self.root, "sample-feature"))}
+        rejected = self.cli(*command)
+        self.assertNotEqual(0, rejected.returncode)
+        self.assertIn("checkout recovery", rejected.stderr)
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        foreign.unlink()
+        first = self.cli(*command)
+        self.assertEqual(0, first.returncode, first.stderr)
+        reopened = json.loads(first.stdout)
+        self.assertEqual("awaiting_accept", reopened["status"])
+        self.assertEqual(hashlib.sha256(unchanged[runtime]).hexdigest(),
+                         reopened["recovery_authorization"]["runtime_state_sha256"])
+        state_path = controller.state_path(self.root, "sample-feature")
+        after_reopen = {p: p.read_bytes() for p in (state_path, self.spec)}
+        replay = self.cli(*command)
+        self.assertEqual(0, replay.returncode, replay.stderr)
+        self.assertEqual(after_reopen, {p: p.read_bytes() for p in after_reopen})
+        final = self.complete_fresh_v2_reopen("blocked-fresh-report.md")
+        self.assertEqual("spec_ready", final["status"])
+        self.assertEqual(unchanged, {p: p.read_bytes() for p in unchanged})
+        self.assertEqual(view["next_action"]["blocker"], public.status()["next_action"]["blocker"])
+        self.assertIs(True, public.status()["next_action"]["user_input_required"])
+
+    def test_approved_prd_rewind_preserves_a_genuine_runtime_blocker(self) -> None:
+        ready = self.make_ready()
+        runtime = self.bind_direct_v2(ready)
+        public = controller._pipeline_v2_runner.Controller(
+            controller._pipeline_v2_transaction.StateStore(runtime)
+        )
+        action = public.status()["next_action"]
+        assigned = public.next(command_id=action["command_id"], assignment=action["assignment"])
+        output = self.root / assigned["active_assignment"]["output_path"]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({
+            "outcome": "blocked", "summary": "External dependency unavailable.",
+            "blocker": "External dependency unavailable.",
+            "required_action": "Change the prerequisite or revise approved authority.",
+        }), encoding="utf-8")
+        public.complete(command_id=public.status()["next_action"]["command_id"])
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        action = public.status()["next_action"]
+        self.assertEqual("init", action["command"])
+        self.assertIs(True, action["user_input_required"])
+        before = runtime.read_bytes()
+        revised = controller.command_revise_ready(self.args(
+            reason="Fresh approved product scope", architect_id="architect-2",
+            recovery_token=None, specification_only=False,
+        ))
+        self.assertEqual("awaiting_accept", revised["status"])
+        self.assertEqual(before, runtime.read_bytes())
+        self.assertEqual(action["blocker"], public.status()["next_action"]["blocker"])
 
     def test_ready_requires_clean_complete_same_sha_pass(self) -> None:
         self.initialize(with_spec=False)
@@ -2282,7 +2706,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             "changed during read-only proofreading",
         ):
             controller.command_record_proofread(
-                self.args(
+                self.proofread_args(
                     proofreader_id="proofreader-early-edit",
                     critical=0,
                     major=0,
@@ -2552,7 +2976,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             self.args(architect_id="architect-2", proofreader_id="proofreader-2")
         )
         controller.command_record_proofread(
-            self.args(
+            self.proofread_args(
                 proofreader_id="proofreader-2",
                 critical=0,
                 major=0,
@@ -2590,23 +3014,275 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertEqual("awaiting_accept", state["status"])
         self.assertEqual("architect-2", state["active_architect_id"])
 
-    def test_revise_in_progress_requires_recorded_active_wave(self) -> None:
+    def prepare_unfinished_specification(self, point: str) -> None:
+        if point in {"helper_issued", "helper_completed", "helper_partial"}:
+            self.initialize(with_spec=False)
+            if point == "helper_completed":
+                self.write_spec()
+                self.write_fake_helper_result()
+            elif point == "helper_partial":
+                self.spec.write_text("Interrupted helper draft without frontmatter.\n", encoding="utf-8")
+            return
+        if point in {"missing", "stale_input", "before_acceptance"}:
+            if point != "missing":
+                self.write_spec()
+                if point == "stale_input":
+                    self.spec.write_text(
+                        self.spec.read_text(encoding="utf-8").replace(
+                            "  revision: 3", "  revision: 2", 1
+                        ), encoding="utf-8",
+                    )
+            controller.command_init(self.args(
+                prd=self.prd.relative_to(self.root).as_posix(),
+                spec=self.spec.relative_to(self.root).as_posix(),
+                architect_id="architect-1",
+            ))
+            return
         self.initialize()
-        controller.command_start_cycle(
-            self.args(architect_id="architect-1", proofreader_id="proofreader-1")
-        )
-        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        if point in {"correction_issued", "correction_completed"}:
+            self.start_and_record(1)
+            self.prepare_helper("correction", ["SPEC-FINDING-1"])
+            if point == "correction_completed":
+                self.write_spec(revision=2, suffix="Corrected before authority changed.")
+                self.write_fake_helper_result()
+        elif point == "active_proofreader":
+            controller.command_start_cycle(self.args(
+                architect_id="architect-1", proofreader_id="proofreader-1"
+            ))
+        elif point in {"hold", "awaiting_accept"}:
+            for number in range(1, 6):
+                self.start_and_record(number)
+                controller.command_complete_cycle(self.args(
+                    architect_id="architect-1", resolution_note=f"round {number}",
+                    user_decision_note=None,
+                ))
+            with self.assertRaisesRegex(controller.SpecificationStateError, "sixth cycle"):
+                controller.command_start_cycle(self.args(
+                    architect_id="architect-1", proofreader_id="proofreader-6"
+                ))
+            if point == "awaiting_accept":
+                controller.command_handoff(self.args(
+                    new_architect_id="architect-handoff", decision_note="fresh owner"
+                ))
+
+    def test_revise_unfinished_states_reconverge_through_public_cli(self) -> None:
+        for point in (
+            "missing", "stale_input", "before_acceptance", "between_waves",
+            "active_proofreader", "hold", "awaiting_accept",
+            "helper_issued", "helper_completed", "helper_partial",
+            "correction_issued", "correction_completed",
+        ):
+            with self.subTest(point=point):
+                fixture = SpecificationStateTests("test_init_marks_missing_spec_for_generation")
+                fixture.setUp()
+                try:
+                    fixture.prepare_unfinished_specification(point)
+                    prior = controller.load_state(fixture.root, "sample-feature")
+                    old_bytes = fixture.spec.read_bytes() if fixture.spec.exists() else None
+                    fixture.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+                    rejected_helper = prior["active_helper_request"] is not None
+                    if rejected_helper:
+                        request_id = prior["active_helper_request"]["summary"]["request_id"]
+                        reject_args = [
+                            "reject-helper-result", "--request-id", request_id,
+                            "--reason", "approved PRD superseded completed helper work",
+                            "--helper-status", "completed" if point.endswith("completed") else "stopped",
+                            "--helper-evidence", "fixture helper ended; no live process owns this request",
+                        ]
+                        rejected = fixture.cli(*reject_args)
+                        self.assertEqual(0, rejected.returncode, rejected.stderr)
+                        rejected_state = json.loads(rejected.stdout)
+                        self.assertIsNone(rejected_state["active_helper_request"])
+                        self.assertEqual([], rejected_state["helper_evidence"]["results"])
+                        rejection = rejected_state["history"][-1]
+                        self.assertEqual(prior["active_helper_request"], rejection["request"])
+                        self.assertEqual(prior["acceptance"], rejection["prior_convergence"]["acceptance"])
+                        state_path = controller.state_path(fixture.root, "sample-feature")
+                        rejected_bytes = state_path.read_bytes()
+                        replay = fixture.cli(*reject_args)
+                        self.assertEqual(0, replay.returncode, replay.stderr)
+                        self.assertEqual(rejected_bytes, state_path.read_bytes())
+                        prior = rejected_state
+                    result = fixture.cli(
+                        "revise-in-progress", "--reason", "new approved PRD",
+                        "--architect-id", "architect-fresh",
+                    )
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    reopened = json.loads(result.stdout)
+                    generation = rejected_helper or point in {"missing", "stale_input"}
+                    self.assertEqual(
+                        "needs_generation" if generation else "awaiting_accept", reopened["status"]
+                    )
+                    self.assertEqual("4", reopened["prd"]["revision"])
+                    self.assertIsNone(reopened["acceptance"])
+                    self.assertIsNone(reopened["active_wave"])
+                    self.assertIsNone(reopened["ready"])
+                    self.assertEqual([], reopened["waves"])
+                    self.assertEqual(0, reopened["total_cycles_completed"])
+                    event = reopened["history"][-1]
+                    self.assertEqual(prior["active_wave"], event["prior_active_wave"])
+                    self.assertEqual(prior["acceptance"], event["prior_acceptance"])
+                    self.assertEqual(prior["hold"], event["prior_hold"])
+                    self.assertEqual(prior["helper_evidence"], event["prior_helper_evidence"])
+                    self.assertIn("architect-1", reopened["identity_history"])
+                    if generation:
+                        self.assertEqual(
+                            old_bytes, fixture.spec.read_bytes() if fixture.spec.exists() else None
+                        )
+                    stale_start = fixture.cli(
+                        "start-cycle", "--architect-id", "architect-fresh",
+                        "--proofreader-id", "proofreader-fresh",
+                    )
+                    self.assertEqual(2, stale_start.returncode)
+                    operation = "generation" if generation else "correction"
+                    helper = fixture.cli(
+                        "prepare-helper", "--operation", operation,
+                        *([] if generation else ["--correction-id", "C-NEW-PRD"]),
+                    )
+                    self.assertEqual(0, helper.returncode, helper.stderr)
+                    if generation:
+                        try:
+                            prior_revision = controller.exact_positive_revision(fixture.spec, "old fixture input")
+                        except (OSError, controller.SpecificationStateError):
+                            prior_revision = 0
+                        fixture.write_spec(revision=prior_revision + 1)
+                        fixture.spec.write_text(
+                            fixture.spec.read_text(encoding="utf-8").replace(
+                                "  revision: 3", "  revision: 4", 1
+                            ), encoding="utf-8",
+                        )
+                    else:
+                        fixture.spec.write_text(
+                            fixture.spec.read_text(encoding="utf-8").replace(
+                                "status: draft", "status: approved", 1
+                            ), encoding="utf-8",
+                        )
+                    fixture.write_fake_helper_result()
+                    consumed = fixture.cli("record-helper-result")
+                    self.assertEqual(0, consumed.returncode, consumed.stderr)
+                    receipt = fixture.write_preaccept_receipt()
+                    accepted = fixture.cli(
+                        "accept-spec", "--preaccept-receipt", str(receipt)
+                    )
+                    self.assertEqual(0, accepted.returncode, accepted.stderr)
+                    started = fixture.cli(
+                        "start-cycle", "--architect-id", "architect-fresh",
+                        "--proofreader-id", "proofreader-fresh",
+                    )
+                    self.assertEqual(0, started.returncode, started.stderr)
+                    report = fixture.proofread_args(
+                        proofreader_id="proofreader-fresh", report_path="fresh-revision.md"
+                    )
+                    recorded = fixture.cli(
+                        "record-proofread", "--proofreader-id", report.proofreader_id,
+                        "--report-path", report.report_path,
+                    )
+                    self.assertEqual(0, recorded.returncode, recorded.stderr)
+                    ready = fixture.cli(
+                        "confirm-ready", "--architect-id", "architect-fresh",
+                        "--confirmation", "fresh revision verified",
+                    )
+                    self.assertEqual(0, ready.returncode, ready.stderr)
+                    final = json.loads(ready.stdout)
+                    self.assertEqual("spec_ready", final["status"])
+                    self.assertEqual(controller.sha256(fixture.prd), final["ready"]["prd_sha256"])
+                    self.assertEqual("proofreader-fresh", final["ready"]["proofreader_id"])
+                finally:
+                    fixture.tearDown()
+
+    def test_unaccepted_rewind_preserves_authority_and_writer_guards(self) -> None:
+        self.prepare_unfinished_specification("missing")
         state_path = controller.state_path(self.root, "sample-feature")
-        state_before = state_path.read_bytes()
-        spec_before = self.spec.read_bytes()
+        original = state_path.read_bytes()
+        for revision, approved_at in ((3, "2099-08-11T00:00:00Z"), (4, "2020-01-01T00:00:00Z")):
+            self.write_full_approved_prd(revision, approved_at)
+            result = self.cli("revise-in-progress", "--reason", "revision",
+                              "--architect-id", "architect-fresh")
+            self.assertEqual(2, result.returncode)
+            self.assertEqual(original, state_path.read_bytes())
+            self.assertFalse(self.spec.exists())
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        self.spec.write_text("unexpected writer output", encoding="utf-8")
+        result = self.cli("revise-in-progress", "--reason", "revision",
+                          "--architect-id", "architect-fresh")
+        self.assertEqual(2, result.returncode)
+        self.assertIn("controller-recorded SHA", result.stderr)
+        self.assertEqual(original, state_path.read_bytes())
+        self.spec.unlink()
+        self.prd.write_text(PRD, encoding="utf-8")
+        self.prepare_helper("generation")
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        active_bytes = state_path.read_bytes()
+        result = self.cli("revise-in-progress", "--reason", "revision",
+                          "--architect-id", "architect-fresh")
+        self.assertEqual(2, result.returncode)
+        self.assertIn("helper", result.stderr)
+        self.assertEqual(active_bytes, state_path.read_bytes())
 
-        with self.assertRaisesRegex(controller.SpecificationStateError, "recorded Proofreader"):
-            controller.command_revise_in_progress(
-                self.args(reason="new approved PRD", architect_id="architect-2")
-            )
+    def test_superseded_helper_rejection_requires_terminal_evidence_and_new_authority(self) -> None:
+        self.prepare_unfinished_specification("helper_issued")
+        state_path = controller.state_path(self.root, "sample-feature")
+        original = state_path.read_bytes()
+        command = ["reject-helper-result", "--request-id", "HREQ-000001", "--reason", "superseded"]
+        for extra in (
+            [], ["--helper-status", "stopped"],
+            ["--helper-status", "running", "--helper-evidence", "still running"],
+            ["--helper-status", "completed", "--helper-evidence", ""],
+        ):
+            self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+            result = self.cli(*command, *extra)
+            self.assertEqual(2, result.returncode)
+            self.assertEqual(original, state_path.read_bytes())
+        terminal = ["--helper-status", "stopped", "--helper-evidence", "fixture worker stopped"]
+        for revision, approved_at in ((3, "2099-08-11T00:00:00Z"), (4, "2020-01-01T00:00:00Z")):
+            self.write_full_approved_prd(revision, approved_at)
+            result = self.cli(*command, *terminal)
+            self.assertEqual(2, result.returncode)
+            self.assertEqual(original, state_path.read_bytes())
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        request_path = state_path.parent / "helper-requests" / "HREQ-000001.json"
+        request_bytes = request_path.read_bytes()
+        request = json.loads(request_bytes)
+        request["allowed_write_paths"].append("foreign.txt")
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        result = self.cli(*command, *terminal)
+        self.assertEqual(2, result.returncode)
+        self.assertIn("write boundary", result.stderr)
+        self.assertEqual(original, state_path.read_bytes())
+        request_path.write_bytes(request_bytes)
+        (state_path.parent / "pipeline-state.json").write_text("{}", encoding="utf-8")
+        result = self.cli(*command, *terminal)
+        self.assertEqual(2, result.returncode)
+        self.assertIn("before runtime", result.stderr)
+        self.assertEqual(original, state_path.read_bytes())
 
-        self.assertEqual(state_before, state_path.read_bytes())
-        self.assertEqual(spec_before, self.spec.read_bytes())
+    def test_missing_specification_rewind_resumes_pending_finalization(self) -> None:
+        self.prepare_unfinished_specification("missing")
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        arguments = self.args(reason="new approved PRD", architect_id="architect-fresh")
+        original_save = controller.save_state
+        calls = 0
+
+        def interrupt_final_save(root: Path, state: dict) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("interrupted final state write")
+            original_save(root, state)
+
+        with mock.patch.object(controller, "save_state", side_effect=interrupt_final_save):
+            with self.assertRaisesRegex(OSError, "interrupted final"):
+                controller.command_revise_in_progress(arguments)
+        self.assertFalse(self.spec.exists())
+        with self.assertRaisesRegex(controller.SpecificationStateError, "exact original inputs"):
+            controller.command_revise_in_progress(self.args(
+                reason="different", architect_id="architect-fresh"
+            ))
+        resumed = controller.command_revise_in_progress(arguments)
+        self.assertEqual("needs_generation", resumed["status"])
+        self.assertEqual("4", resumed["prd"]["revision"])
+        self.assertEqual(1, len(resumed["history"]))
+        self.assertFalse(self.spec.exists())
 
     def test_revise_in_progress_rejects_reused_identity(self) -> None:
         self.prepare_in_progress_revision()
@@ -2697,8 +3373,8 @@ PRD-REQ-001 is covered by the formatter and runner.
 
     def test_revise_in_progress_rejects_runtime_binding_without_mutation(self) -> None:
         self.prepare_in_progress_revision()
-        state_dir = self.root / ".agentic-pipeline"
-        (state_dir / "state.json").write_text("{}\n", encoding="utf-8")
+        state_dir = controller.workflow_path(self.root, "sample-feature")
+        (state_dir / "pipeline-state.json").write_text("{}\n", encoding="utf-8")
         state_path = controller.state_path(self.root, "sample-feature")
         state_before = state_path.read_bytes()
         spec_before = self.spec.read_bytes()
@@ -2912,9 +3588,6 @@ PRD-REQ-001 is covered by the formatter and runner.
     def test_direct_v2_reopen_rejects_boolean_artifact_candidate_generation_without_mutation(self) -> None:
         self.assert_direct_v2_generation_poison_rejected("artifact candidate")
 
-    def test_direct_v2_reopen_rejects_boolean_gate_candidate_generation_without_mutation(self) -> None:
-        self.assert_direct_v2_generation_poison_rejected("gate candidate_base")
-
     def test_schema10_residue_requires_archive_and_fresh_plan_init(self) -> None:
         ready = self.make_ready()
         runtime = self.bind_schema10_residue(ready)
@@ -2926,7 +3599,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
         with self.assertRaisesRegex(
             controller.SpecificationStateError,
-            re.escape(plan_controller.SCHEMA10_UNSUPPORTED_MESSAGE),
+            "bound v2 specification lineage is invalid",
         ):
             controller.command_revise_ready(
                 self.args(
@@ -3387,7 +4060,7 @@ PRD-REQ-001 is covered by the formatter and runner.
     def test_unrelated_v2_directory_does_not_create_a_runtime_binding(self) -> None:
         self.initialize()
         runtime_directory = controller.workflow_path(self.root, "sample-feature")
-        runtime_directory.mkdir()
+        runtime_directory.mkdir(exist_ok=True)
         (runtime_directory / "diagnostics.json").write_text("{}\n", encoding="utf-8")
 
         state = controller.command_start_cycle(
@@ -3422,11 +4095,8 @@ PRD-REQ-001 is covered by the formatter and runner.
 
         self.assertEqual("awaiting_accept", reopened["status"])
 
-    def test_v2_reopen_rejects_ambiguous_malformed_and_foreign_binding(self) -> None:
+    def test_v2_reopen_rejects_malformed_and_foreign_binding(self) -> None:
         cases = {
-            "ambiguous": lambda runtime: (
-                runtime.parent / "other.json"
-            ).write_bytes(runtime.read_bytes()),
             "malformed": lambda runtime: self._rewrite_runtime(
                 runtime, lambda value: value.update({"generation": True})
             ),
@@ -3666,15 +4336,6 @@ PRD-REQ-001 is covered by the formatter and runner.
                     "user_input_required": False,
                 },
             },
-            "user-input": {
-                "active_assignment": None,
-                "open_questions": [],
-                "next_action": {
-                    "kind": "command",
-                    "command": "init",
-                    "user_input_required": True,
-                },
-            },
             "recovery": {
                 "active_assignment": None,
                 "open_questions": [],
@@ -3809,7 +4470,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             self.args(architect_id="architect-2", proofreader_id="proofreader-2")
         )
 
-        proofread_args = self.args(
+        proofread_args = self.proofread_args(
             proofreader_id="proofreader-2",
             critical=0,
             major=0,
@@ -3840,6 +4501,107 @@ PRD-REQ-001 is covered by the formatter and runner.
                 self.args(architect_id="architect-2", confirmation="exact SHA confirmed")
             )
         self.assertEqual(state_before, controller.state_path(self.root, "sample-feature").read_bytes())
+
+    def ready_after_helper_correction(self) -> dict:
+        self.initialize()
+        self.start_and_record(1, major=1, coverage_complete=True)
+        self.prepare_helper("correction", ["SPEC-FINDING-1"])
+        self.spec.write_text(self.spec.read_text(encoding="utf-8") + "\nPRD-REQ-001 corrected.\n", encoding="utf-8")
+        self.consume_fake_helper_result()
+        controller.command_complete_cycle(self.args(
+            architect_id="architect-1", resolution_note="Consumed helper correction",
+            user_decision_note=None,
+        ))
+        self.accept_spec()
+        self.start_and_record(2, major=0, coverage_complete=True)
+        return controller.command_confirm_ready(self.args(
+            architect_id="architect-1", confirmation="Corrected exact bytes confirmed",
+        ))
+
+    def test_ready_revision_archives_consumed_helper_correction_and_replays(self) -> None:
+        ready = self.ready_after_helper_correction()
+        runtime = self.bind_direct_v2(ready)
+        runtime_before = runtime.read_bytes()
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        args = self.args(reason="New approved PRD after correction", architect_id="architect-2",
+                         recovery_token=None, specification_only=False)
+        reopened = controller.command_revise_ready(args)
+        self.assertEqual("awaiting_accept", reopened["status"])
+        self.assertEqual(ready["waves"], reopened["history"][-1]["prior_waves"])
+        self.assertEqual(runtime_before, runtime.read_bytes())
+        before = controller.state_path(self.root, "sample-feature").read_bytes(), self.spec.read_bytes()
+        self.assertEqual(reopened, controller.command_revise_ready(args))
+        self.assertEqual(before, (controller.state_path(self.root, "sample-feature").read_bytes(), self.spec.read_bytes()))
+
+    def test_corrected_wave_pending_revision_resumes_before_and_after_spec_write(self) -> None:
+        for after_write in (False, True):
+            with self.subTest(after_write=after_write):
+                h = SpecificationStateTests("runTest")
+                h.setUp()
+                try:
+                    ready = h.ready_after_helper_correction()
+                    runtime = h.bind_direct_v2(ready)
+                    runtime_before = runtime.read_bytes()
+                    h.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+                    args = h.args(reason="Exact pending correction archive", architect_id="architect-2",
+                                  recovery_token=None, specification_only=False)
+                    real_write = controller.write_bytes_atomically
+                    def interrupted_write(path: Path, value: bytes) -> None:
+                        if after_write:
+                            real_write(path, value)
+                        raise OSError("interrupted specification write")
+                    with mock.patch.object(controller, "write_bytes_atomically", side_effect=interrupted_write):
+                        with self.assertRaisesRegex(OSError, "interrupted"):
+                            controller.command_revise_ready(args)
+                    pending = controller.load_state(h.root, "sample-feature")
+                    self.assertEqual("ready_revision_pending", pending["status"])
+                    self.assertEqual(ready["waves"], pending["ready_revision"]["prior_waves"])
+                    reopened = controller.command_revise_ready(args)
+                    self.assertEqual("awaiting_accept", reopened["status"])
+                    self.assertEqual(pending["ready_revision"], {k: v for k, v in reopened["history"][-1].items() if k != "event"})
+                    self.assertEqual(runtime_before, runtime.read_bytes())
+                finally:
+                    h.tearDown()
+
+    def test_malformed_correction_archive_refuses_before_pending_write(self) -> None:
+        ready = self.ready_after_helper_correction()
+        self.write_full_approved_prd(4, "2099-08-11T00:00:00Z")
+        state_path = controller.state_path(self.root, "sample-feature")
+        original = state_path.read_bytes()
+        args = self.args(reason="Reject malformed archive", architect_id="architect-2",
+                         recovery_token=None, specification_only=False)
+        mutations = {
+            "empty": lambda wave: wave.update(helper_correction_results=[]),
+            "unknown field": lambda wave: wave.update(unknown_receipt=True),
+            "broken input": lambda wave: wave["helper_correction_results"][0]["request"]["summary"]["specification"]["input"].update(sha256="0" * 64),
+            "broken output": lambda wave: wave["helper_correction_results"][-1]["result"]["summary"]["output_specification"].update(sha256="0" * 64),
+            "wrong request": lambda wave: wave["helper_correction_results"][0]["result"]["summary"]["request"].update(sha256="0" * 64),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                state = json.loads(original)
+                mutate(state["waves"][0])
+                controller.save_state(self.root, state)
+                before = state_path.read_bytes(), self.spec.read_bytes()
+                with self.assertRaisesRegex(controller.SpecificationStateError, "receipt is not canonical"):
+                    controller.command_revise_ready(args)
+                self.assertEqual(before, (state_path.read_bytes(), self.spec.read_bytes()))
+        state_path.write_bytes(original)
+        with mock.patch.object(controller, "write_bytes_atomically", side_effect=OSError("interrupted")):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                controller.command_revise_ready(args)
+        pending_bytes = state_path.read_bytes()
+        for label, mutate in mutations.items():
+            with self.subTest(pending=label):
+                pending = json.loads(pending_bytes)
+                mutate(pending["ready_revision"]["prior_waves"][0])
+                controller.save_state(self.root, pending)
+                before = state_path.read_bytes(), self.spec.read_bytes()
+                with self.assertRaisesRegex(controller.SpecificationStateError, "receipt is not canonical"):
+                    controller.command_revise_ready(args)
+                self.assertEqual(before, (state_path.read_bytes(), self.spec.read_bytes()))
+        state_path.write_bytes(pending_bytes)
+        self.assertEqual("awaiting_accept", controller.command_revise_ready(args)["status"])
 
     def test_pending_v2_reopen_replays_exactly_and_rejects_runtime_change(self) -> None:
         ready = self.make_ready()
@@ -3943,7 +4705,7 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertEqual(legacy, reopened["recovery_authorization"])
         self.assertEqual(legacy, reopened["history"][-1]["recovery_authorization"])
         self.assertIn("status: draft", self.spec.read_text(encoding="utf-8"))
-        self.assertEqual(2, reopened["schema_version"])
+        self.assertEqual(controller.SCHEMA_VERSION, reopened["schema_version"])
         self.assertEqual(
             hashlib.sha256(runtime.read_bytes()).hexdigest(),
             legacy["runtime_state_sha256"],
@@ -4002,7 +4764,7 @@ PRD-REQ-001 is covered by the formatter and runner.
         )
         self.assertEqual(legacy, receipt["recovery_authorization"])
         self.assertNotIn("revision_kind", legacy)
-        self.assertEqual(2, final["schema_version"])
+        self.assertEqual(controller.SCHEMA_VERSION, final["schema_version"])
 
     def test_released_v2_schema1_rejects_malformed_history_runtime_and_source_byte_noop(self) -> None:
         ready = self.make_ready()
@@ -4067,9 +4829,7 @@ PRD-REQ-001 is covered by the formatter and runner.
 
         ambiguous_runtime = runtime.with_name("ambiguous-released-schema1.json")
         ambiguous_runtime.write_bytes(runtime.read_bytes())
-        self.assert_committed_ready_replay_rejected_without_mutation(
-            arguments, "multiple v2|ambiguous", runtime, ambiguous_runtime
-        )
+        self.assert_committed_ready_replay_byte_noop(arguments, runtime, ambiguous_runtime)
         ambiguous_runtime.unlink()
 
         runtime_before = runtime.read_bytes()
@@ -4151,28 +4911,27 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertEqual(state_before, state_path.read_bytes())
         self.assertEqual(spec_before, self.spec.read_bytes())
 
-    def test_schema1_migrates_identity_history_and_preserves_alias_rejection(self) -> None:
+    def test_legacy_schema_rejects_without_migration_and_current_schema_keeps_alias_guards(self) -> None:
         self.initialize()
         state_path = controller.state_path(self.root, "sample-feature")
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        current = state_path.read_bytes()
+        state = json.loads(current)
         state["schema_version"] = 1
         state.pop("identity_history", None)
         state_path.write_text(json.dumps(state), encoding="utf-8")
-
+        legacy = state_path.read_bytes()
         cli = self.cli("status")
-        self.assertEqual(0, cli.returncode, cli.stderr)
-        self.assertEqual(controller.SCHEMA_VERSION, json.loads(cli.stdout)["schema_version"])
-        migrated = controller.load_state(self.root, "sample-feature")
-        self.assertEqual(controller.SCHEMA_VERSION, migrated["schema_version"])
-        self.assertIn("architect-1", migrated["identity_history"])
-        persisted = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(controller.SCHEMA_VERSION, persisted["schema_version"])
+        self.assertEqual(2, cli.returncode)
+        self.assertIn("unsupported specification state schema", cli.stderr)
+        self.assertEqual(legacy, state_path.read_bytes())
+        # Restoring the current fixture is not a controller migration.
+        state_path.write_bytes(current)
 
         controller.command_start_cycle(
             self.args(architect_id="architect-1", proofreader_id="proofreader-1")
         )
         controller.command_record_proofread(
-            self.args(
+            self.proofread_args(
                 proofreader_id="proofreader-1",
                 critical=0,
                 major=0,
@@ -4227,8 +4986,11 @@ PRD-REQ-001 is covered by the formatter and runner.
         self.assertIn("--recovery-token", help_result.stdout)
         self.assertIn("--specification-only", help_result.stdout)
         self.assertIn("v2 revisions", help_result.stdout)
-        self.assertIn("user_input_required=false", help_result.stdout)
         self.assertIn("tokenless", help_result.stdout)
+        self.assertIn("legacy runtime migration is unsupported", help_result.stdout)
+        self.assertIn("tokens are rejected", " ".join(help_result.stdout.split()))
+        self.assertNotIn("requires an exact legacy", help_result.stdout)
+        self.assertNotIn("authority_recovery_hold", help_result.stdout)
         alias_result = self.cli("reopen-ready", "--help")
         self.assertEqual(0, alias_result.returncode)
 
@@ -4280,7 +5042,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             self.assertIn("--specification-only", text)
             self.assertIn("token", text)
             self.assertIn("checkout recovery", text)
-            self.assertIn("user_input_required: false", text)
             self.assertIn("prior runtime requirements", text)
             self.assertIn("active assignment", text)
         self.assertIn("exact v2 state SHA", skill_text)

@@ -363,22 +363,12 @@ def save_state(root: Path, state: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def require_sources(
-    root: Path,
-    feature: str,
-    prd_path: str,
-    spec_path: str,
-    plan_path: str,
-    decision_ledger_path: str,
+def require_approved_source_artifacts(
+    root: Path, prd_path: str, spec_path: str,
 ) -> dict[str, Any]:
+    """Validate current approved source files without requiring stage state."""
     prd = resolve_project_path(root, prd_path, "PRD")
     spec = resolve_project_path(root, spec_path, "specification")
-    plan = resolve_project_path(root, plan_path, "development plan")
-    decision_ledger = resolve_project_path(
-        root, decision_ledger_path, "decision ledger"
-    )
-    if decision_ledger.exists() and not decision_ledger.is_file():
-        raise DevelopmentPlanError("decision ledger path must be a file or a creatable file path")
     prd_validation = _requirements_validator.validate(prd, True)
     if not prd_validation.get("valid"):
         raise DevelopmentPlanError(
@@ -407,6 +397,62 @@ def require_sources(
     }:
         raise DevelopmentPlanError("specification does not trace the exact current approved PRD")
 
+    return {
+        "prd": {"path": expected_prd_path, "revision": prd_revision, "sha256": prd_hash},
+        "specification": {
+            "path": spec.relative_to(root).as_posix(),
+            "revision": spec_meta["revision"], "sha256": spec_hash,
+        },
+    }
+
+
+def require_approved_authority_chain(
+    root: Path, authority_paths: dict[str, str],
+) -> dict[str, Any]:
+    """Reuse Planning's source parsers at Runtime's mutating admission boundary."""
+    sources = require_approved_source_artifacts(
+        root, authority_paths["requirements"], authority_paths["specification"],
+    )
+    plan = resolve_project_path(root, authority_paths["plan"], "development plan")
+    try:
+        meta, _ = _plan_contract.parse_development_plan_frontmatter(
+            plan.read_text(encoding="utf-8"), label="development plan",
+        )
+    except _plan_contract.PlanContractError as error:
+        raise DevelopmentPlanError(str(error)) from error
+    if meta["status"] != "approved":
+        raise DevelopmentPlanError("development plan must be approved")
+    require_approval_actor(meta["approved_by"])
+    for label, prefix, nested, expected in (
+        ("PRD", "source_prd", ("product_authority",), sources["prd"]),
+        ("specification", "source_spec", ("specification_authority",), sources["specification"]),
+    ):
+        if authority_trace(meta, prefix, nested) != expected:
+            raise DevelopmentPlanError(
+                f"development plan does not trace the exact current approved {label}"
+            )
+    return sources
+
+
+def require_sources(
+    root: Path,
+    feature: str,
+    prd_path: str,
+    spec_path: str,
+    plan_path: str,
+    decision_ledger_path: str,
+) -> dict[str, Any]:
+    spec = resolve_project_path(root, spec_path, "specification")
+    plan = resolve_project_path(root, plan_path, "development plan")
+    decision_ledger = resolve_project_path(
+        root, decision_ledger_path, "decision ledger"
+    )
+    if decision_ledger.exists() and not decision_ledger.is_file():
+        raise DevelopmentPlanError("decision ledger path must be a file or a creatable file path")
+    sources = require_approved_source_artifacts(root, prd_path, spec_path)
+    expected_prd_path = sources["prd"]["path"]
+    prd_hash = sources["prd"]["sha256"]
+    spec_hash = sources["specification"]["sha256"]
     specification_state = load_json(
         workflow_path(root, feature) / SPEC_STATE_FILENAME,
         "specification state",
@@ -436,16 +482,7 @@ def require_sources(
         raise DevelopmentPlanError("SPEC_READY evidence does not match current PRD/specification bytes")
 
     return {
-        "prd": {
-            "path": expected_prd_path,
-            "revision": prd_revision,
-            "sha256": prd_hash,
-        },
-        "specification": {
-            "path": spec.relative_to(root).as_posix(),
-            "revision": spec_meta["revision"],
-            "sha256": spec_hash,
-        },
+        **sources,
         "plan_path": plan.relative_to(root).as_posix(),
         "decision_ledger_path": decision_ledger.relative_to(root).as_posix(),
     }
@@ -1037,17 +1074,6 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
                 f"{slice_id} Context Capsule Budget exceeds global limits: "
                 + ", ".join(exceeded)
             )
-        handoff = sections.get("Handoff Contract", "")
-        for required_text in (
-            "schema-2",
-            "decision_ids",
-            "coverage_state",
-            "documentation_state",
-            "open_assumptions",
-        ):
-            if required_text not in handoff:
-                errors.append(f"{slice_id} Handoff Contract must contain {required_text}")
-
     try:
         require_complete_acceptance_coverage(
             slice_acceptance_by_id,

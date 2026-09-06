@@ -7,6 +7,29 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-06
+
+### Исправлено
+
+- Specification поддерживает пересмотр утверждённого PRD во время незавершённой генерации и review: прежняя authority и helper evidence архивируются без переноса readiness credit; superseded helper request закрывается только с зафиксированным terminal handoff, после чего выполняется свежая конвергенция.
+- Proofreader evidence теперь берётся из фактического UTF-8 отчёта с проверкой назначенного автора, PRD/spec SHA, findings и unresolved questions; controller хранит SHA отчёта и не выдаёт новый credit для отсутствующих или изменённых evidence bytes.
+- Передача Specification новому Architect требует его собственного exact-SHA preaccept и свежего acceptance. Добавлена ранняя передача до первого acceptance/review без искусственных циклов и hold.
+- QA pass требует точного набора обязательных identities из утверждённого плана и одного результата с evidence на каждую identity; пропуски, дубли, посторонние IDs, fail и not_run не дают phase credit. После Docs учитывается обязательное покрытие завершённых slices.
+- Замечания Review к документации возвращаются Documentation Finisher с утверждёнными путями; product Review и QA failures возвращаются Engineering. Владелец исправления определяется назначенной фазой и target, а не текстом finding.
+- Runtime reconfiguration сохраняет историю и retained Engineering paths, включает их в последующий scope и Review target и сбрасывает устаревший phase credit. Добавлены ограниченное принятие явно авторизованного prerequisite baseline после первого Engineering blocker и перепривязка idle run после отдельно разрешённого runtime maintenance.
+
+### Уточнено
+
+- Director после потребления результата worker продолжает разрешённый controller next_action; завершение отдельной фазы не завершает run. Ошибка формата возвращается тому же владельцу для исправления только artifact в неизменном assignment.
+- Technical questions допустимы только при pass и внутри согласованной authority; product/scope conflicts используют blocked с точным upstream decision. Сохраняются назначенные владельцы стадий, ограничения пользователя и источник каждого ограничения.
+- Engineering и QA могут применять доступные editor/computer tools в пределах соответствующих persistent и temporary прав. Перед действием требуется установить фактический эффект и destination; прежняя авторизация сохраняется для того же действия и назначения. Непроверенный production path не получает credit из fixture или aggregate tests.
+- Уточнены read-delivery после усечения вывода, сериализация утверждённых методов в caller-owned planned_commands и восстановление после blocker через существующий status/init при разрешённом prerequisite, включая source-grounded опровержение ошибочно заявленного authority conflict.
+- Planning documentation приведена к текущей schema 3 Specification и фактическим runtime механизмам: advisory capability IDs, context estimates, research briefs и handoff context не описываются как отсутствующие автоматические gates или generated state.
+
+### Совместимость
+
+- Coverage Contract требует непустой точный список mandatory_identity_ids; QA checks имеют форму {id, outcome, evidence}. record-proofread принимает назначенный Proofreader и путь к отчёту вместо дублирующих счётчиков и флагов результата.
+
 ## [0.15.0] - 2026-09-04
 
 ### Изменено

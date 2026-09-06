@@ -46,6 +46,7 @@ from .model import (
     slice_records,
     slices_are_read_sealed,
     status_view,
+    terminal_blocked_context,
     validate_state,
     workflow_relative_path,
 )
@@ -83,6 +84,18 @@ if _PLAN_CONTRACT_SPEC is None or _PLAN_CONTRACT_SPEC.loader is None:
 _PLAN_CONTRACT = importlib.util.module_from_spec(_PLAN_CONTRACT_SPEC)
 _PLAN_CONTRACT_SPEC.loader.exec_module(_PLAN_CONTRACT)
 
+_PLAN_AUTHORITY_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "gamedev-development-plan" / "scripts" / "development_plan_state.py"
+)
+_PLAN_AUTHORITY_SPEC = importlib.util.spec_from_file_location(
+    "gamedev_pipeline_plan_authority", _PLAN_AUTHORITY_PATH,
+)
+if _PLAN_AUTHORITY_SPEC is None or _PLAN_AUTHORITY_SPEC.loader is None:
+    raise RuntimeError("Cannot load the existing Planning authority validator")
+_PLAN_AUTHORITY = importlib.util.module_from_spec(_PLAN_AUTHORITY_SPEC)
+_PLAN_AUTHORITY_SPEC.loader.exec_module(_PLAN_AUTHORITY)
+
 
 def _require_expected_generation(value: Any) -> None:
     if value is not None and not is_strict_integer(value):
@@ -103,14 +116,15 @@ def _unsealed_projection(value: Any) -> list[dict[str, Any]]:
 
 def seal_slices_from_approved_plan(
     root: Path, plan_path: str, slices: Any, feature: str,
+    *, rebind_stored_paths: bool = False,
 ) -> list[dict[str, Any]]:
-    """Bind caller slices to controller-parsed approved write and read scopes."""
+    """Seal exact caller scope, or reproject stored scope during reconfiguration."""
     caller = _caller_slices(slices)
     plan = safe_path(root, plan_path, "approved development plan", strict=True)
     try:
         plan_text = plan.read_text(encoding="utf-8")
         contracts_by_id = _PLAN_CONTRACT.parse_slice_path_contracts(
-            plan_text, label=str(plan_path),
+            plan_text, label=str(plan_path), include_qa=True,
         )
     except (OSError, UnicodeError, _PLAN_CONTRACT.PlanContractError) as exc:
         raise PipelineError(f"cannot seal approved plan read scopes: {exc}") from exc
@@ -134,12 +148,15 @@ def seal_slices_from_approved_plan(
     sealed: list[dict[str, Any]] = []
     for item in caller:
         contract = contracts_by_id[item["id"]]
-        if item["allowed_paths"] != contract["write_paths"]:
+        if not rebind_stored_paths and item["allowed_paths"] != contract["write_paths"]:
             raise PipelineError(
                 "caller allowed_paths must exactly equal approved plan write_paths "
                 f"in order for {item['id']}"
             )
-        sealed.append({**item, "read_paths": deepcopy(contract["read_paths"])})
+        sealed.append({
+            **item, "allowed_paths": deepcopy(contract["write_paths"]),
+            "read_paths": deepcopy(contract["read_paths"]),
+        })
     return sealed
 
 
@@ -291,6 +308,44 @@ class Controller:
             changes = [path for path in changes if path_identity(path) not in authority_paths]
         return changes
 
+    @staticmethod
+    def _can_admit_early_blocked_baseline(
+        state: dict[str, Any], root: Path, current: str,
+        observed_authority: dict[str, dict[str, str]],
+    ) -> bool:
+        """Admit a committed prerequisite baseline only before the first product work."""
+        if (
+            state["phase"] != "engineering"
+            or terminal_blocked_context(state) is None
+            or set(state["artifacts"]) != {"plan", "slice", "engineering"}
+            or sum(item.get("command") == "init" for item in state["history"]) != 1
+            or sum(
+                item.get("command") == "complete" and item.get("phase") == "engineering"
+                for item in state["history"]
+            ) != 1
+        ):
+            return False
+        for record in state["artifacts"].values():
+            controller = record.get("controller", {})
+            if (
+                record.get("controller_failure") is not None
+                or controller.get("base_tree_oid") != state["base_tree_oid"]
+                or controller.get("candidate_tree_oid") != state["base_tree_oid"]
+                or controller.get("changed_paths") != []
+                or controller.get("violations") != []
+            ):
+                return False
+        try:
+            _PLAN_AUTHORITY.require_approved_authority_chain(
+                root, {name: item["path"] for name, item in observed_authority.items()},
+            )
+            return require_clean_head(root) == current
+        except (
+            PipelineError, _PLAN_AUTHORITY.DevelopmentPlanError,
+            OSError, UnicodeError, KeyError,
+        ):
+            return False
+
     def _verify_live_checkout(
         self, state: dict[str, Any], root: Path,
     ) -> str:
@@ -316,7 +371,9 @@ class Controller:
             validate_state(state)
             root = canonical_project_root(state["project_root"])
             self.store.validate_project_location(root, state["feature"])
-            if pipeline_runtime_digest() != state["pipeline_runtime_digest"]:
+            runtime_digest = pipeline_runtime_digest()
+            runtime_changed = runtime_digest != state["pipeline_runtime_digest"]
+            if runtime_changed and state["active_assignment"] is not None:
                 raise PipelineError(
                     "pipeline runtime changed during the run; stop and perform a fresh init"
                 )
@@ -328,12 +385,13 @@ class Controller:
                 observed, state["authority"]["items"],
             )
             scope_changed = not slices_are_read_sealed(state)
+            terminal_recovery = terminal_blocked_context(state)
             proposed_slices = None
-            if authority_changed or scope_changed:
+            if authority_changed or scope_changed or runtime_changed:
                 proposed_slices = seal_slices_from_approved_plan(
                     root, observed["plan"]["path"],
                     _unsealed_projection(state["slices"]),
-                    state["feature"],
+                    state["feature"], rebind_stored_paths=True,
                 )
                 scope_changed = proposed_slices != state["slices"]
             current = candidate_tree_oid(root)
@@ -341,22 +399,46 @@ class Controller:
             drift = self._checkout_drift(
                 state, root, current, ignore_authority=authority_changed,
             )
+            admit_baseline = (
+                self._can_admit_early_blocked_baseline(state, root, current, observed)
+                if drift and not policy else False
+            )
             view = status_view(state)
             if policy:
                 view["next_action"] = {
                     "kind": "terminal", "result": "fresh_init_required",
                     "reason": "repository policy changed: " + ", ".join(policy),
                 }
-            elif drift:
+            elif drift and not admit_baseline:
                 view["next_action"] = {
                     "kind": "terminal", "result": "checkout_recovery_required",
                     "reason": f"restore or reconcile checkout drift before mutation: {drift}",
                 }
-            elif authority_changed or scope_changed:
-                view["next_action"] = reconfiguration_action(
+            elif (
+                authority_changed or scope_changed or runtime_changed
+                or terminal_recovery is not None
+            ):
+                action = reconfiguration_action(
                     state, observed, proposed_slices,
                     candidate_tree_oid=current,
+                    pipeline_runtime_digest=runtime_digest,
                 )
+                if terminal_recovery is not None:
+                    action.update({
+                        **terminal_recovery,
+                        "reason": (
+                            "execute this exact init only after authority or capability evidence resolves "
+                            "the recorded prerequisite under the shared stage-handoff invariant; "
+                            "restart at plan and preserve terminal history"
+                        ),
+                        "user_input_required": True,
+                    })
+                    if admit_baseline:
+                        action["reason"] += (
+                            "; accept this committed prerequisite baseline only after explicit "
+                            "authorization: the first blocked Engineering attempt recorded no product changes"
+                        )
+                view["next_action"] = action
             return view
 
     def next(self, *, command_id: str, assignment: dict[str, Any] | None = None, expected_generation: int | None = None) -> dict[str, Any]:
@@ -455,7 +537,7 @@ class Controller:
             runtime_digest = pipeline_runtime_digest()
             if state is not None:
                 validate_state(state)
-                if runtime_digest != state["pipeline_runtime_digest"]:
+                if runtime_digest != state["pipeline_runtime_digest"] and state["active_assignment"] is not None:
                     raise PipelineError(
                         "pipeline runtime changed during the run; stop and perform a fresh init"
                     )
@@ -482,6 +564,15 @@ class Controller:
             proposed_items = value.get("authority", {}).get("items", {})
             if not isinstance(proposed_items, dict) or "plan" not in proposed_items:
                 raise PipelineError("init requires controller-resolved authority paths")
+            try:
+                _PLAN_AUTHORITY.require_approved_authority_chain(
+                    root, {name: item["path"] for name, item in proposed_items.items()},
+                )
+            except (_PLAN_AUTHORITY.DevelopmentPlanError, OSError, UnicodeError, KeyError) as error:
+                raise PipelineError(
+                    "approved authority chain is not ready; reconverge requirements, "
+                    f"specification, and plan before init: {error}"
+                ) from error
             if state is None:
                 value["slices"] = seal_slices_from_approved_plan(
                     root, proposed_items["plan"]["path"], value.get("slices"),
@@ -491,15 +582,16 @@ class Controller:
                 base_slices = _unsealed_projection(state["slices"])
                 proposed_slices = seal_slices_from_approved_plan(
                     root, proposed_items["plan"]["path"], base_slices,
-                    feature,
+                    feature, rebind_stored_paths=True,
                 )
                 supplied_slices = value.get("slices")
-                if supplied_slices not in (base_slices, proposed_slices):
+                if supplied_slices not in (_unsealed_projection(proposed_slices), proposed_slices):
                     raise PipelineError(
                         "init slices must match the controller-projected status action"
                     )
                 value["slices"] = proposed_slices
             current = require_clean_head(root) if state is None else candidate_tree_oid(root)
+            admit_baseline = False
             if state is not None:
                 policy = repository_policy_changed(root, state["base_tree_oid"], current)
                 if policy:
@@ -515,14 +607,24 @@ class Controller:
                     state, root, current, ignore_authority=authority_changed,
                 )
                 if drift:
+                    admit_baseline = self._can_admit_early_blocked_baseline(
+                        state, root, current, value["authority"]["items"],
+                    )
+                if drift and not admit_baseline:
                     if state.get("active_assignment") is not None:
                         raise PipelineError(f"candidate changed forbidden paths: {drift}")
                     raise PipelineError(f"live checkout drifted from controller evidence: {drift}")
                 scope_changed = value["slices"] != state["slices"]
-                if authority_changed or scope_changed:
+                terminal_recovery = terminal_blocked_context(state)
+                if (
+                    authority_changed or scope_changed
+                    or runtime_digest != state["pipeline_runtime_digest"]
+                    or terminal_recovery is not None
+                ):
                     expected = reconfiguration_action(
                         state, value["authority"]["items"], value.get("slices"),
                         candidate_tree_oid=current,
+                        pipeline_runtime_digest=runtime_digest,
                     )
                     if value.get("id") != expected["command_id"]:
                         raise PipelineError(
@@ -552,6 +654,8 @@ class Controller:
                     "changed_paths": changes,
                     "violations": violations(changes, active["access"]["write"]),
                 }
+            if admit_baseline and require_clean_head(root) != current:
+                raise PipelineError("committed prerequisite baseline changed; run status again")
             return self.store._dispatch_locked(value)
 
     def migrate(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -615,7 +719,13 @@ class Controller:
                 return checked
             if active is None:  # pragma: no cover - conflicting replay is reported above
                 raise PipelineError("there is no active assignment")
-            artifact = _worker_artifact(artifact, active["phase"], active["role"])
+            required_ids = (
+                default_assignment(state)["context"]["required_identity_ids"]
+                if active["phase"] == "qa" else None
+            )
+            if required_ids is not None and active["capsule"]["context"].get("required_identity_ids") != required_ids:
+                raise PipelineError("QA assignment identities no longer match approved authority")
+            artifact = _worker_artifact(artifact, active["phase"], active["role"], required_ids)
             results = []
 
             def run_checks(

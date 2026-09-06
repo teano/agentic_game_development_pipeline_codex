@@ -19,6 +19,7 @@ from .model import (
     candidate_record_valid,
     canonical_command,
     command_intent_digest,
+    completed_slice_ids,
     compact_assignment_context,
     current_candidate,
     current_slice,
@@ -32,8 +33,13 @@ from .model import (
     new_state,
     passing_artifact,
     pending,
+    qa_coverage_complete,
+    qa_credit_complete,
+    retained_engineering_paths,
+    required_qa_identity_ids,
     slice_records,
     slices_are_read_sealed,
+    terminal_blocked_context,
     validate_state,
 )
 
@@ -75,7 +81,9 @@ def _contains_forbidden(value: Any) -> str | None:
     return None
 
 
-def _worker_artifact(value: Any, phase: str, role: str) -> dict[str, Any]:
+def _worker_artifact(
+    value: Any, phase: str, role: str, required_identity_ids: list[str] | None = None,
+) -> dict[str, Any]:
     schema = artifact_schema(phase, role)
     allowed = set(schema["allowed_keys"])
     required = set(schema["required_keys"])
@@ -92,7 +100,7 @@ def _worker_artifact(value: Any, phase: str, role: str) -> dict[str, Any]:
     for key in ("assumptions", "checks"):
         if key in value and not isinstance(value[key], list):
             raise PipelineError(f"worker {key} must be a list")
-    for key in ("assumptions", "checks"):
+    for key in ("assumptions",):
         if key in value and any(not isinstance(item, str) or not item.strip() for item in value[key]):
             raise PipelineError(f"worker {key} must contain non-empty strings")
     if phase == "review":
@@ -109,10 +117,26 @@ def _worker_artifact(value: Any, phase: str, role: str) -> dict[str, Any]:
             raise PipelineError("failed Review requires at least one finding")
     if phase == "qa":
         checks = value.get("checks")
-        if not isinstance(checks, list):
-            raise PipelineError("QA checks are required")
+        if not isinstance(checks, list) or any(
+            not isinstance(item, dict) or set(item) != {"id", "outcome", "evidence"}
+            or not isinstance(item.get("id"), str) or not item["id"].strip()
+            or item.get("outcome") not in {"pass", "fail", "not_run"}
+            or not isinstance(item.get("evidence"), str) or not item["evidence"].strip()
+            for item in checks
+        ):
+            raise PipelineError("QA checks require exact id, outcome (pass|fail|not_run), and non-empty execution evidence")
+        identities = [item["id"] for item in checks]
+        if len(identities) != len(set(identities)):
+            raise PipelineError("QA checks contain duplicate identity IDs")
         if value["outcome"] != "blocked" and not checks:
             raise PipelineError("QA pass/fail requires at least one check")
+        if required_identity_ids is not None:
+            if set(identities) - set(required_identity_ids):
+                raise PipelineError("QA checks contain identities outside the approved assignment")
+            if value["outcome"] == "pass" and not qa_coverage_complete({
+                "required_identity_ids": required_identity_ids, "worker": value,
+            }):
+                raise PipelineError("QA pass requires the exact mandatory identity set with every outcome pass")
     if value["outcome"] == "blocked":
         _require_text(value.get("blocker"), "blocker")
         _require_text(value.get("required_action"), "required action")
@@ -123,6 +147,8 @@ def _worker_artifact(value: Any, phase: str, role: str) -> dict[str, Any]:
         not isinstance(item, str) or not item.strip() for item in questions
     ):
         raise PipelineError("worker questions must be non-empty strings")
+    if questions and value["outcome"] != "pass":
+        raise PipelineError("questions are for passing technical clarifications only; use blocker/required_action for authority conflicts")
     return value
 
 
@@ -302,8 +328,8 @@ del _proof_protocol
 
 
 def _latest_remediation_candidate(state: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the newest artifact-bound, noncredit candidate for Engineering."""
-    if state.get("phase") != "engineering" or state.get("active_assignment") is not None:
+    """Return the newest artifact-bound, noncredit candidate for its existing writer."""
+    if state.get("phase") not in {"engineering", "docs"} or state.get("active_assignment") is not None:
         return None
     last_completed_slice_generation = max(
         (
@@ -314,15 +340,16 @@ def _latest_remediation_candidate(state: dict[str, Any]) -> dict[str, Any] | Non
         default=-1,
     )
     candidates: list[tuple[int, int, dict[str, Any]]] = []
-    for phase in ("engineering", "review", "qa"):
+    owner = state["phase"]
+    for phase in (owner, "review", "qa"):
         item = state["artifacts"].get(phase)
         worker = item.get("worker") if isinstance(item, dict) else None
         candidate = (
-            item.get("candidate") if phase == "engineering" and isinstance(item, dict)
+            item.get("candidate") if phase == owner and isinstance(item, dict)
             else item.get("candidate_binding") if isinstance(item, dict) else None
         )
         noncredit = (
-            phase == "engineering"
+            phase == owner
             and isinstance(worker, dict)
             and (
                 worker.get("outcome") != "pass"
@@ -377,6 +404,8 @@ def _verification_failure_context(
                 item["findings"] = deepcopy(worker.get("findings", []))
             else:
                 item["checks"] = deepcopy(worker.get("checks", []))
+            if isinstance(record.get("review_target"), dict):
+                item["review_target"] = deepcopy(record["review_target"])
             if isinstance(record.get("controller_failure"), dict):
                 item["controller_failure"] = deepcopy(record["controller_failure"])
             failures.append((candidate["generation"], PHASES.index(phase), item))
@@ -388,9 +417,20 @@ def _engineering_candidate_diff_base(
 ) -> str:
     """Keep accepted Engineering deltas cumulative across nonpassing retries."""
     execution_base = active["base"]["candidate_tree_oid"]
-    if active.get("phase") != "engineering":
+    if active.get("phase") not in {"engineering", "docs"}:
         return execution_base
     binding = active.get("capsule", {}).get("candidate")
+    failure = active.get("capsule", {}).get("context", {}).get("verification_failure", {})
+    documentation_origin = failure.get("review_target", {}).get("kind") == "documentation_changes"
+    if active["phase"] == "engineering" and documentation_origin:
+        # Product QA failed after Docs: the reviewed Docs bytes are the execution
+        # baseline, not product changes that the Engineer must rewrite.
+        return execution_base
+    if active["phase"] == "docs":
+        prior_docs = state["artifacts"].get("docs", {})
+        if binding is not None and (prior_docs.get("candidate") == binding or documentation_origin):
+            return binding["base_tree_oid"]
+        return execution_base
     last_completed_slice_generation = max(
         (
             item["generation"] for item in state["history"]
@@ -433,15 +473,6 @@ def _validate_interrupted_assignment(state: dict[str, Any], evidence: Any) -> di
     }
 
 
-def _interrupted_paths(state: dict[str, Any]) -> list[str]:
-    for item in reversed(state["history"]):
-        if item.get("command") == "init" and item.get("result") == "authority_scope_reconfigured":
-            prior = item.get("prior", {})
-            paths = prior.get("interrupted_paths", []) if isinstance(prior, dict) else []
-            return paths if isinstance(paths, list) else []
-    return []
-
-
 def _controller_checkout_baseline(
     authority_digest: str, pipeline_runtime_digest: str, value: Any,
 ) -> dict[str, Any] | None:
@@ -475,9 +506,7 @@ def _controller_checkout_baseline(
     }
 
 
-def _retained_candidate_evidence(
-    state: dict[str, Any], authority_digest: str,
-) -> dict[str, Any]:
+def _retained_candidate_evidence(state: dict[str, Any]) -> dict[str, Any]:
     """Keep the latest accepted candidate record as non-credit audit evidence."""
     candidate = current_candidate(state)
     if candidate is None:
@@ -486,8 +515,7 @@ def _retained_candidate_evidence(
         record = state["artifacts"].get(phase)
         if isinstance(record, dict) and record.get("candidate") == candidate:
             retained = deepcopy(record)
-            if candidate["authority_digest"] != authority_digest:
-                retained.pop("candidate")
+            retained.pop("candidate")
             return {phase: retained}
     return {}
 
@@ -547,13 +575,15 @@ def _reduce_command(
                 base_tree_oid=command["controller_base"]["candidate_tree_oid"],
                 pipeline_runtime_digest=command["pipeline_runtime_digest"],
             )
-            if (
+            unchanged_bindings = (
                 authority_items_equal(
                     proposed["authority"]["items"], state["authority"]["items"],
                 )
                 and proposed["slices"] == state["slices"]
-            ):
-                raise PipelineError("reconfiguration did not change authority or scope")
+                and proposed["pipeline_runtime_digest"] == state["pipeline_runtime_digest"]
+            )
+            if unchanged_bindings and terminal_blocked_context(state) is None:
+                raise PipelineError("reconfiguration did not change authority, scope, or runtime")
             baseline = _controller_checkout_baseline(
                 proposed["authority"]["digest"], proposed["pipeline_runtime_digest"],
                 command.get("controller_base"),
@@ -584,9 +614,7 @@ def _reduce_command(
                 prior["open_questions"] = {
                     key: deepcopy(state["questions"][key]) for key in pending(state["questions"])
                 }
-            retained_artifacts = _retained_candidate_evidence(
-                state, proposed["authority"]["digest"],
-            )
+            retained_artifacts = _retained_candidate_evidence(state)
             if baseline is not None:
                 retained_artifacts["plan"] = baseline
             work.update({
@@ -682,12 +710,12 @@ def _reduce_command(
         ):
             raise PipelineError("next requires a controller-derived Git candidate base")
         candidate = current_candidate(work)
-        if phase == "engineering":
+        if phase in {"engineering", "docs"}:
             remediation_candidate = _latest_remediation_candidate(work)
             candidate = remediation_candidate or candidate
         engineering_base_tree = candidate.get("candidate_tree_oid") if candidate is not None else None
         if (
-            phase == "engineering" and candidate is not None
+            phase in {"engineering", "docs"} and candidate is not None
             and engineering_base_tree != base["candidate_tree_oid"]
         ):
             raise PipelineError("engineering Git candidate drifted from its retained base")
@@ -705,10 +733,18 @@ def _reduce_command(
             raise PipelineError(
                 "review target is controller-derived and must match status.next_action"
             )
+        if phase == "qa" and context not in ({}, canonical["context"]):
+            raise PipelineError("QA required identities are controller-derived")
         context = deepcopy(context)
         context["current_slice"] = current_slice(work)
         if phase == "review":
             context["review_target"] = deepcopy(canonical["context"]["review_target"])
+        if phase == "qa":
+            expected_context = canonical["context"]
+            context.update(deepcopy(expected_context))
+            prior_target = work["artifacts"].get("review", {}).get("review_target")
+            if isinstance(prior_target, dict):
+                context["review_target"] = deepcopy(prior_target)
         verification_failure = _verification_failure_context(work, candidate)
         if verification_failure is not None:
             context["verification_failure"] = verification_failure
@@ -739,7 +775,13 @@ def _reduce_command(
         active = work["active_assignment"]
         if active is None:
             raise PipelineError("there is no active assignment")
-        artifact = _worker_artifact(command.get("artifact"), active["phase"], active["role"])
+        required_ids = (
+            default_assignment(work)["context"]["required_identity_ids"]
+            if active["phase"] == "qa" else None
+        )
+        if required_ids is not None and active["capsule"]["context"].get("required_identity_ids") != required_ids:
+            raise PipelineError("QA assignment identities no longer match approved authority")
+        artifact = _worker_artifact(command.get("artifact"), active["phase"], active["role"], required_ids)
         forbidden = _contains_forbidden(artifact)
         if forbidden:
             raise PipelineError(f"worker artifact contains controller-owned field {forbidden!r}")
@@ -764,9 +806,17 @@ def _reduce_command(
         questions = artifact.get("questions", [])
         record = {"assignment_id": active["id"], "worker": deepcopy(artifact), "controller": evidence}
         record["candidate_binding"] = deepcopy(active["capsule"].get("candidate"))
+        if required_ids is not None:
+            record["required_identity_ids"] = deepcopy(required_ids)
+        review_scope = active["capsule"]["context"].get("review_target")
+        if active["phase"] in {"review", "qa"} and isinstance(review_scope, dict):
+            record["review_target"] = deepcopy(review_scope)
+        docs_rework = active["phase"] == "docs" and (
+            work["artifacts"].get("docs", {}).get("candidate") == record["candidate_binding"]
+            and record["candidate_binding"] is not None
+        )
         if active["phase"] == "engineering" or (
-            active["phase"] == "docs" and evidence["changed_paths"]
-            and artifact["outcome"] == "pass" and controller_failure is None
+            active["phase"] == "docs" and (evidence["changed_paths"] or docs_rework)
         ):
             record["candidate"] = {
                 "base_tree_oid": _engineering_candidate_diff_base(work, active),
@@ -776,6 +826,13 @@ def _reduce_command(
                 "pipeline_runtime_digest": work["pipeline_runtime_digest"],
                 "generation": work["generation"] + 1,
             }
+            if docs_rework:
+                prior_docs = work["artifacts"].get("docs", {})
+                record["review_paths"] = sorted(set(
+                    prior_docs.get("review_paths", [])
+                    + prior_docs.get("candidate", {}).get("changed_paths", [])
+                    + evidence["changed_paths"]
+                ))
         if failure_capsule is not None:
             record["controller_failure"] = failure_capsule
         work["artifacts"][active["phase"]] = record
@@ -789,7 +846,7 @@ def _reduce_command(
         if active["phase"] == "engineering":
             for stale in ("review", "qa", "docs", "ready"):
                 work["artifacts"].pop(stale, None)
-        elif active["phase"] == "docs" and evidence["changed_paths"]:
+        elif active["phase"] == "docs" and record.get("candidate") is not None:
             for stale in ("review", "qa", "ready"):
                 work["artifacts"].pop(stale, None)
         if (
@@ -798,10 +855,15 @@ def _reduce_command(
             and (artifact["outcome"] == "fail" or controller_failure is not None)
         ):
             failed_phase = active["phase"]
-            for stale in ("engineering", "review", "qa", "docs", "ready"):
+            docs_failure = (
+                failed_phase == "review"
+                and record.get("review_target", {}).get("kind") == "documentation_changes"
+            )
+            stale_phases = ("qa", "ready") if docs_failure else ("engineering", "review", "qa", "docs", "ready")
+            for stale in stale_phases:
                 if stale != failed_phase:
                     work["artifacts"].pop(stale, None)
-            work["phase"] = "engineering"
+            work["phase"] = "docs" if docs_failure else "engineering"
         work["active_assignment"] = None
         return _record(work, command, active["id"], completed_actor={
             "actor_id": active["worker_id"], "phase": active["phase"],
@@ -829,13 +891,15 @@ def _reduce_command(
             raise PipelineError("current phase has no passing artifact")
         if phase in {"review", "qa"} and record.get("candidate_binding") != current_candidate(work):
             raise PipelineError("current candidate changed after Review/QA")
+        if phase == "qa" and record.get("required_identity_ids") != required_qa_identity_ids(work):
+            raise PipelineError("QA evidence does not cover the approved mandatory identities")
         if phase == "slice":
             proposed_slices = slice_records(
                 record["worker"].get("slices", work["slices"]), sealed=True,
             )
             proposed_rules = [rule for item in proposed_slices for rule in item["allowed_paths"]]
             uncovered = [
-                path for path in _interrupted_paths(work)
+                path for path in retained_engineering_paths(work)
                 if not any(matches(path, rule) for rule in proposed_rules)
             ]
             if uncovered:
@@ -865,7 +929,8 @@ def _reduce_command(
             else:
                 work["phase"] = "docs"
             result = _record(work, command, work["phase"])
-            result["history"][-1]["completed_slice_id"] = completed_slice["id"]
+            if completed_slice["id"] not in completed_slice_ids(work):
+                result["history"][-1]["completed_slice_id"] = completed_slice["id"]
             validate_state(result)
             return result
         else:
@@ -900,6 +965,11 @@ def _reduce_command(
         for phase in ("review", "qa"):
             if work["artifacts"][phase].get("candidate_binding") != candidate:
                 raise PipelineError(f"{phase} is stale for the current candidate")
+        if (
+            not qa_credit_complete(work["artifacts"]["qa"])
+            or work["artifacts"]["qa"].get("required_identity_ids") != required_qa_identity_ids(work)
+        ):
+            raise PipelineError("ready requires exact mandatory QA result coverage")
         work["artifacts"]["ready"] = {
             "candidate": candidate, "authority_digest": work["authority"]["digest"],
             "controller": deepcopy(controller),
