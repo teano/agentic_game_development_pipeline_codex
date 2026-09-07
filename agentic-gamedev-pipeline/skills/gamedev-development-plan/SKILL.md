@@ -18,7 +18,7 @@ Act as Development Plan Director: own source authority, deterministic state, int
 1. Resolve the project root, lowercase feature, canonical PRD, specification, plan, and append-only decision ledger through the contract. Ask one path question only if ambiguity remains.
 2. Require the exact PRD to pass the complete current approved Requirements validator and require current schema-3 `SPEC_READY` evidence from the same exact feature workflow whose paths and hashes match the files. Planning never scans sibling workflows, migrates legacy specification state, or grandfathers malformed authority; return a controlled upstream revision/reconvergence handoff instead.
 3. Pass global `--feature <slug>` on every controller call and initialize `.agentic-pipeline/Workflows/<feature>/development-plan-state.json` with the resolved paths and exact source hashes.
-4. Assign exactly one fresh internal read-only Planning Analyst with bounded canonical inputs. With `spawn_agent`, pass `fork_turns: "none"`, `model: "gpt-5.6-sol"`, and `reasoning_effort: "high"` explicitly unless an applicable user override selects different values. Apply the same policy to the fresh Analyst required by revision or reinitialization. Do not reuse an implementation or specification worker.
+4. Assign exactly one fresh internal read-only Planning Analyst with bounded canonical inputs. With `spawn_agent`, pass `fork_turns: "none"`, `model: "gpt-6-astra"`, and `reasoning_effort: "low"` explicitly unless an applicable user override selects different values. Apply the same policy to the fresh Analyst required by revision or reinitialization. Do not reuse an implementation or specification worker.
 5. Record the result with `accept-analysis`.
 
 ## Choose ownership shape

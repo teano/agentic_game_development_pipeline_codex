@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-09-07
+
+### Изменено
+
+- Значения по умолчанию Sol high заменены на `gpt-6-astra` с `reasoning_effort="low"` для Requirements, Specification и Development Plan, а также semantic review, Architect, Generator/helper, Proofreader, Planning Analyst, runtime Plan и Review. Entrypoints и Specification helper передают обновлённую пару при создании соответствующих workers.
+- Сохранены настройки Terra для implementation Director и Engineering (`xhigh`), research, Slice, QA и Coverage Advisory (`high`), Docs (`medium`), приоритет явных overrides и продолжение назначенных workers с прежними настройками.
+
 ## [0.16.1] - 2026-09-07
 
 ### Изменено
