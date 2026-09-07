@@ -1,0 +1,200 @@
+{
+  "scope": "Independent static review; no worker dispatch or game run",
+  "routes": {
+    "gamedev-requirements": {
+      "direct_policy_link": true,
+      "policy_exists": true
+    },
+    "gamedev-specification": {
+      "direct_policy_link": true,
+      "policy_exists": true
+    },
+    "gamedev-development-plan": {
+      "direct_policy_link": true,
+      "policy_exists": true
+    },
+    "gamedev-pipeline": {
+      "direct_policy_link": true,
+      "policy_exists": true
+    },
+    "gamedev-engineer": {
+      "worker_to_invariant": true,
+      "invariant_to_policy": true
+    },
+    "gamedev-review": {
+      "worker_to_invariant": true,
+      "invariant_to_policy": true
+    },
+    "gamedev-qa": {
+      "worker_to_invariant": true,
+      "invariant_to_policy": true
+    },
+    "gamedev-documentation-finisher": {
+      "worker_to_invariant": true,
+      "invariant_to_policy": true
+    },
+    "gamedev-coverage-steward": {
+      "worker_to_invariant": true,
+      "invariant_to_policy": true
+    }
+  },
+  "runtime_roles_from_ast": {
+    "plan": "planner",
+    "slice": "slicer",
+    "engineering": "engineer",
+    "review": "reviewer",
+    "qa": "qa",
+    "docs": "documentation_finisher"
+  },
+  "runtime_role_row_counts": {
+    "planner": 1,
+    "slicer": 1,
+    "engineer": 1,
+    "reviewer": 1,
+    "qa": 1,
+    "documentation_finisher": 1
+  },
+  "selected_pairs": [
+    {
+      "role": "`$gamedev-requirements`",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    {
+      "role": "`$gamedev-specification`",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    {
+      "role": "`$gamedev-development-plan`",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    {
+      "role": "`$gamedev-pipeline` implementation Director",
+      "model": "gpt-5.6-terra",
+      "effort": "xhigh"
+    },
+    {
+      "role": "Requirements bounded research agent",
+      "model": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    {
+      "role": "Requirements semantic review agent",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    {
+      "role": "Technical Spec Architect",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    {
+      "role": "Specification Generator/helper",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    {
+      "role": "Specification Proofreader",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    {
+      "role": "Specification helper semantic review or post-fix verification worker, when its existing route delegates one",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    {
+      "role": "Specification repository-research helper",
+      "model": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    {
+      "role": "Development Plan Planning Analyst",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    {
+      "role": "Runtime Plan (`planner`)",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    {
+      "role": "Runtime Slice (`slicer`)",
+      "model": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    {
+      "role": "Engineering (`engineer`)",
+      "model": "gpt-5.6-terra",
+      "effort": "xhigh"
+    },
+    {
+      "role": "Review (`reviewer`), including post-Docs Review",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    {
+      "role": "QA (`qa`)",
+      "model": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    {
+      "role": "Docs (`documentation_finisher`)",
+      "model": "gpt-5.6-terra",
+      "effort": "medium"
+    },
+    {
+      "role": "Explicit standalone Coverage Advisory",
+      "model": "gpt-5.6-terra",
+      "effort": "high"
+    }
+  ],
+  "pairs_supported_by_current_callable_metadata": true,
+  "tool_contract": {
+    "collaboration.spawn_agent": [
+      "task_name",
+      "message",
+      "fork_turns",
+      "model",
+      "reasoning_effort"
+    ],
+    "explicit_model_fork": "none or positive turn count; policy uses none",
+    "collaboration.followup_task": [
+      "target",
+      "message"
+    ],
+    "collaboration.send_message": [
+      "target",
+      "message"
+    ],
+    "app_model_fields": [
+      "model",
+      "thinking"
+    ],
+    "app_create_thread_model_rule": "omit unless user explicitly requested specific model"
+  },
+  "runtime_digest": {
+    "head": "85bea71dee8a50134046d22a29c0f112cbb63a0fe7c69aea82a0e9073ee89017",
+    "worktree": "9ef024daf6dfe5dd4af94d3066da5665379ff0d3096adeb151a262a0647d73af",
+    "changed": true,
+    "shared_policy_in_fixed_manifest": false
+  },
+  "reviewed_sha256": {
+    "agentic-gamedev-pipeline/skills/gamedev-requirements/SKILL.md": "592ab58a3c25dd55ea73305ba50374093d6fadb2564c0dca450c754691b81106",
+    "agentic-gamedev-pipeline/skills/gamedev-specification/SKILL.md": "e8f9b437c08627f547ebf5e118d26f08aa52e4a8a07fcd3b5f24a3a4384f0957",
+    "agentic-gamedev-pipeline/skills/gamedev-development-plan/SKILL.md": "684c7d81d4632543d653bcfdc80d7be581a58ad7bef6af56ff8a829ee57e1c29",
+    "agentic-gamedev-pipeline/skills/gamedev-pipeline/SKILL.md": "8d0c892cea811d944f146ef08b6da62f59db587ab06db1bff0b954c7dc1c2ead",
+    "agentic-gamedev-pipeline/skills/gamedev-specification/references/specification-contract.md": "0cfa943fa1d9c611fc4ae5065931a963530a1e5bbcd6ec48769e333f0e891752",
+    "agentic-gamedev-pipeline/skills/gamedev-pipeline/references/stage-handoff-invariant.md": "afe50dacd51b1eb1d078d99888da9fd8dec0af2ab48393f33f759a89805c603e",
+    "agentic-gamedev-pipeline/skills/gamedev-pipeline/references/agent-model-policy.md": "202704d595b8874919565aae80f829de3baddfe4a93ed1ed7d093c85f8a138b5"
+  },
+  "resolved_finding": {
+    "id": "R1",
+    "severity": "P2",
+    "area": "app task creation metadata",
+    "resolution": "Only explicit user model choice is sent to create_thread; otherwise model is omitted. Role recommendations are not user choices. thinking follows explicit effort choice or is omitted."
+  },
+  "verdict": "PASS: no unresolved material findings"
+}

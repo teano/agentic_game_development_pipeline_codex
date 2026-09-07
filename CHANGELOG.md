@@ -7,6 +7,18 @@
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-09-07
+
+### Изменено
+
+- Добавлена единая политика моделей и reasoning effort для существующих ролей GameDev: Requirements, Specification и Development Plan рекомендуют Sol high, implementation Director и Engineering — Terra xhigh; semantic review и planning используют Sol high, research, Slice, QA и Coverage Advisory — Terra high, Docs — Terra medium.
+- Entrypoints стадий и Specification helper передают фактические `fork_turns`, `model` и `reasoning_effort` при создании новых внутренних workers; настройки и применимые overrides передаются в orchestration packet вне immutable assignments, helper schemas и controller state.
+
+### Уточнено
+
+- Явный выбор пользователя и ограничения назначенного владельца сохраняют приоритет. Persistent workers продолжаются с прежними настройками; применение defaults не разрешает замену владельца, перезапуск задачи, новую review wave или reinitialization.
+- Рекомендации для новых stage sessions не меняют текущую модель Director и не считаются выбором пользователя при создании видимой Codex task.
+
 ## [0.16.0] - 2026-09-06
 
 ### Исправлено

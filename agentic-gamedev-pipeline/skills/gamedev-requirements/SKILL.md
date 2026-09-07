@@ -11,6 +11,8 @@ Proceed only on the explicit activation described above. Missing requirements, a
 
 Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md). Act as product requirements facilitator; keep product decisions separate from technical design and implementation.
 
+Read the Requirements rows and dispatch rules in the shared [agent model policy](../gamedev-pipeline/references/agent-model-policy.md). Apply its role defaults only where no explicit user or scoped parent override exists; session-start guidance does not change the running session's model.
+
 Before creating, approving, or structurally editing a PRD, read [product-requirements-contract.md](references/product-requirements-contract.md). It is the canonical path, schema, content-boundary, and approval contract; do not restate or override it here.
 
 ## Resolve product decisions
@@ -29,6 +31,8 @@ Stop discovery as soon as all material product decisions and the completeness, f
 ## Conditional read-only lanes
 
 Requirements sessions need not spawn subagents. Use persistent, reusable, read-only lanes only when nontrivial research or review is required or the user explicitly requests delegation. When such work is required and collaboration is available, offload it from the root context through the smallest useful set of lanes.
+
+For each initial or legitimately replaced lane, resolve its model and reasoning effort from that policy and call `spawn_agent(..., fork_turns="none", model=<resolved-model>, reasoning_effort=<resolved-effort>)`. Without an override, use `model="gpt-5.6-terra", reasoning_effort="high"` for bounded repository research and `model="gpt-5.6-sol", reasoning_effort="high"` for semantic requirements review. Give it a bounded source-backed packet with the resolved pair and applicable overrides. Reuse the same lane with `followup_task`, which retains its model and effort; do not invent model parameters on that tool or replace a lane solely to apply a default. Preserve the assigned pair and override scope through checkpoint, handoff, and recovery.
 
 Allow every started lane to finish or to checkpoint and hand off under the shared stage handoff invariant. Do not cancel and restart lanes per answer. The root must consume every terminal lane result before requesting approval or reporting readiness.
 

@@ -9,7 +9,7 @@ description: Explicit-invocation only. Use only when the user explicitly request
 
 Proceed only on the explicit activation described above. Approved documents, apparent implementation readiness, or a generic planning request is not authorization. Do not activate another GameDev stage.
 
-Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md) and [development-plan-contract.md](references/development-plan-contract.md). The contract is canonical for paths, schema, slice semantics, context ceilings, approval, and staleness.
+Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md), the Development Plan Director and Planning Analyst rows in [agent model policy](../gamedev-pipeline/references/agent-model-policy.md), and [development-plan-contract.md](references/development-plan-contract.md). The contract is canonical for paths, schema, slice semantics, context ceilings, approval, and staleness.
 
 Act as Development Plan Director: own source authority, deterministic state, internal delegation, and the approval gate. Do not perform the Planning Analyst's analysis in the Director context. Use `scripts/development_plan_state.py` for every transition; never edit its JSON state directly. Start from [development-plan.md](assets/development-plan.md) when creating the canonical plan.
 
@@ -18,7 +18,7 @@ Act as Development Plan Director: own source authority, deterministic state, int
 1. Resolve the project root, lowercase feature, canonical PRD, specification, plan, and append-only decision ledger through the contract. Ask one path question only if ambiguity remains.
 2. Require the exact PRD to pass the complete current approved Requirements validator and require current schema-3 `SPEC_READY` evidence from the same exact feature workflow whose paths and hashes match the files. Planning never scans sibling workflows, migrates legacy specification state, or grandfathers malformed authority; return a controlled upstream revision/reconvergence handoff instead.
 3. Pass global `--feature <slug>` on every controller call and initialize `.agentic-pipeline/Workflows/<feature>/development-plan-state.json` with the resolved paths and exact source hashes.
-4. Assign exactly one fresh internal read-only Planning Analyst with bounded canonical inputs. Do not reuse an implementation or specification worker.
+4. Assign exactly one fresh internal read-only Planning Analyst with bounded canonical inputs. With `spawn_agent`, pass `fork_turns: "none"`, `model: "gpt-5.6-sol"`, and `reasoning_effort: "high"` explicitly unless an applicable user override selects different values. Apply the same policy to the fresh Analyst required by revision or reinitialization. Do not reuse an implementation or specification worker.
 5. Record the result with `accept-analysis`.
 
 ## Choose ownership shape
