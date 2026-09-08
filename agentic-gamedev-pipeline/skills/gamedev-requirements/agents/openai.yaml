@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Requirements"
   short_description: "Explicit-only GameDev requirements workflow"
-  default_prompt: "Use $gamedev-requirements to maintain a confirmation-only canonical PRD: write only exact user-confirmed semantics, keep every agent proposal outside the artifact as a question with 2-3 options and tradeoffs, never expand a short confirmation into unstated consequences, require explicit approval before PRD_READY, return NEXT_ACTION, and stop."
+  default_prompt: "Use $gamedev-requirements to maintain a confirmation-only canonical PRD: write only exact user-confirmed semantics, keep every agent proposal outside the artifact as a question with 2-3 options and tradeoffs, never expand a short confirmation into unstated consequences, require explicit approval before PRD_READY, return NEXT_ACTION, and stop. Read relevant current feature technical decisions on entry, reentry and lane handoff as evidence only; never promote TD-* choices into PRD or DEC-* authority. Preserve explicit local targeted amendment versus structural return and exact approval."
 policy:
   allow_implicit_invocation: false

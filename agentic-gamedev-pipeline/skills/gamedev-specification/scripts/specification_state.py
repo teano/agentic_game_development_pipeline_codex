@@ -17,6 +17,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+_journal_path = Path(__file__).resolve().parents[2] / "gamedev-pipeline" / "scripts" / "pipeline_v2" / "technical_decisions.py"
+_journal_spec = importlib.util.spec_from_file_location("specification_technical_decisions", _journal_path)
+if _journal_spec is None or _journal_spec.loader is None:
+    raise RuntimeError("Cannot load the shared technical decisions contract")
+_journal_module = importlib.util.module_from_spec(_journal_spec)
+_journal_spec.loader.exec_module(_journal_module)
+technical_decisions_context = _journal_module.technical_decisions_context
+
+
+def technical_decisions_binding(root: Path, feature: str) -> dict[str, str]:
+    context = technical_decisions_context(root, feature)
+    return {key: context[key] for key in ("path", "sha256")}
+
+
+def require_journal_binding(root: Path, state: dict[str, Any], binding: Any) -> None:
+    context = technical_decisions_context(root, state["feature"])
+    current = {key: context[key] for key in ("path", "sha256")}
+    # Legacy evidence without a journal binding is admissible only with no entries.
+    if binding is None and not context["entries"]:
+        return
+    if binding != current:
+        raise SpecificationStateError(
+            "technical decisions changed; stop the affected worker, then use "
+            "refresh-technical-decisions before fresh assessment"
+        )
+
 
 SCHEMA_VERSION = 3
 V2_RECOVERY_AUTHORIZATION_SCHEMA = 2
@@ -719,6 +745,8 @@ def validate_helper_output_preflight(
     require_current_identity: bool,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Validate current helper output without consuming or writing controller state."""
+    if request_record == state.get("active_helper_request"):
+        require_journal_binding(root, state, state.get("active_helper_journal_binding"))
     if not isinstance(request_record, dict) or set(request_record) != {
         "path",
         "sha256",
@@ -1002,8 +1030,15 @@ def validate_preaccept_receipt(
         raise SpecificationStateError(
             "Architect pre-accept receipt must contain valid UTF-8 JSON"
         ) from error
-    if not isinstance(receipt, dict) or set(receipt) != PREACCEPT_RECEIPT_KEYS:
+    if not isinstance(receipt, dict) or set(receipt) not in (
+        PREACCEPT_RECEIPT_KEYS, PREACCEPT_RECEIPT_KEYS | {"technical_decisions_sha256"}
+    ):
         raise SpecificationStateError("Architect pre-accept receipt schema is invalid")
+    journal = technical_decisions_context(root, state["feature"])
+    if (journal["entries"] or "technical_decisions_sha256" in receipt) and receipt.get(
+        "technical_decisions_sha256"
+    ) != journal["sha256"]:
+        raise SpecificationStateError("Architect pre-accept receipt technical decisions binding is stale or missing")
     if type(receipt.get("schema")) is not int or receipt["schema"] != PREACCEPT_RECEIPT_SCHEMA:
         raise SpecificationStateError("Architect pre-accept receipt version is invalid")
     architect_id = receipt.get("architect_id")
@@ -1121,6 +1156,7 @@ def require_current_preaccept_acceptance(
     use_wave_specification_revision: bool = False,
 ) -> dict[str, Any]:
     acceptance = state.get("acceptance") or {}
+    require_journal_binding(root, state, acceptance.get("technical_decisions_binding"))
     accepted_preaccept = acceptance.get("preaccept_receipt")
     if not isinstance(accepted_preaccept, dict):
         raise SpecificationStateError(
@@ -3334,6 +3370,7 @@ def command_prepare_helper(args: argparse.Namespace) -> dict[str, Any]:
     )
     state["helper_sequence"] = sequence
     state["active_helper_request"] = request_record
+    state["active_helper_journal_binding"] = technical_decisions_binding(root, state["feature"])
     state["updated_at"] = utc_now()
     save_state(root, state)
     return state
@@ -3877,6 +3914,7 @@ def command_accept_spec(args: argparse.Namespace) -> dict[str, Any]:
         "trace_errors": [],
     }
     state["acceptance"] = {
+        "technical_decisions_binding": technical_decisions_binding(root, state["feature"]),
         "prd_path": state["prd"]["path"],
         "prd_revision": state["prd"]["revision"],
         "prd_sha256": state["prd"]["sha256"],
@@ -4337,6 +4375,63 @@ def command_handoff(args: argparse.Namespace) -> dict[str, Any]:
     return state
 
 
+def command_technical_decisions_context(args: argparse.Namespace) -> dict[str, Any]:
+    return technical_decisions_context(Path(args.project_root), args.feature)
+
+
+def command_refresh_technical_decisions(args: argparse.Namespace) -> dict[str, Any]:
+    """Discard only stale unfinished assessments; never change source or journal bytes."""
+    root = Path(args.project_root).resolve()
+    state = load_state(root, args.feature)
+    if state["status"] not in {"needs_generation", "reviewing", "awaiting_accept", "spec_convergence_hold"}:
+        raise SpecificationStateError("technical decisions refresh requires unfinished specification work")
+    require_bound_recovery_continuation(root, state)
+    current = technical_decisions_binding(root, state["feature"])
+    active = state.get("active_helper_request")
+    previous = (state.get("active_helper_journal_binding") if active else
+                (state.get("acceptance") or {}).get("technical_decisions_binding") or
+                (state.get("technical_decisions_refresh") or {}).get("binding"))
+    if previous == current or (
+        previous is None and not technical_decisions_context(root, state["feature"])["entries"]
+    ):
+        raise SpecificationStateError("technical decisions are unchanged; refresh is not a retry route")
+    if args.worker_status not in {"completed", "stopped"} or not args.worker_evidence.strip():
+        raise SpecificationStateError("refresh requires observed terminal worker status and tool evidence")
+    prd = resolve_project_path(root, state["prd"]["path"], "canonical PRD")
+    validate_approved_prd_contract(prd)
+    if sha256(prd) != state["prd"]["sha256"]:
+        raise SpecificationStateError("PRD changed; use its sanctioned upstream revision route")
+    spec = resolve_project_path(root, state["specification"]["path"], "canonical specification")
+    current_sha = sha256(spec) if spec.is_file() else None
+    if active:
+        request = validate_helper_request(root, state, active["path"], require_current_identity=True)
+        if request != active:
+            raise SpecificationStateError("active helper request changed before journal refresh")
+        # Stopped helper output is only input to a fresh helper, never accepted work.
+        reset_helper_chain(state, current_sha)
+        state["status"] = "needs_generation"
+        state["specification"] = {**state["specification"], "sha256": None,
+                                  "generation_input_sha256": current_sha}
+    else:
+        require_source_unchanged(root, state)
+        state["status"] = "awaiting_accept"
+    if state.get("active_wave") is not None:
+        close_active_wave(state, "technical_decisions_changed_noncredit", current_sha)
+    state["acceptance"] = None
+    state["ready"] = None
+    # A convergence hold retains its owner/budget restriction; refresh cannot reset it.
+    if state.get("hold"):
+        state["status"] = "spec_convergence_hold"
+    state["active_helper_journal_binding"] = current
+    state["technical_decisions_refresh"] = {
+        "binding": current, "worker_status": args.worker_status,
+        "worker_evidence": args.worker_evidence.strip(), "spec_sha256": current_sha,
+    }
+    state["updated_at"] = utc_now()
+    save_state(root, state)
+    return state
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", required=True)
@@ -4345,6 +4440,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="lowercase feature slug selecting .agentic-pipeline/Workflows/<feature>",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+
+    journal_context = commands.add_parser("technical-decisions-context")
+    journal_context.set_defaults(handler=command_technical_decisions_context)
+    refresh = commands.add_parser("refresh-technical-decisions")
+    refresh.add_argument("--worker-status", choices=("completed", "stopped"), required=True)
+    refresh.add_argument("--worker-evidence", required=True)
+    refresh.set_defaults(handler=command_refresh_technical_decisions)
 
     init = commands.add_parser("init")
     init.add_argument("--prd", required=True)

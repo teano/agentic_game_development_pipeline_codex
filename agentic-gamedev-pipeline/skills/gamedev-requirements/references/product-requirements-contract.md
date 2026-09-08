@@ -73,6 +73,8 @@ contain only non-blocking open questions.
 
 ## Content boundary
 
+The feature's current technical decisions journal follows the shared [technical decisions contract](../../gamedev-pipeline/references/technical-decisions.md). Read relevant records on entry and reentry as source evidence. Technical decisions are separate from accepted product `DEC-*` authority: their existence, successful checks, or incorporation in implementation never confirms a requirement. Preserve the source of any explicit user amendment and its chosen local-amendment or owning-stage-return route. Only the confirmed product delta may enter this document through its normal revision and approval procedure; purely technical journal changes leave the PRD unchanged.
+
 Record what the product must achieve and what observable behavior proves it. Exclude implementation plans, class structures, speculative architecture, agent activity, raw interview transcripts, and discarded ideas unless they become an explicit constraint or non-goal.
 
 Only the user's direct answer or explicit selection becomes a requirement. An unambiguous `yes` confirms only one immediately preceding, explicitly worded proposal. Explicit approval applies only to the exact current PRD revision shown to the user. Proposals, inferences, assumed exclusions, risks, reviewer opinions, repository facts, inspected code, common practice, feasibility analysis, silence, permission to continue, and existing draft text are not decision authority and stay outside the PRD unless the user explicitly confirms their exact content.

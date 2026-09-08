@@ -529,6 +529,24 @@ Only the approved feature and named shared symbol are in scope.
             encoding="utf-8",
         )
 
+    def test_current_journal_change_stales_draft_but_does_not_edit_product_authority(self) -> None:
+        state = self.initialize()
+        before = (self.prd.read_bytes(), self.spec.read_bytes())
+        current = {"path": "journal#technical_decisions", "sha256": "a" * 64, "entries": {"TD-1": {}}}
+        with mock.patch.object(controller, "technical_decisions_context", return_value=current):
+            self.assertTrue(any("technical decisions changed" in item for item in controller.source_drift(self.root, state)))
+            self.assertEqual(controller.command_status(self.args())["status"], "stale")
+        self.assertEqual(before, (self.prd.read_bytes(), self.spec.read_bytes()))
+
+    def test_runtime_journal_change_does_not_revoke_approved_plan(self) -> None:
+        state = self.approve_current_plan()
+        before = (self.prd.read_bytes(), self.spec.read_bytes(), self.plan.read_bytes())
+        current = {"path": "journal#technical_decisions", "sha256": "b" * 64, "entries": {"TD-1": {}}}
+        with mock.patch.object(controller, "technical_decisions_context", return_value=current):
+            self.assertEqual(controller.source_drift(self.root, state), [])
+            self.assertEqual(controller.command_status(self.args())["status"], "approved")
+        self.assertEqual(before, (self.prd.read_bytes(), self.spec.read_bytes(), self.plan.read_bytes()))
+
     def test_init_requires_exact_spec_ready_hashes(self) -> None:
         self.spec.write_text(self.spec.read_text(encoding="utf-8") + "drift\n", encoding="utf-8")
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "SPEC_READY evidence"):

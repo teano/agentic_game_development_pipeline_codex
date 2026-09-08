@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Final Review"
   short_description: "Explicit-only GameDev pipeline Review mode"
-  default_prompt: "Use $gamedev-review for one fresh read-only review of only assignment.context.review_target. Bind introduced-defect and KISS/YAGNI findings to exact candidate_changes; outside them allow only missing mandatory implementation in required_scope or a proven direct regression. Require concrete current-candidate evidence and material mandatory impact, ignore theoretical or optional improvements, and pass with empty findings as soon as the bounded target is proven. Return only the assigned semantic artifact and stop without remediation."
+  default_prompt: "Use $gamedev-review for one fresh read-only review of assignment.context.review_target under its artifact contract. Apply the shared technical-decisions policy to relevant current decisions: independently check authority and evidence, neither reject a justified technical deviation nor accept a logged waiver. Use ordinary fail remediation for concrete technical defects and record encountered blockers in the issued artifact. Keep the audit bounded, ignore speculative or optional improvements, and stop without product edits."
 policy:
   allow_implicit_invocation: false

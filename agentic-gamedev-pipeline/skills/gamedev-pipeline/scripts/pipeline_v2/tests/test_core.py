@@ -1058,7 +1058,7 @@ None.
         self.assertEqual("test-feature", ready["feature"])
         self.assertEqual(self.workflow_path, ready["workflow_path"])
         self.assertNotIn("gates", ready)
-        self.assertEqual(7, len(PHASES)); self.assertEqual(8, len(COMMANDS))
+        self.assertEqual(7, len(PHASES)); self.assertEqual(10, len(COMMANDS))
 
     def test_feature_runtime_states_and_repeat_assignment_ids_are_isolated(self) -> None:
         first_before = self.store.path.read_bytes()
@@ -1731,7 +1731,7 @@ None.
 
         self.assertEqual("engineering", after_first_qa["phase"])
         self.assertNotIn("current_slice", after_first_qa)
-        self.assertEqual(7, len(PHASES)); self.assertEqual(8, len(COMMANDS))
+        self.assertEqual(7, len(PHASES)); self.assertEqual(10, len(COMMANDS))
 
         self._engineer_slice("engineer-s2", "candidate two\n", slice_index=1, target="slice-two.txt")
         self._accept("engineering-s2")
@@ -3796,7 +3796,7 @@ None.
             with self.subTest(phase=phase):
                 schema = artifact_schema(phase, ROLES[phase])
                 self.assertEqual(
-                    allowed | {"blocker", "required_action"},
+                    allowed | {"blocker", "required_action", "technical_decisions"},
                     set(schema["allowed_keys"]),
                 )
                 self.assertEqual(required, set(schema["required_keys"]))
@@ -5129,7 +5129,7 @@ None.
             ensure_ascii=False, sort_keys=True,
         )
         self.assertIn(json.dumps(candidate, ensure_ascii=False, sort_keys=True), audit_json)
-        self.assertEqual(7, len(PHASES)); self.assertEqual(8, len(COMMANDS))
+        self.assertEqual(7, len(PHASES)); self.assertEqual(10, len(COMMANDS))
 
         replay = deepcopy(command); replay["expected_generation"] = -1
         self.assertEqual(reconfigured, self.store.dispatch(replay))

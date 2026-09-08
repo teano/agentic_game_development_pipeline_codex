@@ -11,6 +11,7 @@ import shutil
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from .technical_decisions import validate_entry
 
 from .checkout import (
     authority_items,
@@ -34,6 +35,7 @@ from .model import (
     assignment_output_path,
     canonical_command,
     current_candidate,
+    current_slice,
     default_assignment,
     digest,
     feature_slug,
@@ -41,6 +43,7 @@ from .model import (
     is_generation,
     is_git_oid,
     is_strict_integer,
+    normalize_literal_path,
     reconfiguration_action,
     safe_identifier,
     slice_records,
@@ -404,6 +407,11 @@ class Controller:
                 if drift and not policy else False
             )
             view = status_view(state)
+            if state["active_assignment"] is not None and state["phase"] == "engineering":
+                view["technical_actions"] = {
+                    "observed_tree_oid": current, "expected_generation": state["generation"],
+                    "observation": "technical-observe", "decision": "technical-decision",
+                }
             if policy:
                 view["next_action"] = {
                     "kind": "terminal", "result": "fresh_init_required",
@@ -830,3 +838,88 @@ class Controller:
                 },
             }
             return self.store._dispatch_locked(command)
+
+    def technical_action(self, *, command_id: str, expected_generation: int,
+                         action: str | None = None, packet: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Observe a sole-writer action or apply a precise technical amendment.
+
+        An observation is captured before editor work. Reconciliation admits only
+        exact foreign paths appearing since that observation, never earlier drift.
+        Semantic necessity remains subject to independent Review and QA.
+        """
+        self._preflight_existing_store_location()
+        with self.store.transaction():
+            state, root = self._loaded()
+            name = "technical-observe" if action is not None else "technical-decision"
+            intent = {"name": name, "id": command_id, "packet": deepcopy(packet), "action": action}
+            command = {**intent, "expected_generation": expected_generation}
+            checked = self.store._preflight_locked(state, command)
+            current = candidate_tree_oid(root)
+            if repository_policy_changed(root, state["base_tree_oid"], current):
+                raise PipelineError("technical action cannot change repository policy")
+            if isinstance(checked, dict):
+                self._verify_live_checkout(state, root)
+                return checked
+            active = state["active_assignment"]
+            if active is None or active["phase"] != "engineering":
+                raise PipelineError("technical action requires the current Engineering assignment")
+            if action is not None:
+                if not isinstance(action, str) or not action.strip():
+                    raise PipelineError("technical observation requires an action description")
+                self._verify_live_checkout(state, root)
+                command["controller"] = {"tree": current, "action": action}
+            else:
+                if not isinstance(packet, dict) or not {"assignment_id", "observed_tree_oid", "entry"} <= set(packet) or set(packet) - {"assignment_id", "observed_tree_oid", "entry", "additional_paths", "command_order", "observation_id"}:
+                    raise PipelineError("malformed technical decision packet")
+                if packet["assignment_id"] != active["id"] or packet["observed_tree_oid"] != current:
+                    raise PipelineError("technical packet assignment or observed tree is stale")
+                try:
+                    entry = validate_entry(packet["entry"])
+                except ValueError as exc:
+                    raise PipelineError(str(exc)) from exc
+                previous = state.get("technical_decisions", {}).get(entry["id"], {}).get("execution", {})
+                if previous and (previous["slice_id"] != current_slice(state)["id"] or previous["authority"] != state["authority"]["digest"]):
+                    previous = {}  # Reassess this same situation; never inherit a stale execution grant.
+                paths = packet.get("additional_paths", previous.get("additional_paths", []))
+                if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+                    raise PipelineError("additional_paths must contain exact project-relative files")
+                if len(paths) != len(set(paths)):
+                    raise PipelineError("additional_paths contains duplicates")
+                authority = {path_identity(item["path"]) for item in state["authority"]["items"].values()}
+                for path in paths:
+                    if normalize_literal_path(path) != path or "*" in path or path_identity(path) in authority:
+                        raise PipelineError("technical amendment cannot grant authority or wildcard paths")
+                    parts = path.replace("\\", "/").split("/")
+                    if any(part.casefold() in {".git", ".agentic-pipeline", ".agentic-pipeline-v2", ".gitignore", ".gitattributes", ".gitmodules", "agents.md"} for part in parts):
+                        raise PipelineError("technical amendment cannot grant control or policy paths")
+                    target = safe_path(root, path, "technical additional path")
+                    if target.is_dir():
+                        raise PipelineError("technical amendment requires exact files, not directories")
+                order = packet.get("command_order", previous.get("command_order", []))
+                if order:
+                    if not isinstance(order, list) or sorted(json.dumps(item, sort_keys=True) for item in order) != sorted(json.dumps(item, sort_keys=True) for item in active["commands"]):
+                        raise PipelineError("command_order must be a permutation preserving every mandatory check")
+                elif "command_order" in packet:
+                    raise PipelineError("command_order cannot remove mandatory checks")
+                foreign = self._checkout_drift(state, root, current)
+                if foreign:
+                    observation = active.get("technical_observation", {})
+                    if packet.get("observation_id") != observation.get("id") or not observation:
+                        raise PipelineError("foreign paths require a controller observation captured before the action")
+                    since = changed_paths(root, observation["tree"], current)
+                    if set(foreign) - set(paths) or set(foreign) - set(since):
+                        raise PipelineError("reconciliation must cover the exact observed foreign paths")
+                    # An unmentioned foreign change must never be adopted through a wider overlay.
+                    if set(violations(since, active["access"]["write"])) != set(foreign):
+                        raise PipelineError("reconciliation contains unrelated or previously owned foreign changes")
+                entry["execution"] = {"slice_id": current_slice(state)["id"], "authority": state["authority"]["digest"],
+                                      "additional_paths": paths, "command_order": order}
+                projected = deepcopy(state)
+                projected.setdefault("technical_decisions", {})[entry["id"]] = entry
+                allowed = default_assignment(projected)["access"]["write"]
+                all_changes = changed_paths(root, _engineering_candidate_diff_base(state, active), current)
+                if violations(all_changes, allowed):
+                    raise PipelineError("technical amendment leaves changed paths outside the effective scope")
+                command["controller"] = {"entry": entry}
+            command["controller"]["assignment_id"] = active["id"]
+            return self.store._dispatch_prechecked_locked(checked, command)

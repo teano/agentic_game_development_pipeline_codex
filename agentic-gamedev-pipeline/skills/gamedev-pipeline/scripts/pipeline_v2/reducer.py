@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
+from .technical_decisions import journal_digest, journal_reference, validate_entry
 
 from .checkout import authority_items_equal, matches, path_identity, violations as diff_violations
 from .legacy_gen53 import SCHEMA10_UNSUPPORTED_MESSAGE
@@ -15,6 +16,7 @@ from .model import (
     PipelineError,
     all_slices_completed,
     artifact_schema,
+    assignment_identity,
     assignment_output_path,
     candidate_record_valid,
     canonical_command,
@@ -24,6 +26,7 @@ from .model import (
     current_candidate,
     current_slice,
     default_assignment,
+    effective_slice,
     digest,
     is_digest,
     is_generation,
@@ -43,7 +46,7 @@ from .model import (
     validate_state,
 )
 
-COMMANDS = {"init", "status", "next", "complete", "answer", "accept", "migrate", "ready"}
+COMMANDS = {"init", "status", "next", "complete", "answer", "accept", "migrate", "ready", "technical-observe", "technical-decision"}
 WORKER_FORBIDDEN_KEYS = {
     "authority_digest", "base_checkout_sha256", "current_checkout_sha256", "checkout",
     "controller", "diff", "diff_sha256", "inventory", "commands", "tests", "receipts",
@@ -97,6 +100,17 @@ def _worker_artifact(
     if phase == "slice" and "slices" in value:
         value = deepcopy(value)
         value["slices"] = slice_records(value["slices"])
+    if "technical_decisions" in value:
+        entries = value["technical_decisions"]
+        if not isinstance(entries, list):
+            raise PipelineError("technical_decisions must be a list")
+        try:
+            for entry in entries:
+                validate_entry(entry)
+        except ValueError as exc:
+            raise PipelineError(str(exc)) from exc
+        if len({entry["id"] for entry in entries}) != len(entries):
+            raise PipelineError("duplicate technical decision ID in artifact")
     for key in ("assumptions", "checks"):
         if key in value and not isinstance(value[key], list):
             raise PipelineError(f"worker {key} must be a list")
@@ -660,6 +674,36 @@ def _reduce_command(
     assert state is not None
     work = deepcopy(state)
 
+    if name in {"technical-observe", "technical-decision"}:
+        active = work["active_assignment"]
+        if active is None or active["phase"] != "engineering" or command.get("controller", {}).get("assignment_id") != active["id"]:
+            raise PipelineError("technical action requires the current Engineering assignment")
+        if name == "technical-observe":
+            observed = command.get("controller")
+            if not isinstance(observed, dict) or set(observed) != {"tree", "action", "assignment_id"} or not is_git_oid(observed["tree"]):
+                raise PipelineError("technical observation requires controller tree evidence")
+            _require_text(observed["action"], "technical action description")
+            active["technical_observation"] = {"id": command["id"], **deepcopy(observed)}
+        else:
+            entry = command.get("controller", {}).get("entry")
+            try:
+                validate_entry(entry, sealed=True)
+            except ValueError as exc:
+                raise PipelineError(str(exc)) from exc
+            work.setdefault("technical_decisions", {})[entry["id"]] = deepcopy(entry)
+            canonical = default_assignment(work)
+            active["access"] = deepcopy(canonical["access"])
+            active["commands"] = deepcopy(canonical["checks"])
+            active["capsule"]["context"]["current_slice"] = current_slice(work)
+            active["capsule"]["context"]["technical_journal"] = journal_reference(work)
+            active["capsule"]["context"]["technical_decisions"] = list(work["technical_decisions"].values())
+            active["id"] = assignment_identity(work["run_id"], work["generation"] + 1, "engineering")["id"]
+            active["output_path"] = assignment_output_path(active["id"], work["feature"])
+            active.pop("technical_observation", None)
+            for stale in ("review", "qa", "docs", "ready"):
+                work["artifacts"].pop(stale, None)
+        return _record(work, command, command["id"])
+
     if name == "next":
         if work["phase"] == "ready" or work["active_assignment"] is not None:
             raise PipelineError("no next assignment is available")
@@ -737,6 +781,8 @@ def _reduce_command(
             raise PipelineError("QA required identities are controller-derived")
         context = deepcopy(context)
         context["current_slice"] = current_slice(work)
+        context["technical_journal"] = journal_reference(work)
+        context["technical_decisions"] = list(work.get("technical_decisions", {}).values())
         if phase == "review":
             context["review_target"] = deepcopy(canonical["context"]["review_target"])
         if phase == "qa":
@@ -782,6 +828,8 @@ def _reduce_command(
         if required_ids is not None and active["capsule"]["context"].get("required_identity_ids") != required_ids:
             raise PipelineError("QA assignment identities no longer match approved authority")
         artifact = _worker_artifact(command.get("artifact"), active["phase"], active["role"], required_ids)
+        if active["capsule"]["context"].get("technical_journal", {}).get("sha256", journal_digest({})) != journal_digest(work.get("technical_decisions", {})):
+            raise PipelineError("assignment technical journal is stale")
         forbidden = _contains_forbidden(artifact)
         if forbidden:
             raise PipelineError(f"worker artifact contains controller-owned field {forbidden!r}")
@@ -803,8 +851,22 @@ def _reduce_command(
                 if key in controller_failure:
                     failure_capsule[key] = deepcopy(controller_failure[key])
         evidence = deepcopy(command["controller"])
+        for entry in artifact.get("technical_decisions", []):
+            entry = deepcopy(entry)
+            previous = work.get("technical_decisions", {}).get(entry["id"], {})
+            if "execution" in previous:
+                entry["execution"] = deepcopy(previous["execution"])
+            work.setdefault("technical_decisions", {})[entry["id"]] = entry
+        if artifact["outcome"] == "blocked" and not artifact.get("technical_decisions"):
+            blocker_id = f"TD-BLOCK-{digest(current_slice(work)['id'])[:10]}-{active['phase']}"
+            work.setdefault("technical_decisions", {})[blocker_id] = {
+                "id": blocker_id, "situation": artifact["blocker"],
+                "decision": "Unresolved: " + artifact["required_action"], "basis": artifact.get("summary", artifact["blocker"]),
+                "checks": [], "downstream": "Unresolved prerequisite; no passing credit. Resume only after the recorded prerequisite is resolved.",
+            }
         questions = artifact.get("questions", [])
         record = {"assignment_id": active["id"], "worker": deepcopy(artifact), "controller": evidence}
+        record["technical_journal_digest"] = journal_digest(work.get("technical_decisions", {}))
         record["candidate_binding"] = deepcopy(active["capsule"].get("candidate"))
         if required_ids is not None:
             record["required_identity_ids"] = deepcopy(required_ids)
@@ -897,7 +959,7 @@ def _reduce_command(
             proposed_slices = slice_records(
                 record["worker"].get("slices", work["slices"]), sealed=True,
             )
-            proposed_rules = [rule for item in proposed_slices for rule in item["allowed_paths"]]
+            proposed_rules = [rule for item in proposed_slices for rule in effective_slice(work, item)["allowed_paths"]]
             uncovered = [
                 path for path in retained_engineering_paths(work)
                 if not any(matches(path, rule) for rule in proposed_rules)
@@ -908,7 +970,10 @@ def _reduce_command(
         if phase not in NEXT_PHASE:
             raise PipelineError("ready has no acceptance transition")
         candidate = current_candidate(work)
-        if phase == "docs" and record.get("candidate") is not None:
+        if phase in {"qa", "docs"} and work["artifacts"].get("review", {}).get("technical_journal_digest", journal_digest({})) != journal_digest(work.get("technical_decisions", {})):
+            work["phase"] = "review"
+            work["artifacts"].pop("review", None)
+        elif phase == "docs" and record.get("candidate") is not None:
             work["phase"] = "review"
         elif (
             phase == "qa" and isinstance(work["artifacts"].get("docs"), dict)
@@ -963,6 +1028,8 @@ def _reduce_command(
             if not isinstance(record, dict) or record.get("worker", {}).get("outcome") != "pass":
                 raise PipelineError(f"ready requires accepted {phase} evidence")
         for phase in ("review", "qa"):
+            if work["artifacts"][phase].get("technical_journal_digest", journal_digest({})) != journal_digest(work.get("technical_decisions", {})):
+                raise PipelineError(f"{phase} is stale for the current technical journal")
             if work["artifacts"][phase].get("candidate_binding") != candidate:
                 raise PipelineError(f"{phase} is stale for the current candidate")
         if (

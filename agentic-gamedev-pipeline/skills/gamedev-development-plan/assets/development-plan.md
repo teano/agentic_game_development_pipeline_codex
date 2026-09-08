@@ -92,6 +92,8 @@ Exact input revision, assumptions, and prerequisite evidence.
 
 Relevant approved sources and decisions, completed work, verification evidence, and unresolved assumptions needed by the next assigned owner. Use the actual runtime assignment and candidate context; do not invent a generated handoff object.
 
+Include the current feature technical-journal locator, digest and relevant current entries with their basis/checks and downstream implications. Keep technical TD-* context separate from accepted DEC-* authority; do not carry overwritten record text or invent product obligations. Reassess exact overrides after source revision.
+
 ### Owned Paths
 
 - path/to/expected-write
@@ -140,6 +142,8 @@ For a legitimately isolated slice, replace both touchpoint rows above with the e
 - decision_ids: DEC-001 | none
 - evidence_sources: exact controller/Review/QA IDs
 
+Include applicable current technical decisions as verified context; a journal claim alone does not prove an implemented behavior or authorize a normative promise.
+
 ### Context Capsule Budget
 
 - max_authority_files: 8
@@ -150,6 +154,8 @@ For a legitimately isolated slice, replace both touchpoint rows above with the e
 - metric_scope: capsule_plus_referenced_files
 - authority_paths: exact bounded paths
 - evidence_paths: exact bounded paths
+
+Count delivered technical-journal entries and their referenced evidence in these estimates. The controller supplies the journal packet; do not add controller-state files to candidate edit scope or use TD-* as DEC-* amendment authority.
 
 ### Verification and Exit Criteria
 

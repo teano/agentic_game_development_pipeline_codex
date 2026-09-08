@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Development Plan"
   short_description: "Plan bounded sequential game feature work"
-  default_prompt: "Use $gamedev-development-plan to produce approved PLAN_READY authority and bounded slice records for v2; keep decision/finding custody controller-internal and stop before runtime."
+  default_prompt: "Use $gamedev-development-plan to produce approved PLAN_READY authority and bounded slice records for v2; keep decision/finding custody controller-internal and stop before runtime. Read technical-decisions-context for the Director and fresh Analyst on initial, resumed, reinitialized and revised planning. Keep TD-* technical context separate from accepted DEC-* authority; incorporate justified decisions through normal analysis and exact approval, preserve targeted local amendment versus structural return, and count relevant records in bounded downstream handoffs."
 policy:
   allow_implicit_invocation: false

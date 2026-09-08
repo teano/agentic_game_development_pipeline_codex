@@ -9,7 +9,7 @@ description: Explicit-invocation only. Use only when the user explicitly request
 
 Proceed only on direct explicit user invocation. Pipeline runtime coverage is controller-owned; this skill has no pipeline assignment, capsule, worker, state, or handoff authority. A request to add tests, run QA, review code, improve coverage, or complete a runtime transition is not authorization. Do not activate another GameDev stage.
 
-Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md) and [coverage-contract.md](references/coverage-contract.md). The contract is canonical for schema 2, identity equality, amendments, execution dimensions, and implementation/verification eligibility.
+Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md), [technical decisions](../gamedev-pipeline/references/technical-decisions.md), and [coverage-contract.md](references/coverage-contract.md). The contract is canonical for schema 2, identity equality, amendments, execution dimensions, and implementation/verification eligibility. Consider relevant current journal entries only when supplied or explicitly authorized as evidence; they do not waive identities, authorize product amendments, or grant this advisory role runtime or journal mutation authority.
 
 Remain read-only. Inspect only coverage data and exact source references supplied or explicitly authorized by the user. Do not persist or mutate coverage artifacts.
 

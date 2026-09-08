@@ -17,6 +17,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+_journal_path = Path(__file__).resolve().parents[2] / "gamedev-pipeline" / "scripts" / "pipeline_v2" / "technical_decisions.py"
+_journal_spec = importlib.util.spec_from_file_location("planning_technical_decisions", _journal_path)
+if _journal_spec is None or _journal_spec.loader is None:
+    raise RuntimeError("Cannot load the shared technical decisions contract")
+_journal_module = importlib.util.module_from_spec(_journal_spec)
+_journal_spec.loader.exec_module(_journal_module)
+technical_decisions_context = _journal_module.technical_decisions_context
+
+
+def technical_decisions_binding(root: Path, feature: str) -> dict[str, str]:
+    context = technical_decisions_context(root, feature)
+    return {key: context[key] for key in ("path", "sha256")}
+
 try:
     from capability_contract import parse_capability_ids
 except ImportError:  # pragma: no cover - importlib loading from the pipeline controller
@@ -507,6 +520,17 @@ def source_drift(root: Path, state: dict[str, Any]) -> list[str]:
                 drift.append(
                     f"{key}.{field}: expected {state[key][field]!r}, got {current[key][field]!r}"
                 )
+    # Runtime technical decisions do not revoke an already approved plan. They
+    # are fresh analysis inputs when its owner deliberately reopens that plan.
+    if state.get("status") not in {"approved", "revision_reopen_pending"}:
+        try:
+            journal = technical_decisions_context(root, state["feature"])
+            binding = {key: journal[key] for key in ("path", "sha256")}
+            previous = state.get("technical_decisions_binding")
+            if previous != binding and (previous is not None or journal["entries"]):
+                drift.append("technical decisions changed; reinitialize with a fresh Planning Analyst")
+        except (OSError, ValueError) as error:
+            drift.append(str(error))
     return drift
 
 
@@ -1138,6 +1162,7 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         "workflow_path": workflow_relative_path(feature).as_posix(),
         "status": "analyzing",
         "analyst_id": args.analyst_id,
+        "technical_decisions_binding": technical_decisions_binding(root, feature),
         "prd": sources["prd"],
         "specification": sources["specification"],
         "plan_path": sources["plan_path"],
@@ -1293,6 +1318,7 @@ def command_reinitialize(args: argparse.Namespace) -> dict[str, Any]:
                 pending_draft_bytes,
             )
     renewed = {
+        "technical_decisions_binding": technical_decisions_binding(root, state["feature"]),
         "schema_version": SCHEMA_VERSION,
         "feature": state["feature"],
         "workflow_path": state["workflow_path"],
@@ -1654,6 +1680,7 @@ def finalize_approved_revision_reopen(
     root: Path, state: dict[str, Any], args: argparse.Namespace
 ) -> dict[str, Any]:
     transition = state.get("revision_reopen") or {}
+    journal_binding = technical_decisions_binding(root, state["feature"])
     exact_args = {
         "opened_by": args.reopened_by,
         "reason": args.reason,
@@ -1702,6 +1729,7 @@ def finalize_approved_revision_reopen(
     event["event"] = "approved_plan_revision_opened"
     state.setdefault("history", []).append(event)
     state["status"] = "analyzing"
+    state["technical_decisions_binding"] = journal_binding
     state["analyst_id"] = transition["new_analyst_id"]
     state["analysis"] = None
     state["submission"] = None
@@ -1911,6 +1939,10 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
     return state
 
 
+def command_technical_decisions_context(args: argparse.Namespace) -> dict[str, Any]:
+    return technical_decisions_context(Path(args.project_root), args.feature)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", required=True)
@@ -1919,6 +1951,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="lowercase feature slug selecting .agentic-pipeline/Workflows/<feature>",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+
+    journal_context = commands.add_parser("technical-decisions-context")
+    journal_context.set_defaults(handler=command_technical_decisions_context)
 
     init = commands.add_parser("init")
     init.add_argument("--prd", required=True)

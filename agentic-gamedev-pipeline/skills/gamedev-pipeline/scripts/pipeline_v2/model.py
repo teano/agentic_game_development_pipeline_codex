@@ -10,6 +10,15 @@ import re
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any
+try:
+    from .technical_decisions import journal_digest, journal_reference, validate_journal
+except ImportError:  # Upstream authority controllers load this file without a package.
+    _journal_spec = importlib.util.spec_from_file_location("gamedev_technical_decisions", Path(__file__).with_name("technical_decisions.py"))
+    _journal_module = importlib.util.module_from_spec(_journal_spec)
+    _journal_spec.loader.exec_module(_journal_module)
+    journal_digest = _journal_module.journal_digest
+    journal_reference = _journal_module.journal_reference
+    validate_journal = _journal_module.validate_journal
 
 _PLAN_CONTRACT_PATH = Path(__file__).resolve().parents[4] / "scripts" / "development_plan_contract.py"
 _PLAN_CONTRACT_SPEC = importlib.util.spec_from_file_location("gamedev_runtime_plan_contract", _PLAN_CONTRACT_PATH)
@@ -57,11 +66,12 @@ _ARTIFACT_SHAPES = {
         },
     ),
     "engineering": (
-        ("outcome", "summary", "questions", "assumptions", "blocker", "required_action"),
+        ("outcome", "summary", "questions", "assumptions", "blocker", "required_action", "technical_decisions"),
         ("outcome", "summary"),
         {
             "summary": "non-empty string", "questions[]": "non-empty string",
             "assumptions[]": "non-empty string",
+            "technical_decisions[]": "current TD-* entries: id, situation, decision, basis, checks[], downstream, optional overrides exact reference; replace existing ID in place",
             "blocker": "non-empty string only and always when blocked",
             "required_action": "non-empty string only and always when blocked",
         },
@@ -254,10 +264,10 @@ def artifact_schema(phase: str, role: str | None = None) -> dict[str, Any]:
         raise PipelineError("artifact schema requires a known phase/role")
     allowed, required, shapes = _ARTIFACT_SHAPES[phase]
     return {
-        "allowed_keys": list(allowed),
+        "allowed_keys": list(dict.fromkeys([*allowed, "technical_decisions"])),
         "required_keys": list(required),
         "outcome_enum": ["pass", "fail", "blocked"],
-        "item_shapes": deepcopy(shapes),
+        "item_shapes": {**deepcopy(shapes), "technical_decisions[]": "current TD-* entries: id, situation, decision, basis, checks[], downstream, optional overrides exact reference; execution is controller-owned"},
     }
 
 
@@ -310,6 +320,14 @@ def _bounded_context_records(
 def compact_assignment_context(source: dict[str, Any], bound_candidate: Any) -> dict[str, Any]:
     """Keep worker context semantic, deterministic, and bounded."""
     context: dict[str, Any] = {}
+    if isinstance(source.get("technical_journal"), dict):
+        context["technical_journal"] = deepcopy(source["technical_journal"])
+    if isinstance(source.get("technical_decisions"), list):
+        context["technical_decisions"], _ = _bounded_context_records(source["technical_decisions"], None)
+        if "technical_journal" in context:
+            omitted = max(0, context["technical_journal"]["count"] - len(context["technical_decisions"]))
+            context["technical_journal"]["omitted_entry_count"] = omitted
+            context["technical_journal"]["requires_current_journal_read"] = omitted > 0
     if isinstance(source.get("current_slice"), dict):
         context["current_slice"] = deepcopy(source["current_slice"])
     if isinstance(source.get("review_target"), dict):
@@ -499,7 +517,18 @@ def completed_slice_ids(state: dict[str, Any]) -> list[str]:
 def current_slice(state: dict[str, Any]) -> dict[str, Any]:
     """Return the next unverified slice, or the final slice after all are verified."""
     completed = completed_slice_ids(state)
-    return deepcopy(state["slices"][min(len(completed), len(state["slices"]) - 1)])
+    return effective_slice(state, state["slices"][min(len(completed), len(state["slices"]) - 1)])
+
+
+def effective_slice(state: dict[str, Any], selected: dict[str, Any]) -> dict[str, Any]:
+    selected = deepcopy(selected)
+    for entry in state.get("technical_decisions", {}).values():
+        execution = entry.get("execution", {})
+        if execution.get("authority") == state["authority"]["digest"] and execution.get("slice_id") == selected["id"]:
+            selected["allowed_paths"] = list(dict.fromkeys(selected["allowed_paths"] + execution["additional_paths"]))
+            if execution["command_order"]:
+                selected["planned_commands"] = deepcopy(execution["command_order"])
+    return selected
 
 
 def _integrated_slice_paths(state: dict[str, Any]) -> list[str]:
@@ -507,7 +536,8 @@ def _integrated_slice_paths(state: dict[str, Any]) -> list[str]:
     last_index = min(len(completed_slice_ids(state)), len(state["slices"]) - 1)
     return list(dict.fromkeys(
         path
-        for item in state["slices"][:last_index + 1]
+        for original in state["slices"][:last_index + 1]
+        for item in [effective_slice(state, original)]
         for path in item["allowed_paths"] + item.get("read_paths", [])
     ))
 
@@ -691,6 +721,8 @@ def pending(mapping: dict[str, Any]) -> list[str]:
 def passing_artifact(state: dict[str, Any], phase: str) -> dict[str, Any] | None:
     """Return live semantic credit, excluding evidence retained across a boundary."""
     record = state.get("artifacts", {}).get(phase)
+    if isinstance(record, dict) and record.get("technical_journal_digest", journal_digest({})) != journal_digest(state.get("technical_decisions", {})):
+        return None
     worker = record.get("worker") if isinstance(record, dict) else None
     if (
         not isinstance(worker, dict) or worker.get("outcome") != "pass"
@@ -1032,7 +1064,7 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
         if phase in {"engineering", "review", "qa"}
         else selected["allowed_paths"]
     )
-    read = list(dict.fromkeys(authority_paths + slice_read))
+    read = list(dict.fromkeys(authority_paths + slice_read + ([f"{state['workflow_path']}/pipeline-state.json"] if state.get("technical_decisions") else [])))
     target = review_target(state) if phase == "review" else None
     if target is not None and target["kind"] == "documentation_changes":
         read = list(dict.fromkeys(read + target["candidate_changes"]))
@@ -1050,6 +1082,8 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
             if no_documentation
             else list(dict.fromkeys(read + write))
         )
+    if state.get("technical_decisions"):
+        read = list(dict.fromkeys(read + [f"{state['workflow_path']}/pipeline-state.json"]))
     assignment = {
         "id": assignment_id,
         "worker_id": identity["worker_id"],
@@ -1140,12 +1174,16 @@ def validate_state(state: dict[str, Any]) -> None:
             "legacy filesystem-inventory state is unsupported; "
             "remove the old state and run a fresh init"
         )
-    if not isinstance(state, dict) or set(state) != STATE_FIELDS:
+    if not isinstance(state, dict) or set(state) - {"technical_decisions"} != STATE_FIELDS:
         extra = sorted(set(state) - STATE_FIELDS) if isinstance(state, dict) else []
         missing = sorted(STATE_FIELDS - set(state)) if isinstance(state, dict) else sorted(STATE_FIELDS)
         raise PipelineError(f"invalid state fields; missing={missing}, extra={extra}")
-    if len(state) != 16 or state["schema"] != SCHEMA:
+    if len(state) not in {16, 17} or state["schema"] != SCHEMA:
         raise PipelineError("state must use the compact schema-4 shape")
+    try:
+        validate_journal(state.get("technical_decisions", {}))
+    except ValueError as exc:
+        raise PipelineError(str(exc)) from exc
     if state["checkout_model"] != CHECKOUT_MODEL:
         raise PipelineError("state must use the git-tree-v1 checkout model")
     if not is_git_oid(state["base_tree_oid"]):
@@ -1167,6 +1205,16 @@ def validate_state(state: dict[str, Any]) -> None:
         raise PipelineError("authority has an invalid shape")
     if authority_record(authority.get("items", {})) != authority:
         raise PipelineError("authority digest does not match its items")
+    for entry in state.get("technical_decisions", {}).values():
+        execution = entry.get("execution")
+        if execution and execution["authority"] == authority["digest"]:
+            selected = next((item for item in state["slices"] if item["id"] == execution["slice_id"]), None)
+            if selected is None:
+                raise PipelineError("technical overlay names an unknown slice")
+            if any(Path(path) == Path(item["path"]) for path in execution["additional_paths"] for item in authority["items"].values()):
+                raise PipelineError("technical overlay cannot grant authority writes")
+            if execution["command_order"] and sorted(canonical_bytes(argv) for argv in execution["command_order"]) != sorted(canonical_bytes(argv) for argv in selected["planned_commands"]):
+                raise PipelineError("technical overlay changed mandatory check coverage")
     for key in ("artifacts", "questions"):
         if not isinstance(state[key], dict):
             raise PipelineError(f"{key} must be an object")
@@ -1253,7 +1301,7 @@ def validate_state(state: dict[str, Any]) -> None:
     active = state["active_assignment"]
     if active is not None:
         required = {"id", "phase", "role", "worker_id", "task", "access", "capsule", "base", "commands", "status"}
-        optional = {"output_path", "artifact_schema"}
+        optional = {"output_path", "artifact_schema", "technical_observation"}
         if not isinstance(active, dict) or not required <= set(active) or not set(active) - required <= optional or active["status"] != "active":
             raise PipelineError("active_assignment has an invalid shape")
         if active["phase"] != state["phase"] or active["role"] != ROLES.get(state["phase"]):
@@ -1264,6 +1312,12 @@ def validate_state(state: dict[str, Any]) -> None:
             raise PipelineError("active_assignment output path is not controller-derived")
         if "artifact_schema" in active and active["artifact_schema"] != artifact_schema(active["phase"], active["role"]):
             raise PipelineError("active_assignment artifact schema is not controller-derived")
+        if "technical_observation" in active:
+            observation = active["technical_observation"]
+            if (not isinstance(observation, dict) or set(observation) != {"id", "tree", "action", "assignment_id"}
+                    or not is_git_oid(observation.get("tree")) or observation.get("assignment_id") != active["id"]
+                    or any(not isinstance(observation.get(key), str) or not observation[key].strip() for key in ("id", "action"))):
+                raise PipelineError("technical observation is stale or malformed")
         access = active["access"]
         if not isinstance(access, dict) or set(access) != {"read", "write"}:
             raise PipelineError("assignment requires explicit read/write access")
@@ -1319,6 +1373,7 @@ def _active_assignment_view(
         "context": context,
         "output_path": assignment_output_path(active, state["feature"]),
         "artifact_schema": artifact_schema(active["phase"], active["role"]),
+        **({"technical_observation": deepcopy(active["technical_observation"])} if "technical_observation" in active else {}),
     }
 
 
@@ -1335,5 +1390,6 @@ def status_view(state: dict[str, Any]) -> dict[str, Any]:
         "candidate": current_candidate(state),
         "open_questions": pending(state["questions"]),
         "ready": production_ready(state),
+        "technical_journal": journal_reference(state),
         "next_action": next_action(state),
     }

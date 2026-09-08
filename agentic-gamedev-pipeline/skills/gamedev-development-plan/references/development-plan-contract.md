@@ -52,6 +52,8 @@ Only `single_owner` and `sequential_slices` are valid modes. `writer_strategy` i
 
 ## Analyst decision
 
+The shared [technical decisions contract](../../gamedev-pipeline/references/technical-decisions.md) also applies to the Director and Analyst, on fresh planning and every reentry/revision/replacement. Consume relevant current feature-journal records with their source binding as technical context, independently of the accepted `DEC-*` ledger. Reassess their exact overrides, basis and checks against the current PRD/SPEC, and incorporate justified dependency, slice, verification and documentation consequences through ordinary plan approval. A technical record never declares product scope, a material permission or a coverage amendment authority. Preserve the user's chosen local-amendment or owning-stage-return route. A journal change alone does not rewrite approved plan bytes or promote a technical choice into a requirement.
+
 Analyze product and technical breadth, estimated files/symbols/tests, context working set, cross-system dependencies, ownership seams, merge/conflict surface, verification cost, documentation outputs, and handoff stability. Prefer `single_owner` whenever production implementation and tightly coupled automated tests fit one bounded engineering scope without context compression.
 
 Use `sequential_slices` only if every slice is independently understandable and produces an observable end-to-end outcome. A later slice may consume a sealed earlier handoff, but writers never overlap. Do not create layer-only slices such as backend, UI, or tests. When boundaries are inseparable, retain one integration owner and add `MILESTONE-*` checkpoints.
@@ -107,6 +109,8 @@ For `sequential_slices`, use at least two slices. IDs must be ordered and unique
 Every Handoff Contract describes the semantic inputs the next assigned owner needs: relevant approved sources and decisions, completed work, verification evidence, and unresolved assumptions. The controller supplies the existing runtime assignment and candidate/failure context; the plan must not promise a separate generated handoff schema or coverage/documentation state object. Workers do not hand-author revision/change/diff mechanics.
 
 ## State and approval
+
+The read-only `technical-decisions-context` command returns the selected feature's current journal locator, digest and entries. The controller binds that digest during initial/reinitialized/reopened analysis and checks it before draft credit or approval. Drift uses existing `stale` and `reinitialize` with a fresh Analyst; missing or foreign bound sources fail closed without sibling fallback. A runtime journal update alone never revokes an approved plan. A deliberate `revise-approved` obtains the current journal before replacing plan bytes and binds it for fresh analysis. These bindings are operational context, not a fourth approved authority artifact or a replacement for accepted `DEC-*` decisions.
 
 `submit` validates structure, exact source traces, mode, analyst identity, and current `SPEC_READY`, then records the draft SHA. An exact replay while awaiting approval revalidates the unchanged draft and returns the recorded result without changing plan bytes, state, history, `submitted_at`, or `updated_at`. Any edit invalidates that submission and requires resubmission.
 

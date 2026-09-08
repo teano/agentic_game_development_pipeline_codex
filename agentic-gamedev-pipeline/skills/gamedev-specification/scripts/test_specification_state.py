@@ -101,6 +101,65 @@ Android build gate remains.
 
 
 class SpecificationStateTests(unittest.TestCase):
+    def test_journal_change_invalidates_active_review_and_refresh_preserves_authority(self) -> None:
+        self.initialize()
+        controller.command_start_cycle(self.args(architect_id="architect-1", proofreader_id="proofreader-1"))
+        before = (self.prd.read_bytes(), self.spec.read_bytes())
+        current = {"path": "journal#technical_decisions", "sha256": "a" * 64,
+                   "entries": {"TD-1": {"decision": "current technical choice"}}}
+        with mock.patch.object(controller, "technical_decisions_context", return_value=current):
+            state = controller.load_state(self.root, "sample-feature")
+            with self.assertRaisesRegex(controller.SpecificationStateError, "technical decisions changed"):
+                controller.require_current_preaccept_acceptance(self.root, state, self.prd, self.spec, state["active_wave"])
+            refreshed = controller.command_refresh_technical_decisions(self.args(
+                worker_status="stopped", worker_evidence="coordination confirmed proofreader stopped"))
+            self.assertEqual(refreshed["status"], "awaiting_accept")
+            self.assertIsNone(refreshed["acceptance"])
+            self.assertIsNone(refreshed["active_wave"])
+            with self.assertRaisesRegex(controller.SpecificationStateError, "technical decisions binding"):
+                self.accept_spec(self.write_preaccept_receipt(technical_decisions_sha256=None))
+            receipt = self.write_preaccept_receipt(technical_decisions_sha256=current["sha256"])
+            accepted = self.accept_spec(receipt)
+            self.assertEqual(accepted["acceptance"]["technical_decisions_binding"]["sha256"], current["sha256"])
+        self.assertEqual(before, (self.prd.read_bytes(), self.spec.read_bytes()))
+
+    def test_journal_change_rejects_active_helper_preflight_without_consumption(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec()
+        before = controller.state_path(self.root, "sample-feature").read_bytes()
+        current = {"path": "journal#technical_decisions", "sha256": "b" * 64, "entries": {"TD-1": {}}}
+        with mock.patch.object(controller, "technical_decisions_context", return_value=current):
+            active = controller.load_state(self.root, "sample-feature")["active_helper_request"]
+            with self.assertRaisesRegex(controller.SpecificationStateError, "technical decisions changed"):
+                controller.command_preflight_helper_output(self.args(request=active["path"]))
+        self.assertEqual(before, controller.state_path(self.root, "sample-feature").read_bytes())
+
+    def test_journal_refresh_requires_real_drift_and_terminal_worker_evidence(self) -> None:
+        self.initialize()
+        with self.assertRaisesRegex(controller.SpecificationStateError, "unchanged"):
+            controller.command_refresh_technical_decisions(self.args(worker_status="stopped", worker_evidence="observed"))
+        current = {"path": "journal#technical_decisions", "sha256": "c" * 64, "entries": {"TD-1": {}}}
+        with mock.patch.object(controller, "technical_decisions_context", return_value=current):
+            with self.assertRaisesRegex(controller.SpecificationStateError, "terminal worker"):
+                controller.command_refresh_technical_decisions(self.args(worker_status="stopped", worker_evidence=""))
+
+    def test_journal_refresh_preserves_stopped_helper_output_as_uncredited_fresh_input(self) -> None:
+        self.initialize(with_spec=False)
+        self.write_spec()
+        before = (self.prd.read_bytes(), self.spec.read_bytes())
+        current = {"path": "journal#technical_decisions", "sha256": "d" * 64, "entries": {"TD-1": {}}}
+        with mock.patch.object(controller, "technical_decisions_context", return_value=current):
+            refreshed = controller.command_refresh_technical_decisions(self.args(
+                worker_status="stopped", worker_evidence="coordination confirmed generator stopped"))
+            self.assertEqual(refreshed["status"], "needs_generation")
+            self.assertEqual(refreshed["helper_evidence"]["results"], [])
+            with self.assertRaisesRegex(controller.SpecificationStateError, "consumed external generation"):
+                self.accept_spec(self.write_preaccept_receipt(technical_decisions_sha256=current["sha256"]))
+            next_state = self.prepare_helper("generation")
+            self.assertEqual(next_state["active_helper_request"]["summary"]["route"]["target_operation"], "continue")
+            self.assertEqual(next_state["active_helper_journal_binding"]["sha256"], current["sha256"])
+        self.assertEqual(before, (self.prd.read_bytes(), self.spec.read_bytes()))
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -209,6 +268,9 @@ Implement the exact approved behavior.
             "semantic_assessment": "accept",
             "section_applicability_inventory": inventory,
         }
+        journal = controller.technical_decisions_context(self.root, "sample-feature")
+        if journal["entries"]:
+            payload["technical_decisions_sha256"] = journal["sha256"]
         payload.update(overrides)
         self.preaccept_receipt.write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"

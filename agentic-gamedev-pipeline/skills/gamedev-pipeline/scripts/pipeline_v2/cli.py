@@ -92,6 +92,12 @@ def parser() -> argparse.ArgumentParser:
     migrate.add_argument("--id", required=True); migrate.add_argument("--legacy-state", type=Path, required=True); migrate.add_argument("--slice", action="append", required=True)
     ready = commands.add_parser("ready", help="Seal the fully verified live candidate as production-ready.")
     ready.add_argument("--id", required=True); ready.add_argument("--expected-generation", type=int, required=True)
+    observe = commands.add_parser("technical-observe", help="Capture an in-scope baseline before an Engineering editor action.")
+    observe.add_argument("--id", required=True); observe.add_argument("--expected-generation", type=int, required=True)
+    observe.add_argument("--action", required=True)
+    decision = commands.add_parser("technical-decision", help="Record a technical decision and reconcile exact scoped paths or check order.")
+    decision.add_argument("--id", required=True); decision.add_argument("--expected-generation", type=int, required=True)
+    decision.add_argument("--packet", type=Path, required=True)
     return value
 
 
@@ -125,6 +131,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         })
     elif args.command == "ready":
         state = Controller(store).ready(command_id=args.id, expected_generation=args.expected_generation)
+    elif args.command == "technical-observe":
+        state = Controller(store).technical_action(command_id=args.id, expected_generation=args.expected_generation, action=args.action)
+    elif args.command == "technical-decision":
+        packet_path = safe_path(root, args.packet, "technical decision packet", strict=True)
+        try:
+            packet = json.loads(packet_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PipelineError(f"cannot read technical decision packet: {exc}") from exc
+        state = Controller(store).technical_action(command_id=args.id, expected_generation=args.expected_generation, packet=packet)
     else:  # pragma: no cover
         raise AssertionError(args.command)
     view = status_view(state)

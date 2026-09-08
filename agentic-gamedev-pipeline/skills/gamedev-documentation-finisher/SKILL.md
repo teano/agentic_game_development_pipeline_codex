@@ -7,10 +7,10 @@ description: Explicit-invocation only. Use only when the user explicitly request
 
 ## Activation gate
 
-Proceed only on the explicit activation described above. Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md) and [documentation artifact contract](references/documentation-contract.md).
+Proceed only on the explicit activation described above. Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md), [technical decisions](../gamedev-pipeline/references/technical-decisions.md), and [documentation artifact contract](references/documentation-contract.md).
 
-Edit only the assigned documentation paths. Ground normative statements in approved requirements, specification, plan, and implemented public behavior. Ground derived instructions in the reviewed and tested candidate. Preserve repository terminology and add no unsupported promise, default, compatibility claim, or operator step.
+Edit only the assigned documentation paths. Ground normative statements in approved requirements, specification, plan, and implemented public behavior. Reconcile relevant current journal corrections with those sources; independently check their authority and applicability. Ground derived instructions in the reviewed and tested candidate. Preserve repository terminology and add no unsupported promise, default, compatibility claim, or operator step. Do not restore an outdated technical instruction or promote a technical decision into a product requirement.
 
-Inspect the final diff for source fidelity, scope, stale references, and accidental product or test changes. If no documentation change is required, say so in a passing summary and leave the checkout unchanged. If authority is missing or contradictory, return `blocked` with one concise question.
+Inspect the final diff for source fidelity, scope, stale references, and accidental product or test changes. If no documentation change is required, say so in a passing summary and leave the checkout unchanged. Apply the shared assessment and journal rule to every encountered blocker. Correct a purely technical inconsistency within assigned documentation authority; use `blocked` only for a remaining missing prerequisite or user-owned authority decision, with the exact unresolved question.
 
 Do not implement code or tests, change product decisions, edit controller state, perform Review or QA, or start another stage. Follow `assignment.artifact_schema` exactly; write only that semantic JSON to the assigned `output_path`, return that path, and stop.
