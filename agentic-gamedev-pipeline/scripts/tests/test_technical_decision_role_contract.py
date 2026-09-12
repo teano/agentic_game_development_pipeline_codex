@@ -15,7 +15,7 @@ import unittest
 BUNDLE = Path(__file__).resolve().parents[2]
 SKILLS = BUNDLE / "skills"
 sys.path.insert(0, str(SKILLS / "gamedev-pipeline" / "scripts"))
-from pipeline_v2.model import PipelineError, ROLES, artifact_schema, compact_assignment_context
+from pipeline_v2.model import PipelineError, ROLES, artifact_schema, compact_assignment_context, journal_digest
 from pipeline_v2.reducer import _worker_artifact
 
 
@@ -119,15 +119,15 @@ class TechnicalDecisionRoleContractTests(unittest.TestCase):
                 self.assertRegex(prompt, "technical-decision")
         self.assertTrue(policy.is_file())
 
-    def test_omitted_corrected_entry_requires_current_journal_read_before_work(self) -> None:
+    def test_corrected_current_entry_is_delivered_losslessly_before_work(self) -> None:
         records = [{**decision(), "id": f"TD-{number}"} for number in range(12)]
         records[0]["decision"] = "Corrected current decision under the same oldest ID."
         context = compact_assignment_context({
-            "technical_journal": {"path": "workflow/pipeline-state.json#technical_decisions", "sha256": "a" * 64, "count": len(records)},
+            "technical_journal": {"path": "workflow/pipeline-state.json#technical_decisions", "sha256": journal_digest({entry["id"]: entry for entry in records}), "count": len(records)},
             "technical_decisions": records,
         }, None)
-        self.assertTrue(context["technical_journal"]["requires_current_journal_read"])
-        self.assertNotIn("TD-0", [entry["id"] for entry in context["technical_decisions"]])
+        self.assertFalse(context["technical_journal"]["requires_current_journal_read"])
+        self.assertEqual(records, context["technical_decisions"])
         self.assertEqual(len(records) - len(context["technical_decisions"]), context["technical_journal"]["omitted_entry_count"])
         for name in ("technical-decisions.md", "stage-handoff-invariant.md"):
             with self.subTest(reference=name):

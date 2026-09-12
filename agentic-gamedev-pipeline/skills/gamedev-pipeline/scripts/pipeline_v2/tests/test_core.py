@@ -1255,6 +1255,184 @@ None.
         with self.assertRaises(PipelineError):
             validate_state(schema2)
 
+    def _large_failure_assignment(self, phase="review"):
+        self._reach_engineering("-large-context")
+        self.controller.next(command_id="NEXT-LARGE-CANDIDATE")
+        (self.root / "tests").mkdir(exist_ok=True)
+        for index in range(6):
+            (self.root / f"tests/context-{index}.txt").write_text(str(index), encoding="utf-8")
+        self._complete("COMPLETE-LARGE-CANDIDATE", {"outcome": "pass", "summary": "Implemented"})
+        self._accept("large-candidate")
+        if phase == "qa":
+            self._review_pass("review-before-large-qa")
+        artifact = ({"outcome": "fail", "findings": [
+            {"text": f"Exact defect {index}", "severity": "high", "kind": "correctness"}
+            for index in range(19)]} if phase == "review" else
+            {"outcome": "fail", "checks": self._qa_checks("Exact failing scenario", outcome="fail")})
+        self._complete_readonly(phase, f"{phase}-large-failure", artifact)
+        action = self.controller.status()["next_action"]
+        issued = self.controller.next(command_id=action["command_id"], expected_generation=action["expected_generation"])
+        return issued, action
+
+    def _assert_large_failure_visible(self, phase):
+        issued, action = self._large_failure_assignment(phase)
+        expected = deepcopy(issued["active_assignment"]["capsule"]["context"])
+        self.assertIn("verification_failure", expected)
+        failure = expected["verification_failure"]
+        self.assertEqual(failure["candidate"], issued["active_assignment"]["capsule"]["candidate"])
+        self.assertEqual([f"tests/context-{index}.txt" for index in range(6)], failure["candidate"]["changed_paths"])
+        evidence_key = "findings" if phase == "review" else "checks"
+        self.assertEqual(issued["artifacts"][phase]["worker"][evidence_key], failure[evidence_key])
+        if phase == "review":
+            self.assertEqual(19, len(failure["findings"]))
+        before = self.store.path.read_bytes()
+        for view in (self.controller.status(), status_view(issued)):
+            self.assertEqual(expected, view["active_assignment"]["context"])
+        replayed = self.controller.next(command_id=action["command_id"], expected_generation=action["expected_generation"])
+        self.assertEqual(expected, status_view(replayed)["active_assignment"]["context"])
+        self.assertEqual(before, self.store.path.read_bytes())
+        visible = status_view(issued)["active_assignment"]["context"]
+        visible["verification_failure"]["phase"] = "altered-view"
+        self.assertEqual(phase, issued["active_assignment"]["capsule"]["context"]["verification_failure"]["phase"])
+
+    def _maintenance_packet(self):
+        action = self.controller.status(maintenance={})["next_action"]
+        self.assertEqual("maintenance_authorization_required", action["result"])
+        return {**action["maintenance_binding"],
+                "authorization": "User explicitly authorized fixing the controller incident",
+                "quiescence": "Director stopped the worker; no output or owned mutations remain"}
+
+    def test_active_maintenance_restarts_without_credit_and_preserves_all_findings(self):
+        issued, old_action = self._large_failure_assignment()
+        original = self.store.load()
+        with mock.patch.object(runner_module, "pipeline_runtime_digest", return_value=digest("repaired-runtime")):
+            with self.assertRaisesRegex(PipelineError, "runtime changed"):
+                self.controller.status()
+            packet = self._maintenance_packet()
+            packet_path = self.root / self.workflow_path / "maintenance.json"
+            packet_path.write_text(json.dumps(packet), encoding="utf-8")
+            action = cli_run(cli_parser().parse_args([
+                "--root", str(self.root), "--feature", self.feature,
+                "status", "--maintenance", str(packet_path)]))["next_action"]
+            command = {**self._baseline_init_command(action), "maintenance": packet}
+            restarted = self.controller.reconfigure(command)
+            self.assertEqual("plan", restarted["phase"])
+            self.assertIsNone(restarted["active_assignment"])
+            self.assertIsNone(current_candidate(restarted))
+            self.assertEqual(original["history"], restarted["history"][:-1])
+            prior = restarted["history"][-1]["prior"]
+            self.assertEqual(original["artifacts"]["review"], prior["verification_artifact"])
+            self.assertEqual(19, len(prior["verification_failure"]["findings"]))
+            self.assertEqual(original["active_assignment"]["capsule"]["candidate"], prior["interrupted_assignment"]["candidate"])
+            before = self.store.path.read_bytes()
+            self.assertEqual(restarted, self.controller.reconfigure(command))
+            self.assertEqual(before, self.store.path.read_bytes())
+            self._reach_engineering("-maintenance-replanned")
+            fresh = self.controller.next(command_id="NEXT-AFTER-MAINTENANCE")
+            self.assertNotEqual(issued["active_assignment"]["id"], fresh["active_assignment"]["id"])
+            self.assertIsNone(fresh["active_assignment"]["capsule"]["candidate"])
+            failure = self.controller.status()["active_assignment"]["context"]["verification_failure"]
+            self.assertEqual(prior["verification_failure"], failure)
+            self.assertEqual(19, len(failure["findings"]))
+            self._complete("COMPLETE-AFTER-MAINTENANCE", {"outcome": "pass", "summary": "Corrections checked"})
+            self._accept("after-maintenance")
+            target = self.controller.status()["next_action"]["assignment"]["context"]["review_target"]
+            self.assertEqual([f"tests/context-{index}.txt" for index in range(6)], target["candidate_changes"])
+
+    def test_active_maintenance_rejects_stale_packets_mutations_and_output(self):
+        self._reach_engineering("-maintenance-negative")
+        self.controller.next(command_id="NEXT-MAINTENANCE-NEGATIVE")
+        before = self.store.path.read_bytes()
+        with mock.patch.object(runner_module, "pipeline_runtime_digest", return_value=digest("repaired-runtime")):
+            packet = self._maintenance_packet()
+            action = self.controller.status(maintenance=packet)["next_action"]
+            command = {**self._baseline_init_command(action), "maintenance": packet}
+            for key in packet:
+                bad = deepcopy(packet); bad[key] = -1 if key == "generation" else ""
+                with self.subTest(key=key), self.assertRaises(PipelineError):
+                    self.controller.status(maintenance=bad)
+                self.assertEqual(before, self.store.path.read_bytes())
+            with self.assertRaises(PipelineError):
+                self.controller.reconfigure(self._baseline_init_command(action))
+            changed = deepcopy(command); changed["maintenance"]["authorization"] = "Different authorization"
+            with self.assertRaisesRegex(PipelineError, "stale.*reconfiguration"):
+                self.controller.reconfigure(changed)
+            with self.assertRaises(PipelineError):
+                self.controller.reconfigure({**command, "expected_generation": packet["generation"] - 1})
+            with mock.patch.object(runner_module, "pipeline_runtime_digest", return_value=digest("later-runtime")):
+                with self.assertRaises(PipelineError):
+                    self.controller.reconfigure(command)
+            for path in ("game.txt", ".gitignore"):
+                target = self.root / path
+                previous = target.read_bytes() if target.exists() else None
+                target.write_text("unexpected modification", encoding="utf-8")
+                with self.subTest(path=path), self.assertRaises(PipelineError):
+                    self.controller.reconfigure(command)
+                if previous is None:
+                    target.unlink()
+                else:
+                    target.write_bytes(previous)
+            output = self.root / assignment_output_path(packet["assignment_id"], self.feature)
+            output.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(PipelineError, "existing worker output"):
+                self.controller.reconfigure(command)
+            output.unlink()
+            self._write_approved_plan(self.slices, revision=2)
+            with self.assertRaises(PipelineError):
+                self.controller.reconfigure(command)
+            self.assertEqual(before, self.store.path.read_bytes())
+
+    def test_terminal_qa_new_product_failure_requires_evidence_and_returns_engineering(self):
+        self._reach_candidate()
+        self._review_pass("review-before-terminal-product-failure")
+        self._complete_readonly("qa", "qa-terminal-product-failure", {
+            "outcome": "blocked", "checks": self._qa_checks("Prerequisite unproven", outcome="not_run"),
+            "blocker": "Owner cycle unavailable", "required_action": "Establish a working owner cycle"})
+        original = self.store.load()
+        before = self.store.path.read_bytes()
+        evidence = self.root / self.workflow_path / "new-observation.json"
+        evidence.write_text('{"observed":"owner does not move"}', encoding="utf-8")
+        with mock.patch.object(runner_module, "pipeline_runtime_digest", return_value=digest("terminal-route-repair")):
+            binding = self.controller.status(product_failure={})["next_action"]["product_failure_binding"]
+            packet = {**binding, "authorization": "User explicitly authorized routing this evidenced product defect to Engineering",
+                      "evidence_path": evidence.relative_to(self.root).as_posix(),
+                      "evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+                      "checks": [{"id": original["artifacts"]["qa"]["required_identity_ids"][0],
+                                  "outcome": "fail", "evidence": "New observation: owner does not move; new-observation.json"}]}
+            for key in ("evidence_path", "evidence_sha256", "authorization"):
+                missing = deepcopy(packet); del missing[key]
+                with self.subTest(key=key), self.assertRaises(PipelineError):
+                    self.controller.status(product_failure=missing)
+                self.assertEqual(before, self.store.path.read_bytes())
+            action = self.controller.status(product_failure=packet)["next_action"]
+            command = {**self._baseline_init_command(action), "product_failure": packet}
+            evidence.write_text("changed observation", encoding="utf-8")
+            with self.assertRaises(PipelineError):
+                self.controller.reconfigure(command)
+            self.assertEqual(before, self.store.path.read_bytes())
+            evidence.write_text('{"observed":"owner does not move"}', encoding="utf-8")
+            result = self.controller.reconfigure(command)
+            self.assertEqual("engineering", result["phase"])
+            self.assertIsNone(current_candidate(result))
+            self.assertEqual(original["history"], result["history"][:-1])
+            self.assertEqual(original["artifacts"], result["history"][-1]["prior_artifacts"])
+            self.assertEqual(current_slice(original), current_slice(result))
+            self.assertEqual("fail", result["artifacts"]["qa"]["worker"]["outcome"])
+            saved = self.store.path.read_bytes()
+            self.assertEqual(result, self.controller.reconfigure(command))
+            self.assertEqual(saved, self.store.path.read_bytes())
+            fresh = self.controller.next(command_id="NEXT-NEW-PRODUCT-FAILURE")
+            failure = fresh["active_assignment"]["capsule"]["context"]["verification_failure"]
+            self.assertEqual(packet["checks"], failure["checks"])
+            self.assertEqual(binding["candidate_tree_oid"], fresh["active_assignment"]["base"]["candidate_tree_oid"])
+            self.assertFalse(self.controller.status()["ready"])
+
+    def test_review_failure_survives_public_view_and_next_replay_after_compaction(self):
+        self._assert_large_failure_visible("review")
+
+    def test_qa_failure_survives_public_view_and_next_replay_after_compaction(self):
+        self._assert_large_failure_visible("qa")
+
     def test_review_fail_routes_directly_to_engineering_with_bounded_evidence(self) -> None:
         candidate = self._reach_candidate()
         failed = self._complete_readonly("review", "reviewer-direct-fail", {
@@ -5285,7 +5463,7 @@ None.
         issue("--read", "game.txt", "--write", "game.txt")
         self._complete("DERIVE-DOCS-C", {"outcome": "pass", "summary": "Documentation is current"})
 
-    def test_public_assignment_context_stays_bounded_after_many_decisions(self) -> None:
+    def test_public_assignment_context_keeps_all_answers_without_controller_history(self) -> None:
         status_args = cli_parser().parse_args(["--root", str(self.root), "--feature", self.feature, "status"])
 
         for index in range(12):
@@ -5310,7 +5488,7 @@ None.
                 "--id", decision["command_id"],
                 "--expected-generation", str(decision["expected_generation"]),
                 "--question-id", decision["question_id"],
-                "--text", f"answer-{index}-" + "a" * 900,
+                "--text", f"answer-{index}-" + "a" * 900 + " literal …[sha256=" + "b" * 64 + "]…",
             ]
             cli_run(cli_parser().parse_args(answer_argv))
 
@@ -5325,8 +5503,16 @@ None.
             "--task", assignment["task"],
         ]))
         view = cli_run(status_args)
-        self.assertLessEqual(len(json.dumps(view, ensure_ascii=False).encode("utf-8")), 8192)
-        self.assertEqual(12, view["active_assignment"]["context"]["decision_history"]["total"])
+        context = view["active_assignment"]["context"]
+        expected = [{"id": key, "phase": item["phase"], "prompt": item["prompt"], "answer": item["answer"]}
+                    for key, item in sorted(self.store.load()["questions"].items()) if item["status"] == "answered"]
+        self.assertEqual(12, len(expected))
+        self.assertEqual(expected, context["decisions"])
+        self.assertEqual({"total": 12, "included": 12, "omitted": 0}, context["decision_history"])
+        self.assertNotIn("history", context)
+        self.assertNotIn("artifacts", context)
+        self.assertNotIn("questions", context)
+        self.assertEqual(context, cli_run(status_args)["active_assignment"]["context"])
 
     def test_public_status_routes_approved_authority_drift_to_existing_init(self) -> None:
         self._reach_candidate()
@@ -5925,6 +6111,125 @@ None.
         self.assertEqual("retained implementation\n", (self.root / "game.txt").read_text())
         self._complete_readonly("review", "reviewer-retained", {"outcome": "pass", "findings": []})
         self.assertEqual("qa", self._accept("retained-review")["phase"])
+
+    def _retained_recovery_fixture(self):
+        self._reach_engineering("-explicit-recovery")
+        self.controller.next(command_id="NEXT-RECOVERY", assignment={})
+        (self.root / "game.txt").write_text("retained product work\n", encoding="utf-8")
+        self._complete("COMPLETE-RECOVERY", {
+            "outcome": "blocked", "summary": "Editor save unavailable",
+            "blocker": "Editor access lost", "required_action": "Restore editor and save",
+        })
+        (self.root / "game.txt").write_text("retained work and restored save\n", encoding="utf-8")
+        (self.root / "AGENTS.md").write_text("Explicit user recovery permission\n", encoding="utf-8")
+        (self.root / "tests").mkdir(exist_ok=True)
+        (self.root / "tests/recovered.txt").write_text("restored assigned asset", encoding="utf-8")
+        action = self.controller.status()["next_action"]
+        self.assertEqual("checkout_recovery_required", action["result"])
+        packet = deepcopy(action["recovery_binding"])
+        paths = packet.pop("changed_paths")
+        packet["paths"] = [{"path": path,
+            "kind": "external_prerequisite" if path == "AGENTS.md" else "retained_engineering",
+            "authorization": "User explicitly authorized this recovery change",
+            "provenance": "User rule amendment" if path == "AGENTS.md" else "Assigned work saved after editor restoration",
+        } for path in paths]
+        return packet
+
+    def test_explicit_recovery_retains_history_review_and_exact_replay(self):
+        packet = self._retained_recovery_fixture()
+        old = self.store.load()
+        packet_path = self.root / self.workflow_path / "recovery.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        action = cli_run(cli_parser().parse_args([
+            "--root", str(self.root), "--feature", self.feature,
+            "status", "--recovery", str(packet_path),
+        ]))["next_action"]
+        command = {**self._baseline_init_command(action), "recovery": packet}
+        restarted = self.controller.reconfigure(command)
+        self.assertEqual("plan", restarted["phase"])
+        self.assertEqual(old["history"], restarted["history"][:-1])
+        self.assertEqual(packet, restarted["history"][-1]["prior"]["recovery"])
+        self.assertIsNone(current_candidate(restarted))
+        saved = self.store.path.read_bytes()
+        self.assertEqual(restarted, self.controller.reconfigure(command))
+        self.assertEqual(saved, self.store.path.read_bytes())
+        self._reach_engineering("-recovery-replanned")
+        self.controller.next(command_id="NEXT-RECOVERY-RESUMED", assignment={})
+        self._complete("COMPLETE-RECOVERY-RESUMED", {"outcome": "pass", "summary": "Retained work verified"})
+        self._accept("recovery-resumed")
+        target = self.controller.status()["next_action"]["assignment"]["context"]["review_target"]
+        self.assertEqual(["game.txt", "tests/recovered.txt"], target["candidate_changes"])
+
+    def test_explicit_recovery_rejects_invalid_packets(self):
+        packet = self._retained_recovery_fixture()
+        before = self.store.path.read_bytes()
+        bad_packets = []
+        for key in ("generation", "run_id", "feature", "base_tree_oid", "candidate_tree_oid", "authority_digest"):
+            bad = deepcopy(packet); bad[key] = -1 if key == "generation" else "wrong"; bad_packets.append(bad)
+        bad = deepcopy(packet); bad["paths"].pop(); bad_packets.append(bad)
+        bad = deepcopy(packet); bad["paths"].append(deepcopy(bad["paths"][0])); bad_packets.append(bad)
+        for key in ("authorization", "provenance", "kind"):
+            bad = deepcopy(packet); bad["paths"][0][key] = ""; bad_packets.append(bad)
+        for bad in bad_packets:
+            with self.subTest(packet=bad), self.assertRaises(PipelineError):
+                self.controller.status(recovery=bad)
+            self.assertEqual(before, self.store.path.read_bytes())
+        action = self.controller.status(recovery=packet)["next_action"]
+        command = {**self._baseline_init_command(action), "recovery": packet}
+        with self.assertRaises(PipelineError):
+            self.controller.reconfigure(self._baseline_init_command(action))
+        altered = deepcopy(command)
+        altered["recovery"]["paths"][0]["provenance"] = "Changed provenance after status"
+        with self.assertRaisesRegex(PipelineError, "stale.*reconfiguration"):
+            self.controller.reconfigure(altered)
+        with self.assertRaises(PipelineError):
+            self.controller.reconfigure({**command, "expected_generation": packet["generation"] - 1})
+        (self.root / "foreign.txt").write_text("unknown writer", encoding="utf-8")
+        with self.assertRaises(PipelineError):
+            self.controller.reconfigure(command)
+        self.assertEqual(before, self.store.path.read_bytes())
+
+    def test_explicit_recovery_rejects_invalid_controller_evidence(self):
+        packet = self._retained_recovery_fixture()
+        original = self.store.load()
+        before = self.store.path.read_bytes()
+        for field in ("base_tree_oid", "candidate_tree_oid", "changed_paths", "commands", "violations"):
+            broken = deepcopy(original)
+            del broken["artifacts"]["engineering"]["controller"][field]
+            with self.subTest(field=field), mock.patch.object(self.store, "load", return_value=broken):
+                with self.assertRaises(PipelineError):
+                    self.controller.status(recovery=packet)
+            self.assertEqual(before, self.store.path.read_bytes())
+
+    def test_explicit_recovery_rejects_active_assignment(self):
+        self._reach_engineering("-active-recovery")
+        self.controller.next(command_id="NEXT-ACTIVE-RECOVERY", assignment={})
+        state = self.store.load()
+        packet = {"run_id": state["run_id"], "feature": self.feature,
+                  "generation": state["generation"], "base_tree_oid": state["base_tree_oid"],
+                  "candidate_tree_oid": candidate_tree_oid(self.root),
+                  "authority_digest": state["authority"]["digest"], "paths": []}
+        before = self.store.path.read_bytes()
+        with self.assertRaisesRegex(PipelineError, "idle blocked Engineering"):
+            self.controller.status(recovery=packet)
+        self.assertEqual(before, self.store.path.read_bytes())
+
+    def test_explicit_recovery_rejects_authority_and_policy_drift(self):
+        packet = self._retained_recovery_fixture()
+        before = self.store.path.read_bytes()
+        policy = self.root / ".gitignore"
+        previous = policy.read_bytes() if policy.exists() else None
+        policy.write_text("cache/\n", encoding="utf-8")
+        with self.assertRaises(PipelineError):
+            self.controller.status(recovery=packet)
+        if previous is None:
+            policy.unlink()
+        else:
+            policy.write_bytes(previous)
+        self._write_approved_plan(self.slices, revision=2)
+        with self.assertRaises(PipelineError):
+            self.controller.status(recovery=packet)
+        self.assertEqual(before, self.store.path.read_bytes())
 
     def _block_first_engineering_for_baseline(self) -> None:
         self._reach_engineering("-prerequisite-baseline")

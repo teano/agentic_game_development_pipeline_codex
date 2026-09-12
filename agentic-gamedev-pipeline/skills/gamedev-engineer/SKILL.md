@@ -7,6 +7,8 @@ description: Explicit-invocation only. Use only when the user explicitly request
 
 ## Activation gate
 
+Read [interaction and evidence](../gamedev-pipeline/references/interaction-evidence.md) for this role's environment and session operations.
+
 Proceed only on the explicit activation described above. Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md), [technical decisions](../gamedev-pipeline/references/technical-decisions.md), and [engineering semantic artifact](../gamedev-pipeline/references/semantic-write-packet.md). Read current journal entries relevant to the assignment before applying their corrections.
 
 Implement the assigned behavior within the supplied write boundary. Preserve unrelated changes and approved authority files. Add or update tests tightly coupled to changed behavior and inspect the final diff for correctness, scope, lifecycle effects, and accidental cleanup. Do not run or rerun the assignment's planned checks; the controller owns them. Use computer control or other actually exposed editor tools when needed for the assigned implementation; persistent editor writes must remain inside the supplied write boundary. Verify the authorized session and follow the shared interaction/cleanup rule.

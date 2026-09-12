@@ -191,14 +191,14 @@ class TechnicalDecisionTests(unittest.TestCase):
 
 
 class JournalReadBoundaryTests(unittest.TestCase):
-    def test_bounded_capsule_explicitly_requires_full_current_retrieval_when_an_entry_is_omitted(self):
+    def test_capsule_delivers_every_current_entry_without_omission(self):
         entries = {f"TD-{i}": {"id": f"TD-{i}", "decision": str(i)} for i in range(5)}
         entries["TD-0"]["decision"] = "Corrected earlier entry relevant to this slice"
         context = compact_assignment_context({"technical_decisions": list(entries.values()),
             "technical_journal": {"path": "current.json#technical_decisions", "sha256": journal_digest(entries), "count": 5}}, None)
-        self.assertEqual(4, len(context["technical_decisions"]))
-        self.assertEqual(1, context["technical_journal"]["omitted_entry_count"])
-        self.assertTrue(context["technical_journal"]["requires_current_journal_read"])
+        self.assertEqual(list(entries.values()), context["technical_decisions"])
+        self.assertEqual(0, context["technical_journal"]["omitted_entry_count"])
+        self.assertFalse(context["technical_journal"]["requires_current_journal_read"])
         self.assertEqual(context, compact_assignment_context(context, None))
 
     def test_upstream_loader_rejects_missing_empty_and_relative_project_binding(self):

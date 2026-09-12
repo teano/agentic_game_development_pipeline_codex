@@ -1,0 +1,5 @@
+# Pipeline maintenance observation
+
+Read only for explicitly authorized pipeline maintenance or observation. Product workers follow the shared Controller incident stop and do not activate this route themselves.
+
+Pipeline-observation workers report every issue observed within their assigned observation scope, including independent issues found after the first failure, and verify the evidence before concluding. The pipeline-maintenance observer ledger classifies its issues as `pipeline`, `test`, `product`, or `environment`. Review and QA instead stop at their bounded stage contracts: Review reports only findings eligible under its controller-derived `review_target`, while QA records only assigned acceptance checks and a real blocker when applicable. Review and QA remain read-only. After a new explicit user command starts a separate pipeline-maintenance task, its observer first preserves the minimal reproduction, then adds a compact regression and makes the smallest simplifying pipeline-only change before focused and adjacent regression runs.

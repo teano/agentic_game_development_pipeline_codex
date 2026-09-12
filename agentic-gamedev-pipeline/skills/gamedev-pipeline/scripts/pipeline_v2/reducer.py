@@ -23,6 +23,8 @@ from .model import (
     command_intent_digest,
     completed_slice_ids,
     compact_assignment_context,
+    answered_decisions,
+    required_assignment_context,
     current_candidate,
     current_slice,
     default_assignment,
@@ -578,6 +580,26 @@ def _reduce_command(
                 != path_identity(state["project_root"])
             ):
                 raise PipelineError("reconfiguration cannot change the run ID or project root")
+            if command.get("product_failure") is not None:
+                if state["phase"] != "qa" or terminal_blocked_context(state) is None:
+                    raise PipelineError("product failure requires terminal QA")
+                packet = command["product_failure"]
+                work = deepcopy(state)
+                original = deepcopy(state["artifacts"])
+                record = deepcopy(original["qa"])
+                record["worker"] = _worker_artifact({"outcome": "fail", "checks": packet["checks"]}, "qa", "qa")
+                record.pop("controller_failure", None)
+                # Rebind only noncredit remediation evidence; original QA remains in history.
+                record["candidate_binding"]["pipeline_runtime_digest"] = command["pipeline_runtime_digest"]
+                record["candidate_binding"]["generation"] = state["generation"] + 1
+                work["pipeline_runtime_digest"] = command["pipeline_runtime_digest"]
+                for stale in ("engineering", "review", "qa", "docs", "ready"):
+                    work["artifacts"].pop(stale, None)
+                work["artifacts"]["qa"] = record
+                work["phase"] = "engineering"
+                work = _record(work, command, "qa_product_failure")
+                work["history"][-1].update({"product_failure": deepcopy(packet), "prior_artifacts": original})
+                return work
             interruption = None
             if state["active_assignment"] is not None:
                 interruption = _validate_interrupted_assignment(state, command.get("controller_interrupt"))
@@ -604,6 +626,8 @@ def _reduce_command(
             )
             work = deepcopy(state)
             audit_candidate = _latest_remediation_candidate(state) or current_candidate(state)
+            if command.get("maintenance") is not None:
+                audit_candidate = audit_candidate or deepcopy(state["active_assignment"]["capsule"].get("candidate"))
             prior = {
                 "phase": state["phase"],
                 "authority_digest": state["authority"]["digest"],
@@ -612,7 +636,15 @@ def _reduce_command(
                 "artifact_phases": sorted(state["artifacts"]),
                 "question_ids": sorted(state["questions"]),
             }
+            if command.get("recovery") is not None:
+                prior["recovery"] = deepcopy(command["recovery"])
             active = state["active_assignment"]
+            if command.get("maintenance") is not None:
+                prior["maintenance"] = deepcopy(command["maintenance"])
+                failure = _verification_failure_context(state, active["capsule"].get("candidate"))
+                if failure is not None:
+                    prior["verification_failure"] = failure
+                    prior["verification_artifact"] = deepcopy(state["artifacts"][failure["phase"]])
             if active is not None:
                 prior["interrupted_assignment"] = {
                     "id": active["id"], "phase": active["phase"], "role": active["role"],
@@ -620,6 +652,7 @@ def _reduce_command(
                     "access": deepcopy(active["access"]),
                     "base_tree_oid": active["base"]["candidate_tree_oid"],
                     "candidate": deepcopy(active["capsule"].get("candidate")),
+                    **({"context": deepcopy(active["capsule"]["context"])} if command.get("maintenance") is not None else {}),
                     "after_candidate_tree_oid": interruption["after_candidate_tree_oid"],
                     "changed_paths": interruption["changed_paths"],
                 }
@@ -697,6 +730,7 @@ def _reduce_command(
             active["capsule"]["context"]["current_slice"] = current_slice(work)
             active["capsule"]["context"]["technical_journal"] = journal_reference(work)
             active["capsule"]["context"]["technical_decisions"] = list(work["technical_decisions"].values())
+            active["capsule"]["context"] = required_assignment_context(work, active)
             active["id"] = assignment_identity(work["run_id"], work["generation"] + 1, "engineering")["id"]
             active["output_path"] = assignment_output_path(active["id"], work["feature"])
             active.pop("technical_observation", None)
@@ -794,12 +828,21 @@ def _reduce_command(
         verification_failure = _verification_failure_context(work, candidate)
         if verification_failure is not None:
             context["verification_failure"] = verification_failure
-        context["decisions"] = [
-            {"id": key, "phase": item["phase"], "prompt": item["prompt"], "answer": item["answer"]}
-            for key, item in sorted(work["questions"].items())
-            if item.get("status") == "answered"
-        ]
-        context = compact_assignment_context(context, candidate)
+        context["decisions"] = answered_decisions(work)
+        context = compact_assignment_context(context, candidate, canonical_input=True)
+        if phase == "engineering" and candidate is None:
+            for item in reversed(work["history"]):
+                prior = item.get("prior", {})
+                maintenance = prior.get("maintenance")
+                if not isinstance(maintenance, dict):
+                    continue
+                if (maintenance["candidate_tree_oid"] == base["candidate_tree_oid"]
+                        and maintenance["authority_digest"] == work["authority"]["digest"]
+                        and maintenance["slice_digest"] == digest(current_slice(work))
+                        and isinstance(prior.get("verification_failure"), dict)):
+                    # Historical source binding is evidence, never current phase credit.
+                    context["verification_failure"] = deepcopy(prior["verification_failure"])
+                break
         assignment_id = canonical["id"]
         work["active_assignment"] = {
             "id": assignment_id,
@@ -821,6 +864,7 @@ def _reduce_command(
         active = work["active_assignment"]
         if active is None:
             raise PipelineError("there is no active assignment")
+        required_assignment_context(work, active)
         required_ids = (
             default_assignment(work)["context"]["required_identity_ids"]
             if active["phase"] == "qa" else None

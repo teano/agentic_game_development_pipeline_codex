@@ -271,63 +271,97 @@ def artifact_schema(phase: str, role: str | None = None) -> dict[str, Any]:
     }
 
 
-_CONTEXT_ITEM_LIMIT = 4
-_CONTEXT_TEXT_BYTES = 256
-
-
-def _bounded_context_value(value: Any) -> Any:
+def _has_legacy_omission(value: Any) -> bool:
+    """Recognize the exact markers emitted by the former lossy projection."""
     if isinstance(value, str):
-        encoded = value.encode("utf-8")
-        if len(encoded) <= _CONTEXT_TEXT_BYTES:
-            return value
-        marker = f"…[sha256={digest(value)}]…"
-        budget = _CONTEXT_TEXT_BYTES - len(marker.encode("utf-8"))
-        front = budget // 2
-        return (
-            encoded[:front].decode("utf-8", errors="ignore")
-            + marker
-            + encoded[-(budget - front):].decode("utf-8", errors="ignore")
-        )
-    if isinstance(value, list):
-        included = [_bounded_context_value(item) for item in value[:_CONTEXT_ITEM_LIMIT]]
-        if len(value) > _CONTEXT_ITEM_LIMIT:
-            included.append({
-                "omitted_count": len(value) - _CONTEXT_ITEM_LIMIT,
-                "omitted_sha256": digest(value[_CONTEXT_ITEM_LIMIT:]),
-            })
-        return included
+        return re.search(r"…\[sha256=[0-9a-f]{64}\]…", value) is not None
     if isinstance(value, dict):
-        return {key: _bounded_context_value(child) for key, child in value.items()}
-    return deepcopy(value)
+        return (set(value) == {"omitted_count", "omitted_sha256"}
+                or any(_has_legacy_omission(child) for child in value.values()))
+    return isinstance(value, list) and any(_has_legacy_omission(child) for child in value)
 
 
-def _bounded_context_records(
-    records: list[dict[str, Any]], prior_summary: Any = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    included = records[-_CONTEXT_ITEM_LIMIT:]
-    projected = [_bounded_context_value(item) for item in included]
-    if isinstance(prior_summary, dict) and isinstance(prior_summary.get("total"), int):
-        summary = deepcopy(prior_summary)
-        summary["included"] = len(projected)
-        return projected, summary
-    omitted = records[:-_CONTEXT_ITEM_LIMIT] if len(records) > _CONTEXT_ITEM_LIMIT else []
-    summary = {"total": len(records), "included": len(projected), "omitted": len(omitted)}
-    if omitted:
-        summary["omitted_sha256"] = digest(omitted)
-    return projected, summary
+def _mark_journal_completeness(context: dict[str, Any]) -> None:
+    reference = context.get("technical_journal")
+    if not isinstance(reference, dict):
+        return
+    records = context.get("technical_decisions", [])
+    entries = {entry["id"]: entry for entry in records
+               if isinstance(entry, dict) and isinstance(entry.get("id"), str)}
+    complete = (len(entries) == len(records) == reference.get("count")
+                and journal_digest(entries) == reference.get("sha256"))
+    reference["omitted_entry_count"] = max(0, reference.get("count", 0) - len(entries))
+    # Count alone cannot detect a clipped decision or clipped checks within it.
+    reference["requires_current_journal_read"] = not complete
 
 
-def compact_assignment_context(source: dict[str, Any], bound_candidate: Any) -> dict[str, Any]:
-    """Keep worker context semantic, deterministic, and bounded."""
-    context: dict[str, Any] = {}
+def answered_decisions(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Answered controller questions remain operative until explicit reconfiguration."""
+    return [{"id": key, "phase": item["phase"], "prompt": item["prompt"], "answer": item["answer"]}
+            for key, item in sorted(state.get("questions", {}).items())
+            if item.get("status") == "answered"]
+
+
+def _complete_decisions(context: dict[str, Any], records: list[dict[str, Any]]) -> None:
+    context["decisions"] = deepcopy(records)
+    context["decision_history"] = {"total": len(records), "included": len(records), "omitted": 0}
+
+
+def required_assignment_context(state: dict[str, Any], active: dict[str, Any]) -> dict[str, Any]:
+    """Read-only compatibility for old capsules, from canonical controller evidence.
+
+    Never infer missing obligations from a summary, change a candidate binding, or
+    grant phase credit. An unavailable canonical failure blocks delivery/completion.
+    """
+    context = deepcopy(active["capsule"]["context"])
+    lossless_format = context.get("delivery_version") == 1
+    decisions = answered_decisions(state)
+    if decisions:
+        _complete_decisions(context, decisions)
+    elif not lossless_format and (_has_legacy_omission(context.get("decisions"))
+          or context.get("decision_history", {}).get("omitted", 0) > 0):
+        raise PipelineError("truncated answered decisions have no canonical questions; controlled recovery is required")
+    reference = context.get("technical_journal")
+    if (isinstance(reference, dict)
+            and reference.get("sha256") == journal_digest(state.get("technical_decisions", {}))):
+        context["technical_journal"] = journal_reference(state)
+        context["technical_decisions"] = deepcopy(list(state.get("technical_decisions", {}).values()))
+    _mark_journal_completeness(context)
+    failure = context.get("verification_failure")
+    if not lossless_format and isinstance(failure, dict) and _has_legacy_omission(failure):
+        record = state["artifacts"].get(failure.get("phase"), {})
+        worker = record.get("worker", {})
+        if (record.get("candidate_binding") != failure.get("candidate")
+                or not isinstance(worker, dict)
+                or (worker.get("outcome") != "fail" and not isinstance(record.get("controller_failure"), dict))):
+            raise PipelineError("truncated verification evidence has no matching canonical artifact; controlled recovery is required")
+        field = "findings" if failure.get("phase") == "review" else "checks"
+        restored = {"phase": failure["phase"], "candidate": deepcopy(failure["candidate"]),
+                    "outcome": worker.get("outcome"), field: deepcopy(worker.get(field, []))}
+        for key in ("review_target", "controller_failure"):
+            if isinstance(record.get(key), dict):
+                restored[key] = deepcopy(record[key])
+        # Canonical worker text may legitimately discuss the former marker syntax.
+        context["verification_failure"] = restored
+    context["delivery_version"] = 1
+    return context
+
+
+def compact_assignment_context(
+    source: dict[str, Any], bound_candidate: Any, *, canonical_input: bool = False,
+) -> dict[str, Any]:
+    """Deliver operative input exactly; exclude unrelated controller bookkeeping.
+
+    Only the controller's canonical source or an already lossless envelope can
+    disambiguate literal marker text from an old clipped wire representation.
+    """
+    lossless_format = canonical_input or source.get("delivery_version") == 1
+    context: dict[str, Any] = {"delivery_version": 1}
     if isinstance(source.get("technical_journal"), dict):
         context["technical_journal"] = deepcopy(source["technical_journal"])
     if isinstance(source.get("technical_decisions"), list):
-        context["technical_decisions"], _ = _bounded_context_records(source["technical_decisions"], None)
-        if "technical_journal" in context:
-            omitted = max(0, context["technical_journal"]["count"] - len(context["technical_decisions"]))
-            context["technical_journal"]["omitted_entry_count"] = omitted
-            context["technical_journal"]["requires_current_journal_read"] = omitted > 0
+        context["technical_decisions"] = deepcopy(source["technical_decisions"])
+    _mark_journal_completeness(context)
     if isinstance(source.get("current_slice"), dict):
         context["current_slice"] = deepcopy(source["current_slice"])
     if isinstance(source.get("review_target"), dict):
@@ -337,17 +371,18 @@ def compact_assignment_context(source: dict[str, Any], bound_candidate: Any) -> 
 
     failure = source.get("verification_failure")
     if isinstance(failure, dict) and failure.get("candidate") == bound_candidate:
-        context["verification_failure"] = _bounded_context_value(failure)
+        if not lossless_format and _has_legacy_omission(failure):
+            raise PipelineError("truncated verification evidence requires canonical recovery before dispatch")
+        context["verification_failure"] = deepcopy(failure)
 
     decision_source = source.get("decisions", [])
     if not isinstance(decision_source, list):
         decision_source = []
-    decisions, decision_history = _bounded_context_records(
-        decision_source, source.get("decision_history"),
-    )
-    if decisions:
-        context["decisions"] = decisions
-        context["decision_history"] = decision_history
+    if not lossless_format and (_has_legacy_omission(decision_source)
+            or source.get("decision_history", {}).get("omitted", 0) > 0):
+        raise PipelineError("truncated answered decisions require canonical recovery before dispatch")
+    if decision_source:
+        _complete_decisions(context, decision_source)
     return context
 
 
@@ -568,6 +603,8 @@ def retained_engineering_paths(state: dict[str, Any]) -> list[str]:
             continue
         prior = item.get("prior", {})
         candidate = prior.get("candidate") or {}
+        paths.update(item["path"] for item in prior.get("recovery", {}).get("paths", [])
+                     if item["kind"] == "retained_engineering")
         for changes in (candidate.get("changed_paths", []), prior.get("interrupted_paths", [])):
             if literal_paths_valid(changes):
                 paths.update(changes)
@@ -865,6 +902,9 @@ def reconfiguration_action(
     state: dict[str, Any], authority_items: dict[str, dict[str, Any]],
     slices: list[dict[str, Any]] | None = None,
     *, candidate_tree_oid: str, pipeline_runtime_digest: str | None = None,
+    recovery: dict[str, Any] | None = None,
+    maintenance: dict[str, Any] | None = None,
+    product_failure: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bind the public init capability to the exact controller observation."""
     if not is_git_oid(candidate_tree_oid):
@@ -875,8 +915,13 @@ def reconfiguration_action(
         state["run_id"], state["generation"], authority["digest"],
         digest(proposed_slices), candidate_tree_oid,
         pipeline_runtime_digest or state["pipeline_runtime_digest"],
-    ])[:10]
+    ] + ([recovery] if recovery is not None else [])
+      + ([maintenance] if maintenance is not None else [])
+      + ([product_failure] if product_failure is not None else []))[:10]
     return {
+        **({"recovery": deepcopy(recovery)} if recovery is not None else {}),
+        **({"maintenance": deepcopy(maintenance)} if maintenance is not None else {}),
+        **({"product_failure": deepcopy(product_failure)} if product_failure is not None else {}),
         "kind": "command", "command": "init",
         "command_id": f"reconfigure-g{state['generation']}-{token}",
         "expected_generation": state["generation"],
@@ -1349,9 +1394,8 @@ def _active_assignment_view(
     state: dict[str, Any], active: dict[str, Any],
 ) -> dict[str, Any]:
     """Project the recoverable worker packet without controller bookkeeping."""
-    source = active["capsule"]["context"]
     bound_candidate = active["capsule"].get("candidate")
-    context = compact_assignment_context(source, bound_candidate)
+    context = required_assignment_context(state, active)
     selected = context.get("current_slice")
     if (
         active["phase"] == "review"

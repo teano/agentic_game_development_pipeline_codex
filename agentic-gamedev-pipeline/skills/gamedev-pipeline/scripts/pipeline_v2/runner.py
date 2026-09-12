@@ -44,6 +44,7 @@ from .model import (
     is_git_oid,
     is_strict_integer,
     normalize_literal_path,
+    literal_paths_valid,
     reconfiguration_action,
     safe_identifier,
     slice_records,
@@ -349,6 +350,128 @@ class Controller:
         ):
             return False
 
+    def _validate_recovery_packet(self, state, root, current, observed, packet):
+        """Validate explicit Director authorization without inferring ownership from a diff."""
+        keys = {"run_id", "feature", "generation", "base_tree_oid", "candidate_tree_oid", "authority_digest", "paths"}
+        if not isinstance(packet, dict) or set(packet) != keys:
+            raise PipelineError("recovery packet has an invalid shape")
+        record = state["artifacts"].get("engineering", {})
+        evidence = record.get("controller", {})
+        if (state["active_assignment"] is not None or state["phase"] != "engineering"
+                or terminal_blocked_context(state) is None
+                or record.get("worker", {}).get("outcome") != "blocked"
+                or record.get("controller_failure") is not None
+                or evidence.get("violations") != []):
+            raise PipelineError("recovery requires idle blocked Engineering with valid controller evidence")
+        required_evidence = {"authority_digest", "pipeline_runtime_digest", "base_tree_oid",
+                             "candidate_tree_oid", "changed_paths", "violations", "commands"}
+        if (set(evidence) != required_evidence
+                or evidence["authority_digest"] != state["authority"]["digest"]
+                or evidence["pipeline_runtime_digest"] != state["pipeline_runtime_digest"]
+                or not is_git_oid(evidence["base_tree_oid"])
+                or not is_git_oid(evidence["candidate_tree_oid"])
+                or not literal_paths_valid(evidence["changed_paths"])
+                or evidence["commands"] != []
+                or self._latest_controller_tree(state) != evidence["candidate_tree_oid"]
+                or violations(evidence["changed_paths"], current_slice(state)["allowed_paths"])):
+            raise PipelineError("recovery requires complete valid blocked Engineering controller evidence")
+        if not authority_items_equal(observed, state["authority"]["items"]):
+            raise PipelineError("recovery cannot adopt authority drift")
+        _PLAN_AUTHORITY.require_approved_authority_chain(
+            root, {name: item["path"] for name, item in observed.items()},
+        )
+        expected = {"run_id": state["run_id"], "feature": state["feature"],
+                    "generation": state["generation"], "base_tree_oid": self._latest_controller_tree(state),
+                    "candidate_tree_oid": current, "authority_digest": state["authority"]["digest"]}
+        if any(packet.get(key) != value for key, value in expected.items()) or type(packet["generation"]) is not int:
+            raise PipelineError("stale recovery packet binding; read status again")
+        drift = self._checkout_drift(state, root, current)
+        paths = packet["paths"]
+        if not isinstance(paths, list) or not paths or any(not isinstance(item, dict) for item in paths):
+            raise PipelineError("recovery requires exact path authorizations")
+        if [item.get("path") for item in paths] != drift:
+            raise PipelineError("recovery paths must exactly match observed checkout drift")
+        scope = current_slice(state)["allowed_paths"]
+        for item in paths:
+            if set(item) != {"path", "kind", "authorization", "provenance"} or any(
+                    not isinstance(item.get(key), str) or not item[key].strip()
+                    for key in ("authorization", "provenance")):
+                raise PipelineError("recovery requires per-path authorization and provenance")
+            kind = "external_prerequisite" if violations([item["path"]], scope) else "retained_engineering"
+            if item.get("kind") != kind:
+                raise PipelineError("recovery path classification disagrees with approved Engineering scope")
+        return deepcopy(packet)
+
+    def _maintenance_binding(self, state, root, current, observed, runtime_digest):
+        active = state["active_assignment"]
+        if active is None or active["phase"] != "engineering":
+            raise PipelineError("maintenance requires an active Engineering assignment")
+        if runtime_digest == state["pipeline_runtime_digest"]:
+            raise PipelineError("maintenance requires changed runtime bytes")
+        if (not authority_items_equal(observed, state["authority"]["items"])
+                or not slices_are_read_sealed(state)):
+            raise PipelineError("maintenance cannot change approved authority or scope")
+        if current != active["base"]["candidate_tree_oid"]:
+            raise PipelineError("maintenance requires an untouched active candidate")
+        if repository_policy_changed(root, state["base_tree_oid"], current):
+            raise PipelineError("maintenance cannot change repository policy")
+        output = safe_path(root, assignment_output_path(active, state["feature"]), "active output", strict=False)
+        if output.exists():
+            raise PipelineError("maintenance cannot discard an existing worker output")
+        return {"run_id": state["run_id"], "feature": state["feature"],
+                "generation": state["generation"], "assignment_id": active["id"],
+                "candidate_tree_oid": current, "authority_digest": state["authority"]["digest"],
+                "slice_digest": digest(current_slice(state)),
+                "previous_runtime_digest": state["pipeline_runtime_digest"],
+                "runtime_digest": runtime_digest}
+
+    def _validate_maintenance_packet(self, state, root, current, observed, runtime_digest, packet):
+        binding = self._maintenance_binding(state, root, current, observed, runtime_digest)
+        if (not isinstance(packet, dict) or set(packet) != set(binding) | {"authorization", "quiescence"}
+                or type(packet.get("generation")) is not int
+                or any(packet.get(key) != value for key, value in binding.items())
+                or any(not isinstance(packet.get(key), str) or not packet[key].strip()
+                       for key in ("authorization", "quiescence"))):
+            raise PipelineError("stale or incomplete maintenance authorization packet; read status --maintenance again")
+        return deepcopy(packet)
+
+    def _product_failure_binding(self, state, root, current, observed, runtime_digest):
+        record = state["artifacts"].get("qa", {})
+        candidate = record.get("candidate_binding") or {}
+        if (state["phase"] != "qa" or terminal_blocked_context(state) is None
+                or state["active_assignment"] is not None
+                or candidate.get("candidate_tree_oid") != current
+                or not authority_items_equal(observed, state["authority"]["items"])
+                or self._checkout_drift(state, root, current)
+                or repository_policy_changed(root, state["base_tree_oid"], current)):
+            raise PipelineError("product failure requires unchanged terminal QA candidate and authority")
+        return {"run_id": state["run_id"], "feature": state["feature"], "generation": state["generation"],
+                "qa_assignment_id": record["assignment_id"], "candidate_tree_oid": current,
+                "authority_digest": state["authority"]["digest"], "slice_digest": digest(current_slice(state)),
+                "runtime_digest": runtime_digest}
+
+    def _product_failure_evidence(self, state, root, packet):
+        path = packet.get("evidence_path")
+        if not isinstance(path, str) or not path.startswith(state["workflow_path"] + "/"):
+            raise PipelineError("product failure evidence must be workflow-local")
+        raw = safe_path(root, path, "product failure evidence", strict=True).read_bytes()
+        if not raw.strip() or hashlib.sha256(raw).hexdigest() != packet.get("evidence_sha256"):
+            raise PipelineError("product failure evidence is missing or stale")
+
+    def _validate_product_failure(self, state, root, current, observed, runtime_digest, packet):
+        binding = self._product_failure_binding(state, root, current, observed, runtime_digest)
+        if (not isinstance(packet, dict) or set(packet) != set(binding) | {"authorization", "evidence_path", "evidence_sha256", "checks"}
+                or type(packet.get("generation")) is not int
+                or any(packet.get(key) != value for key, value in binding.items())
+                or not isinstance(packet.get("authorization"), str) or not packet["authorization"].strip()):
+            raise PipelineError("product failure requires exact binding and explicit authorization")
+        self._product_failure_evidence(state, root, packet)
+        worker = _worker_artifact({"outcome": "fail", "checks": packet["checks"]}, "qa", "qa")
+        allowed = state["artifacts"]["qa"].get("required_identity_ids", [])
+        if not worker["checks"] or any(item["outcome"] != "fail" or item["id"] not in allowed for item in worker["checks"]):
+            raise PipelineError("product failure requires newly evidenced failed approved QA identities")
+        return deepcopy(packet)
+
     def _verify_live_checkout(
         self, state: dict[str, Any], root: Path,
     ) -> str:
@@ -366,7 +489,7 @@ class Controller:
             raise PipelineError(f"live checkout drifted from controller evidence: {drift}")
         return current
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, recovery: dict[str, Any] | None = None, maintenance: dict[str, Any] | None = None, product_failure: dict[str, Any] | None = None) -> dict[str, Any]:
         """Return an executable action or a terminal recovery fact from one lock-bound observation."""
         self._preflight_existing_store_location()
         with self.store.transaction():
@@ -376,7 +499,7 @@ class Controller:
             self.store.validate_project_location(root, state["feature"])
             runtime_digest = pipeline_runtime_digest()
             runtime_changed = runtime_digest != state["pipeline_runtime_digest"]
-            if runtime_changed and state["active_assignment"] is not None:
+            if runtime_changed and state["active_assignment"] is not None and maintenance is None:
                 raise PipelineError(
                     "pipeline runtime changed during the run; stop and perform a fresh init"
                 )
@@ -402,10 +525,39 @@ class Controller:
             drift = self._checkout_drift(
                 state, root, current, ignore_authority=authority_changed,
             )
+            if product_failure is not None:
+                if maintenance is not None or recovery is not None:
+                    raise PipelineError("product failure cannot be combined with other recovery packets")
+                binding = self._product_failure_binding(state, root, current, observed, runtime_digest)
+                if proposed_slices is not None and proposed_slices != state["slices"]:
+                    raise PipelineError("product failure cannot change scope")
+                if product_failure == {}:
+                    view = status_view(state)
+                    view["next_action"] = {"kind": "terminal", "result": "product_failure_evidence_required",
+                                           "product_failure_binding": binding}
+                    return view
+                product_failure = self._validate_product_failure(state, root, current, observed, runtime_digest, product_failure)
+            if maintenance is not None:
+                if recovery is not None:
+                    raise PipelineError("maintenance and checkout recovery cannot be combined")
+                binding = self._maintenance_binding(state, root, current, observed, runtime_digest)
+                if proposed_slices is not None and proposed_slices != state["slices"]:
+                    raise PipelineError("maintenance cannot change approved scope")
+                if maintenance == {}:
+                    view = status_view(state)
+                    view["next_action"] = {"kind": "terminal", "result": "maintenance_authorization_required",
+                        "maintenance_binding": binding,
+                        "reason": "stop the worker; provide exact maintenance authorization and quiescence evidence"}
+                    return view
+                maintenance = self._validate_maintenance_packet(state, root, current, observed, runtime_digest, maintenance)
             admit_baseline = (
                 self._can_admit_early_blocked_baseline(state, root, current, observed)
                 if drift and not policy else False
             )
+            if recovery is not None:
+                if policy:
+                    raise PipelineError("recovery cannot adopt repository policy drift")
+                recovery = self._validate_recovery_packet(state, root, current, observed, recovery)
             view = status_view(state)
             if state["active_assignment"] is not None and state["phase"] == "engineering":
                 view["technical_actions"] = {
@@ -417,10 +569,14 @@ class Controller:
                     "kind": "terminal", "result": "fresh_init_required",
                     "reason": "repository policy changed: " + ", ".join(policy),
                 }
-            elif drift and not admit_baseline:
+            elif drift and not admit_baseline and recovery is None:
                 view["next_action"] = {
                     "kind": "terminal", "result": "checkout_recovery_required",
                     "reason": f"restore or reconcile checkout drift before mutation: {drift}",
+                    "recovery_binding": {"run_id": state["run_id"], "feature": state["feature"],
+                        "generation": state["generation"], "base_tree_oid": self._latest_controller_tree(state),
+                        "candidate_tree_oid": current, "authority_digest": state["authority"]["digest"],
+                        "changed_paths": drift},
                 }
             elif (
                 authority_changed or scope_changed or runtime_changed
@@ -429,7 +585,7 @@ class Controller:
                 action = reconfiguration_action(
                     state, observed, proposed_slices,
                     candidate_tree_oid=current,
-                    pipeline_runtime_digest=runtime_digest,
+                    pipeline_runtime_digest=runtime_digest, recovery=recovery, maintenance=maintenance, product_failure=product_failure,
                 )
                 if terminal_recovery is not None:
                     action.update({
@@ -446,6 +602,8 @@ class Controller:
                             "; accept this committed prerequisite baseline only after explicit "
                             "authorization: the first blocked Engineering attempt recorded no product changes"
                         )
+                if product_failure is not None:
+                    action["reason"] = "record newly evidenced product failure and return terminal QA to Engineering without QA credit"
                 view["next_action"] = action
             return view
 
@@ -539,13 +697,20 @@ class Controller:
         with self.store.transaction():
             state = self.store.load(required=False)
             value = deepcopy(command)
+            recovery = value.get("recovery")
+            maintenance = value.get("maintenance")
+            product_failure = value.get("product_failure")
+            if product_failure is not None and (maintenance is not None or recovery is not None):
+                raise PipelineError("product failure cannot be combined with other recovery packets")
+            if maintenance is not None and recovery is not None:
+                raise PipelineError("maintenance and checkout recovery cannot be combined")
             supplied_paths = value.pop("authority_paths", None)
             root = canonical_project_root(value["project_root"])
             value["project_root"] = str(root)
             runtime_digest = pipeline_runtime_digest()
             if state is not None:
                 validate_state(state)
-                if runtime_digest != state["pipeline_runtime_digest"] and state["active_assignment"] is not None:
+                if runtime_digest != state["pipeline_runtime_digest"] and state["active_assignment"] is not None and maintenance is None:
                     raise PipelineError(
                         "pipeline runtime changed during the run; stop and perform a fresh init"
                     )
@@ -581,6 +746,12 @@ class Controller:
                     "approved authority chain is not ready; reconverge requirements, "
                     f"specification, and plan before init: {error}"
                 ) from error
+            if state is None and product_failure is not None:
+                raise PipelineError("product failure requires an existing terminal QA")
+            if state is None and maintenance is not None:
+                raise PipelineError("maintenance requires an existing active run")
+            if state is None and recovery is not None:
+                raise PipelineError("recovery requires an existing blocked run")
             if state is None:
                 value["slices"] = seal_slices_from_approved_plan(
                     root, proposed_items["plan"]["path"], value.get("slices"),
@@ -618,7 +789,44 @@ class Controller:
                     admit_baseline = self._can_admit_early_blocked_baseline(
                         state, root, current, value["authority"]["items"],
                     )
-                if drift and not admit_baseline:
+                if product_failure is not None:
+                    prior = next((item for item in state["history"] if item.get("id") == value.get("id")), None)
+                    if prior is not None:
+                        if (prior.get("product_failure") != product_failure
+                                or current != product_failure.get("candidate_tree_oid")
+                                or runtime_digest != product_failure.get("runtime_digest")
+                                or authority_changed or digest(current_slice(state)) != product_failure.get("slice_digest")):
+                            raise PipelineError("stale product failure replay")
+                        self._product_failure_evidence(state, root, product_failure)
+                    else:
+                        self._validate_product_failure(state, root, current, value["authority"]["items"], runtime_digest, product_failure)
+                    if value["slices"] != state["slices"]:
+                        raise PipelineError("product failure cannot change scope")
+                if maintenance is not None:
+                    prior = next((item for item in state["history"] if item.get("id") == value.get("id")), None)
+                    if prior is not None:
+                        if (prior.get("prior", {}).get("maintenance") != maintenance
+                                or current != maintenance.get("candidate_tree_oid")
+                                or runtime_digest != maintenance.get("runtime_digest")
+                                or authority_changed or value["slices"] != state["slices"]):
+                            raise PipelineError("stale maintenance replay")
+                        output = safe_path(root, assignment_output_path(maintenance["assignment_id"], feature), "retired output", strict=False)
+                        if output.exists():
+                            raise PipelineError("maintenance cannot discard an existing worker output")
+                    else:
+                        self._validate_maintenance_packet(state, root, current, value["authority"]["items"], runtime_digest, maintenance)
+                        if value["slices"] != state["slices"]:
+                            raise PipelineError("maintenance cannot change approved scope")
+                if recovery is not None:
+                    prior = next((item for item in state["history"] if item.get("id") == value.get("id")), None)
+                    if prior is not None:
+                        if (prior.get("prior", {}).get("recovery") != recovery
+                                or current != recovery.get("candidate_tree_oid")
+                                or authority_changed or runtime_digest != state["pipeline_runtime_digest"]):
+                            raise PipelineError("stale recovery replay")
+                    else:
+                        self._validate_recovery_packet(state, root, current, value["authority"]["items"], recovery)
+                if drift and not admit_baseline and recovery is None:
                     if state.get("active_assignment") is not None:
                         raise PipelineError(f"candidate changed forbidden paths: {drift}")
                     raise PipelineError(f"live checkout drifted from controller evidence: {drift}")
@@ -632,7 +840,7 @@ class Controller:
                     expected = reconfiguration_action(
                         state, value["authority"]["items"], value.get("slices"),
                         candidate_tree_oid=current,
-                        pipeline_runtime_digest=runtime_digest,
+                        pipeline_runtime_digest=runtime_digest, recovery=recovery, maintenance=maintenance, product_failure=product_failure,
                     )
                     if value.get("id") != expected["command_id"]:
                         raise PipelineError(
@@ -664,6 +872,14 @@ class Controller:
                 }
             if admit_baseline and require_clean_head(root) != current:
                 raise PipelineError("committed prerequisite baseline changed; run status again")
+            if maintenance is not None:
+                output = safe_path(root, assignment_output_path(maintenance["assignment_id"], feature), "retired output", strict=False)
+                if output.exists():
+                    raise PipelineError("maintenance cannot discard an existing worker output")
+            if product_failure is not None:
+                self._product_failure_evidence(state, root, product_failure)
+            if (recovery is not None or maintenance is not None or product_failure is not None) and candidate_tree_oid(root) != current:
+                raise PipelineError("recovery checkout changed; read status again")
             return self.store._dispatch_locked(value)
 
     def migrate(self, command: dict[str, Any]) -> dict[str, Any]:

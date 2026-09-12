@@ -13,6 +13,9 @@ from pathlib import Path
 BUNDLE = Path(__file__).resolve().parents[2]
 SKILLS = BUNDLE / "skills"
 INVARIANT = SKILLS / "gamedev-pipeline" / "references" / "stage-handoff-invariant.md"
+DIRECTOR = INVARIANT.with_name("director-runtime.md")
+INTERACTION = INVARIANT.with_name("interaction-evidence.md")
+MAINTENANCE = INVARIANT.with_name("maintenance-observation.md")
 sys.path.insert(0, str(SKILLS / "gamedev-pipeline" / "scripts"))
 
 from pipeline_v2.model import PipelineError, ROLES, artifact_schema
@@ -70,7 +73,7 @@ class SharedOperationalInvariantTests(unittest.TestCase):
         self.assertEqual([], offenders, "early context-only thresholds: " + ", ".join(offenders))
 
     def test_platform_and_observer_rules_are_shared_and_fail_closed(self) -> None:
-        text = INVARIANT.read_text(encoding="utf-8")
+        text = "\n".join(path.read_text(encoding="utf-8") for path in (INVARIANT, INTERACTION, MAINTENANCE))
         required = (
             "platform-neutral",
             "explicit user-approved product authority",
@@ -116,7 +119,7 @@ class SharedOperationalInvariantTests(unittest.TestCase):
                 self.assertNotIn(platform_default, template.lower())
 
     def test_director_waits_for_and_consumes_each_child_result_before_final(self) -> None:
-        text = INVARIANT.read_text(encoding="utf-8")
+        text = DIRECTOR.read_text(encoding="utf-8")
         required = (
             "After spawning any phase worker",
             "owns that exact child until its terminal result",
@@ -137,13 +140,11 @@ class SharedOperationalInvariantTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
 
-        section = text.split("## Director child-result consumption", 1)[1].split(
-            "\n## ", 1
-        )[0]
-        self.assertNotRegex(
-            section,
-            r"(?i)\b(?:timeout|retry|retries|daemon|service|sleep)\b",
-        )
+        self.assertIn("wait_agent({timeout_ms:600000})", text)
+        self.assertIn("wakes early for messages or user input", text)
+        self.assertIn("No message alone does not prove a stall", text)
+        self.assertIn("do not add a second observer", text)
+        self.assertIn("director-runtime.md", INVARIANT.read_text(encoding="utf-8"))
 
     def test_minimal_role_examples_pass_the_actual_semantic_validator(self) -> None:
         examples = (

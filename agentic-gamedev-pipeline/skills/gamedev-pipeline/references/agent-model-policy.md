@@ -22,17 +22,17 @@ Choose the row for the actual assigned work. Rows do not create roles, activate 
 | Existing role | Model | Effort | Workload |
 | --- | --- | --- | --- |
 | Requirements bounded research agent | `gpt-5.6-terra` | `high` | Ground questions and constraints in the current project and stack. |
-| Requirements semantic review agent | `gpt-6-astra` | `low` | Check confirmed meaning, contradictions and mandatory coverage. |
-| Technical Spec Architect | `gpt-6-astra` | `low` | Own semantic assessment, minimal design and correction decisions. |
+| Requirements semantic review agent | `gpt-6-astra` | `high` | Check confirmed meaning, contradictions and mandatory coverage before specification work begins. |
+| Technical Spec Architect | `gpt-6-astra` | `high` | Own semantic assessment, minimal design and correction decisions. |
 | Specification Generator/helper | `gpt-6-astra` | `low` | Generate or correct technical specification text from exact authority. |
 | Specification Proofreader | `gpt-6-astra` | `low` | Independently compare exact specification bytes with approved scope. |
 | Specification helper semantic review or post-fix verification worker, when its existing route delegates one | `gpt-6-astra` | `low` | Independently check helper output against the exact request; use the Proofreader setting. |
 | Specification repository-research helper | `gpt-5.6-terra` | `high` | Answer a bounded project-evidence question. |
-| Development Plan Planning Analyst | `gpt-6-astra` | `low` | Analyze coupling, seams, dependencies, context budgets and coverage. |
-| Runtime Plan (`planner`) | `gpt-6-astra` | `low` | Confirm approved intent and unresolved product decisions. |
+| Development Plan Planning Analyst | `gpt-6-astra` | `high` | Analyze coupling, seams, dependencies, context budgets and coverage. |
+| Runtime Plan (`planner`) | `gpt-6-astra` | `high` | Confirm approved intent and unresolved product decisions. |
 | Runtime Slice (`slicer`) | `gpt-5.6-terra` | `high` | Confirm bounded approved scope and retained-path coverage. |
 | Engineering (`engineer`) | `gpt-5.6-terra` | `xhigh` | Implement the assigned game slice and coupled tests. |
-| Review (`reviewer`), including post-Docs Review | `gpt-6-astra` | `low` | Independently inspect mandatory behavior, supported paths and sufficient complexity. |
+| Review (`reviewer`), including post-Docs Review | `gpt-6-astra` | `high` | Independently inspect mandatory behavior, supported paths and sufficient complexity. |
 | QA (`qa`) | `gpt-5.6-terra` | `high` | Execute assigned player/editor acceptance and report bound evidence. |
 | Docs (`documentation_finisher`) | `gpt-5.6-terra` | `medium` | Synchronize bounded documentation with approved and verified sources. |
 | Explicit standalone Coverage Advisory | `gpt-5.6-terra` | `high` | Inspect supplied source-to-identity mappings; it is not a runtime assignment. |

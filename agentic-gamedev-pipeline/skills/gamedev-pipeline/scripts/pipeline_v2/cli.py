@@ -1,4 +1,4 @@
-"""Eight thin CLI commands for the v2 reducer."""
+"""Thin CLI commands for the v2 reducer and bounded delivery."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .checkout import safe_path
+from .delivery import director_brief, execute_step, export_assignment, read_delivery, read_file
 from .legacy_gen53 import load_schema10
 from .model import (
     PIPELINE_STATE_FILENAME,
@@ -61,6 +62,7 @@ def parser() -> argparse.ArgumentParser:
         description="Run the replay-safe seven-phase GameDev pipeline controller.",
     )
     value.add_argument("--root", type=Path, required=True)
+    value.add_argument("--brief", action="store_true", help="Return Director control facts without full worker input; place before the subcommand.")
     value.add_argument(
         "--feature", required=True, type=feature_slug,
         help="lowercase feature slug selecting .agentic-pipeline/Workflows/<feature>",
@@ -71,7 +73,13 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("--run-id", required=True, help="Compact safe run identifier (letters, digits, dot, underscore, or hyphen).")
     init.add_argument("--authority", action="append", default=[], required=True)
     init.add_argument("--slice", action="append", required=True); init.add_argument("--expected-generation", type=int)
-    commands.add_parser("status", help="Return one executable action or terminal recovery fact.")
+    status = commands.add_parser("status", help="Return one executable action or terminal recovery fact.")
+    status.add_argument("--recovery", type=Path)
+    init.add_argument("--recovery", type=Path)
+    status.add_argument("--maintenance", nargs="?", const="", type=str)
+    init.add_argument("--maintenance", type=Path)
+    status.add_argument("--product-failure", nargs="?", const="", type=str)
+    init.add_argument("--product-failure", type=Path)
     next_cmd = commands.add_parser("next", help="Issue the controller-derived assignment for the current phase.")
     next_cmd.add_argument("--id", required=True); next_cmd.add_argument("--expected-generation", type=int)
     next_cmd.add_argument("--assignment-id", help="Optional exact status-derived assignment ID.")
@@ -98,17 +106,57 @@ def parser() -> argparse.ArgumentParser:
     decision = commands.add_parser("technical-decision", help="Record a technical decision and reconcile exact scoped paths or check order.")
     decision.add_argument("--id", required=True); decision.add_argument("--expected-generation", type=int, required=True)
     decision.add_argument("--packet", type=Path, required=True)
+    export = commands.add_parser("assignment-export", help="Export the exact active assignment; optionally deliver a same-worker delta.")
+    export.add_argument("--baseline", help="Digest of a fully received previous assignment packet for this worker.")
+    export.add_argument("--input", action="append", default=[], help="Selected exact project-relative input; records version without loading its body.")
+    delivery = commands.add_parser("delivery-read", help="Read one bounded page of an immutable delivery artifact.")
+    delivery.add_argument("--digest", required=True)
+    delivery.add_argument("--pointer", help="Optional exact JSON pointer selecting a full semantic section before pagination.")
+    file_read = commands.add_parser("file-read", help="Read one bounded, version-checked page inside active read access.")
+    file_read.add_argument("--path", required=True)
+    file_read.add_argument("--version", help="Previous page or selected-input SHA-256; required for continuation.")
+    for reader in (delivery, file_read):
+        reader.add_argument("--offset", type=int, default=0)
+        reader.add_argument("--limit", type=int, default=8192)
+    step = commands.add_parser("step", help="Execute exactly one current next/complete/accept; stop at all semantic boundaries.")
+    step.add_argument("--expected-generation", type=int, required=True)
+    step.add_argument("--action-id", required=True, help="Exact public status.next_action.command_id; safely retries the same action.")
     return value
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
+def _run(args: argparse.Namespace) -> dict[str, Any]:
     root = safe_path(args.root, None, "project root", strict=True)
     workflow = workflow_relative_path(args.feature)
     store = StateStore(root / workflow / PIPELINE_STATE_FILENAME)
+    recovery = {}
+    if getattr(args, "recovery", None) is not None:
+        packet_path = safe_path(root, args.recovery, "recovery packet", strict=True)
+        try:
+            recovery = {"recovery": json.loads(packet_path.read_text(encoding="utf-8"))}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PipelineError(f"cannot read recovery packet: {exc}") from exc
+    if getattr(args, "maintenance", None) is not None:
+        if args.maintenance == "":
+            recovery["maintenance"] = {}
+        else:
+            packet_path = safe_path(root, args.maintenance, "maintenance packet", strict=True)
+            try:
+                recovery["maintenance"] = json.loads(packet_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise PipelineError(f"cannot read maintenance packet: {exc}") from exc
+    if getattr(args, "product_failure", None) is not None:
+        if args.product_failure == "":
+            recovery["product_failure"] = {}
+        else:
+            packet_path = safe_path(root, args.product_failure, "product failure packet", strict=True)
+            try:
+                recovery["product_failure"] = json.loads(packet_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise PipelineError(f"cannot read product failure packet: {exc}") from exc
     if args.command == "init":
-        state = Controller(store).reconfigure({"name": "init", "id": args.id, "expected_generation": args.expected_generation, "run_id": args.run_id, "feature": args.feature, "workflow_path": workflow, "project_root": str(root), "authority_paths": _pairs(args.authority, "authority"), "slices": _slices(args.slice)})
+        state = Controller(store).reconfigure({"name": "init", "id": args.id, "expected_generation": args.expected_generation, "run_id": args.run_id, "feature": args.feature, "workflow_path": workflow, "project_root": str(root), "authority_paths": _pairs(args.authority, "authority"), "slices": _slices(args.slice), **recovery})
     elif args.command == "status":
-        return Controller(store).status()
+        return Controller(store).status(**recovery)
     elif args.command == "next":
         assignment = {
             key: value for key, value in {
@@ -140,10 +188,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         except (OSError, json.JSONDecodeError) as exc:
             raise PipelineError(f"cannot read technical decision packet: {exc}") from exc
         state = Controller(store).technical_action(command_id=args.id, expected_generation=args.expected_generation, packet=packet)
+    elif args.command == "assignment-export":
+        return export_assignment(root, Controller(store).status(), args.baseline, args.input)
+    elif args.command == "delivery-read":
+        return read_delivery(root, workflow, args.digest, args.offset, args.limit, args.pointer)
+    elif args.command == "file-read":
+        return read_file(root, Controller(store).status(), args.path, version=args.version, offset=args.offset, limit=args.limit)
+    elif args.command == "step":
+        return execute_step(Controller(store), root, args.expected_generation, args.action_id)
     else:  # pragma: no cover
         raise AssertionError(args.command)
     view = status_view(state)
     return view
+
+
+def run(args: argparse.Namespace) -> dict[str, Any]:
+    result = _run(args)
+    return director_brief(result) if getattr(args, "brief", False) else result
 
 
 def main(argv: list[str] | None = None) -> int:
