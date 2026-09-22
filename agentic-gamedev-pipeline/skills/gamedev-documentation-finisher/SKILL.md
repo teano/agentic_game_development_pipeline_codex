@@ -5,6 +5,8 @@ description: Explicit-invocation only. Use only when the user explicitly request
 
 # GameDev Documentation Finisher
 
+When the caller supplies `control_binding`, first apply the shared [control-return contract](../gamedev-pipeline/references/control-return.md). Keep semantic JSON and native stage handoffs unchanged; wrap only the requested return. A bounded caller task performs only its stated existing-role work, without automatic stage restart or approval. Standalone user calls retain their existing public result.
+
 ## Activation gate
 
 Proceed only on the explicit activation described above. Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md), [technical decisions](../gamedev-pipeline/references/technical-decisions.md), and [documentation artifact contract](references/documentation-contract.md).

@@ -97,6 +97,16 @@ class ContextProjectionTests(unittest.TestCase):
 
 
 class AssignmentDeliveryTests(unittest.TestCase):
+    def assert_lossless_findings_with_unique_ids(self, expected, actual):
+        self.assertEqual(19, len(expected))
+        self.assertEqual(len(expected), len(actual))
+        self.assertEqual(expected, [{key: value for key, value in item.items() if key != "id"} for item in actual])
+        self.assertEqual([item["text"].encode("utf-8") for item in expected],
+                         [item["text"].encode("utf-8") for item in actual])
+        identities = [item.get("id") for item in actual]
+        self.assertTrue(all(isinstance(identity, str) and identity.strip() for identity in identities))
+        self.assertEqual(len(identities), len(set(identities)))
+
     def setUp(self):
         self.h = test_core.PipelineV2CoreTests()
         self.h.setUp()
@@ -117,7 +127,7 @@ class AssignmentDeliveryTests(unittest.TestCase):
         active = issued["active_assignment"]
         failure = active["capsule"]["context"]["verification_failure"]
         self.assertEqual(candidate, failure["candidate"])
-        self.assertEqual(findings, failure["findings"])
+        self.assert_lossless_findings_with_unique_ids(findings, failure["findings"])
         before = self.h.store.path.read_bytes()
         for _ in range(3):
             self.assertEqual(failure, self.h.controller.status()["active_assignment"]["context"]["verification_failure"])
@@ -154,7 +164,7 @@ class AssignmentDeliveryTests(unittest.TestCase):
         context["technical_decisions"] = [_bounded_context_value(entry)]
         before = deepcopy(issued)
         restored = required_assignment_context(issued, issued["active_assignment"])
-        self.assertEqual(findings, restored["verification_failure"]["findings"])
+        self.assert_lossless_findings_with_unique_ids(findings, restored["verification_failure"]["findings"])
         self.assertEqual(candidate, restored["verification_failure"]["candidate"])
         self.assertEqual([entry], restored["technical_decisions"])
         self.assertFalse(restored["technical_journal"]["requires_current_journal_read"])

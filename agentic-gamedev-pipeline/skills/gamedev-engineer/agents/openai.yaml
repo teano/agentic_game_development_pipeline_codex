@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Engineer"
   short_description: "Explicit-only bounded GameDev engineering pass"
-  default_prompt: "Use $gamedev-engineer for one controller-assigned current-slice implementation or Review/QA remediation. Apply the shared technical-decisions policy: investigate and resolve technical obstacles within authority, record every encountered blocker and its current resolution, and consume applicable current decisions. Use sanctioned actions for governed boundary changes; never waive acceptance or choose product changes. Return the issued compact semantic artifact and stop."
+  default_prompt: "Use $gamedev-engineer to implement and remediate the current slice under its stable owner, technical-decisions policy and controller-owned diagnostic checks."
 policy:
   allow_implicit_invocation: false

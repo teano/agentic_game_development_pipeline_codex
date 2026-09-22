@@ -72,6 +72,7 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("--id", required=True)
     init.add_argument("--run-id", required=True, help="Compact safe run identifier (letters, digits, dot, underscore, or hyphen).")
     init.add_argument("--authority", action="append", default=[], required=True)
+    init.add_argument("--verification", type=Path, help="Workflow-local exact runnable verification manifest.")
     init.add_argument("--slice", action="append", required=True); init.add_argument("--expected-generation", type=int)
     status = commands.add_parser("status", help="Return one executable action or terminal recovery fact.")
     status.add_argument("--recovery", type=Path)
@@ -121,6 +122,25 @@ def parser() -> argparse.ArgumentParser:
     step = commands.add_parser("step", help="Execute exactly one current next/complete/accept; stop at all semantic boundaries.")
     step.add_argument("--expected-generation", type=int, required=True)
     step.add_argument("--action-id", required=True, help="Exact public status.next_action.command_id; safely retries the same action.")
+    step.add_argument("--through-handoff", action="store_true", help="Optionally continue a passing complete through accept and next; stop at the first new assignment or other boundary.")
+    for name in ("check", "rotate-owner", "read-admit", "recover-capability", "reconcile"):
+        operation = commands.add_parser(name)
+        operation.add_argument("--id", required=True)
+        operation.add_argument("--expected-generation", type=int, required=True)
+        if name == "check":
+            operation.add_argument("--assignment-id", required=True)
+            operation.add_argument("--quiescence", required=True)
+            operation.add_argument("--collect-independent", action="store_true")
+        elif name in {"rotate-owner", "read-admit"}:
+            operation.add_argument("--reason", required=True)
+            if name == "read-admit":
+                operation.add_argument("--path", required=True)
+        elif name == "recover-capability":
+            operation.add_argument("--evidence", type=Path, required=True)
+        else:
+            operation.add_argument("--packet", type=Path, required=True)
+    pin = commands.add_parser("pin-runtime", help="Create a new verified immutable runtime bundle outside the product checkout.")
+    pin.add_argument("--destination", type=Path, required=True)
     return value
 
 
@@ -154,6 +174,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             except (OSError, json.JSONDecodeError) as exc:
                 raise PipelineError(f"cannot read product failure packet: {exc}") from exc
     if args.command == "init":
+        if args.verification is not None:
+            source = safe_path(root, args.verification, "verification manifest", strict=True)
+            if not source.is_relative_to(root / workflow):
+                raise PipelineError("verification manifest must be workflow-local")
+            try:
+                recovery["verification"] = json.loads(source.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise PipelineError(f"cannot read verification manifest: {exc}") from exc
         state = Controller(store).reconfigure({"name": "init", "id": args.id, "expected_generation": args.expected_generation, "run_id": args.run_id, "feature": args.feature, "workflow_path": workflow, "project_root": str(root), "authority_paths": _pairs(args.authority, "authority"), "slices": _slices(args.slice), **recovery})
     elif args.command == "status":
         return Controller(store).status(**recovery)
@@ -193,9 +221,25 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     elif args.command == "delivery-read":
         return read_delivery(root, workflow, args.digest, args.offset, args.limit, args.pointer)
     elif args.command == "file-read":
-        return read_file(root, Controller(store).status(), args.path, version=args.version, offset=args.offset, limit=args.limit)
+        return read_file(root, Controller(store).read_status(), args.path, version=args.version, offset=args.offset, limit=args.limit)
     elif args.command == "step":
-        return execute_step(Controller(store), root, args.expected_generation, args.action_id)
+        return execute_step(Controller(store), root, args.expected_generation, args.action_id,
+                            through_handoff=args.through_handoff)
+    elif args.command == "pin-runtime":
+        from .runtime_pin import pin_runtime
+        return pin_runtime(args.destination)
+    elif args.command in {"check", "rotate-owner", "read-admit", "recover-capability", "reconcile"}:
+        payload = {key: getattr(args, key) for key in ("assignment_id", "quiescence", "collect_independent", "reason", "path") if hasattr(args, key)}
+        for key in ("evidence", "packet"):
+            if hasattr(args, key):
+                source = safe_path(root, getattr(args, key), key, strict=True)
+                if not source.is_relative_to(root / workflow):
+                    raise PipelineError(f"{key} must be workflow-local")
+                try:
+                    payload[key] = json.loads(source.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise PipelineError(f"cannot read {key}: {exc}") from exc
+        state = Controller(store).control_action(args.command, command_id=args.id, expected_generation=args.expected_generation, **payload)
     else:  # pragma: no cover
         raise AssertionError(args.command)
     view = status_view(state)
@@ -211,7 +255,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = run(parser().parse_args(argv))
     except PipelineError as exc:
-        print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        from .execution import classify_error
+        print(json.dumps(classify_error(exc), ensure_ascii=False), file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0

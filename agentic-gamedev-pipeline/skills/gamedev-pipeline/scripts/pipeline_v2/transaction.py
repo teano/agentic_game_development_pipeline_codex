@@ -146,7 +146,7 @@ class StateStore:
 
     def dispatch(self, command: dict[str, Any]) -> dict[str, Any]:
         command = canonical_command(command)
-        if command.get("name") in {"next", "complete", "ready"}:
+        if command.get("name") in {"next", "complete", "ready", "check", "rotate-owner", "read-admit", "recover-capability", "reconcile"}:
             raise PipelineError(f"{command['name']} is controller-only")
         with self._lock():
             return self._dispatch_locked(command)

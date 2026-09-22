@@ -106,6 +106,17 @@ class WindowsProcessTreeTests(unittest.TestCase):
         self.assertEqual(process_tree._STDERR_TAIL_BYTES, len(result.stderr_tail))
         self.assertEqual(b"E" * process_tree._STDERR_TAIL_BYTES, result.stderr_tail)
         self.assertTrue(result.stderr_tail_truncated)
+        self.assertEqual(b"O" * process_tree._STDOUT_TAIL_BYTES, result.stdout_tail)
+        self.assertTrue(result.stdout_tail_truncated)
+        self.assertGreater(result.duration_ms, 0)
+
+    def test_nonzero_stdout_only_error_is_available_without_rerunning_command(self) -> None:
+        result = self.run_tree("import sys; print('compile: missing Widget at src/game.py:17'); sys.exit(7)")
+        self.assertEqual(7, result.returncode)
+        self.assertIn(b"missing Widget at src/game.py:17", result.stdout_tail)
+        self.assertEqual(b"", result.stderr_tail)
+        self.assertFalse(result.stdout_tail_truncated)
+        self.assertGreater(result.duration_ms, 0)
 
     def test_successful_parent_cannot_escape_twenty_five_ready_children(self) -> None:
         child_count = 25

@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Runtime QA"
   short_description: "Explicit-only GameDev runtime QA mode"
-  default_prompt: "Use $gamedev-qa for one fresh read-only candidate QA assignment. Apply the shared technical-decisions policy and current relevant journal entries; investigate technical obstacles, record every encountered blocker, and independently verify assigned acceptance. A journal entry never waives an identity or substitutes for runtime evidence. Return the issued semantic artifact and stop without product remediation."
+  default_prompt: "Use $gamedev-qa for independent execution of all assigned identities, current technical-decisions evidence and honest unverified results without product edits."
 policy:
   allow_implicit_invocation: false

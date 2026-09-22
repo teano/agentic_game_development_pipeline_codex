@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Final Review"
   short_description: "Explicit-only GameDev pipeline Review mode"
-  default_prompt: "Use $gamedev-review for one fresh read-only review of assignment.context.review_target under its artifact contract. Apply the shared technical-decisions policy to relevant current decisions: independently check authority and evidence, neither reject a justified technical deviation nor accept a logged waiver. Use ordinary fail remediation for concrete technical defects and record encountered blockers in the issued artifact. Keep the audit bounded, ignore speculative or optional improvements, and stop without product edits."
+  default_prompt: "Use $gamedev-review for independent bounded correctness review, preserving finding IDs and current technical-decisions evidence without product edits."
 policy:
   allow_implicit_invocation: false

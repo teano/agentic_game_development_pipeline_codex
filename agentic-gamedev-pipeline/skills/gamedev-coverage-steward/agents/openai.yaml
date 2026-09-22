@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Coverage Advisory"
   short_description: "Advisory review of exact feature coverage"
-  default_prompt: "Use $gamedev-coverage-steward only for a standalone advisory review of supplied coverage data and relevant authorized current technical-decision evidence. The journal never waives mandatory identities or grants runtime or mutation authority. Return COVERAGE_COMPLETE plus NEXT_ACTION, and stop."
+  default_prompt: "Use $gamedev-coverage-steward for advisory review of supplied coverage and current technical-decisions evidence without runtime or mutation authority."
 policy:
   allow_implicit_invocation: false

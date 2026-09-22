@@ -1,85 +1,39 @@
 # Agentic Game Development Skills
 
-Пользовательский bundle explicit-only Codex skills для подготовки игровой фичи к статусу production-ready candidate. Основной runtime — компактный controller-owned Pipeline v2: семь фаз, девять CLI-команд и одна минимальная Git-tree модель состояния.
+Explicit-only Codex skills for an authorized, reproducible game-development cycle. The runtime controls exact authority, one writer, independent Review/QA and real verification evidence; it does not replace product decisions or grant publication permission.
 
-Bundle обнаруживается через пользовательскую junction `~/.codex/skills/agentic-gamedev-pipeline`, указывающую на `agentic-gamedev-pipeline/skills` этого репозитория. Полный regression suite:
+## Entry points
+
+Use `$gamedev-requirements`, `$gamedev-specification`, `$gamedev-development-plan` for their individual stages, or explicitly request `$gamedev-pipeline` for the intended full-cycle scope. A full-cycle Director consumes each stage's real `PRD_READY`, `SPEC_READY`, `PLAN_READY` before production. Stage workers stop at their own handoff; tokens do not activate stages themselves.
+
+The [authority contract](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/authority-contract.md) preserves direct user decisions and explicit scoped delegation. It distinguishes product choice, exact-revision approval, run-state recovery and shared-pipeline maintenance. A delegated actor is recorded truthfully; there is no blanket autoapproval or forged user consent. A genuine runtime incident pauses product work; do not patch or bypass guards without applicable separate maintenance authority.
+
+## Production cycle
 
 ```text
-python agentic-gamedev-pipeline/scripts/test_skills.py
+plan -> slice -> engineering -> review -> qa -> docs -> ready
 ```
 
-## Активация
+One stable Engineer owns related implementation and remediation in its slice. Assignments remain distinct; independent Reviewer and QA have separate role aliases. Active controller checks return bounded compiler/test feedback while that Engineer is quiescent, without ending its assignment or granting semantic PASS. Independent Review retains stable finding IDs; QA proves each required identity through its actual path. New workers receive a bounded current packet rather than inherited conversation. Status questions do not end the run.
 
-GameDev skills запускаются только когда пользователь явно называет соответствующий skill или просит запустить Agentic GameDev Pipeline. Наличие игрового проекта, документов или runtime-state само по себе не разрешает активацию.
-
-Доступные роли:
-
-- `$gamedev-requirements` — утверждённый product requirements document;
-- `$gamedev-specification` — утверждённая техническая спецификация;
-- `$gamedev-development-plan` — утверждённый план и ограниченные slice records;
-- `$gamedev-pipeline` — единственный Director/controller runtime;
-- `$gamedev-engineer` — реализация или product remediation в controller-derived slice scope;
-- `$gamedev-review` — независимый read-only Review;
-- `$gamedev-qa` — независимая read-only QA;
-- `$gamedev-documentation-finisher` — ограниченная документационная запись;
-- `$gamedev-coverage-steward` — отдельный advisory-only аудит предоставленного coverage.
-
-Явный запуск `$gamedev-pipeline` разрешает Director делегировать внутренние фазы остальным активным ролям. Каждый assignment использует новый worker session ID. Engineer никогда не может быть Review или QA worker того же run.
-
-Если Director или worker подозревает дефект controller/runtime/skill/protocol/state transition, product run немедленно останавливается. Агент подробно, но bounded и redacted описывает действие, фазу/generation, фактическое и ожидаемое поведение, влияние на candidate и условие восстановления. Ему запрещено самостоятельно менять, патчить, обходить или локально подменять pipeline и продолжать run на изменённой версии. Отдельная pipeline-maintenance работа разрешается только новой явной командой пользователя.
-
-## Pipeline v2
-
-Стабильный launcher:
+Start with the launcher's current help:
 
 ```text
 python agentic-gamedev-pipeline/skills/gamedev-pipeline/scripts/pipeline_state.py --help
 ```
 
-Фазы строго фиксированы:
+Global `--root`, `--feature` and optional `--brief` precede the command. State lives only in `.agentic-pipeline/Workflows/<feature>/`. `init` binds the exact approved `requirements`, `specification`, `plan` and ordered three-key caller slices; read scope is controller-derived. The optional verification manifest seals runnable recipes, dependencies, timeouts and conservative reuse categories once. No-op Plan/Slice confirmation is opt-in and guarded, not a substitute for approved upstream artifacts.
+
+Use [Director lifecycle](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/director-runtime.md), [delivery](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/delivery-contract.md) and the relevant [execution/recovery](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/execution-contract.md) route. `step` returns a typed outcome and next action; `check`, `rotate-owner`, `read-admit`, `recover-capability`, `reconcile` and `pin-runtime` retain their specific guards. The [protocol](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/pipeline-protocol.md) documents exact boundaries and legacy-compatible recovery. Command help is authoritative for flags.
+
+Candidate, authority, runtime, executable and environment bindings determine deterministic receipt reuse. Unknown dependencies rerun conservatively. Diagnostic-only journal observations do not waive semantic changes or counterevidence. Historical workflow evidence is provenance, not new product write permission. Product checks run on the canonical live checkout; immutable pinning copies only the pipeline bundle. Schema-10 `migrate` remains a fail-closed tombstone.
+
+`ready` validates the integrated candidate and all required slices, then declares `PRODUCTION_READY_CANDIDATE`. Unexecuted mandatory manual/device checks remain unverified. Ready does not authorize deployment, publication, spending or risk acceptance. Missing host capacity is reported honestly; pipeline code cannot promise to free stuck host slots.
+
+## Validation
 
 ```text
-plan -> slice -> engineering -> review -> qa -> docs -> ready
+python agentic-gamedev-pipeline/scripts/test_skills.py
 ```
 
-Команды строго фиксированы: `init`, `status`, `next`, `complete`, `answer`, `resume`, `accept`, `migrate`, `ready`.
-
-`init` принимает ровно три authority key: `requirements`, `specification`, `plan`. Он также требует один или несколько упорядоченных slice records с полями `id`, `allowed_paths`, `planned_commands`. Каждый slice последовательно проходит Engineering, свежие Review и QA; только после последнего начинается Docs. Engineering write access и controller-run команды выводятся из текущего slice, поэтому caller не может подменить их через `next` или выдать Engineer доступ `**`.
-
-Review получает отдельный controller-derived `context.review_target`: `required_scope` указывает обязательную границу текущего slice, а `candidate_changes` содержит пути принятого Engineering diff и сохранённых при reconfigure Engineering-правок в текущем `required_scope`; после Docs этот exact diff одновременно является всей целью. Более широкий read access к authority, `read_paths`, untouched code и завершённым slice служит только evidence context. Finding о внесённом дефекте или лишней сложности обязан быть привязан к `candidate_changes`; вне них допустимы только пропущенная обязательная реализация внутри required scope или доказанная direct regression. Finding требует конкретного current-candidate evidence, достижимого поддерживаемого игрового пути или детерминированного trace и материального нарушения обязательного поведения либо конкретной лишней сложности. Теоретические риски, misuse/manual tampering, future-scale hardening и необязательные улучшения исключены; при выполненных требованиях и минимальной KISS/YAGNI-реализации Reviewer сразу возвращает `pass` с пустым списком.
-
-`status` всегда возвращает один controller-derived `next_action`: command ID, generation, assignment/session identity, output path, access, checks, Review target и recovery reason не вводятся вручную. Если утверждённая authority изменилась, точный `init` из `next_action` выполняет CAS-защищённую reconfiguration, сохраняет старый candidate/history как audit context и возвращает run в Plan. Активная работа прерывается только после controller proof, что checkout diff оставался в прежнем scope; новый scope затем приходит как обычный semantic result Slicer и обязан покрыть эти Engineering paths.
-
-Workers возвращают только простые semantic artifacts:
-
-```text
-plan/engineering/docs: outcome + non-empty summary
-slice: outcome + summary + optional ordered slice records
-review: outcome + findings[{text,severity,kind}]
-qa: outcome + checks
-blocked: every role also requires blocker + required_action
-```
-
-Git tree OID, changed paths, authority/runtime digests и process receipts принадлежат controller, а не worker artifact. `init` требует чистый committed Git root и tracked authority. Pipeline контролирует tracked и новые non-ignored candidate paths; ignored editor/cache/log files полностью вне его границы. Planned command обязан оставить candidate tree неизменным, а изменение `.gitignore`, `.gitattributes` или `.gitmodules` требует fresh `init`.
-
-## Rework и readiness
-
-Текущий технический журнал хранится в `technical_decisions` выбранного feature runtime state и передаётся ролям по [общему контракту](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/technical-decisions.md). Запись `TD-*` содержит ситуацию, актуальное решение, основание, проверки, последствия и при необходимости точную ссылку на заменяемую часть артефакта. Исправление заменяет ту же запись; прежний текст не переносится в следующие рабочие пакеты. Это отдельный канал от принятой пользовательской authority в `DEC-*` ledger.
-
-Requirements использует журнал как evidence для существенных вопросов; технический выбор сам по себе не становится требованием. Specification и Planning перечитывают актуальные записи при новом входе, повторе, исправлении и смене исполнителя и включают обоснованные решения через свои обычные процедуры. Обёртка Specification передаёт журнал также внутренним ролям внешнего helper. Команда `technical-decisions-context` контроллеров Specification/Planning возвращает locator, digest и текущие записи только выбранной фичи. Незавершённые проверки связаны с этим digest; обновление журнала не отменяет уже выданные `SPEC_READY` или approval плана автоматически.
-
-Пользовательский выбор локальной поправки означает адресное изменение у владельца артефакта с точным approval/readiness и последующей reconvergence; полная перегенерация документа не обязательна. Структурный возврат выбирается отдельно. Runtime `init` при изменении authority может перезапустить Plan/Slice. Журнал сам не разрешает изменение product requirements или утверждённой технологии.
-
-Review/QA остаются read-only. Product `fail` в Review или QA возвращает run в writable `engineering`, инвалидирует engineering и downstream artifacts, а затем требует свежие Review и QA. Review failure документационного target возвращает работу владельцу Docs. `blocked` требует непустые `blocker` и `required_action`, не запускает planned commands и не выдаёт candidate/phase credit. После разрешения prerequisite продолжение использует точный `status → init`, сохраняя журнал и возвращаясь к Plan.
-
-Изменившая candidate документация также инвалидирует Review/QA. `ready` требует доказанное завершение всех ordered slices, повторно сравнивает live checkout с последним независимо reviewed/tested candidate и только тогда устанавливает `PRODUCTION_READY_CANDIDATE`. Это не разрешает deployment, публикацию, spending, store submission или risk acceptance.
-
-## Schema-10 cutover
-
-`migrate` сохранён только как fail-closed tombstone. Миграция schema-10 не поддерживается `git-tree-v1`: legacy state/findings нужно архивировать и запустить свежие Plan/`init`. Import, reconstruction и продолжение старого assignment не выполняются; свежий run проходит полный путь:
-
-```text
-plan -> slice -> engineering -> review -> qa -> docs -> ready
-```
-
-Pipeline v2 не вызывает legacy handlers, Decision Recorder, deferred-findings или recovery-role handlers. Консервативные Director decisions, completed actor IDs и remediation gates хранятся внутри controller state.
+Instruction contracts check discoverability, schema examples and behavioral exercise integrity. The independent role exercises are separate evidence of instruction understanding; static phrase checks are not that evidence. Record actual outcomes and limitations in the run's audit.

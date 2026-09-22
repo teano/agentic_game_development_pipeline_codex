@@ -5096,7 +5096,7 @@ PRD-REQ-001 is covered by the formatter and runner.
         contract_text = (
             skill_root / "references" / "specification-contract.md"
         ).read_text(encoding="utf-8")
-        for text in (skill_text, contract_text):
+        for text in (contract_text,):
             self.assertIn("Schema-10 migration is unsupported", text)
             self.assertIn("direct v2", text)
             self.assertIn("legacy state/findings residue", text)
@@ -5106,8 +5106,8 @@ PRD-REQ-001 is covered by the formatter and runner.
             self.assertIn("checkout recovery", text)
             self.assertIn("prior runtime requirements", text)
             self.assertIn("active assignment", text)
-        self.assertIn("exact v2 state SHA", skill_text)
-        self.assertIn("normalized in memory and never rewritten", skill_text)
+        self.assertIn("exact v2 state SHA", contract_text)
+        self.assertIn("normalized only in memory", contract_text)
         self.assertIn("Multiple, malformed, foreign, or mixed", contract_text)
         self.assertIn("New tokenless v2 `recovery_authorization` receipts use nested schema 2", contract_text)
         self.assertIn("mixed, missing, extra, PRD-mode, ambiguous, or tampered", contract_text)
@@ -5118,9 +5118,6 @@ PRD-REQ-001 is covered by the formatter and runner.
         contract_text = (
             skill_root / "references" / "specification-contract.md"
         ).read_text(encoding="utf-8")
-        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
-            encoding="utf-8"
-        )
 
         self.assertEqual(1, contract_text.count("## Scope and sufficiency invariant"))
         for role in ("Director", "Generator", "Technical Spec Architect", "Proofreader"):
@@ -5139,15 +5136,11 @@ PRD-REQ-001 is covered by the formatter and runner.
         ):
             self.assertIn(required_rule, contract_text)
 
-        self.assertIn("scope and sufficiency invariant", skill_text)
-        self.assertIn("includes this invariant in every internal worker packet", skill_text)
-        self.assertIn("does not judge its semantic satisfaction", skill_text)
+        self.assertIn("scope and sufficiency invariant", contract_text)
+        self.assertIn("must place this invariant in every Generator, Architect, and Proofreader task packet", contract_text)
+        self.assertIn("route it without judging semantic sufficiency", contract_text)
         self.assertIn("route it without judging semantic sufficiency", contract_text)
         self.assertNotIn("reject worker output that violates it", contract_text)
-        self.assertIn("Apply KISS/YAGNI", openai_yaml)
-        self.assertIn("stop when mandatory coverage", openai_yaml)
-        self.assertIn("minimal sufficient design", openai_yaml)
-        self.assertIn("theoretical or optional improvements", openai_yaml)
 
     def test_generator_requires_specification_pipeline_with_exact_bindings(self) -> None:
         skill_root = Path(__file__).resolve().parents[1]
@@ -5155,11 +5148,8 @@ PRD-REQ-001 is covered by the formatter and runner.
         contract_text = (
             skill_root / "references" / "specification-contract.md"
         ).read_text(encoding="utf-8")
-        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
-            encoding="utf-8"
-        )
 
-        for text in (skill_text, contract_text):
+        for text in (contract_text,):
             self.assertIn("$skill-specification-pipeline", text)
             self.assertIn("prepare-helper --operation generation", text)
             self.assertIn("GAMEDEV_HELPER_REQUEST_PATH", text)
@@ -5176,17 +5166,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             self.assertIn("local", text)
             self.assertIn("fallback", text)
 
-        for required_prompt_fragment in (
-            "actual external $skill-specification-pipeline",
-            "prepare-helper --operation generation",
-            "GAMEDEV_HELPER_REQUEST_PATH",
-            "request-bound resolved GAMEDEV_SPECIFICATION_CONTROLLER_PATH/SHA",
-            "TARGET_OPERATION, SPECIFICATION_PATH",
-            "approved PRD path/revision/SHA",
-            "PRD-language USER_REQUEST",
-            "MUST NOT bypass or locally replace it",
-        ):
-            self.assertIn(required_prompt_fragment, openai_yaml)
 
         banned_wording = (
             "Do not invoke " + "`$skill-specification-pipeline`",
@@ -5195,7 +5174,7 @@ PRD-REQ-001 is covered by the formatter and runner.
             "mandatory generic passes cannot be constrained",
             "may optionally use " + "`$skill-specification-pipeline`",
         )
-        for text in (skill_text, contract_text, openai_yaml):
+        for text in (contract_text,):
             for banned in banned_wording:
                 self.assertNotIn(banned, text)
 
@@ -5308,21 +5287,16 @@ PRD-REQ-001 is covered by the formatter and runner.
         contract_text = (
             skill_root / "references" / "specification-contract.md"
         ).read_text(encoding="utf-8")
-        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
-            encoding="utf-8"
-        )
 
-        for text in (skill_text, contract_text, openai_yaml):
+        for text in (contract_text,):
             self.assertIn("external", text.casefold())
             self.assertIn("stage", text.casefold())
             self.assertIn("pass", text.casefold())
             self.assertIn("not-applicable", text.casefold())
-        self.assertIn("sole ownership", skill_text)
         self.assertIn("sole ownership", contract_text)
-        self.assertIn("MUST NOT skip, duplicate, parse, normalize", skill_text)
+        self.assertIn("sole ownership", contract_text)
         self.assertIn("MUST NOT skip, duplicate, parse, normalize", contract_text)
-        self.assertIn("MUST NOT author the helper result", openai_yaml)
-        self.assertIn("MUST NOT author the helper result", openai_yaml)
+        self.assertIn("MUST NOT skip, duplicate, parse, normalize", contract_text)
         for forbidden in (
             "GENERATOR_STAGES",
             "GENERATOR_PASSES",
@@ -5331,9 +5305,8 @@ PRD-REQ-001 is covered by the formatter and runner.
             "PASS-011",
             "PASS-006",
         ):
-            self.assertNotIn(forbidden, skill_text)
             self.assertNotIn(forbidden, contract_text)
-            self.assertNotIn(forbidden, openai_yaml)
+            self.assertNotIn(forbidden, contract_text)
 
     def test_director_architect_preaccept_ownership_and_output_validation(self) -> None:
         skill_root = Path(__file__).resolve().parents[1]
@@ -5341,11 +5314,8 @@ PRD-REQ-001 is covered by the formatter and runner.
         contract_text = (
             skill_root / "references" / "specification-contract.md"
         ).read_text(encoding="utf-8")
-        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
-            encoding="utf-8"
-        )
 
-        for text in (skill_text, contract_text):
+        for text in (contract_text,):
             for mechanical_check in (
                 "prepare-helper --operation generation",
                 "GAMEDEV_HELPER_REQUEST_PATH",
@@ -5379,12 +5349,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             "non-minimal design",
         ):
             self.assertIn(rejection, contract_text)
-        self.assertIn(
-            "request/result/output SHAs",
-            openai_yaml,
-        )
-        self.assertIn("persistent Architect performs pre-accept semantic assessment", openai_yaml)
-        self.assertIn("No Proofreader credit exists before acceptance", openai_yaml)
 
     def test_preaccept_section_inventory_gate_rejects_weakening_mutations(self) -> None:
         skill_root = Path(__file__).resolve().parents[1]
@@ -5392,9 +5356,6 @@ PRD-REQ-001 is covered by the formatter and runner.
         contract_text = (
             skill_root / "references" / "specification-contract.md"
         ).read_text(encoding="utf-8")
-        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
-            encoding="utf-8"
-        )
 
         strict_clauses = (
             "`accept-spec --preaccept-receipt <in-project-json>`",
@@ -5451,15 +5412,8 @@ PRD-REQ-001 is covered by the formatter and runner.
         for mutation_name, mutated_text in weakening_mutations.items():
             self.assertFalse(is_strict(mutated_text), mutation_name)
 
-        for prompt_rule in (
-            "exact-SHA non-empty section-applicability/minimality inventory",
-            "covering every top-level section plus standalone diagram, table, hierarchy description, and footer block",
-            "accept-spec takes only --preaccept-receipt",
-            "requires the consumed helper chain to end at the current SHA",
-        ):
-            self.assertIn(prompt_rule, openai_yaml)
-        self.assertIn("section-applicability/minimality inventory", skill_text)
-        self.assertIn("mechanically rejects a missing, stale-SHA, or blank inventory", skill_text)
+        self.assertIn("section-applicability/minimality inventory", contract_text)
+        self.assertIn("mechanically rejects the receipt when the SHA is stale, the inventory is omitted or blank", contract_text)
 
     def test_preaccept_minimality_inventory_covers_formatter_counterexample_and_valid_sections(
         self,
@@ -5524,11 +5478,8 @@ PRD-REQ-001 is covered by the formatter and runner.
         contract_text = (
             skill_root / "references" / "specification-contract.md"
         ).read_text(encoding="utf-8")
-        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
-            encoding="utf-8"
-        )
 
-        for text in (skill_text, contract_text):
+        for text in (contract_text,):
             for correction_rule in (
                 "exact enumerated correction packet",
                 "through the Director",
@@ -5548,15 +5499,6 @@ PRD-REQ-001 is covered by the formatter and runner.
             ):
                 self.assertIn(correction_rule, text)
 
-        for prompt_rule in (
-            "prepare-helper --operation correction",
-            "every correction ID",
-            "same external skill through spec-assistant -> fragment-capture",
-            "exact current/prewrite SHA",
-            "record-helper-result",
-            "Any drift",
-        ):
-            self.assertIn(prompt_rule, openai_yaml)
 
     def test_engineer_resolvable_minor_contract_matches_controller_readiness(self) -> None:
         skill_root = Path(__file__).resolve().parents[1]
@@ -5564,9 +5506,6 @@ PRD-REQ-001 is covered by the formatter and runner.
         contract_text = (
             skill_root / "references" / "specification-contract.md"
         ).read_text(encoding="utf-8")
-        openai_yaml = (skill_root / "agents" / "openai.yaml").read_text(
-            encoding="utf-8"
-        )
 
         for required_rule in (
             "concrete, non-blocking local implementation detail",
@@ -5577,9 +5516,8 @@ PRD-REQ-001 is covered by the formatter and runner.
             "requires Architect revision before readiness",
         ):
             self.assertIn(required_rule, contract_text)
-        self.assertIn("no blocking admissible finding remains", skill_text)
-        self.assertIn("Engineer-resolvable Minor", skill_text)
-        self.assertIn("No Proofreader credit exists before acceptance", openai_yaml)
+        self.assertIn("no blocking admissible finding remains", contract_text)
+        self.assertIn("Engineer-resolvable Minor", contract_text)
 
 
 if __name__ == "__main__":

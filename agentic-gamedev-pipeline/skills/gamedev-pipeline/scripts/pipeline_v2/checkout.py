@@ -409,9 +409,12 @@ def pipeline_runtime_digest() -> str:
         (skill_root / "references" / "stage-handoff-invariant.md", "skill/references/stage-handoff-invariant.md"),
         (skill_root / "references" / "technical-decisions.md", "skill/references/technical-decisions.md"),
         (skill_root / "references" / "director-runtime.md", "skill/references/director-runtime.md"),
+        (skill_root / "references" / "control-return.md", "skill/references/control-return.md"),
         (skill_root / "references" / "interaction-evidence.md", "skill/references/interaction-evidence.md"),
         (skill_root / "references" / "maintenance-observation.md", "skill/references/maintenance-observation.md"),
         (skill_root / "references" / "delivery-contract.md", "skill/references/delivery-contract.md"),
+        (skill_root / "references" / "execution-contract.md", "skill/references/execution-contract.md"),
+        (skill_root / "references" / "authority-contract.md", "skill/references/authority-contract.md"),
         (skill_root / "scripts" / "pipeline_state.py", "skill/scripts/pipeline_state.py"),
         (skills_root / "gamedev-engineer" / "SKILL.md", "delegates/engineering/SKILL.md"),
         (skills_root / "gamedev-review" / "SKILL.md", "delegates/review/SKILL.md"),
@@ -424,6 +427,8 @@ def pipeline_runtime_digest() -> str:
         (runtime_dir / "checkout.py", "pipeline_v2/checkout.py"),
         (runtime_dir / "cli.py", "pipeline_v2/cli.py"),
         (runtime_dir / "delivery.py", "pipeline_v2/delivery.py"),
+        (runtime_dir / "execution.py", "pipeline_v2/execution.py"),
+        (runtime_dir / "runtime_pin.py", "pipeline_v2/runtime_pin.py"),
         (runtime_dir / "legacy_gen53.py", "pipeline_v2/legacy_gen53.py"),
         (runtime_dir / "model.py", "pipeline_v2/model.py"),
         (runtime_dir / "process_tree.py", "pipeline_v2/process_tree.py"),
@@ -441,4 +446,14 @@ def pipeline_runtime_digest() -> str:
         if not path.is_file():
             raise PipelineError(f"pipeline runtime manifest file is missing: {label}")
         records.append({"path": label, "sha256": file_sha256(path)})
-    return digest(records)
+    result = digest(records)
+    pin = bundle_root / "runtime-pin.json"
+    if pin.exists():
+        try:
+            import json
+            marker = json.loads(pin.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise PipelineError("runtime pin marker is unreadable") from exc
+        if marker.get("format") != "pipeline-runtime-pin-v1" or marker.get("runtime_digest") != result:
+            raise PipelineError("pinned runtime changed; create a new verified pin and use authorized maintenance")
+    return result

@@ -13,9 +13,19 @@ def journal_digest(entries: dict) -> str:
     return hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
+def semantic_journal_digest(entries: dict) -> str:
+    """Only explicitly diagnostic observations are outside verification meaning.
+
+Checks, basis and counterevidence remain semantic. An observation may never be
+used to conceal a contradiction in those fields.
+"""
+    return journal_digest({key: {field: value for field, value in entry.items() if field != "observations"}
+                           for key, entry in entries.items()})
+
+
 def validate_entry(entry: dict, *, sealed: bool = False) -> dict:
     required = {"id", "situation", "decision", "basis", "checks", "downstream"}
-    optional = {"overrides"} | ({"execution"} if sealed else set())
+    optional = {"overrides", "observations"} | ({"execution"} if sealed else set())
     if not isinstance(entry, dict) or not required <= set(entry) or set(entry) - required - optional:
         raise ValueError("technical decision requires id, situation, decision, basis, checks, downstream and optional overrides")
     if not isinstance(entry["id"], str) or not re.fullmatch(r"TD-[A-Za-z0-9-]+", entry["id"]):
@@ -25,6 +35,9 @@ def validate_entry(entry: dict, *, sealed: bool = False) -> dict:
             raise ValueError(f"technical decision {key} must be non-empty text")
     if not isinstance(entry["checks"], list) or any(not isinstance(x, str) or not x.strip() for x in entry["checks"]):
         raise ValueError("technical decision checks must be a list of actual evidence strings")
+    if "observations" in entry and (not isinstance(entry["observations"], list)
+            or any(not isinstance(x, str) or not x.strip() for x in entry["observations"])):
+        raise ValueError("technical observations must be non-empty diagnostic strings")
     if "execution" in entry:
         execution = entry["execution"]
         if not isinstance(execution, dict) or set(execution) != {"slice_id", "authority", "additional_paths", "command_order"}:

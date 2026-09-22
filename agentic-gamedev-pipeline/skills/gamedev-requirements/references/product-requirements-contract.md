@@ -6,7 +6,7 @@ The repository owns the PRD location and namespace. Resolve one path from explic
 
 Resolve one lowercase hyphen `FEATURE` and emit the exact downstream operational root `WORKFLOW_PATH=.agentic-pipeline/Workflows/<feature>`. Requirements stores no controller artifact there. Downstream stages may use only that exact folder and must not scan, archive, move, or delete sibling workflow folders.
 
-If the repository is empty and defines no layout, recommend `<project-root>/docs/features/<feature>/product-requirements.md` with a sibling `technical-specification.md` as a proposed default. Do not create the proposed layout until the user confirms it. Keep canonical documents version-controlled and runtime evidence in the repository-defined evidence area.
+If the repository is empty and defines no layout, recommend `<project-root>/docs/features/<feature>/product-requirements.md` with a sibling `technical-specification.md` as a proposed default. Use that layout only after direct confirmation or an applicable explicit delegation of layout/design choices under the shared authority contract. Keep canonical documents version-controlled and runtime evidence in the repository-defined evidence area.
 
 ## Frontmatter
 
@@ -77,9 +77,9 @@ The feature's current technical decisions journal follows the shared [technical 
 
 Record what the product must achieve and what observable behavior proves it. Exclude implementation plans, class structures, speculative architecture, agent activity, raw interview transcripts, and discarded ideas unless they become an explicit constraint or non-goal.
 
-Only the user's direct answer or explicit selection becomes a requirement. An unambiguous `yes` confirms only one immediately preceding, explicitly worded proposal. Explicit approval applies only to the exact current PRD revision shown to the user. Proposals, inferences, assumed exclusions, risks, reviewer opinions, repository facts, inspected code, common practice, feasibility analysis, silence, permission to continue, and existing draft text are not decision authority and stay outside the PRD unless the user explicitly confirms their exact content.
+Default direct-confirmation mode: Only the user's direct answer or explicit selection becomes a requirement. In explicitly delegated decision mode, apply the [authority contract](../../gamedev-pipeline/references/authority-contract.md): the designated owner may select product content within the exact delegation and record its actual decision/provenance. Do not represent it as a direct user answer. The remaining direct-confirmation rules below govern content outside that delegation. An unambiguous `yes` confirms only one immediately preceding, explicitly worded proposal. Explicit approval applies only to the exact current PRD revision shown to the user. Proposals, inferences, assumed exclusions, risks, reviewer opinions, repository facts, inspected code, common practice, feasibility analysis, silence, permission to continue, and existing draft text are not decision authority and stay outside the PRD unless the user explicitly confirms their exact content.
 
-Do not write agent-originated proposals, assumptions, open questions, risks, exclusions, examples, inferred consequences, or candidate acceptance criteria anywhere in the PRD before the user confirms that exact content. Demo, sample, fixture, example, and placeholder data is non-authoritative unless the user explicitly confirms it for this product. Required sections may remain empty. A label does not make unconfirmed content admissible.
+Under direct-confirmation mode, do not write agent-originated proposals, assumptions, open questions, risks, exclusions, examples, inferred consequences, or candidate acceptance criteria anywhere in the PRD before the user confirms that exact content. Within explicit delegation, distinguish the owner's selected decisions from unsettled proposals; delegated choice authority is not approval authority. Demo, sample, fixture, example, and placeholder data is non-authoritative unless the user explicitly confirms it for this product. Required sections may remain empty. A label does not make unconfirmed content admissible.
 
 Faithful paraphrase, stable IDs, and a mechanically equivalent observable check are allowed only when they add no independently choosable semantics. New defaults, owners, APIs, supported-type lists, lifecycle/failure behavior, validation, edge cases, limits, platform mappings, or technical consequences require separate confirmation.
 
@@ -95,12 +95,12 @@ Keep evidence-taxonomy entries in chat or read-only research evidence outside th
 
 ## Approval and changes
 
-- Keep the file in `draft` until the user explicitly approves it.
-- Before every semantic edit and before approval, audit each added or changed statement against the exact confirming user statement or selected option. Unsupported content keeps the PRD not ready.
+- Keep the file in `draft` until the applicable authorizer explicitly approves the exact revision. Direct user approval is the default; an explicit delegation of approval permits the named owner to review and approve those bytes without another user question, with truthful actor/source provenance in existing stage evidence.
+- Before every semantic edit and before approval, audit each added or changed statement against its confirming user statement/selection or the actual delegated decision and scope. Unsupported content keeps the PRD not ready.
 - Request approval only when the full current revision is semantically complete, feasible, and testable: all material product decisions are closed, confirmed requirements do not conflict with current known constraints, and observable acceptance plus the required evidence category can verify each material behavior.
 - `Approve after changes` and equivalent conditional approval do not approve unseen semantics. A semantic edit, or a change request accompanying an approval message, invalidates any prior or conditional approval.
-- After every semantic edit, show the final current revision and request fresh explicit approval. After that approval, modify only approval metadata, validate with `--require-approved`, and report readiness only for those same semantic bytes.
+- After every semantic edit, bind fresh approval to the final current revision. In direct-confirmation mode, show the final current revision and request fresh explicit approval; a delegated approver must inspect and explicitly approve those same bytes under its recorded authority. After that approval, modify only approval metadata, validate with `--require-approved`, and report readiness only for those same semantic bytes.
 - Record the exact-byte SHA-256 at handoff time; do not embed a self-referential hash inside the PRD.
 - Reopen an approved PRD before any semantic edit by incrementing `revision`, setting `status: draft`, and clearing `approved_at`.
 - Treat every technical specification built from an older PRD hash as stale.
-- Emit `PRD_READY` only after explicit user approval and successful `--require-approved` validation on the same bytes. Return `NEXT_ACTION: $gamedev-specification` and stop; the Requirements stage never starts specification work.
+- Emit `PRD_READY` only after the applicable exact-revision approval and successful `--require-approved` validation on the same bytes. Return `NEXT_ACTION: $gamedev-specification` and stop; the Requirements stage never starts specification work.

@@ -10,7 +10,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import BinaryIO
 
@@ -19,6 +19,7 @@ _PIPE_JOIN_SECONDS = 2.0
 _PROCESS_JOIN_SECONDS = 2.0
 _TECHNICAL_LAUNCH_RETURN_CODE = 125
 _STDERR_TAIL_BYTES = 64 * 1024
+_STDOUT_TAIL_BYTES = 64 * 1024
 _LINUX_EXEC = (
     "import os,sys;"
     "ready_fd=int(sys.argv[1]);argv=sys.argv[2:];"
@@ -49,6 +50,9 @@ class ProcessEvidence:
     stderr_sha256: str
     stderr_tail: bytes = b""
     stderr_tail_truncated: bool = False
+    stdout_tail: bytes = b""
+    stdout_tail_truncated: bool = False
+    duration_ms: int = 0
 
 
 class _DigestReader(threading.Thread):
@@ -124,7 +128,7 @@ def _start_readers(process: subprocess.Popen[bytes]) -> tuple[_DigestReader, _Di
     if process.stdout is None or process.stderr is None:  # pragma: no cover - internal invariant
         raise RuntimeError("planned command pipes were not created")
     readers = (
-        _DigestReader(process.stdout),
+        _DigestReader(process.stdout, tail_limit=_STDOUT_TAIL_BYTES),
         _DigestReader(process.stderr, tail_limit=_STDERR_TAIL_BYTES),
     )
     for reader in readers:
@@ -134,7 +138,7 @@ def _start_readers(process: subprocess.Popen[bytes]) -> tuple[_DigestReader, _Di
 
 def _finish_readers(
     readers: tuple[_DigestReader, _DigestReader], *, stderr_suffix: bytes = b"",
-) -> tuple[str, str, bytes, bool]:
+) -> tuple[str, str, bytes, bool, bytes, bool]:
     for reader in readers:
         reader.join(_PIPE_JOIN_SECONDS)
         if reader.is_alive():
@@ -144,9 +148,11 @@ def _finish_readers(
                 pass
             reader.join(0.1)
     stderr_tail, stderr_tail_truncated = readers[1].tail(stderr_suffix)
+    stdout_tail, stdout_tail_truncated = readers[0].tail()
     return (
         readers[0].hexdigest(), readers[1].hexdigest(stderr_suffix),
         stderr_tail, stderr_tail_truncated,
+        stdout_tail, stdout_tail_truncated,
     )
 
 
@@ -248,7 +254,7 @@ def _run_posix(
             process.kill()
             process.wait(timeout=_PROCESS_JOIN_SECONDS)
         ready_reader.join(_PROCESS_JOIN_SECONDS)
-    stdout_digest, stderr_digest, stderr_tail, stderr_tail_truncated = _finish_readers(
+    stdout_digest, stderr_digest, stderr_tail, stderr_tail_truncated, stdout_tail, stdout_tail_truncated = _finish_readers(
         readers,
         stderr_suffix=(
             _timeout_message(timeout) if timed_out
@@ -262,6 +268,8 @@ def _run_posix(
         stderr_digest,
         stderr_tail,
         stderr_tail_truncated,
+        stdout_tail,
+        stdout_tail_truncated,
     )
 
 
@@ -498,13 +506,13 @@ if os.name == "nt":
                 raise cleanup_error
         if process is None or readers is None:  # pragma: no cover - launch errors propagate
             raise RuntimeError("planned command did not start")
-        stdout_digest, stderr_digest, stderr_tail, stderr_tail_truncated = _finish_readers(
+        stdout_digest, stderr_digest, stderr_tail, stderr_tail_truncated, stdout_tail, stdout_tail_truncated = _finish_readers(
             readers,
             stderr_suffix=_timeout_message(timeout) if timed_out else b"",
         )
         return ProcessEvidence(
             124 if timed_out else int(process.returncode), stdout_digest, stderr_digest,
-            stderr_tail, stderr_tail_truncated,
+            stderr_tail, stderr_tail_truncated, stdout_tail, stdout_tail_truncated,
         )
 
 
@@ -512,6 +520,9 @@ def run_process_tree(
     argv: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
 ) -> ProcessEvidence:
     """Run one command and end its complete descendant lifetime before returning."""
+    started = time.monotonic()
     if os.name == "nt":
-        return _run_windows(argv, cwd=cwd, env=env, timeout=timeout)
-    return _run_posix(argv, cwd=cwd, env=env, timeout=timeout)
+        result = _run_windows(argv, cwd=cwd, env=env, timeout=timeout)
+    else:
+        result = _run_posix(argv, cwd=cwd, env=env, timeout=timeout)
+    return replace(result, duration_ms=max(0, round((time.monotonic() - started) * 1000)))

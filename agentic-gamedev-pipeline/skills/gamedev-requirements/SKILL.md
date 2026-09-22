@@ -5,13 +5,15 @@ description: Explicit-invocation only. Use only when the user explicitly request
 
 # GameDev Requirements
 
+When the caller supplies `control_binding`, first apply the shared [control-return contract](../gamedev-pipeline/references/control-return.md). Keep semantic JSON and native stage handoffs unchanged; wrap only the requested return. A bounded caller task performs only its stated existing-role work, without automatic stage restart or approval. Standalone user calls retain their existing public result.
+
 ## Activation gate
 
 Proceed only on the explicit activation described above. Missing requirements, ambiguity, a game-design discussion, or an existing feature document is not authorization. Do not activate another GameDev stage.
 
 Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md). Act as product requirements facilitator; keep product decisions separate from technical design and implementation.
 
-Read the shared [technical decisions contract](../gamedev-pipeline/references/technical-decisions.md) on initial entry, repeated discovery, upstream return, and context recovery. Resolve only the selected feature's current journal through its public controller view. Give the root and each bounded research/review lane the relevant current records and source binding; refresh those inputs when reusing a lane after a record changes. Journal situations and checks are feasibility evidence for material questions, not product decisions. Never copy an Engineering choice, workaround, or technical override into PRD requirements, constraints, risks, exclusions, or acceptance criteria without the user's explicit confirmation of that exact product content. A changed technical record alone causes no PRD edit, new ID, revision increment, or stage activation.
+Read the shared [technical decisions contract](../gamedev-pipeline/references/technical-decisions.md) on initial entry, repeated discovery, upstream return, and context recovery. Resolve only the selected feature's current journal through its public controller view. Give the root and each bounded research/review lane the relevant current records and source binding; refresh those inputs when reusing a lane after a record changes. Journal situations and checks are feasibility evidence for material questions, not product decisions. Never copy an Engineering choice, workaround, or technical override into product authority merely because it worked. Require direct confirmation of that exact product content or an actual decision by the explicitly delegated product owner under the shared authority contract. A changed technical record alone causes no PRD edit, new ID, revision increment, or stage activation.
 
 When a journal blocker requires a product decision or the approved technology cannot achieve the product goal, preserve the user's selected route: an explicitly authorized local amendment with its exact affected content, or return to the named owning stage for structural revision. Do not turn the local option into an automatic full-stage rewind. When canonical PRD bytes must change, the Requirements owner still uses the normal current-revision approval gate. On handoff, include only relevant current records, unresolved user choices, their provenance and the exact chosen route, never superseded record text.
 
@@ -20,6 +22,8 @@ Read the Requirements rows and dispatch rules in the shared [agent model policy]
 Before creating, approving, or structurally editing a PRD, read [product-requirements-contract.md](references/product-requirements-contract.md). It is the canonical path, schema, content-boundary, and approval contract; do not restate or override it here.
 
 ## Resolve product decisions
+
+First establish direct-confirmation or explicitly delegated decision/approval mode under the shared authority contract. The interview steps below apply to material choices still owned by the user. In a valid autonomous delegation, make and record the scoped decisions instead of asking those questions; retain exact-revision validation and the actual approver identity. A no-questions preference alone supplies no missing authority. Under delegated autonomy, choose the smallest release scope that satisfies the requested outcome. Assess verification cost when selecting defaults: additional platforms, input combinations and numeric quality thresholds need a product reason, not generic completeness. Preserve explicit user requirements; later verification difficulty does not silently waive approved scope.
 
 1. Match the user's language. Resolve the project root, lowercase `FEATURE` slug, exact `WORKFLOW_PATH=.agentic-pipeline/Workflows/<feature>`, and canonical PRD through the contract. Requirements creates no state there and never inspects a sibling workflow. Ask one blocking path question only when resolution remains ambiguous.
 2. Read an existing PRD before interviewing. Preserve stable IDs and epistemic state; do not replace it without explicit approval.
@@ -42,7 +46,7 @@ Allow every started lane to finish or to checkpoint and hand off under the share
 
 The root Requirements agent alone interprets user decisions, edits the canonical PRD, and requests or records approval. Research and review results are evidence, not decision authority.
 
-For context checkpoint and handoff behavior, follow the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md) instead of restating its thresholds. A Requirements checkpoint adds only the canonical PRD path and current metadata, confirmed decisions already incorporated, pending blocking decisions, unconsumed lane results, and the exact next question or action needed to continue.
+For context checkpoint and handoff behavior, follow the shared [stage handoff invariant](../gamedev-pipeline/references/stage-handoff-invariant.md) and its useful-working-set policy. A Requirements checkpoint adds only the canonical PRD path and current metadata, confirmed decisions already incorporated, pending blocking decisions, unconsumed lane results, and the exact next question or action needed to continue.
 
 ## Complete the stage
 
@@ -52,7 +56,7 @@ The validator requires exact canonical list declarations: `- PRD-REQ-001: plain-
 
 During discovery, report only concrete important new decisions, blockers, evidence, and the next material question. Do not require revision, ID, or SHA boilerplate in an interim response.
 
-At terminal handoff, return only:
+At terminal handoff, return these existing fields unchanged, as `task_result.payload` when a caller binding is supplied or directly for a standalone call:
 
 - `PRD_READY: yes|no`, canonical path, status, revision, and exact SHA-256 when ready;
 - exact `FEATURE` and `WORKFLOW_PATH=.agentic-pipeline/Workflows/<feature>`;

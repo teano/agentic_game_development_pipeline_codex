@@ -11,7 +11,7 @@ from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any
 try:
-    from .technical_decisions import journal_digest, journal_reference, validate_journal
+    from .technical_decisions import journal_digest, journal_reference, validate_journal, semantic_journal_digest
 except ImportError:  # Upstream authority controllers load this file without a package.
     _journal_spec = importlib.util.spec_from_file_location("gamedev_technical_decisions", Path(__file__).with_name("technical_decisions.py"))
     _journal_module = importlib.util.module_from_spec(_journal_spec)
@@ -19,6 +19,15 @@ except ImportError:  # Upstream authority controllers load this file without a p
     journal_digest = _journal_module.journal_digest
     journal_reference = _journal_module.journal_reference
     validate_journal = _journal_module.validate_journal
+    semantic_journal_digest = _journal_module.semantic_journal_digest
+
+if __package__:
+    from .execution import validate_metadata as _validate_execution_metadata
+else:  # Upstream controllers also load this model as a standalone module.
+    _execution_spec = importlib.util.spec_from_file_location("gamedev_execution_metadata", Path(__file__).with_name("execution.py"))
+    _execution_module = importlib.util.module_from_spec(_execution_spec)
+    _execution_spec.loader.exec_module(_execution_module)
+    _validate_execution_metadata = _execution_module.validate_metadata
 
 _PLAN_CONTRACT_PATH = Path(__file__).resolve().parents[4] / "scripts" / "development_plan_contract.py"
 _PLAN_CONTRACT_SPEC = importlib.util.spec_from_file_location("gamedev_runtime_plan_contract", _PLAN_CONTRACT_PATH)
@@ -81,7 +90,7 @@ _ARTIFACT_SHAPES = {
         ("outcome", "findings"),
         {
             "findings[]": {
-                "allowed_keys": ["text", "severity", "kind"],
+                "allowed_keys": ["id", "text", "severity", "kind"],
                 "required_keys": ["text", "severity", "kind"],
                 "values": "non-empty strings",
             },
@@ -132,6 +141,12 @@ SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?\Z
 
 class PipelineError(ValueError):
     """A deterministic contract or transition failure."""
+
+
+class WorkerArtifactValidationError(PipelineError):
+    """The current active worker's artifact violates its issued contract."""
+
+    worker_artifact_validation = True
 
 
 class ConflictError(PipelineError):
@@ -267,7 +282,7 @@ def artifact_schema(phase: str, role: str | None = None) -> dict[str, Any]:
         "allowed_keys": list(dict.fromkeys([*allowed, "technical_decisions"])),
         "required_keys": list(required),
         "outcome_enum": ["pass", "fail", "blocked"],
-        "item_shapes": {**deepcopy(shapes), "technical_decisions[]": "current TD-* entries: id, situation, decision, basis, checks[], downstream, optional overrides exact reference; execution is controller-owned"},
+        "item_shapes": {**deepcopy(shapes), "technical_decisions[]": "current TD-* entries: id, situation, decision, basis, checks[], downstream, optional overrides exact reference and diagnostic-only observations[]; execution is controller-owned"},
     }
 
 
@@ -357,6 +372,9 @@ def compact_assignment_context(
     """
     lossless_format = canonical_input or source.get("delivery_version") == 1
     context: dict[str, Any] = {"delivery_version": 1}
+    for key in ("convergence", "diagnostic_checks", "machine_checks", "capability_recovery"):
+        if key in source:
+            context[key] = deepcopy(source[key])
     if isinstance(source.get("technical_journal"), dict):
         context["technical_journal"] = deepcopy(source["technical_journal"])
     if isinstance(source.get("technical_decisions"), list):
@@ -448,7 +466,7 @@ def command_intent_digest(command: dict[str, Any]) -> str:
     """Hash caller intent, excluding CAS and controller-derived observations."""
     intent = {
         key: value for key, value in command.items()
-        if key not in {"expected_generation", "controller", "controller_base", "controller_interrupt"}
+        if key not in {"expected_generation", "controller", "controller_base", "controller_interrupt", "controller_receipts", "controller_environment", "controller_machine_checks"}
     }
     return digest(intent)
 
@@ -540,10 +558,15 @@ def completed_slice_ids(state: dict[str, Any]) -> list[str]:
     """Return the accepted slice prefix in the current authority/scope epoch."""
     history = state.get("history", [])
     start = 0
+    prefix = []
     for index, item in enumerate(history):
         if item.get("command") == "init" and item.get("result") == "authority_scope_reconfigured":
             start = index + 1
-    return [
+            prefix = []
+        elif item.get("command") == "reconcile" and "retained_prefix" in item:
+            start = index + 1
+            prefix = item["retained_prefix"]
+    return list(prefix) + [
         item["completed_slice_id"] for item in history[start:]
         if isinstance(item.get("completed_slice_id"), str)
     ]
@@ -647,15 +670,37 @@ def review_target(
         if isinstance(engineering, dict) and engineering.get("candidate") == candidate
         else []
     )
-    paths = sorted(set(paths) | {
+    all_write_rules = [rule for original in state["slices"] for rule in effective_slice(state, original)["allowed_paths"]]
+    first_slice = selected["id"] == state["slices"][0]["id"] and not completed_slice_ids(state)
+    retained = {
         path for path in retained_engineering_paths(state)
         if any(matches(path, rule) for rule in selected["allowed_paths"])
-    })
+        or (first_slice and not any(matches(path, rule) for rule in all_write_rules))
+    }
+    retained.update(state.get("execution", {}).get("review_obligations", {}).get(selected["id"], []))
+    paths = sorted(set(paths) | retained)
+    outside = sorted(path for path in retained if not any(matches(path, rule) for rule in selected["allowed_paths"]))
+    provenance = {}
+    for event in reversed(state["history"]):
+        packet = event.get("packet", {}) if event.get("command") == "reconcile" else {}
+        for item in packet.get("paths", []):
+            if item.get("path") in retained and item["path"] not in provenance:
+                provenance[item["path"]] = {"source": "authorized_external_reconcile", "generation": event["generation"],
+                                            "candidate_tree_oid": packet["candidate_tree_oid"],
+                                            "authorization": item["authorization"], "provenance": item["provenance"]}
+        prior = event.get("prior", {})
+        previous = prior.get("candidate") or {}
+        for path in previous.get("changed_paths", []) + prior.get("interrupted_paths", []):
+            if path in retained and path not in provenance:
+                provenance[path] = {"source": "retained_engineering", "generation": event["generation"],
+                                    "authority_digest": prior.get("authority_digest"),
+                                    "candidate_tree_oid": previous.get("candidate_tree_oid") or prior.get("interrupted_assignment", {}).get("after_candidate_tree_oid")}
     return {
         "kind": "current_slice_implementation",
         "slice_id": selected["id"],
-        "required_scope": deepcopy(selected["allowed_paths"]),
+        "required_scope": list(dict.fromkeys(deepcopy(selected["allowed_paths"]) + outside)),
         "candidate_changes": paths,
+        **({"read_only_obligations": sorted(retained), "retained_provenance": provenance} if retained else {}),
     }
 
 
@@ -758,7 +803,7 @@ def pending(mapping: dict[str, Any]) -> list[str]:
 def passing_artifact(state: dict[str, Any], phase: str) -> dict[str, Any] | None:
     """Return live semantic credit, excluding evidence retained across a boundary."""
     record = state.get("artifacts", {}).get(phase)
-    if isinstance(record, dict) and record.get("technical_journal_digest", journal_digest({})) != journal_digest(state.get("technical_decisions", {})):
+    if isinstance(record, dict) and record.get("semantic_journal_digest", record.get("technical_journal_digest", journal_digest({}))) != semantic_journal_digest(state.get("technical_decisions", {})):
         return None
     worker = record.get("worker") if isinstance(record, dict) else None
     if (
@@ -826,6 +871,11 @@ def passing_artifact(state: dict[str, Any], phase: str) -> dict[str, Any] | None
         ):
             return None
     return record
+
+
+def review_journal_changed(state: dict[str, Any]) -> bool:
+    record = state.get("artifacts", {}).get("review", {})
+    return record.get("semantic_journal_digest", record.get("technical_journal_digest", journal_digest({}))) != semantic_journal_digest(state.get("technical_decisions", {}))
 
 
 def qa_coverage_complete(record: Any) -> bool:
@@ -898,6 +948,41 @@ def _action_id(state: dict[str, Any], verb: str) -> str:
     return f"{verb}-{state['phase']}-g{state['generation']}-{suffix}"
 
 
+def capability_recovery_binding(state: dict[str, Any]) -> dict[str, Any]:
+    """Bind one prerequisite observation to this exact inactive blocked result."""
+    if terminal_blocked_context(state) is None:
+        raise PipelineError("capability recovery requires an idle blocked phase")
+    record = state["artifacts"][state["phase"]]
+    controller = record.get("controller", {})
+    tree = controller.get("candidate_tree_oid")
+    if (not is_git_oid(tree)
+            or controller.get("authority_digest") != state["authority"]["digest"]
+            or controller.get("pipeline_runtime_digest") != state["pipeline_runtime_digest"]):
+        raise PipelineError("capability recovery requires current blocked controller evidence")
+    return {
+        "run_id": state["run_id"], "feature": state["feature"],
+        "generation": state["generation"], "phase": state["phase"],
+        "assignment_id": record["assignment_id"], "blocked_artifact_digest": digest(record),
+        "candidate_tree_oid": tree, "authority_digest": state["authority"]["digest"],
+        "pipeline_runtime_digest": state["pipeline_runtime_digest"],
+        "slices_digest": digest(state["slices"]), "slice_digest": digest(current_slice(state)),
+        "technical_journal_digest": journal_digest(state.get("technical_decisions", {})),
+    }
+
+
+def validate_capability_recovery(state: dict[str, Any], command: dict[str, Any]) -> None:
+    binding = capability_recovery_binding(state)
+    evidence = command.get("evidence")
+    fields = {"prerequisite", "resolution", "evidence", "unchanged_dependencies"}
+    if (command.get("id") != _action_id(state, "recover-capability")
+            or not isinstance(evidence, dict) or set(evidence) != fields | {"binding"}
+            or not isinstance(evidence.get("binding"), dict)
+            or type(evidence["binding"].get("generation")) is not int
+            or evidence["binding"] != binding
+            or any(not isinstance(evidence.get(key), str) or not evidence[key].strip() for key in fields)):
+        raise PipelineError("capability recovery requires exact current binding and changed prerequisite evidence; read status again")
+
+
 def reconfiguration_action(
     state: dict[str, Any], authority_items: dict[str, dict[str, Any]],
     slices: list[dict[str, Any]] | None = None,
@@ -950,15 +1035,18 @@ def assignment_identity(run_id: str, generation: int, phase: str) -> dict[str, s
     }
 
 
-def _documentation_authority(state: dict[str, Any]) -> tuple[bool, list[str]]:
-    """Derive Docs write authority from exact approved-plan declarations."""
+def _documentation_contract_paths(state: dict[str, Any]) -> dict[str, list[str]]:
+    """Read the two documentation categories without treating absence as a policy."""
     plan_item = state.get("authority", {}).get("items", {}).get("plan")
     if not isinstance(plan_item, dict) or not isinstance(plan_item.get("path"), str):
         raise PipelineError("Docs requires an approved plan authority path")
     try:
-        text = (Path(state["project_root"]) / plan_item["path"]).read_text(encoding="utf-8")
+        raw = (Path(state["project_root"]) / plan_item["path"]).read_bytes()
+        text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     except (KeyError, OSError, UnicodeError):
         raise PipelineError("Docs cannot read its approved plan authority")
+    if hashlib.sha256(raw).hexdigest() != plan_item.get("sha256"):
+        raise PipelineError("Docs approved plan authority changed")
 
     frontmatter = re.match(r"\A---\n(.*?)\n---(?:\n|\Z)", text, re.S)
     statuses = (
@@ -1030,8 +1118,7 @@ def _documentation_authority(state: dict[str, Any]) -> tuple[bool, list[str]]:
         declarations["normative"].append(contract["normative_pre_review_paths"])
         declarations["derived"].append(contract["derived_post_qa_paths"])
 
-    paths: list[str] = []
-    all_not_required = True
+    paths: dict[str, list[str]] = {"normative": [], "derived": []}
     for kind, values in declarations.items():
         parsed: list[tuple[str, str | list[str]]] = []
         for value in values:
@@ -1066,7 +1153,6 @@ def _documentation_authority(state: dict[str, Any]) -> tuple[bool, list[str]]:
                 )
             continue
 
-        all_not_required = False
         required_slices = [
             item_value
             for item_kind, item_value in parsed[1:]
@@ -1088,19 +1174,54 @@ def _documentation_authority(state: dict[str, Any]) -> tuple[bool, list[str]]:
                 f"Docs {kind} slice paths are absent from the plan-wide declaration: "
                 + ", ".join(invented)
             )
-        for path in global_value:
-            if path not in paths:
-                paths.append(path)
+        paths[kind] = list(global_value)
 
-    if all_not_required:
-        return True, []
-    return False, paths
+    return paths
+
+
+def _documentation_authority(state: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Derive Docs write authority from exact approved-plan declarations."""
+    categories = _documentation_contract_paths(state)
+    paths = list(dict.fromkeys(categories["normative"] + categories["derived"]))
+    return not paths, paths
+
+
+def documentation_not_required_after_qa(state: dict[str, Any]) -> bool:
+    """Only explicit no-derived-work with pre-review files owned by Engineering."""
+    try:
+        categories = _documentation_contract_paths(state)
+    except PipelineError:
+        # Preserve the existing Docs validation route for absent/invalid contracts.
+        return False
+    owned = {path for item in state["slices"] for path in item["allowed_paths"]}
+    if categories["derived"] or not all(
+        "*" not in path and path in owned and (Path(state["project_root"]) / path).is_file()
+        for path in categories["normative"]
+    ):
+        return False
+    if not categories["normative"]:
+        return True
+    candidate = current_candidate(state)
+    if candidate is None:
+        return False
+    from .checkout import _git
+    try:
+        return all(
+            _git(Path(state["project_root"]), [
+                "cat-file", "-t", f"{candidate['candidate_tree_oid']}:{path}",
+            ], label="normative documentation candidate presence").strip() == b"blob"
+            for path in categories["normative"]
+        )
+    except PipelineError:
+        return False
 
 
 def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
     """Derive the complete technical assignment; callers supply no IDs or path rules."""
     phase = state["phase"]
     identity = assignment_identity(state["run_id"], state["generation"], phase)
+    from .execution import owner_key
+    identity["worker_id"] = state.get("execution", {}).get("owners", {}).get(owner_key(state), identity["worker_id"])
     assignment_id = identity["id"]
     authority_paths = [item["path"] for item in state["authority"]["items"].values()]
     selected = current_slice(state)
@@ -1110,6 +1231,9 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
         else selected["allowed_paths"]
     )
     read = list(dict.fromkeys(authority_paths + slice_read + ([f"{state['workflow_path']}/pipeline-state.json"] if state.get("technical_decisions") else [])))
+    # History grants read-only audit context, never fresh write authority.
+    read = list(dict.fromkeys(read + retained_engineering_paths(state)))
+    read = list(dict.fromkeys(read + [path for paths in state.get("execution", {}).get("review_obligations", {}).values() for path in paths]))
     target = review_target(state) if phase == "review" else None
     if target is not None and target["kind"] == "documentation_changes":
         read = list(dict.fromkeys(read + target["candidate_changes"]))
@@ -1129,6 +1253,8 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
         )
     if state.get("technical_decisions"):
         read = list(dict.fromkeys(read + [f"{state['workflow_path']}/pipeline-state.json"]))
+    additions = state.get("execution", {}).get("read_admissions", {}).get(owner_key(state, "shared"), [])
+    read = list(dict.fromkeys(read + additions))
     assignment = {
         "id": assignment_id,
         "worker_id": identity["worker_id"],
@@ -1139,8 +1265,36 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
     }
     if target is not None:
         assignment["context"] = {"review_target": target}
+    if phase == "review" and target is not None and target["kind"] == "current_slice_implementation":
+        assignment["context"]["required_identity_ids"] = required_qa_identity_ids(state)
     if phase == "qa":
         assignment["context"] = {"required_identity_ids": required_qa_identity_ids(state)}
+    for index in range(len(state["history"]) - 1, -1, -1):
+        event = state["history"][index]
+        if event.get("command") == "init":
+            break
+        if event.get("command") != "recover-capability":
+            continue
+        evidence = event.get("evidence", {})
+        binding = evidence.get("binding", {})
+        blocked_phase = binding.get("phase")
+        record = state["artifacts"].get(blocked_phase, {})
+        if (phase in {event.get("resume_phase", blocked_phase), blocked_phase}
+                and record.get("assignment_id") == binding.get("assignment_id")
+                and binding.get("run_id") == state["run_id"] and binding.get("feature") == state["feature"]
+                and binding.get("authority_digest") == state["authority"]["digest"]
+                and binding.get("pipeline_runtime_digest") == state["pipeline_runtime_digest"]
+                and binding.get("slices_digest") == digest(state["slices"])
+                and binding.get("slice_digest") == digest(current_slice(state))
+                and binding.get("candidate_tree_oid") == record.get("controller", {}).get("candidate_tree_oid")
+                and (blocked_phase not in {"review", "qa"}
+                     or record.get("candidate_binding") == current_candidate(state))):
+            locator = f"{state['workflow_path']}/pipeline-state.json#/history/{index}"
+            assignment.setdefault("context", {})["capability_recovery"] = {
+                "source_locator": locator + "/evidence", "evidence": deepcopy(evidence),
+                "blocked_artifact_locator": locator + f"/prior_artifacts/{blocked_phase}",
+            }
+        break
     return assignment
 
 
@@ -1172,8 +1326,13 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
         return {
             "kind": "terminal", "result": "user_input_required",
             **blocked, "user_input_required": True,
+            "command": "recover-capability", "command_id": _action_id(state, "recover-capability"),
+            "expected_generation": generation,
+            "capability_binding": capability_recovery_binding(state),
+            "evidence_required": ["binding", "prerequisite", "resolution", "evidence", "unchanged_dependencies"],
             "recovery": (
-                "After the prerequisite changes, read public status and execute its exact init action."
+                "After a factual prerequisite change, read public status and submit workflow-local evidence "
+                "with its exact capability_binding as binding to recover-capability. Until then remain blocked."
             ),
         }
     open_questions = pending(state["questions"])
@@ -1219,12 +1378,14 @@ def validate_state(state: dict[str, Any]) -> None:
             "legacy filesystem-inventory state is unsupported; "
             "remove the old state and run a fresh init"
         )
-    if not isinstance(state, dict) or set(state) - {"technical_decisions"} != STATE_FIELDS:
+    if not isinstance(state, dict) or set(state) - {"technical_decisions", "execution"} != STATE_FIELDS:
         extra = sorted(set(state) - STATE_FIELDS) if isinstance(state, dict) else []
         missing = sorted(STATE_FIELDS - set(state)) if isinstance(state, dict) else sorted(STATE_FIELDS)
         raise PipelineError(f"invalid state fields; missing={missing}, extra={extra}")
-    if len(state) not in {16, 17} or state["schema"] != SCHEMA:
+    if len(state) not in {16, 17, 18} or state["schema"] != SCHEMA:
         raise PipelineError("state must use the compact schema-4 shape")
+    if "execution" in state:
+        _validate_execution_metadata(state["execution"], error_type=PipelineError, digest_validator=is_digest)
     try:
         validate_journal(state.get("technical_decisions", {}))
     except ValueError as exc:
@@ -1280,6 +1441,16 @@ def validate_state(state: dict[str, Any]) -> None:
             raise PipelineError("artifact candidate is malformed")
         failure = item.get("controller_failure")
         if failure is not None:
+            failure = deepcopy(failure)
+            stdout_fields = {"stdout_excerpt", "stdout_excerpt_truncated", "stdout_excerpt_redacted"}
+            if set(failure) & stdout_fields:
+                if (not stdout_fields <= set(failure) or not isinstance(failure["stdout_excerpt"], str)
+                        or len(failure["stdout_excerpt"].encode("utf-8")) > 4096
+                        or type(failure["stdout_excerpt_truncated"]) is not bool
+                        or type(failure["stdout_excerpt_redacted"]) is not bool):
+                    raise PipelineError("controller stdout failure capsule is malformed")
+                for key in stdout_fields:
+                    failure.pop(key)
             core_fields = {
                 "command_index", "returncode", "stdout_sha256", "stderr_sha256",
                 "unexecuted_count",
@@ -1356,7 +1527,12 @@ def validate_state(state: dict[str, Any]) -> None:
         if "output_path" in active and active["output_path"] != assignment_output_path(active, state["feature"]):
             raise PipelineError("active_assignment output path is not controller-derived")
         if "artifact_schema" in active and active["artifact_schema"] != artifact_schema(active["phase"], active["role"]):
-            raise PipelineError("active_assignment artifact schema is not controller-derived")
+            legacy = artifact_schema(active["phase"], active["role"])
+            legacy["item_shapes"]["technical_decisions[]"] = "current TD-* entries: id, situation, decision, basis, checks[], downstream, optional overrides exact reference; execution is controller-owned"
+            if active["phase"] == "review":
+                legacy["item_shapes"]["findings[]"]["allowed_keys"].remove("id")
+            if active["artifact_schema"] != legacy:
+                raise PipelineError("active_assignment artifact schema is not controller-derived; use authorized maintenance/reinit")
         if "technical_observation" in active:
             observation = active["technical_observation"]
             if (not isinstance(observation, dict) or set(observation) != {"id", "tree", "action", "assignment_id"}
@@ -1425,6 +1601,7 @@ def status_view(state: dict[str, Any]) -> dict[str, Any]:
     validate_state(state)
     active = state["active_assignment"]
     return {
+        "project_root": state["project_root"],
         "run_id": state["run_id"],
         "feature": state["feature"],
         "workflow_path": state["workflow_path"],

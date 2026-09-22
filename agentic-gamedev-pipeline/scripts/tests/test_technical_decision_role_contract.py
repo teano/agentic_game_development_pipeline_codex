@@ -113,8 +113,16 @@ class TechnicalDecisionRoleContractTests(unittest.TestCase):
         for role in roles:
             with self.subTest(role=role):
                 source = SKILLS / role / "SKILL.md"
-                links = re.findall(r"\]\(([^)]+technical-decisions\.md)\)", source.read_text(encoding="utf-8"))
-                self.assertEqual([policy], [(source.parent / link).resolve() for link in links])
+                if role == "gamedev-pipeline":
+                    self.assertIn("(references/director-runtime.md)", source.read_text(encoding="utf-8"))
+                    router = source.parent / "references/director-runtime.md"
+                    text = router.read_text(encoding="utf-8")
+                    dispatch = text.split("First dispatch reads", 1)[1].split("\n\n", 1)[0]
+                    links = re.findall(r"\]\(([^)]*technical-decisions\.md)#role-responsibilities\)", dispatch)
+                    self.assertEqual([policy], [(router.parent / link).resolve() for link in links])
+                else:
+                    links = re.findall(r"\]\(([^)]+technical-decisions\.md)\)", source.read_text(encoding="utf-8"))
+                    self.assertEqual([policy], [(source.parent / link).resolve() for link in links])
                 prompt = (source.parent / "agents/openai.yaml").read_text(encoding="utf-8")
                 self.assertRegex(prompt, "technical-decision")
         self.assertTrue(policy.is_file())

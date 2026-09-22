@@ -23,7 +23,7 @@ import pipeline_v2.reducer as reducer_module
 import pipeline_v2.runner as runner_module
 import pipeline_v2.transaction as transaction_module
 from pipeline_v2.checkout import (
-    authority_items, candidate_tree_oid, changed_paths, matches,
+    authority_items, candidate_tree_oid, changed_paths, file_sha256, matches,
     pipeline_runtime_digest, repository_policy_changed, require_clean_head,
 )
 from pipeline_v2.cli import parser as cli_parser, run as cli_run
@@ -102,7 +102,7 @@ class PipelineV2CoreTests(unittest.TestCase):
         self.assertEqual("next", action["command"])
         fresh = self.controller.next(command_id=action["command_id"], expected_generation=action["expected_generation"])
         self.assertEqual("qa", fresh["phase"])
-        self.assertNotEqual(prior_worker, fresh["active_assignment"]["worker_id"])
+        self.assertEqual(prior_worker, fresh["active_assignment"]["worker_id"])
         self.assertEqual("Use the existing simpler format.", fresh["active_assignment"]["capsule"]["context"]["decisions"][0]["answer"])
         self._complete("COMPLETE-FRESH-QA-AFTER-ANSWER", {"outcome": "pass", "checks": checks})
         action = self.controller.status()["next_action"]
@@ -339,7 +339,7 @@ class PipelineV2CoreTests(unittest.TestCase):
 
     def test_runtime_digest_manifest_includes_delegated_worker_contracts(self) -> None:
         with mock.patch(
-            "pipeline_v2.checkout.file_sha256", return_value="a" * 64,
+            "pipeline_v2.checkout.file_sha256", wraps=file_sha256,
         ) as hasher:
             pipeline_runtime_digest()
 
@@ -1054,11 +1054,13 @@ None.
     def test_normal_run_reaches_ready_with_git_tree_state_fields(self) -> None:
         self._reach_candidate()
         ready = self._finish_ready("reviewer-1", "qa-1", "docs-1")
-        self.assertEqual(16, len(ready))
+        self.assertEqual(17, len(ready))
+        self.assertEqual(1, ready["execution"]["version"])
         self.assertEqual("test-feature", ready["feature"])
         self.assertEqual(self.workflow_path, ready["workflow_path"])
         self.assertNotIn("gates", ready)
-        self.assertEqual(7, len(PHASES)); self.assertEqual(10, len(COMMANDS))
+        self.assertEqual(7, len(PHASES))
+        self.assertTrue({"check", "rotate-owner", "read-admit", "recover-capability", "reconcile"} <= COMMANDS)
 
     def test_feature_runtime_states_and_repeat_assignment_ids_are_isolated(self) -> None:
         first_before = self.store.path.read_bytes()
@@ -1140,25 +1142,21 @@ None.
             })
         self.assertFalse(target.exists())
 
-    def test_schema4_blocked_is_terminal_replay_safe_and_fresh_init_only(self) -> None:
+    def test_schema4_blocked_routes_bound_recovery_and_runtime_reconfiguration(self) -> None:
         self._reach_engineering("-terminal-block")
-
         state = self.store.load()
         unchanged = {
             "name": "init", "id": "FORGED-UNCHANGED-INIT",
             "expected_generation": state["generation"],
             "run_id": state["run_id"], "feature": state["feature"],
             "workflow_path": state["workflow_path"], "project_root": state["project_root"],
-            "authority_paths": {
-                name: item["path"] for name, item in state["authority"]["items"].items()
-            },
+            "authority_paths": {name: item["path"] for name, item in state["authority"]["items"].items()},
             "slices": state["slices"],
         }
         before = self.store.path.read_bytes()
         with self.assertRaisesRegex(PipelineError, "did not change"):
             self.controller.reconfigure(unchanged)
         self.assertEqual(before, self.store.path.read_bytes())
-
         self.controller.next(command_id="NEXT-terminal-block")
         (self.root / "game.txt").write_text("partial blocked change\n", encoding="utf-8")
         artifact = self._write_artifact({
@@ -1166,90 +1164,64 @@ None.
             "blocker": "A user-owned capability is unavailable.",
             "required_action": "Provide the capability outside this run.",
         })
-        completed = self.controller.complete(
-            command_id="COMPLETE-terminal-block", artifact_path=artifact,
-        )
-        action = status_view(completed)["next_action"]
-
+        completed = self.controller.complete(command_id="COMPLETE-terminal-block", artifact_path=artifact)
+        before_status = self.store.path.read_bytes()
+        recovery = self.controller.status()["next_action"]
+        self.assertEqual(before_status, self.store.path.read_bytes())
         self.assertNotIn("gates", completed)
-        self.assertEqual("terminal", action["kind"])
-        self.assertEqual("user_input_required", action["result"])
-        self.assertIs(True, action["user_input_required"])
-        self.assertEqual(completed, self.controller.complete(
-            command_id="COMPLETE-terminal-block", artifact_path=artifact,
-        ))
-        public = self.controller.status()
-        recovery = public["next_action"]
-        self.assertEqual("command", recovery["kind"])
-        self.assertEqual("init", recovery["command"])
+        self.assertEqual(status_view(completed)["next_action"], recovery)
+        self.assertEqual("terminal", recovery["kind"])
+        self.assertEqual("user_input_required", recovery["result"])
+        self.assertEqual("recover-capability", recovery["command"])
         self.assertIs(True, recovery["user_input_required"])
         self.assertEqual("A user-owned capability is unavailable.", recovery["blocker"])
         self.assertEqual("Provide the capability outside this run.", recovery["required_action"])
-        self.assertIn("only after authority or capability evidence resolves the recorded prerequisite", recovery["reason"])
-        self.assertEqual(completed, self.store.load())
-
+        self.assertEqual(completed, self.controller.complete(command_id="COMPLETE-terminal-block", artifact_path=artifact))
+        with self.assertRaisesRegex(PipelineError, "recover-capability"):
+            self.controller.reconfigure({**unchanged, "expected_generation": completed["generation"]})
         before = self.store.path.read_bytes()
         with mock.patch("pipeline_v2.runner.pipeline_runtime_digest", return_value=digest("repaired runtime")):
             rebound = self.controller.status()["next_action"]
-        self.assertEqual("init", rebound["command"])
-        self.assertNotEqual(recovery["command_id"], rebound["command_id"])
-        for field in ("phase", "blocker", "required_action", "user_input_required", "reason"):
-            self.assertEqual(recovery[field], rebound.get(field), field)
-        self.assertEqual(before, self.store.path.read_bytes())
-
-        command = {
-            "name": "init", "id": recovery["command_id"],
-            "expected_generation": recovery["expected_generation"],
-            "run_id": recovery["run_id"], "feature": recovery["feature"],
-            "workflow_path": recovery["workflow_path"],
-            "project_root": recovery["project_root"],
-            "authority_paths": recovery["authority"], "slices": recovery["slices"],
-        }
-        before = self.store.path.read_bytes()
-        stale = deepcopy(command)
-        stale["id"] += "-STALE"
-        with self.assertRaisesRegex(PipelineError, "stale.*reconfiguration"):
-            self.controller.reconfigure(stale)
-        self.assertEqual(before, self.store.path.read_bytes())
-        with mock.patch("pipeline_v2.runner.pipeline_runtime_digest", return_value=digest("later runtime")):
+            self.assertEqual(before, self.store.path.read_bytes())
+            self.assertEqual("init", rebound["command"])
+            for field in ("phase", "blocker", "required_action", "user_input_required"):
+                self.assertEqual(recovery[field], rebound[field], field)
+            command = self._baseline_init_command(rebound)
+            stale = deepcopy(command)
+            stale["id"] += "-STALE"
             with self.assertRaisesRegex(PipelineError, "stale.*reconfiguration"):
+                self.controller.reconfigure(stale)
+            self.assertEqual(before, self.store.path.read_bytes())
+            with mock.patch("pipeline_v2.runner.pipeline_runtime_digest", return_value=digest("later runtime")):
+                with self.assertRaisesRegex(PipelineError, "stale.*reconfiguration"):
+                    self.controller.reconfigure(command)
+            self.assertEqual(before, self.store.path.read_bytes())
+            drift = self.root / "tests" / "drift.txt"
+            drift.parent.mkdir()
+            drift.write_text("unbound drift\n", encoding="utf-8")
+            with self.assertRaisesRegex(PipelineError, "live checkout drifted"):
                 self.controller.reconfigure(command)
-        self.assertEqual(before, self.store.path.read_bytes())
-
-        drift = self.root / "tests" / "drift.txt"
-        drift.parent.mkdir()
-        drift.write_text("unbound drift\n", encoding="utf-8")
-        with self.assertRaisesRegex(PipelineError, "live checkout drifted"):
-            self.controller.reconfigure(command)
-        drift.unlink()
-        self.assertEqual(before, self.store.path.read_bytes())
-
-        restarted = self.controller.reconfigure(command)
-        self.assertEqual("plan", restarted["phase"])
-        self.assertIsNone(restarted["active_assignment"])
-        self.assertIsNone(current_candidate(restarted))
-        self.assertEqual(["game.txt"], retained_engineering_paths(restarted))
-        self.assertEqual(restarted, self.controller.reconfigure(command))
-
-        self._reach_engineering("-terminal-recovered")
-        self.controller.next(command_id="NEXT-terminal-recovered")
-        self._complete("COMPLETE-terminal-recovered", {
-            "outcome": "pass", "summary": "External prerequisite is available",
-        })
-        self._accept("terminal-recovered")
-        target = self.controller.status()["next_action"]["assignment"]["context"]["review_target"]
-        self.assertEqual(["game.txt"], target["candidate_changes"])
-        with self.assertRaisesRegex(PipelineError, "blocked is terminal"):
-            reduce(completed, {
-                "name": "next", "id": "FORGED-NEXT-AFTER-BLOCK",
-                "expected_generation": completed["generation"],
-                "assignment": default_assignment(completed),
+            drift.unlink()
+            self.assertEqual(before, self.store.path.read_bytes())
+            restarted = self.controller.reconfigure(command)
+            self.assertEqual("plan", restarted["phase"])
+            self.assertIsNone(restarted["active_assignment"])
+            self.assertIsNone(current_candidate(restarted))
+            self.assertEqual(["game.txt"], retained_engineering_paths(restarted))
+            self.assertEqual(restarted, self.controller.reconfigure(command))
+            self._reach_engineering("-terminal-recovered")
+            self.controller.next(command_id="NEXT-terminal-recovered")
+            self._complete("COMPLETE-terminal-recovered", {
+                "outcome": "pass", "summary": "External prerequisite is available",
             })
+            self._accept("terminal-recovered")
+            target = self.controller.status()["next_action"]["assignment"]["context"]["review_target"]
+            self.assertEqual(["game.txt"], target["candidate_changes"])
+        with self.assertRaisesRegex(PipelineError, "blocked is terminal; resolve the prerequisite and use status-bound recover-capability with fresh evidence"):
+            reduce(completed, {"name": "next", "id": "FORGED-NEXT-AFTER-BLOCK",
+                               "expected_generation": completed["generation"], "assignment": default_assignment(completed)})
         with self.assertRaisesRegex(PipelineError, "unknown command"):
-            reduce(completed, {
-                "name": "resume", "id": "FORGED-RESUME",
-                "expected_generation": completed["generation"],
-            })
+            reduce(completed, {"name": "resume", "id": "FORGED-RESUME", "expected_generation": completed["generation"]})
         schema2 = deepcopy(completed)
         schema2["schema"] = 2
         with self.assertRaises(PipelineError):
@@ -1909,7 +1881,10 @@ None.
 
         self.assertEqual("engineering", after_first_qa["phase"])
         self.assertNotIn("current_slice", after_first_qa)
-        self.assertEqual(7, len(PHASES)); self.assertEqual(10, len(COMMANDS))
+        self.assertEqual(("plan", "slice", "engineering", "review", "qa", "docs", "ready"), PHASES)
+        self.assertEqual({"init", "status", "next", "complete", "answer", "accept", "migrate", "ready",
+                          "technical-observe", "technical-decision", "check", "rotate-owner", "read-admit",
+                          "recover-capability", "reconcile"}, COMMANDS)
 
         self._engineer_slice("engineer-s2", "candidate two\n", slice_index=1, target="slice-two.txt")
         self._accept("engineering-s2")
@@ -2095,14 +2070,8 @@ None.
             "allowed_paths": ["src/**"],
             "planned_commands": [self.command],
         }]
-        state = self.store.load()
-        self.store.dispatch({
-            "name": "init", "id": "CONFIGURE-BROAD-REVIEW-TARGET",
-            "expected_generation": state["generation"], "run_id": state["run_id"],
-            "project_root": state["project_root"], "authority": state["authority"],
-            "slices": self._sealed(self.slices),
-            **self._reconfigure_evidence(state),
-        })
+        self._write_approved_plan(self.slices)
+        self._commit_fixture_and_restart("broad review target fixture")
         self._reach_engineering("-broad-review-target")
         self._engineer_slice(
             "engineer-broad-review-target", "return 3\n",
@@ -2236,7 +2205,7 @@ None.
         self.assertEqual("plan", self.controller.reconfigure({**command, "slices": expanded})["phase"])
 
     def test_rebound_narrower_plan_cannot_drop_retained_engineering_coverage(self) -> None:
-        self._reach_candidate()
+        original_candidate = self._reach_candidate()
         product_before = (self.root / "game.txt").read_bytes()
         narrower = [{**deepcopy(self.slices[0]), "allowed_paths": ["replacement.luau"]}]
         self._write_approved_plan(narrower, revision=2)
@@ -2246,10 +2215,17 @@ None.
         self._complete_readonly("plan", "planner-narrow", {"outcome": "pass", "summary": "New authority"})
         self._accept("plan-narrow")
         self._complete_readonly("slice", "slicer-narrow", {"outcome": "pass", "summary": "New slice"})
-        before = self.store.path.read_bytes()
-        with self.assertRaisesRegex(PipelineError, "do not cover interrupted Engineering paths"):
-            self._accept("slice-narrow")
-        self.assertEqual(before, self.store.path.read_bytes())
+        self._accept("slice-narrow")
+        action = self.controller.status()["next_action"]
+        engineering = self.controller.next(command_id=action["command_id"], expected_generation=action["expected_generation"])
+        self.assertNotIn("game.txt", engineering["active_assignment"]["access"]["write"])
+        self.assertIn("game.txt", engineering["active_assignment"]["access"]["read"])
+        self._complete("NARROW-ENGINEERING", {"outcome": "pass", "summary": "The new scope needs no additional mutation."})
+        self._accept("narrow-engineering")
+        target = self.controller.status()["next_action"]["assignment"]["context"]["review_target"]
+        self.assertIn("game.txt", target["required_scope"])
+        self.assertIn("game.txt", target["candidate_changes"])
+        self.assertEqual(original_candidate["candidate_tree_oid"], target["retained_provenance"]["game.txt"]["candidate_tree_oid"])
         self.assertEqual(product_before, (self.root / "game.txt").read_bytes())
 
     def test_plan_write_scope_binding_rejects_narrower_broader_and_reordered_caller(self) -> None:
@@ -4727,30 +4703,138 @@ None.
         ready = self.controller.ready(command_id="READY-DOCS", expected_generation=terminal["generation"])
         self.assertTrue(status_view(ready)["ready"])
 
-    def test_docs_not_required_contract_grants_no_project_writes_and_allows_noop(self) -> None:
+    def test_docs_not_required_contract_reaches_ready_without_docs_artifact_or_actor(self) -> None:
         self._reconfigure_documentation_contract(policy="TS-SCOPE-001")
-        self._reach_candidate(); self._review_pass("reviewer-no-docs"); self._qa_pass("qa-no-docs")
-        action = self.controller.status()["next_action"]
-        self.assertEqual([], action["assignment"]["access"]["write"])
-        self.assertEqual(
-            [item["path"] for item in self.store.load()["authority"]["items"].values()],
-            action["assignment"]["access"]["read"],
-        )
-        self.assertEqual(
-            ".agentic-pipeline/Workflows/test-feature/outputs/"
-            + action["assignment"]["id"]
-            + ".json",
-            action["assignment"]["output_path"],
-        )
-        issued = self.controller.next(
-            command_id=action["command_id"], assignment=action["assignment"],
-            expected_generation=action["expected_generation"],
-        )
-        self.assertEqual([], issued["active_assignment"]["access"]["write"])
-        self._complete("COMPLETE-docs-noop", {
-            "outcome": "pass", "summary": "No documentation change required",
+        self._reach_candidate(); self._review_pass("reviewer-no-docs")
+        self._complete_readonly("qa", "qa-no-docs", {
+            "outcome": "pass", "checks": self._qa_checks("acceptance: pass"),
         })
-        self.assertEqual("ready", self._accept("docs-noop")["phase"])
+        action = self.controller.status()["next_action"]
+        command = {
+            "name": "accept", "id": action["command_id"],
+            "expected_generation": action["expected_generation"],
+        }
+        accepted = self.controller.transition(command)
+        self.assertEqual("ready", accepted["phase"])
+        self.assertEqual("documentation_not_required", accepted["history"][-1]["result"])
+        self.assertEqual("SLICE-1", accepted["history"][-1]["completed_slice_id"])
+        self.assertNotIn("docs", accepted["artifacts"])
+        self.assertFalse(any(item.get("phase") == "docs" for item in accepted["history"]))
+        self.assertFalse(list((self.store.path.parent / "outputs").glob("docs-*.json")))
+        before_replay = self.store.path.read_bytes()
+        self.assertEqual(accepted, self.controller.transition(command))
+        self.assertEqual(before_replay, self.store.path.read_bytes())
+        ready_action = self.controller.status()["next_action"]
+        self.assertEqual("ready", ready_action["command"])
+        plan = self.root / "plan.md"
+        approved_bytes = plan.read_bytes()
+        plan.write_bytes(approved_bytes + b"\n")
+        with self.assertRaises(PipelineError):
+            self.controller.ready(
+                command_id=ready_action["command_id"],
+                expected_generation=ready_action["expected_generation"],
+            )
+        self.assertEqual(before_replay, self.store.path.read_bytes())
+        plan.write_bytes(approved_bytes)
+        ready = self.controller.ready(
+            command_id=ready_action["command_id"],
+            expected_generation=ready_action["expected_generation"],
+        )
+        self.assertTrue(status_view(ready)["ready"])
+        self.assertNotIn("docs", ready["artifacts"])
+
+    def test_docs_no_derived_work_skips_only_engineer_owned_existing_normative_paths(self) -> None:
+        self._reconfigure_documentation_contract(derived_policy="POLICY-DERIVED", path="game.txt")
+        self._reach_candidate(); self._review_pass("reviewer-normative-owned")
+        accepted = self._qa_pass("qa-normative-owned")
+        self.assertEqual("ready", accepted["phase"])
+        self.assertNotIn("docs", accepted["artifacts"])
+        self.assertIn("game.txt", accepted["artifacts"]["review"]["review_target"]["required_scope"])
+        action = self.controller.status()["next_action"]
+        ready = self.controller.ready(
+            command_id=action["command_id"], expected_generation=action["expected_generation"],
+        )
+        self.assertTrue(status_view(ready)["ready"])
+
+    def test_docs_normative_path_outside_engineering_still_requires_docs(self) -> None:
+        path = "docs/normative.md"
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("Existing normative documentation\n", encoding="utf-8")
+        self._commit_fixture_and_restart("existing normative documentation")
+        self._reconfigure_documentation_contract(derived_policy="POLICY-DERIVED", path=path)
+        self._reach_candidate(); self._review_pass("reviewer-normative-required")
+        self._qa_pass("qa-normative-required")
+        action = self.controller.status()["next_action"]
+        self.assertEqual("docs", self.store.load()["phase"])
+        self.assertEqual([path], action["assignment"]["access"]["write"])
+
+    def test_docs_no_work_does_not_bypass_failed_or_blocked_qa(self) -> None:
+        for outcome in ("fail", "blocked"):
+            with self.subTest(outcome=outcome):
+                other = PipelineV2CoreTests("runTest")
+                other.setUp()
+                try:
+                    other._reconfigure_documentation_contract(policy="POLICY-NONE")
+                    other._reach_candidate(); other._review_pass("reviewer-before-nonpass")
+                    artifact = {"outcome": outcome, "checks": other._qa_checks("not accepted", outcome="fail")}
+                    if outcome == "blocked":
+                        artifact.update(blocker="Unavailable prerequisite", required_action="Restore prerequisite")
+                        artifact["checks"] = other._qa_checks("unavailable", outcome="not_run")
+                    other._complete_readonly("qa", "qa-nonpass", artifact)
+                    state = other.store.load()
+                    before = other.store.path.read_bytes()
+                    self.assertNotEqual("ready", state["phase"])
+                    with self.assertRaises(PipelineError):
+                        other.controller.transition({"name": "accept", "id": "NO-CREDIT", "expected_generation": state["generation"]})
+                    with self.assertRaises(PipelineError):
+                        other.controller.ready(command_id="NO-READY", expected_generation=state["generation"])
+                    self.assertEqual(before, other.store.path.read_bytes())
+                    self.assertNotIn("docs", state["artifacts"])
+                finally:
+                    other.tearDown()
+
+    def test_docs_owned_normative_path_must_exist_in_accepted_candidate(self) -> None:
+        for ignored_file_exists in (False, True):
+            with self.subTest(ignored_file_exists=ignored_file_exists):
+                other = PipelineV2CoreTests("runTest")
+                other.setUp()
+                try:
+                    path = "generated/normative.md"
+                    other.slices[0]["allowed_paths"].append(path)
+                    if ignored_file_exists:
+                        target = other.root / path
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text("Ignored working file is not candidate evidence\n", encoding="utf-8")
+                    other._write_approved_plan(
+                        other.slices, revision=2,
+                        derived_documentation_policy="POLICY-DERIVED", documentation_path=path,
+                    )
+                    other._commit_fixture_and_restart("owned normative declaration")
+                    other._reach_candidate(); other._review_pass("reviewer-normative-absent")
+                    state = other._qa_pass("qa-normative-absent")
+                    self.assertEqual("docs", state["phase"])
+                    self.assertNotIn("ready", state["artifacts"])
+                    action = other.controller.status()["next_action"]
+                    self.assertEqual([path], action["assignment"]["access"]["write"])
+                    with self.assertRaises(PipelineError):
+                        other.controller.ready(command_id="ABSENT-DOCS-READY", expected_generation=state["generation"])
+                finally:
+                    other.tearDown()
+
+    def test_docs_no_work_does_not_bypass_open_qa_question(self) -> None:
+        self._reconfigure_documentation_contract(policy="POLICY-NONE")
+        self._reach_candidate(); self._review_pass("reviewer-before-question")
+        self._complete_readonly("qa", "qa-question", {
+            "outcome": "pass", "checks": self._qa_checks("covered"),
+            "questions": ["Clarify the recorded technical choice"],
+        })
+        state = self.store.load()
+        before = self.store.path.read_bytes()
+        with self.assertRaises(PipelineError):
+            self.controller.transition({"name": "accept", "id": "QUESTION-ACCEPT", "expected_generation": state["generation"]})
+        self.assertEqual(before, self.store.path.read_bytes())
+        self.assertFalse(status_view(state)["ready"])
 
     def test_docs_distinct_category_policies_allow_noop(self) -> None:
         self._reconfigure_documentation_contract(
@@ -4760,15 +4844,8 @@ None.
 
         action = self.controller.status()["next_action"]
 
-        self.assertEqual([], action["assignment"]["access"]["write"])
-        self.controller.next(
-            command_id=action["command_id"], assignment=action["assignment"],
-            expected_generation=action["expected_generation"],
-        )
-        self._complete("COMPLETE-docs-distinct-policy", {
-            "outcome": "pass", "summary": "No documentation change required",
-        })
-        self.assertEqual("ready", self._accept("docs-distinct-policy")["phase"])
+        self.assertEqual("ready", action["command"])
+        self.assertNotIn("docs", self.store.load()["artifacts"])
 
     def test_docs_slice_policy_must_match_its_plan_wide_category_policy(self) -> None:
         self._write_approved_plan(
@@ -5307,7 +5384,10 @@ None.
             ensure_ascii=False, sort_keys=True,
         )
         self.assertIn(json.dumps(candidate, ensure_ascii=False, sort_keys=True), audit_json)
-        self.assertEqual(7, len(PHASES)); self.assertEqual(10, len(COMMANDS))
+        self.assertEqual(("plan", "slice", "engineering", "review", "qa", "docs", "ready"), PHASES)
+        self.assertEqual({"init", "status", "next", "complete", "answer", "accept", "migrate", "ready",
+                          "technical-observe", "technical-decision", "check", "rotate-owner", "read-admit",
+                          "recover-capability", "reconcile"}, COMMANDS)
 
         replay = deepcopy(command); replay["expected_generation"] = -1
         self.assertEqual(reconfigured, self.store.dispatch(replay))
@@ -6249,6 +6329,14 @@ None.
             "authority_paths": action["authority"], "slices": action["slices"],
         }
 
+    def _legacy_blocked_init_command(self) -> dict:
+        # Model the old fallback as caller input; native status now requires
+        # recover-capability until actual authority/runtime/checkout change.
+        from pipeline_v2.model import reconfiguration_action
+        state = self.store.load()
+        return self._baseline_init_command(reconfiguration_action(
+            state, state["authority"]["items"], candidate_tree_oid=candidate_tree_oid(self.root)))
+
     def _commit_prerequisite_baseline(self, text: str = "confirmed external prerequisite\n") -> None:
         (self.root / "prerequisite.txt").write_text(text, encoding="utf-8")
         subprocess.run(["git", "-C", str(self.root), "add", "--", "prerequisite.txt"], check=True)
@@ -6258,7 +6346,7 @@ None.
         self._block_first_engineering_for_baseline()
         before = self.store.path.read_bytes()
         old = self.store.load()
-        clean_command = self._baseline_init_command(self.controller.status()["next_action"])
+        clean_command = self._legacy_blocked_init_command()
         (self.root / "prerequisite.txt").write_text("confirmed external prerequisite\n", encoding="utf-8")
         self.assertEqual("checkout_recovery_required", self.controller.status()["next_action"]["result"])
         with self.assertRaisesRegex(PipelineError, "checkout drifted"):
@@ -6303,6 +6391,7 @@ None.
                 try:
                     if mode == "earlier-init":
                         h._block_first_engineering_for_baseline()
+                        h._commit_prerequisite_baseline("first prerequisite baseline\n")
                         h.controller.reconfigure(h._baseline_init_command(h.controller.status()["next_action"]))
                         h._reach_engineering("-second-epoch")
                     else:
@@ -6340,8 +6429,7 @@ None.
 
     def test_early_committed_baseline_keeps_policy_and_authority_guards(self) -> None:
         self._block_first_engineering_for_baseline()
-        clean_action = self.controller.status()["next_action"]
-        command = self._baseline_init_command(clean_action)
+        command = self._legacy_blocked_init_command()
         self._commit_prerequisite_baseline()
         before = self.store.path.read_bytes()
         prd = self.root / "requirements.md"
@@ -6363,7 +6451,7 @@ None.
     def test_early_committed_baseline_composes_with_reconverged_approved_authority(self) -> None:
         self._block_first_engineering_for_baseline()
         before = self.store.path.read_bytes()
-        command = self._baseline_init_command(self.controller.status()["next_action"])
+        command = self._legacy_blocked_init_command()
         self._commit_prerequisite_baseline()
         self._write_source_authority(revision=2)
         # The old plan still traces revision1; a clean commit cannot grant authority credit.

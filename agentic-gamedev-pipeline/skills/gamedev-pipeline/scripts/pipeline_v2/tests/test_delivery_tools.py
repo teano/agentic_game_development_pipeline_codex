@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from copy import deepcopy
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 from unittest.mock import Mock
 
 SCRIPTS = Path(__file__).resolve().parents[2]
@@ -18,7 +22,8 @@ if str(SCRIPTS) not in sys.path:
 from pipeline_v2.cli import main, parser, run
 from pipeline_v2.checkout import candidate_tree_oid
 from pipeline_v2.delivery import director_brief, execute_step, export_assignment, json_patch, read_delivery, read_file
-from pipeline_v2.model import PipelineError, canonical_bytes
+from pipeline_v2.model import ROLES, PipelineError, canonical_bytes, digest
+from pipeline_v2.process_tree import ProcessEvidence
 
 
 def apply_patch(document, patch):
@@ -50,7 +55,7 @@ class DeliveryTests(unittest.TestCase):
         self.workflow = ".agentic-pipeline/Workflows/test"
         self.view = {"run_id": "run", "feature": "test", "workflow_path": self.workflow, "generation": 4,
             "next_action": {"kind": "command", "command": "complete"},
-            "active_assignment": {"id": "A-1", "role": "Engineering", "worker_id": "W-1",
+            "active_assignment": {"id": "A-1", "role": "engineer", "worker_id": "W-1",
                 "access": {"read": ["src/**"], "write": ["src/**"]}, "output_path": "a.json",
                 "context": {"technical_decisions": [{"id": "T-1", "text": "unchanged " * 600},
                     {"id": "T-2", "text": "Привет 🌍\r\n" * 1000}]}}}
@@ -77,6 +82,9 @@ class DeliveryTests(unittest.TestCase):
         full = export_assignment(self.root, self.view, inputs=["src/a.txt"])
         before = self.receive(full["response_digest"])
         self.assertFalse(full["delivery_complete"])
+        self.assertEqual(self.view["active_assignment"]["worker_id"], full["worker_id"])
+        self.assertEqual("full", full["dispatch"]["input"]["mode"])
+        self.assertNotIn("baseline_digest", full["dispatch"]["input"])
         self.assertEqual(self.view["active_assignment"], before["assignment"])
         self.assertEqual(1, len(before["selected_inputs"]))
         self.view["generation"] += 1
@@ -84,6 +92,11 @@ class DeliveryTests(unittest.TestCase):
         self.view["active_assignment"]["context"]["technical_decisions"][1]["text"] = "Fixed completely."
         result = export_assignment(self.root, self.view, full["packet_digest"], ["src/a.txt"])
         delta = self.receive(result["response_digest"])
+        self.assertEqual(self.view["active_assignment"]["worker_id"], result["worker_id"])
+        self.assertEqual("A-2", result["dispatch"]["assignment_id"])
+        self.assertEqual(full["packet_digest"], result["dispatch"]["input"]["baseline_digest"])
+        self.assertEqual(result["response_digest"], result["dispatch"]["input"]["digest"])
+        self.assertEqual(result["packet_digest"], result["dispatch"]["input"]["packet_digest"])
         self.assertNotIn("unchanged", json.dumps(delta))
         rebuilt = apply_patch(before, delta["patch"])
         self.assertEqual(result["packet_digest"], hashlib.sha256(canonical_bytes(rebuilt)).hexdigest())
@@ -91,6 +104,238 @@ class DeliveryTests(unittest.TestCase):
         identical = export_assignment(self.root, self.view, result["packet_digest"], ["src/a.txt"])
         self.assertEqual([], self.receive(identical["response_digest"])["patch"])
 
+    def test_role_instruction_locators_match_existing_sources_without_expanding_assignment(self):
+        expected = {
+            "engineer": "gamedev-engineer/SKILL.md",
+            "reviewer": "gamedev-review/SKILL.md",
+            "qa": "gamedev-qa/SKILL.md",
+            "documentation_finisher": "gamedev-documentation-finisher/SKILL.md",
+            "planner": "gamedev-pipeline/references/pipeline-protocol.md",
+            "slicer": "gamedev-pipeline/references/pipeline-protocol.md",
+        }
+        self.assertEqual(set(ROLES.values()), set(expected))
+        skills = SCRIPTS.parents[1]
+        for role, relative in expected.items():
+            with self.subTest(role=role):
+                view = deepcopy(self.view)
+                view["active_assignment"]["role"] = role
+                original = deepcopy(view)
+                exported = export_assignment(self.root, view)
+                locator = exported["role_instructions"]
+                self.assertEqual(role, locator["role"])
+                self.assertEqual((skills / relative).resolve(), Path(locator["path"]))
+                self.assertTrue(Path(locator["path"]).is_file())
+                if role in {"planner", "slicer"}:
+                    self.assertEqual("Assignment and artifact boundaries", locator["section"])
+                    self.assertIn("## " + locator["section"], Path(locator["path"]).read_text(encoding="utf-8"))
+                else:
+                    self.assertNotIn("section", locator)
+                self.assertNotEqual(skills / "gamedev-pipeline/SKILL.md", Path(locator["path"]))
+                packet = self.receive(exported["packet_digest"])
+                self.assertEqual(locator, packet["role_instructions"])
+                self.assertEqual(locator, director_brief(view)["active_assignment"]["role_instructions"])
+                self.assertEqual(view["active_assignment"], packet["assignment"])
+                self.assertEqual(original, view)
+                self.assertEqual({"role", "path", "section"} if role in {"planner", "slicer"}
+                                 else {"role", "path"}, set(locator))
+
+    def test_full_and_delta_keep_exact_output_right_separate_from_product_scope(self):
+        from pipeline_v2.model import artifact_schema
+        for phase, role in (("engineering", "engineer"), ("review", "reviewer"), ("qa", "qa")):
+            with self.subTest(role=role):
+                view = deepcopy(self.view)
+                assignment = view["active_assignment"]
+                assignment["role"] = role
+                assignment["access"]["write"] = ["src/**"] if role == "engineer" else []
+                assignment["artifact_schema"] = artifact_schema(phase, role)
+                # An older view without root still binds the trusted export root,
+                # never the process cwd or the output's containing directory.
+                self.assertNotIn("project_root", view)
+                assignment["output_path"] = f"{self.workflow}/Outputs/{role}-1.json"
+                access = deepcopy(assignment["access"])
+                schema = deepcopy(assignment["artifact_schema"])
+                baseline = None
+                previous = None
+                for mode in ("full", "delta"):
+                    original = deepcopy(view)
+                    exported = export_assignment(self.root, view, baseline=baseline)
+                    transport = self.receive(exported["response_digest"])
+                    packet = transport if mode == "full" else apply_patch(previous, transport["patch"])
+                    descriptor = exported["dispatch"]
+                    self.assertEqual(mode, descriptor["input"]["mode"])
+                    self.assertEqual(original, view)
+                    self.assertEqual(assignment, packet["assignment"])
+                    self.assertEqual(access, packet["assignment"]["access"])
+                    self.assertEqual(schema, packet["assignment"]["artifact_schema"])
+                    self.assertEqual(exported["packet_digest"], hashlib.sha256(canonical_bytes(packet)).hexdigest())
+                    self.assertEqual("issued_exact_terminal_artifact", descriptor["output"]["write_authority"])
+                    self.assertEqual("requires_separate_bounded_grant", descriptor["controller_mutation_authority"])
+                    self.assertNotIn("native_mutation_authority", descriptor)
+                    self.assertEqual("terminal_artifact_or_required_control_pause", descriptor["stop_boundary"])
+                    output = self.root / assignment["output_path"]
+                    self.assertEqual(str(output), descriptor["output"]["path"])
+                    self.assertEqual(assignment["output_path"], descriptor["output"]["relative_path"])
+                    self.assertFalse(output.exists(), "export describes output authority; it does not write the artifact")
+                    self.assertEqual(access, json.loads(read_delivery(
+                        self.root, self.workflow, descriptor["scope"]["packet_digest"],
+                        pointer=descriptor["scope"]["pointer"])["text"]))
+                    previous, baseline = packet, exported["packet_digest"]
+                    view["generation"] += 1
+                    assignment["id"] = "A-2"
+                    assignment["output_path"] = f"{self.workflow}/Outputs/{role}-2.json"
+
+    def test_draft_brief_locates_current_phase_only_and_idle_boundaries_have_no_locator(self):
+        view = deepcopy(self.view)
+        draft = view["active_assignment"]
+        draft.pop("role")
+        view["active_assignment"] = None
+        view["next_action"] = {"kind": "command", "command": "next", "assignment": draft}
+        for phase, role in ROLES.items():
+            view["phase"] = phase
+            brief = director_brief(view)
+            self.assertEqual(role, brief["next_action"]["assignment"]["role_instructions"]["role"])
+            self.assertNotIn("role_instructions", draft)
+        for action in ({"kind": "command", "command": "init"}, {"kind": "command", "command": "accept"},
+                       {"kind": "command", "command": "ready"}, {"kind": "controller_decision", "command": "answer"},
+                       {"kind": "terminal", "result": "recovery_required"}):
+            view["next_action"] = action
+            brief = director_brief(view)
+            self.assertEqual(action, brief["next_action"])
+            self.assertNotIn("role_instructions", json.dumps(brief))
+
+    def test_instruction_locator_resolves_from_relocated_bundle_not_project_or_main_source(self):
+        # Load just the transport module from an isolated fixture bundle. This
+        # exercises its real __file__ without creating/changing an immutable pin.
+        import pipeline_v2.delivery as source
+        bundle = self.root / "relocated runtime with spaces"
+        module_path = bundle / "skills/gamedev-pipeline/scripts/pipeline_v2/delivery.py"
+        module_path.parent.mkdir(parents=True)
+        module_path.write_bytes(Path(source.__file__).read_bytes())
+        (module_path.parent.parent / "pipeline_state.py").write_bytes((SCRIPTS / "pipeline_state.py").read_bytes())
+        for role in ROLES.values():
+            locator = source._role_instructions(role)
+            relative = Path(locator["path"]).relative_to(SCRIPTS.parents[2])
+            target = bundle / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(Path(locator["path"]).read_bytes())
+        spec = importlib.util.spec_from_file_location("pipeline_v2.relocated_delivery_fixture", module_path)
+        relocated = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(relocated)
+        for role in ROLES.values():
+            view = deepcopy(self.view)
+            view["active_assignment"]["role"] = role
+            exported = relocated.export_assignment(self.root, view)
+            locator = exported["role_instructions"]
+            self.assertTrue(Path(locator["path"]).is_relative_to(bundle))
+            self.assertTrue(Path(exported["dispatch"]["launcher_argv"][1]).is_relative_to(bundle))
+            self.assertEqual(locator, exported["dispatch"]["role_instructions"])
+            self.assertEqual(locator, self.receive(exported["packet_digest"])["role_instructions"])
+            self.assertEqual(locator, relocated.director_brief(view)["active_assignment"]["role_instructions"])
+        (bundle / "skills/gamedev-engineer/SKILL.md").unlink()
+        with self.assertRaisesRegex(PipelineError, "inside the running bundle"):
+            relocated.export_assignment(self.root, self.view)
+
+    def test_legacy_delivery_delta_adds_locator_with_integrity_and_unknown_roles_invent_no_path(self):
+        full = export_assignment(self.root, self.view)
+        legacy = self.receive(full["packet_digest"])
+        legacy.pop("role_instructions")
+        legacy.pop("project_root")
+        payload = canonical_bytes(legacy)
+        version = hashlib.sha256(payload).hexdigest()
+        (self.root / self.workflow / "Delivery" / f"{version}.json").write_bytes(payload)
+        exported = export_assignment(self.root, self.view, baseline=version)
+        delta = self.receive(exported["response_digest"])
+        self.assertEqual(["/project_root", "/role_instructions"], [item["path"] for item in delta["patch"]])
+        self.assertEqual(str(self.root.resolve()), delta["project_root"])
+        rebuilt = apply_patch(legacy, delta["patch"])
+        self.assertEqual(exported["packet_digest"], hashlib.sha256(canonical_bytes(rebuilt)).hexdigest())
+        self.assertEqual(legacy["assignment"], rebuilt["assignment"])
+        for role in ("director", "../external/SKILL.md", "gamedev-engineering", "unknown"):
+            view = deepcopy(self.view)
+            view["active_assignment"]["role"] = role
+            self.assertNotIn("role_instructions", export_assignment(self.root, view))
+            self.assertNotIn("role_instructions", director_brief(view)["active_assignment"])
+
+    def test_export_measures_working_set_and_locates_complete_decisions_without_inlining(self):
+        exported = export_assignment(self.root, self.view, inputs=["src/a.txt"])
+        measurements = exported["working_set"]
+        self.assertEqual(len((self.root / "src/a.txt").read_bytes()), measurements["selected_source_bytes"])
+        self.assertEqual(1, measurements["selected_source_count"])
+        self.assertIn("excludes conversation", measurements["measurement"])
+        index = measurements["technical_decision_index"]
+        self.assertEqual(["T-1", "T-2"], [item["id"] for item in index])
+        self.assertNotIn("Привет", json.dumps(exported, ensure_ascii=False))
+        page = read_delivery(self.root, self.workflow, exported["packet_digest"],
+                             limit=16384, pointer=index[0]["pointer"])
+        self.assertTrue(page["complete"])
+        self.assertEqual(self.view["active_assignment"]["context"]["technical_decisions"][0], json.loads(page["text"]))
+
+    def test_export_locates_only_current_slice_verification_source_with_exact_file_read_range(self):
+        current_slice = {"id": "SLICE-1", "allowed_paths": ["src/**"], "planned_commands": [["python", "-c", "pass"]]}
+        plan_text = (
+            "# Approved plan\r\n\r\n"
+            "## Slice SLICE-1\r\n\r\n"
+            "### Verification and Exit Criteria\r\n\r\n"
+            "Observe board state \U0001f7e2\r\n"
+            "Keep this exact CRLF content.\r\n\r\n"
+            "### Rollback and Recovery\r\n\r\n"
+            "Restore the prior state.\r\n\r\n"
+            "## Slice SLICE-2\r\n\r\n"
+            "### Verification and Exit Criteria\r\n\r\n"
+            "Do not select this slice.\r\n"
+        )
+        plan_path = self.root / "plan.md"
+        plan_path.write_bytes(plan_text.encode("utf-8"))
+        version = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+        self.view["active_assignment"]["access"] = {"read": ["src/**", "plan.md"], "write": ["src/**"]}
+        self.view["active_assignment"]["context"] = {"current_slice": current_slice}
+        state_path = self.root / self.workflow / "pipeline-state.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "active_assignment": {"id": "A-1", "capsule": {"context": {"current_slice": current_slice}}},
+            "authority": {"items": {"plan": {"path": "plan.md", "sha256": version}}},
+        }), encoding="utf-8")
+        before = deepcopy(self.view["active_assignment"])
+
+        locator = export_assignment(self.root, self.view)["working_set"]["verification_exit_criteria"]
+
+        self.assertEqual({"path": "plan.md", "version": version, "total_characters": len(plan_text)},
+                         {key: locator[key] for key in ("path", "version", "total_characters")})
+        start = plan_text.index("### Verification and Exit Criteria")
+        end = plan_text.index("### Rollback and Recovery")
+        self.assertEqual({"heading": "Verification and Exit Criteria", "start_offset": start, "end_offset": end},
+                         locator["section"])
+        self.assertEqual(before, self.view["active_assignment"])
+
+        offset = start
+        received = []
+        while offset < end:
+            page = read_file(self.root, self.view, "plan.md", version=version, offset=offset,
+                             limit=min(13, end - offset))
+            received.append(page["text"])
+            offset = page["next_offset"]
+        self.assertEqual(plan_text[start:end], "".join(received))
+
+    def test_export_keeps_bound_full_plan_source_when_exact_section_is_unavailable(self):
+        current_slice = {"id": "SLICE-1", "allowed_paths": ["src/**"], "planned_commands": [["python", "-c", "pass"]]}
+        plan_text = "## Slice SLICE-1\r\n\r\n### Coverage Contract\r\n\r\n- required evidence\r\n"
+        plan_path = self.root / "plan.md"
+        plan_path.write_bytes(plan_text.encode("utf-8"))
+        version = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+        self.view["active_assignment"]["access"] = {"read": ["src/**", "plan.md"], "write": ["src/**"]}
+        self.view["active_assignment"]["context"] = {"current_slice": current_slice}
+        state_path = self.root / self.workflow / "pipeline-state.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "active_assignment": {"id": "A-1", "capsule": {"context": {"current_slice": current_slice}}},
+            "authority": {"items": {"plan": {"path": "plan.md", "sha256": version}}},
+        }), encoding="utf-8")
+
+        locator = export_assignment(self.root, self.view)["working_set"]["verification_exit_criteria"]
+
+        self.assertEqual({"path": "plan.md", "version": version, "total_characters": len(plan_text)}, locator)
+        page = read_file(self.root, self.view, locator["path"], version=locator["version"])
+        self.assertEqual(plan_text, page["text"])
     def test_patch_handles_deletion_appends_types_empty_values_and_escaped_keys(self):
         before = {"a/b": [{"~": 2}, 4, 5], "delete": 0, "type": False}
         after = {"a/b": [{"~": 3}], "add": [1, 2], "type": 0}
@@ -131,6 +376,23 @@ class DeliveryTests(unittest.TestCase):
         fresh = read_file(self.root, self.view, "src/a.txt")
         self.assertNotEqual(page["version"], fresh["version"])
 
+    def test_export_rejects_conflicting_project_root_without_widening_access(self):
+        view = deepcopy(self.view)
+        view["project_root"] = str(self.root / "other-checkout")
+        with self.assertRaisesRegex(PipelineError, "controller-bound project_root"):
+            export_assignment(self.root, view)
+        view["project_root"] = "."
+        with self.assertRaisesRegex(PipelineError, "controller-bound project_root"):
+            export_assignment(self.root, view)
+        full = export_assignment(self.root, self.view)
+        foreign = self.receive(full["packet_digest"])
+        foreign["project_root"] = str(self.root / "other-checkout")
+        payload = canonical_bytes(foreign)
+        version = hashlib.sha256(payload).hexdigest()
+        (self.root / self.workflow / "Delivery" / f"{version}.json").write_bytes(payload)
+        with self.assertRaisesRegex(PipelineError, "this project_root"):
+            export_assignment(self.root, self.view, baseline=version)
+
     def test_read_scope_selection_path_and_corrupt_snapshot_guards(self):
         with self.assertRaises(PipelineError):
             read_file(self.root, self.view, "../escape.txt")
@@ -143,6 +405,12 @@ class DeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "digest does not match"):
             read_delivery(self.root, self.workflow, full["response_digest"])
 
+    def test_dispatch_cannot_direct_an_artifact_outside_the_project(self):
+        view = deepcopy(self.view)
+        view["active_assignment"]["output_path"] = "../foreign-artifact.json"
+        with self.assertRaises(PipelineError):
+            export_assignment(self.root, view)
+
     def test_boundary_actions_never_dispatch(self):
         for action in ({"kind": "controller_decision", "command": "answer"},
                        {"kind": "terminal", "result": "recovery_required"},
@@ -153,6 +421,22 @@ class DeliveryTests(unittest.TestCase):
             controller.store.load.return_value = {"history": []}
             result = execute_step(controller, self.root, 4, "unused")
             self.assertEqual("stopped", result["result"])
+            controller.next.assert_not_called()
+            controller.complete.assert_not_called()
+            controller.transition.assert_not_called()
+
+    def test_handoff_option_never_crosses_decision_recovery_init_or_ready(self):
+        for action in ({"kind": "controller_decision", "command": "answer"},
+                       {"kind": "terminal", "result": "recovery_required"},
+                       {"kind": "command", "command": "init"},
+                       {"kind": "command", "command": "ready"}):
+            controller = Mock()
+            controller.status.return_value = {"generation": 4, "next_action": action}
+            controller.store.load.return_value = {"history": []}
+            result = execute_step(controller, self.root, 4, "unused", through_handoff=True)
+            self.assertEqual("stopped", result["result"])
+            self.assertEqual([], result["steps"])
+            self.assertEqual(action, result["next_action"])
             controller.next.assert_not_called()
             controller.complete.assert_not_called()
             controller.transition.assert_not_called()
@@ -172,6 +456,47 @@ class DeliveryTests(unittest.TestCase):
             view["next_action"] = action
             self.assertEqual(action, director_brief(view)["next_action"])
 
+    def test_brief_projects_only_bound_diagnostic_result_metadata_without_acceptance_credit(self):
+        view = deepcopy(self.view)
+        view["active_assignment"]["context"].update({
+            "diagnostic_checks": {
+                "assignment_id": "A-1", "candidate_tree_oid": "candidate-1",
+                "grants_semantic_credit": False, "overall": "pass",
+                "results": [
+                    {"check_id": "unit", "returncode": 0, "duration_ms": 321,
+                     "argv": ["python", "-m", "unittest"], "stdout_excerpt": "secret output",
+                     "stderr_excerpt": "secret error", "execution_reason": "new_input_binding"},
+                    {"check_id": "partial", "returncode": 7},
+                ],
+            },
+            "machine_checks": {"grants_manual_acceptance": False, "outcome": "pass",
+                               "pending_check_ids": ["not-run"]},
+            "private_context": "must stay in the lossless packet",
+        })
+        brief = director_brief(view)
+        projected = brief["active_assignment"]["diagnostic_checks"]
+        self.assertEqual({
+            "assignment_id": "A-1", "candidate_tree_oid": "candidate-1",
+            "grants_semantic_credit": False, "grants_manual_acceptance": False,
+            "results": [
+                {"check_id": "unit", "returncode": 0, "duration_ms": 321},
+                {"check_id": "partial", "returncode": 7},
+            ],
+        }, projected)
+        encoded = json.dumps(brief)
+        for forbidden in ("secret output", "secret error", "argv", "execution_reason",
+                          "private_context", "pending_check_ids", '"overall"', '"outcome"'):
+            self.assertNotIn(forbidden, encoded)
+        packet = self.receive(export_assignment(self.root, view)["packet_digest"])
+        self.assertEqual(view["active_assignment"], packet["assignment"])
+        self.assertEqual("secret output", packet["assignment"]["context"]["diagnostic_checks"]
+                         ["results"][0]["stdout_excerpt"])
+        view["active_assignment"]["context"]["diagnostic_checks"]["results"] = []
+        empty = director_brief(view)["active_assignment"]["diagnostic_checks"]
+        self.assertEqual([], empty["results"])
+        self.assertNotIn("outcome", empty)
+        self.assertNotIn("passed", empty)
+
 
 class ControllerDeliveryIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -183,14 +508,169 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
         self.root = self.fixture.root
         self.controller = Controller(self.fixture.store)
 
+    def test_worker_can_consume_and_return_using_only_dispatch_from_foreign_cwd(self):
+        action = self.controller.status()["next_action"]
+        issued = execute_step(self.controller, self.root, action["expected_generation"], action["command_id"])
+        # The Director forwards only the generated descriptor and host binding.
+        # A worker can resolve every native input/output without the caller cwd,
+        # source inspection, hand-built launcher, or full Director-side packet read.
+        dispatch = issued["assignment_delivery"]["dispatch"]
+        before = self.fixture.store.path.read_bytes()
+        tree = candidate_tree_oid(self.root)
+        with tempfile.TemporaryDirectory(prefix="foreign dispatch cwd ") as foreign:
+            response = subprocess.run(
+                dispatch["launcher_argv"] + dispatch["controller_args"] + [
+                    "delivery-read", "--digest", dispatch["input"]["digest"],
+                    "--pointer", "/assignment", "--limit", "16384"],
+                cwd=foreign, capture_output=True, text=True, encoding="utf-8", check=True,
+            )
+            page = json.loads(response.stdout)
+            self.assertTrue(page["complete"])
+            assignment = json.loads(page["text"])
+            self.assertEqual(dispatch["assignment_id"], assignment["id"])
+            self.assertEqual(dispatch["worker_id"], assignment["worker_id"])
+            self.assertEqual(str(self.root), dispatch["cwd"])
+            self.assertEqual("requires_separate_bounded_grant", dispatch["controller_mutation_authority"])
+            self.assertEqual("execute_issued_assignment", dispatch["allowed_action"])
+            self.assertEqual("terminal_artifact_or_required_control_pause", dispatch["stop_boundary"])
+            self.assertEqual("issued_exact_terminal_artifact", dispatch["output"]["write_authority"])
+            packet_bytes = Path(dispatch["input"]["packet_path"]).read_bytes()
+            self.assertEqual(dispatch["input"]["packet_digest"], hashlib.sha256(packet_bytes).hexdigest())
+            packet = json.loads(packet_bytes)
+            self.assertEqual(assignment, packet["assignment"])
+            self.assertEqual(assignment["access"], json.loads(read_delivery(
+                self.root, self.fixture.workflow_path, dispatch["scope"]["packet_digest"],
+                pointer=dispatch["scope"]["pointer"], limit=16384)["text"]))
+            self.assertEqual(assignment["artifact_schema"], json.loads(read_delivery(
+                self.root, self.fixture.workflow_path, dispatch["output"]["schema"]["packet_digest"],
+                pointer=dispatch["output"]["schema"]["pointer"], limit=16384)["text"]))
+            self.assertEqual(before, self.fixture.store.path.read_bytes())
+            self.assertEqual(tree, candidate_tree_oid(self.root))
+            output = Path(dispatch["output"]["path"])
+            self.assertEqual(self.root / assignment["output_path"], output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps({"outcome": "pass", "summary": "Assigned plan confirmed."}), encoding="utf-8")
+            self.assertFalse((Path(foreign) / assignment["output_path"]).exists())
+        complete = issued["next_action"]
+        consumed = execute_step(self.controller, self.root, complete["expected_generation"], complete["command_id"])
+        self.assertEqual("phase_passed", consumed["outcome"])
+        self.assertEqual("accept", consumed["next_action"]["command"])
+        self.assertEqual(tree, candidate_tree_oid(self.root))
+
+    def test_readonly_roles_write_exact_dispatched_output_without_product_or_state_access(self):
+        self.fixture._reach_candidate()
+        for phase, artifact in (
+            ("review", {"outcome": "pass", "findings": []}),
+            ("qa", {"outcome": "pass", "checks": self.fixture._qa_checks("Assigned fixture scenarios observed.")}),
+        ):
+            with self.subTest(phase=phase):
+                view = self.controller.status()
+                self.assertEqual(phase, view["phase"])
+                action = view["next_action"]
+                issued = execute_step(self.controller, self.root, action["expected_generation"], action["command_id"])
+                dispatch = issued["assignment_delivery"]["dispatch"]
+                packet = json.loads(Path(dispatch["input"]["packet_path"]).read_bytes())
+                assignment = packet["assignment"]
+                self.assertEqual([], assignment["access"]["write"])
+                self.assertEqual("issued_exact_terminal_artifact", dispatch["output"]["write_authority"])
+                self.assertEqual("requires_separate_bounded_grant", dispatch["controller_mutation_authority"])
+                state_before = self.fixture.store.path.read_bytes()
+                tree_before = candidate_tree_oid(self.root)
+                output = Path(dispatch["output"]["path"])
+                self.assertEqual(self.root / assignment["output_path"], output)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps(artifact), encoding="utf-8")
+                self.assertEqual(tree_before, candidate_tree_oid(self.root))
+                self.assertEqual(state_before, self.fixture.store.path.read_bytes())
+                # Terminal-output authority cannot be substituted with state or
+                # Delivery, even though those paths are in the same workflow.
+                for wrong_path in (self.fixture.store.path, Path(dispatch["input"]["packet_path"])):
+                    with self.assertRaisesRegex(PipelineError, "only the assigned artifact path"):
+                        self.controller.complete(command_id=f"WRONG-OUTPUT-{phase}", artifact_path=wrong_path)
+                    self.assertEqual(state_before, self.fixture.store.path.read_bytes())
+                action = issued["next_action"]
+                completed = execute_step(self.controller, self.root, action["expected_generation"], action["command_id"])
+                self.assertEqual("phase_passed", completed["outcome"])
+                self.assertEqual(tree_before, candidate_tree_oid(self.root))
+                self.fixture._accept(f"dispatched-{phase}")
+
+    def test_native_project_root_survives_full_and_continued_delivery_from_foreign_cwd(self):
+        with tempfile.TemporaryDirectory() as previous_project:
+            old_root = Path(previous_project).resolve()
+            (old_root / "index.html").write_text("Historical project entry", encoding="utf-8")
+            (old_root / "game.txt").write_text("Do not change this checkout", encoding="utf-8")
+            # Real sealed authority includes a historical URL that must not select cwd.
+            plan = self.root / self.fixture.store.load()["authority"]["items"]["plan"]["path"]
+            with plan.open("a", encoding="utf-8") as stream:
+                stream.write("\n## Historical manual entry\n\n" + (old_root / "index.html").as_uri() + "\n")
+            (self.root / "game.txt").unlink()  # Assigned greenfield file, not a missing root.
+            self.fixture._commit_fixture_and_restart("root binding delivery fixture")
+            self.fixture._reach_engineering("-root-binding")
+            from pipeline_v2.runner import Controller
+            self.controller = Controller(self.fixture.store)
+            prefix = ["--root", str(self.root), "--feature", self.fixture.feature]
+            saved_cwd = Path.cwd()
+            try:
+                os.chdir(old_root)
+                pending = self.controller.status()["next_action"]
+                issued = run(parser().parse_args(prefix + ["step", "--expected-generation",
+                    str(pending["expected_generation"]), "--action-id", pending["command_id"]]))
+                full = issued["assignment_delivery"]
+                packet = json.loads((self.root / full["path"]).read_text(encoding="utf-8"))
+                view = self.controller.status()
+                brief = director_brief(view)
+                for value in (view, brief, brief["assignment_delivery"], full, packet):
+                    self.assertEqual(str(self.root), value["project_root"])
+                    self.assertTrue(Path(value["project_root"]).is_absolute())
+                self.assertEqual(view["active_assignment"], packet["assignment"])
+                access = deepcopy(packet["assignment"]["access"])
+                self.assertFalse((Path(packet["project_root"]) / "game.txt").exists())
+                self.assertEqual("Do not change this checkout", Path("game.txt").read_text(encoding="utf-8"))
+                # Real native refresh; no planned product command/check is run.
+                self.controller.technical_action(command_id="OBS-ROOT-BINDING",
+                    expected_generation=view["generation"], action="Observe assigned greenfield files before creation")
+                continued = run(parser().parse_args(prefix + ["assignment-export", "--baseline", full["packet_digest"]]))
+                delta = json.loads((self.root / continued["path"]).read_text(encoding="utf-8"))
+                rebuilt = apply_patch(packet, delta["patch"])
+                for value in (continued, delta, rebuilt):
+                    self.assertEqual(str(self.root), value["project_root"])
+                self.assertEqual(continued["packet_digest"], hashlib.sha256(canonical_bytes(rebuilt)).hexdigest())
+                self.assertEqual(access, rebuilt["assignment"]["access"])
+                self.assertEqual(packet["assignment"]["id"], rebuilt["assignment"]["id"])
+                bound_root = Path(rebuilt["project_root"])
+                (bound_root / "game.txt").write_text("Created in assigned root", encoding="utf-8")
+                output = bound_root / rebuilt["assignment"]["output_path"]
+                self.assertTrue(output.is_relative_to(self.root))
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text('{"fixture": "relative artifact location"}', encoding="utf-8")
+                self.assertTrue(output.is_file())
+                self.assertFalse((old_root / rebuilt["assignment"]["output_path"]).exists())
+                self.assertEqual("Do not change this checkout", (old_root / "game.txt").read_text(encoding="utf-8"))
+                page = read_file(bound_root, self.controller.status(), "game.txt")
+                self.assertEqual("Created in assigned root", page["text"])
+                with self.assertRaisesRegex(PipelineError, "outside"):
+                    read_file(bound_root, self.controller.status(), "private.txt")
+            finally:
+                os.chdir(saved_cwd)
+
     def test_cli_step_issues_once_retries_without_advancing_and_waits_for_real_artifact(self):
         initial_tree = candidate_tree_oid(self.root)
         action = self.controller.status()["next_action"]
+        pending = director_brief(self.controller.status())["next_action"]["assignment"]["role_instructions"]
+        self.assertEqual("planner", pending["role"])
+        self.assertEqual("Assignment and artifact boundaries", pending["section"])
         argv = ["--root", str(self.root), "--feature", self.fixture.feature, "step",
                 "--expected-generation", str(action["expected_generation"]), "--action-id", action["command_id"]]
         issued = run(parser().parse_args(argv))
         self.assertEqual("executed", issued["result"])
         self.assertIn("assignment_delivery", issued)
+        self.assertEqual(self.controller.status()["active_assignment"]["worker_id"], issued["assignment_delivery"]["worker_id"])
+        self.assertEqual(pending, issued["assignment_delivery"]["role_instructions"])
+        before = self.fixture.store.path.read_bytes()
+        exported = export_assignment(self.root, self.controller.status())
+        self.assertEqual(self.controller.status()["active_assignment"]["worker_id"], exported["worker_id"])
+        self.assertEqual(pending, exported["role_instructions"])
+        self.assertEqual(before, self.fixture.store.path.read_bytes())
         self.assertEqual(initial_tree, candidate_tree_oid(self.root))
         replay = run(parser().parse_args(argv))
         self.assertEqual("already_applied", replay["result"])
@@ -208,6 +688,32 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
             execute_step(self.controller, self.root, action["expected_generation"], "wrong")
         self.assertIsNone(self.controller.status()["active_assignment"])
 
+    def test_brief_cli_check_returns_bound_metadata_without_full_check_payload(self):
+        self.fixture._reach_engineering("-brief-check")
+        action = self.controller.status()["next_action"]
+        self.controller.next(command_id=action["command_id"], expected_generation=action["expected_generation"])
+        active = self.controller.status()["active_assignment"]
+        state = self.fixture.store.load()
+        argv = ["--root", str(self.root), "--feature", self.fixture.feature, "--brief", "check",
+                "--id", "CLI-BRIEF-CHECK", "--expected-generation", str(state["generation"]),
+                "--assignment-id", active["id"], "--quiescence", "Writer stopped for this check."]
+        evidence = ProcessEvidence(7, digest("stdout"), digest("stderr"),
+                                   b"full stderr must not be projected", False,
+                                   b"full stdout must not be projected", False, 321)
+        with mock.patch("pipeline_v2.runner.run_process_tree", return_value=evidence):
+            checked = run(parser().parse_args(argv))
+        diagnostic = checked["active_assignment"]["diagnostic_checks"]
+        self.assertEqual(active["id"], diagnostic["assignment_id"])
+        self.assertEqual(7, diagnostic["results"][0]["returncode"])
+        self.assertIsInstance(diagnostic["results"][0]["duration_ms"], int)
+        self.assertGreaterEqual(diagnostic["results"][0]["duration_ms"], 0)
+        self.assertFalse(diagnostic["grants_semantic_credit"])
+        self.assertFalse(diagnostic["grants_manual_acceptance"])
+        encoded = json.dumps(checked)
+        self.assertNotIn("full stderr", encoded)
+        self.assertNotIn("full stdout", encoded)
+        self.assertNotIn('"argv"', encoded)
+
     def test_step_complete_validates_artifact_and_accept_is_a_separate_action(self):
         action = self.controller.status()["next_action"]
         execute_step(self.controller, self.root, action["expected_generation"], action["command_id"])
@@ -219,11 +725,193 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
         self.fixture._write_artifact({"outcome": "pass", "summary": "Delivered the assigned result."})
         completed = execute_step(self.controller, self.root, action["expected_generation"], action["command_id"])
         self.assertEqual("complete", completed["command"])
+        self.assertEqual("phase_passed", completed["outcome"])
+        self.assertEqual("accept", completed["next_action"]["command"])
         self.assertEqual("accept", self.controller.status()["next_action"]["command"])
         action = self.controller.status()["next_action"]
         accepted = execute_step(self.controller, self.root, action["expected_generation"], action["command_id"])
         self.assertEqual("accept", accepted["command"])
+        self.assertEqual("accepted", accepted["outcome"])
+        self.assertEqual("next", accepted["next_action"]["command"])
         self.assertEqual("next", self.controller.status()["next_action"]["command"])
+
+    def handoff(self, action=None):
+        action = action or self.controller.status()["next_action"]
+        return execute_step(self.controller, self.root, action["expected_generation"],
+                            action["command_id"], through_handoff=True)
+
+    def test_handoff_engineer_and_reviewer_each_stop_at_new_assignment_and_full_replay_is_readonly(self):
+        self.fixture._reach_engineering("-handoff")
+        issued = self.handoff()  # Starting at next must issue exactly one assignment.
+        self.assertEqual(self.controller.status()["active_assignment"]["worker_id"], issued["assignment_delivery"]["worker_id"])
+        self.fixture._write_artifact({"outcome": "pass", "summary": "Owned implementation complete."})
+        original = self.controller.status()["next_action"]
+        native_next = self.controller.next
+
+        def next_with_new_worker_output(**kwargs):
+            state = native_next(**kwargs)
+            self.fixture._write_artifact({"outcome": "pass", "findings": []})
+            return state
+
+        with mock.patch.object(self.controller, "next", side_effect=next_with_new_worker_output):
+            result = self.handoff(original)
+        self.assertEqual(["complete", "accept", "next"], [item["command"] for item in result["steps"]])
+        self.assertEqual(["phase_passed", "accepted", "assignment_issued"], [item["outcome"] for item in result["steps"]])
+        self.assertEqual(original["expected_generation"] + 3, result["generation"])
+        self.assertEqual({"expected_generation": original["expected_generation"], "action_id": original["command_id"]}, result["request"])
+        self.assertEqual("review", result["phase"])
+        state = self.fixture.store.load()
+        self.assertEqual("review", state["active_assignment"]["phase"])
+        self.assertNotIn("review", state["artifacts"])
+        self.assertTrue((self.root / state["active_assignment"]["output_path"]).is_file())
+        before = self.fixture.store.path.read_bytes()
+        delivery = self.root / self.fixture.workflow_path / "Delivery"
+        files = {p.name: p.read_bytes() for p in delivery.iterdir()}
+        replay = self.handoff(original)
+        self.assertEqual("already_applied", replay["result"])
+        self.assertEqual([], replay["steps"])
+        self.assertEqual(state["active_assignment"]["id"], replay["active_assignment"]["id"])
+        self.assertEqual("assignment-export", replay["assignment_delivery"]["command"])
+        self.assertEqual(before, self.fixture.store.path.read_bytes())
+        self.assertEqual(files, {p.name: p.read_bytes() for p in delivery.iterdir()})
+        reviewed = self.handoff()  # Separately established terminal Review output.
+        self.assertEqual(["complete", "accept", "next"], [item["command"] for item in reviewed["steps"]])
+        self.assertEqual("qa", reviewed["phase"])
+        self.assertEqual("qa", self.fixture.store.load()["active_assignment"]["phase"])
+        self.assertNotIn("qa", self.fixture.store.load()["artifacts"])
+
+    def test_handoff_cli_missing_artifact_and_partial_replays_do_not_finish_remaining_chain(self):
+        issued = self.handoff()
+        self.assertEqual(["next"], [item["command"] for item in issued["steps"]])
+        original = self.controller.status()["next_action"]
+        argv = ["--root", str(self.root), "--feature", self.fixture.feature, "step", "--through-handoff",
+                "--expected-generation", str(original["expected_generation"]), "--action-id", original["command_id"]]
+        waiting = run(parser().parse_args(argv))
+        self.assertEqual("waiting_for_artifact", waiting["outcome"])
+        self.assertEqual([], waiting["steps"])
+        self.assertEqual(original, waiting["next_action"])
+        self.fixture._write_artifact({"outcome": "pass", "summary": "Plan confirmed."})
+        execute_step(self.controller, self.root, original["expected_generation"], original["command_id"])
+        for after_accept in (False, True):
+            if after_accept:
+                action = self.controller.status()["next_action"]
+                execute_step(self.controller, self.root, action["expected_generation"], action["command_id"])
+            before = self.fixture.store.path.read_bytes()
+            replay = run(parser().parse_args(argv))
+            self.assertEqual("already_applied", replay["result"])
+            self.assertEqual([], replay["steps"])
+            self.assertEqual("next" if after_accept else "accept", replay["next_action"]["command"])
+            self.assertIsNone(replay["active_assignment"])
+            self.assertEqual(before, self.fixture.store.path.read_bytes())
+        with self.assertRaisesRegex(PipelineError, "identity conflicts"):
+            execute_step(self.controller, self.root, original["expected_generation"] + 1,
+                         original["command_id"], through_handoff=True)
+        current = self.controller.status()["next_action"]
+        with self.assertRaisesRegex(PipelineError, "action ID"):
+            execute_step(self.controller, self.root, current["expected_generation"], "wrong", through_handoff=True)
+        with self.assertRaisesRegex(PipelineError, "stale"):
+            execute_step(self.controller, self.root, current["expected_generation"] - 1, "stale", through_handoff=True)
+        self.assertEqual(before, self.fixture.store.path.read_bytes())
+
+    def test_handoff_partial_error_replays_original_request_without_any_new_action(self):
+        self.handoff()
+        original = self.controller.status()["next_action"]
+        self.fixture._write_artifact({"outcome": "pass", "summary": "Plan confirmed."})
+        with mock.patch.object(self.controller, "transition", side_effect=PipelineError("Concurrent boundary changed")):
+            with self.assertRaisesRegex(PipelineError, "Concurrent boundary changed"):
+                self.handoff(original)
+        before = self.fixture.store.path.read_bytes()
+        self.assertEqual(original["expected_generation"] + 1, self.fixture.store.load()["generation"])
+        replay = self.handoff(original)
+        self.assertEqual([], replay["steps"])
+        self.assertEqual("accept", replay["next_action"]["command"])
+        self.assertEqual(before, self.fixture.store.path.read_bytes())
+        remaining = self.handoff()
+        self.assertEqual(["accept", "next"], [item["command"] for item in remaining["steps"]])
+        self.assertEqual("slice", remaining["phase"])
+
+    def test_handoff_stops_when_concurrent_actor_already_applied_following_action(self):
+        self.handoff()
+        self.fixture._write_artifact({"outcome": "pass", "summary": "Plan confirmed."})
+        original = self.controller.status()["next_action"]
+        native_complete = self.controller.complete
+
+        def complete_then_external_accept(**kwargs):
+            result = native_complete(**kwargs)
+            action = self.controller.status()["next_action"]
+            self.controller.transition({"name": "accept", "id": action["command_id"], "expected_generation": action["expected_generation"]})
+            return result
+
+        with mock.patch.object(self.controller, "complete", side_effect=complete_then_external_accept):
+            result = self.handoff(original)
+        self.assertEqual("replayed", result["outcome"])
+        self.assertEqual(["complete"], [item["command"] for item in result["steps"]])
+        self.assertEqual(original["expected_generation"] + 2, result["generation"])
+        self.assertIsNone(self.fixture.store.load()["active_assignment"])
+        self.assertEqual("next", result["next_action"]["command"])
+
+    def test_handoff_stops_on_semantic_failure_block_and_question(self):
+        self.handoff()
+        self.fixture._write_artifact({"outcome": "fail", "summary": "Plan needs correction."})
+        failed = self.handoff()
+        self.assertEqual("phase_failed", failed["outcome"])
+        self.assertEqual(["complete"], [item["command"] for item in failed["steps"]])
+        self.assertIsNone(self.fixture.store.load()["active_assignment"])
+        self.handoff()
+        self.fixture._write_artifact({"outcome": "pass", "summary": "Technical choice needs resolution.",
+                                     "questions": ["Which existing implementation should be used?"]})
+        question = self.handoff()
+        self.assertEqual(["complete"], [item["command"] for item in question["steps"]])
+        self.assertEqual("answer", question["next_action"]["command"])
+        stopped = self.handoff()
+        self.assertEqual([], stopped["steps"])
+        action = self.controller.status()["next_action"]
+        self.controller.transition({"name": "answer", "id": action["command_id"], "expected_generation": action["expected_generation"],
+                                    "question_id": action["question_id"], "answer": "Use the existing supported implementation."})
+        self.handoff()
+        self.fixture._write_artifact({"outcome": "blocked", "summary": "Required capability unavailable.",
+                                     "blocker": "Mandatory capability remains unavailable.", "required_action": "Restore that capability."})
+        blocked = self.handoff()
+        self.assertEqual("blocked", blocked["outcome"])
+        self.assertEqual(["complete"], [item["command"] for item in blocked["steps"]])
+        self.assertIsNone(self.fixture.store.load()["active_assignment"])
+
+    def test_handoff_stops_on_gate_failure_and_replay_never_reruns_checks(self):
+        self.fixture._reach_engineering("-handoff-gate")
+        self.handoff()
+        original = self.controller.status()["next_action"]
+        self.fixture._write_artifact({"outcome": "pass", "summary": "Implementation ready for its mandatory check."})
+        failed_process = ProcessEvidence(7, digest("stdout"), digest("stderr"))
+        with mock.patch("pipeline_v2.runner.run_process_tree", return_value=failed_process) as process:
+            failed = self.handoff(original)
+            self.assertEqual("gate_failed", failed["outcome"])
+            self.assertEqual("pass", failed["semantic_outcome"])
+            self.assertEqual(["complete"], [item["command"] for item in failed["steps"]])
+            self.assertEqual(7, failed["failure"]["returncode"])
+            before = self.fixture.store.path.read_bytes()
+            replay = self.handoff(original)
+            self.assertEqual([], replay["steps"])
+            self.assertEqual(1, process.call_count)
+            self.assertEqual(before, self.fixture.store.path.read_bytes())
+
+    def test_handoff_stops_when_checkout_drifts_after_first_action(self):
+        self.handoff()
+        self.fixture._write_artifact({"outcome": "pass", "summary": "Plan confirmed."})
+        native_complete = self.controller.complete
+
+        def complete_then_drift(**kwargs):
+            result = native_complete(**kwargs)
+            (self.root / "game.txt").write_text("External change after completion\n", encoding="utf-8")
+            return result
+
+        original = self.controller.status()["next_action"]
+        with mock.patch.object(self.controller, "complete", side_effect=complete_then_drift):
+            result = self.handoff(original)
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual(["complete"], [item["command"] for item in result["steps"]])
+        self.assertEqual("terminal", result["next_action"]["kind"])
+        self.assertEqual(original["expected_generation"] + 1, result["generation"])
+        self.assertIsNone(self.fixture.store.load()["active_assignment"])
 
     def test_brief_cli_status_and_technical_actions_do_not_print_unchanged_journal(self):
         self.fixture._reach_engineering("-brief")

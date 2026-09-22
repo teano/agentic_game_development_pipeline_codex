@@ -2,7 +2,7 @@
 
 ## Canonical authority
 
-Use only the repository-owned PRD, specification, development plan, and append-only decision ledger resolved from explicit user context, repository instructions, feature manifests/indexes, existing artifacts, and unambiguous sibling relationships. All paths must stay inside the project root. Do not create copies, symlinks, moves, or an alternate namespace for the controller. Ask the user if more than one plausible path remains. In an empty repository, recommend `docs/features/<feature>/` with the four sibling artifacts as a proposed layout and wait for confirmation.
+Use only the repository-owned PRD, specification, development plan, and append-only decision ledger resolved from explicit user context, repository instructions, feature manifests/indexes, existing artifacts, and unambiguous sibling relationships. All paths must stay inside the project root. Do not create copies, symlinks, moves, or an alternate namespace for the controller. Ask the user if more than one plausible path remains. In an empty repository, propose `docs/features/<feature>/` with four sibling artifacts; choose it only under direct confirmation or applicable explicit layout/design delegation.
 
 Operational state remains at:
 
@@ -48,7 +48,7 @@ specification_authority:
   sha256: <64 lowercase hex>
 ```
 
-Only `single_owner` and `sequential_slices` are valid modes. `writer_strategy` is always `sequential`. It means one active write-capable lease per checkout and one writer per phase/write scope, not one Engineer identity for the lifecycle. The controller adds `approved_by` and `approved_at` only after explicit approval of the submitted draft SHA. `approved_by` records the actual safe 1–64 character actor identity: `user` for direct user approval, or the truthful agent/Director identity when current user authority explicitly delegates technical or process approval. A delegated approval must never be attributed to `user`, and it does not resolve a product choice outside that delegation.
+Only `single_owner` and `sequential_slices` are valid modes. `writer_strategy` is always `sequential`. It means one active write-capable lease per checkout and one writer per phase/write scope, with a stable Engineer owner across related remediation and independent Review/QA identities. The controller adds `approved_by` and `approved_at` only after explicit approval of the submitted draft SHA. `approved_by` records the actual safe 1–64 character actor identity: `user` for direct user approval, or the truthful agent/Director identity when current user authority explicitly delegates technical or process approval. A delegated approval must never be attributed to `user`, and it does not resolve a product choice outside that delegation.
 
 ## Analyst decision
 
@@ -121,3 +121,9 @@ When current PRD/SPEC authority is unchanged but an approved plan requires revis
 `revision:` is a typed scalar contract: exactly one top-level field whose source text is an unquoted positive ASCII decimal integer. Quoted numeric strings are invalid during validation, submission, approval, and approved-plan revision/reopen; controllers never strip YAML quotes to coerce them.
 
 The retained `--recovery-token` surface is a compatibility tombstone only: any schema-10 state/findings residue fails closed with the stable instruction to archive it and run fresh Plan/`init`. Neither the tombstone nor v2 reconfiguration carries analysis, submission, or approval forward.
+
+## Executable verification and working-set planning
+
+Resolve repository check recipes once from approved methods and observed capability, including exact command, timeout, mandatory identities, expected candidate writes (none for planned read-only checks) and dependency order. Preserve this in the existing Verification/Coverage/Handoff contracts; runtime may seal its optional verification manifest without inventing another product requirement. Probe immediate tool/session prerequisites cheaply; final device/manual prerequisites stay at the approved final boundary.
+
+Plan behavioral checkpoints within each slice, starting with the smallest real production integration and its required repeat/reset/exit transitions. Do not add separate full role waves per checkpoint. Context ceilings estimate the useful capsule plus referenced files, not a percentage of the model window or permission to load every readable file. Describe seams and current decisions so a replacement can recover only its working set. Mandatory identity coverage names concrete observable assertions and real paths; one green general suite is not evidence for all identities.

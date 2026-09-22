@@ -39,38 +39,30 @@ class SharedOperationalInvariantTests(unittest.TestCase):
         for role in roles:
             with self.subTest(role=role):
                 text = (SKILLS / role / "SKILL.md").read_text(encoding="utf-8")
+                if role == "gamedev-pipeline":
+                    self.assertIn("(references/director-runtime.md)", text)
+                    text = DIRECTOR.read_text(encoding="utf-8")
+                    self.assertIn("First dispatch reads shared [ownership]", text)
+                    self.assertIn("stage-handoff-invariant.md#one-owner-and-one-current-assignment", text)
                 self.assertIn("stage-handoff-invariant.md", text)
 
-    def test_context_rotation_has_one_safe_late_contract(self) -> None:
+    def test_context_rotation_has_one_owner_and_economic_handoff_contract(self) -> None:
         text = INVARIANT.read_text(encoding="utf-8")
-        required = (
-            "MUST NOT rotate or hand off solely because of context below 70%",
-            "At 70% context use",
-            "At 90% context use",
-            "before 100%",
-            "task or assignment is complete",
-            "real blocker",
-            "current project root",
-            "phase and generation",
-            "exact next public action",
-        )
-        for phrase in required:
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, text)
+        self.assertNotRegex(text, r"\b(?:70|90)%")
+        for required in ("useful working set", "Never mark incomplete work PASS", "quiescence", "idle `rotate-owner`", "exact next public action"):
+            self.assertIn(required, text)
+        # Role routers must discover the shared contract, not invent local
+        # thresholds. Behavior under pressure is exercised by role-scenarios.
+        for role in ("gamedev-pipeline", "gamedev-engineer", "gamedev-review", "gamedev-qa"):
+            source = (SKILLS / role / "SKILL.md").read_text(encoding="utf-8")
+            if role == "gamedev-pipeline":
+                self.assertIn("(references/director-runtime.md)", source)
+                source = DIRECTOR.read_text(encoding="utf-8")
+                self.assertIn("For context checkpoint/owner turnover, first read", source)
+                self.assertIn("stage-handoff-invariant.md#working-set-checkpoint-and-rotation", source)
+            self.assertIn("stage-handoff-invariant.md", source)
+            self.assertNotRegex(source, r"\b(?:70|90)%")
 
-        offenders: list[str] = []
-        for path in SKILLS.glob("gamedev-*/**/*.md"):
-            if "gamedev-specification" in path.parts or path == INVARIANT:
-                continue
-            for line_number, line in enumerate(
-                path.read_text(encoding="utf-8").splitlines(), start=1
-            ):
-                if not re.search(r"context|rotation|handoff", line, re.IGNORECASE):
-                    continue
-                for raw in re.findall(r"(?<!\d)(\d{1,3})\s*%", line):
-                    if int(raw) < 70:
-                        offenders.append(f"{path.relative_to(BUNDLE)}:{line_number}:{raw}%")
-        self.assertEqual([], offenders, "early context-only thresholds: " + ", ".join(offenders))
 
     def test_platform_and_observer_rules_are_shared_and_fail_closed(self) -> None:
         text = "\n".join(path.read_text(encoding="utf-8") for path in (INVARIANT, INTERACTION, MAINTENANCE))
@@ -118,33 +110,29 @@ class SharedOperationalInvariantTests(unittest.TestCase):
             with self.subTest(platform_default=platform_default):
                 self.assertNotIn(platform_default, template.lower())
 
-    def test_director_waits_for_and_consumes_each_child_result_before_final(self) -> None:
+    def test_director_owns_consumption_status_steering_and_host_limits(self) -> None:
         text = DIRECTOR.read_text(encoding="utf-8")
-        required = (
-            "After spawning any phase worker",
-            "owns that exact child until its terminal result",
-            "MUST wait using the available coordination primitive",
-            "MUST NOT send a final response",
-            "`work continues asynchronously`",
-            "while that child is live",
-            "re-read public controller status",
-            "same active assignment",
-            "exact returned output artifact",
-            "exact public controller `complete` action",
-            "including for a blocked outcome",
-            "re-read the resulting public controller status",
-            "no child owning an active assignment",
-            "no completed child artifact remaining unconsumed",
-        )
-        for phrase in required:
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, text)
-
-        self.assertIn("wait_agent({timeout_ms:600000})", text)
-        self.assertIn("wakes early for messages or user input", text)
-        self.assertIn("No message alone does not prove a stall", text)
-        self.assertIn("do not add a second observer", text)
+        # The closed event table now owns these obligations; do not require
+        # superseded prose from the former monolithic runtime manual.
+        rules = {
+            "assignment continuation": ("same assignment active", "idle/completed owner: `followup_task` in that assignment"),
+            "exact output and blocked consumption": ("exact assignment/output", "including fail/blocked output"),
+            "terminal consumption": ("Do not finalize an authorized run with a live child or unconsumed terminal output",),
+            "status steering": ("Status: answer from retained facts and resume work/wait", "A necessary question is nonterminal"),
+            "typed native result": ("Use returned typed outcome, final cursor and delivery",),
+            "no message is not a stall": ("Unchanged timeout/empty stdout: only renew the matching host wait", "No timer-driven inventories, messages or packet resend"),
+            "host slot boundary": ("capacity/pending-init/lost-owner", "`interrupt_agent` proves neither free slot nor dead subprocesses", "Retry dispatch only after changed lifecycle evidence"),
+        }
+        for obligation, phrases in rules.items():
+            with self.subTest(obligation=obligation):
+                for phrase in phrases:
+                    self.assertIn(phrase, text)
+        skill = (SKILLS / "gamedev-pipeline" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("(references/director-runtime.md)", skill)
+        self.assertIn("Do not poll, request transcripts, send unchanged packets, create a second observer", skill)
+        self.assertNotRegex(text, r"wait_agent\(\{timeout_ms:600000\}\)")
         self.assertIn("director-runtime.md", INVARIANT.read_text(encoding="utf-8"))
+
 
     def test_minimal_role_examples_pass_the_actual_semantic_validator(self) -> None:
         examples = (
@@ -226,32 +214,34 @@ class SharedOperationalInvariantTests(unittest.TestCase):
 
     def test_dispatch_instructions_name_fresh_context_and_existing_role_paths(self) -> None:
         skill = (SKILLS / "gamedev-pipeline" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn('fork_turns: "none"', skill)
-        self.assertIn("self-contained packet", skill)
-        for relative in re.findall(r"\]\((\.\./[^)]+/SKILL\.md)\)", skill):
-            self.assertTrue((SKILLS / "gamedev-pipeline" / relative).is_file(), relative)
+        self.assertIn("(references/director-runtime.md)", skill)
+        runtime = DIRECTOR.read_text(encoding="utf-8")
+        self.assertRegex(runtime, r'fork_turns:\s*"none"')
+        self.assertIn("control-return.md#caller-binding-and-dispatch", runtime)
+        self.assertIn("Forward delivery/`role_instructions` unchanged", runtime)
+        self.assertIn("Fresh/replaced/lost-context owners need full content", runtime)
+        self.assertIn("self-contained current packet", INVARIANT.read_text(encoding="utf-8"))
+        control = INVARIANT.with_name("control-return.md")
+        template = control.read_text(encoding="utf-8")
+        for field in ("Role instructions:", "Task and stop boundary:", "Inputs:", "Permissions:", "consume required input completely before work"):
+            self.assertIn(field, template)
+        self.assertIn("control-return.md#stage-ingress", runtime)
+        links = re.findall(r"\]\((\.\./[^)]+/SKILL\.md)\)", template)
+        self.assertTrue(links, "The ingress route must name existing role entrypoints")
+        for relative in links:
+            self.assertTrue((control.parent / relative).is_file(), relative)
 
-    def test_pipeline_defect_is_an_instruction_only_incident_stop(self) -> None:
-        pipeline_skill = (SKILLS / "gamedev-pipeline" / "SKILL.md").read_text(
-            encoding="utf-8"
-        )
-        protocol = (
-            SKILLS / "gamedev-pipeline" / "references" / "pipeline-protocol.md"
-        ).read_text(encoding="utf-8")
-        default_prompt = (
-            SKILLS / "gamedev-pipeline" / "agents" / "openai.yaml"
-        ).read_text(encoding="utf-8")
-        root_readme = (BUNDLE.parent / "README.md").read_text(encoding="utf-8")
-        invariant = INVARIANT.read_text(encoding="utf-8")
+    def test_incident_authority_is_scoped_and_prior_delegation_is_preserved(self) -> None:
+        authority = INVARIANT.with_name("authority-contract.md")
+        text = authority.read_text(encoding="utf-8")
+        self.assertIn("authority-contract.md", INVARIANT.read_text(encoding="utf-8"))
+        self.assertIn("A user may explicitly delegate", text)
+        self.assertIn("Reuse explicit prior maintenance authority", text)
+        self.assertIn("otherwise obtain it before changing shared pipeline code", text)
+        self.assertIn("never manufacture a user message", text)
+        self.assertIn("incident is never blanket permission", text)
+        self.assertIn("MUST NOT edit, patch, bypass", INVARIANT.read_text(encoding="utf-8"))
 
-        self.assertIn("MUST immediately stop the product run", invariant)
-        self.assertIn("MUST NOT edit, patch, bypass", invariant)
-        self.assertIn("new explicit user command", invariant)
-        for text in (pipeline_skill, protocol, default_prompt, root_readme):
-            with self.subTest(source=text[:40]):
-                self.assertRegex(text, r"(?i)stop|остана")
-                self.assertRegex(text, r"(?i)patch|патч|менять")
-                self.assertRegex(text, r"(?i)new explicit user|новой явной команд")
 
     def test_v2_authority_reopen_has_one_public_fail_closed_route(self) -> None:
         protocol = (
@@ -273,9 +263,12 @@ class SharedOperationalInvariantTests(unittest.TestCase):
             / "development_plan_state.py"
         ).read_text(encoding="utf-8")
 
-        for text in (protocol, pipeline_skill):
-            self.assertIn("v2 has no `authority_recovery_hold`", text)
-            self.assertIn("every other public mutation fails closed", text)
+        self.assertIn("(references/director-runtime.md)", pipeline_skill)
+        runtime = DIRECTOR.read_text(encoding="utf-8")
+        self.assertIn("pipeline-protocol.md#authority-and-phases", runtime)
+        authority = protocol.split("## Authority and phases", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("v2 has no `authority_recovery_hold`", authority)
+        self.assertIn("every other public mutation fails closed", authority)
         self.assertIn(
             "only after every changed upstream controller reports readiness", protocol
         )

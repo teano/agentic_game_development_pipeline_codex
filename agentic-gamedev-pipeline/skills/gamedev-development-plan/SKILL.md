@@ -5,6 +5,8 @@ description: Explicit-invocation only. Use only when the user explicitly request
 
 # GameDev Development Plan
 
+When the caller supplies `control_binding`, first apply the shared [control-return contract](../gamedev-pipeline/references/control-return.md). Keep semantic JSON and native stage handoffs unchanged; wrap only the requested return. A bounded caller task performs only its stated existing-role work, without automatic stage restart or approval. Standalone user calls retain their existing public result.
+
 ## Activation gate
 
 Proceed only on the explicit activation described above. Approved documents, apparent implementation readiness, or a generic planning request is not authorization. Do not activate another GameDev stage.
@@ -14,6 +16,8 @@ Read the shared [stage handoff invariant](../gamedev-pipeline/references/stage-h
 Act as Development Plan Director: own source authority, deterministic state, internal delegation, and the approval gate. Do not perform the Planning Analyst's analysis in the Director context. Use `scripts/development_plan_state.py` for every transition; never edit its JSON state directly. Start from [development-plan.md](assets/development-plan.md) when creating the canonical plan.
 
 ## Establish authority
+
+Apply the shared authority contract to direct versus explicitly delegated decisions and exact-revision approvals. Record the actual actor and source; never fabricate a user answer or skip owning-controller validation/readiness. Stage workers still return their handoff; an authorized full-cycle parent continues the next stage.
 
 Use read-only `technical-decisions-context` for the current source packet. The planning controller binds journal context during analysis/submission; changed context makes that unfinished draft stale and uses existing `reinitialize` with a fresh Analyst. New runtime entries alone do not revoke an already approved plan. Deliberate `revise-approved` captures the current journal for fresh analysis. A user-chosen local amendment uses a targeted owning-stage edit and its normal exact approval/readiness; runtime reconvergence can restart Plan/Slice through `init`, without requiring full document regeneration.
 
@@ -29,7 +33,7 @@ Reassess applicable decisions against current PRD/SPEC bytes and incorporate jus
 
 ## Choose ownership shape
 
-Use `single_owner` when production work and tightly coupled automated tests form one bounded write scope or have poor seams. It does not reserve one Engineer identity for the lifecycle.
+Use `single_owner` when production work and tightly coupled automated tests form one bounded write scope or have poor seams. At runtime a stable Engineer owns related implementation/remediation within the slice; assignment IDs and role ownership remain separate, and independent reviewers never share its role.
 
 Use `sequential_slices` only when every slice yields an observable end-to-end result, maps to approved requirements/acceptance, has a bounded working set, and consumes a sealed earlier handoff without competing writes. Never split by backend/UI/tests or plan parallel writers.
 
@@ -49,7 +53,7 @@ If an already approved plan itself needs correction while PRD/SPEC authority rem
 
 Any PRD/spec byte drift, lost approval, lost `SPEC_READY`, or trace mismatch makes the plan stale. Preserve history and use `reinitialize` with a distinct fresh Analyst after upstream reconvergence. Never delete state or patch hashes manually.
 
-Return:
+Return these existing handoff fields unchanged, as `task_result.payload` when a caller binding is supplied or directly for a standalone call:
 
 - `PLAN_READY: yes|no`, canonical path, mode, submitted/approved SHA, and source paths/hashes;
 - exact unresolved approval, source, scope, or validation gate;

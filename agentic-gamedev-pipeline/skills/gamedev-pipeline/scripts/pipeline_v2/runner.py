@@ -8,10 +8,12 @@ import json
 import os
 import re
 import shutil
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from .technical_decisions import validate_entry
+from .execution import metadata, owner_key, recipe_for, receipt_binding, seal_verification, verification_environment
 
 from .checkout import (
     authority_items,
@@ -31,6 +33,7 @@ from .legacy_gen53 import SCHEMA10_UNSUPPORTED_MESSAGE
 from .model import (
     PHASES,
     PipelineError,
+    WorkerArtifactValidationError,
     assignment_identity,
     assignment_output_path,
     canonical_command,
@@ -51,6 +54,7 @@ from .model import (
     slices_are_read_sealed,
     status_view,
     terminal_blocked_context,
+    validate_capability_recovery,
     validate_state,
     workflow_relative_path,
 )
@@ -411,8 +415,9 @@ class Controller:
         if (not authority_items_equal(observed, state["authority"]["items"])
                 or not slices_are_read_sealed(state)):
             raise PipelineError("maintenance cannot change approved authority or scope")
-        if current != active["base"]["candidate_tree_oid"]:
-            raise PipelineError("maintenance requires an untouched active candidate")
+        drift = self._checkout_drift(state, root, current)
+        if drift:
+            raise PipelineError("maintenance cannot adopt foreign active changes: " + ", ".join(drift))
         if repository_policy_changed(root, state["base_tree_oid"], current):
             raise PipelineError("maintenance cannot change repository policy")
         output = safe_path(root, assignment_output_path(active, state["feature"]), "active output", strict=False)
@@ -466,7 +471,10 @@ class Controller:
                 or not isinstance(packet.get("authorization"), str) or not packet["authorization"].strip()):
             raise PipelineError("product failure requires exact binding and explicit authorization")
         self._product_failure_evidence(state, root, packet)
-        worker = _worker_artifact({"outcome": "fail", "checks": packet["checks"]}, "qa", "qa")
+        try:
+            worker = _worker_artifact({"outcome": "fail", "checks": packet["checks"]}, "qa", "qa")
+        except WorkerArtifactValidationError as exc:
+            raise PipelineError(str(exc)) from exc
         allowed = state["artifacts"]["qa"].get("required_identity_ids", [])
         if not worker["checks"] or any(item["outcome"] != "fail" or item["id"] not in allowed for item in worker["checks"]):
             raise PipelineError("product failure requires newly evidenced failed approved QA identities")
@@ -580,7 +588,8 @@ class Controller:
                 }
             elif (
                 authority_changed or scope_changed or runtime_changed
-                or terminal_recovery is not None
+                or recovery is not None or maintenance is not None or product_failure is not None
+                or admit_baseline
             ):
                 action = reconfiguration_action(
                     state, observed, proposed_slices,
@@ -637,6 +646,18 @@ class Controller:
                 historical = assignment_identity(
                     state["run_id"], issuance_generation, phase,
                 )
+                issued = prior.get("issued_identity")
+                if isinstance(issued, dict):
+                    historical = deepcopy(issued)
+                else:
+                    # Compatibility for a persisted assignment issued before
+                    # owner aliases were recorded in next receipts.
+                    active = state.get("active_assignment")
+                    if isinstance(active, dict) and active.get("id") == historical["id"]:
+                        historical["worker_id"] = active["worker_id"]
+                    for event in state["history"]:
+                        if event.get("assignment_id") == historical["id"] and isinstance(event.get("actor_id"), str):
+                            historical["worker_id"] = event["actor_id"]
                 for field in ("id", "worker_id", "task"):
                     if field in supplied and supplied[field] != historical[field]:
                         raise PipelineError(
@@ -683,6 +704,8 @@ class Controller:
                 "expected_generation": state["generation"] if expected_generation is None else expected_generation,
                 "controller_base": {"candidate_tree_oid": snapshot},
             }
+            if state["phase"] == "qa":
+                command["controller_machine_checks"] = self._machine_check_inputs(state, snapshot)
             return self.store._dispatch_locked(command)
 
     def reconfigure(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -832,6 +855,10 @@ class Controller:
                     raise PipelineError(f"live checkout drifted from controller evidence: {drift}")
                 scope_changed = value["slices"] != state["slices"]
                 terminal_recovery = terminal_blocked_context(state)
+                if (terminal_recovery is not None and not authority_changed and not scope_changed
+                        and runtime_digest == state["pipeline_runtime_digest"]
+                        and recovery is None and not admit_baseline and product_failure is None):
+                    raise PipelineError("unchanged blocked bindings require recover-capability with fresh prerequisite evidence")
                 if (
                     authority_changed or scope_changed
                     or runtime_digest != state["pipeline_runtime_digest"]
@@ -880,6 +907,11 @@ class Controller:
                 self._product_failure_evidence(state, root, product_failure)
             if (recovery is not None or maintenance is not None or product_failure is not None) and candidate_tree_oid(root) != current:
                 raise PipelineError("recovery checkout changed; read status again")
+            verification = value.get("verification")
+            if verification is None and state is not None:
+                verification = state.get("execution", {}).get("verification")
+            if verification is not None:
+                value["verification"] = seal_verification(verification, value["slices"])
             return self.store._dispatch_locked(value)
 
     def migrate(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -897,7 +929,196 @@ class Controller:
             replay = self.store._replay_locked(command)
             if replay is not None:
                 return replay
+            if command.get("name") == "accept" and state["phase"] == "review":
+                original = state["artifacts"].get("docs", {}).get("reusable_qa")
+                if original is not None:
+                    current_environment = verification_environment(current_slice(state)["planned_commands"], _process_environment(), state=state)
+                    command["controller"] = {"pure_documentation_qa": current_environment is not None
+                                              and current_environment == original.get("verification_environment")}
             return self.store._dispatch_locked(deepcopy(command))
+
+    def read_status(self) -> dict[str, Any]:
+        """Bound source reads validate state/access without a full checkout scan.
+
+        Read access grants no credit. The source reader separately checks exact
+        bytes/version; every mutation and terminal gate retains full guards.
+        """
+        self._preflight_existing_store_location()
+        with self.store.transaction():
+            state = self.store.load()
+            validate_state(state)
+            self.store.validate_project_location(canonical_project_root(state["project_root"]), state["feature"])
+            return status_view(state)
+
+    @staticmethod
+    def _machine_check_row(result, locator, receipt_id):
+        return {"id": result["check_id"], "outcome": "pass" if result["returncode"] == 0 else "fail",
+                "source_locator": locator, "receipt_id": receipt_id, "receipt_sha256": digest(result),
+                "returncode": result["returncode"], "stdout_sha256": result["stdout_sha256"],
+                "stderr_sha256": result["stderr_sha256"]}
+
+    def _machine_check_inputs(self, state, tree):
+        """Publish only currently applicable canonical machine receipts to QA."""
+        rows, pending = [], []
+        environment = _process_environment()
+        for index, argv in enumerate(current_slice(state)["planned_commands"]):
+            recipe = recipe_for(state, argv, index, self.timeout)
+            binding = receipt_binding(state, tree, recipe, environment)
+            receipt = state.get("execution", {}).get("receipts", {}).get(binding)
+            if receipt is None:
+                pending.append(recipe["id"])
+            else:
+                locator = f"{state['workflow_path']}/pipeline-state.json#/execution/receipts/{binding}"
+                rows.append(self._machine_check_row(receipt["result"], locator, receipt["id"]))
+        return {"candidate_tree_oid": tree, "authority_digest": state["authority"]["digest"],
+                "pipeline_runtime_digest": state["pipeline_runtime_digest"], "checks": rows,
+                "pending_check_ids": pending, "grants_manual_acceptance": False}
+
+    def control_action(self, name: str, *, command_id: str, expected_generation: int, **payload):
+        """Bounded execution commands share the existing lock/CAS/reducer path."""
+        if name not in {"check", "rotate-owner", "read-admit", "recover-capability", "reconcile"}:
+            raise PipelineError("unknown execution action")
+        _require_expected_generation(expected_generation)
+        command = {"name": name, "id": command_id, "expected_generation": expected_generation, **deepcopy(payload)}
+        self._preflight_existing_store_location()
+        with self.store.transaction():
+            state, root = self._loaded()
+            current = candidate_tree_oid(root)
+            if repository_policy_changed(root, state["base_tree_oid"], current):
+                raise PipelineError("execution action cannot adopt repository policy drift")
+            checked = self.store._preflight_locked(state, command)
+            if isinstance(checked, dict):
+                self._verify_live_checkout(state, root)
+                return checked
+            active = state["active_assignment"]
+            if name != "reconcile":
+                self._verify_live_checkout(state, root)
+            if name == "check":
+                if (active is None or active["phase"] not in {"engineering", "qa"} or payload.get("assignment_id") != active["id"]
+                        or not isinstance(payload.get("quiescence"), str) or not payload["quiescence"].strip()):
+                    raise PipelineError("check requires exact active Engineering/QA assignment and factual writer/session quiescence")
+                if safe_path(root, active["output_path"], "worker output").exists():
+                    raise PipelineError("terminal worker output exists; consume it before another diagnostic check")
+                results, receipts = self._execute_checks(state, root, active, command_id,
+                                                         collect_independent=bool(payload.get("collect_independent")))
+                command["controller"] = {"assignment_id": active["id"], "candidate_tree_oid": current,
+                                         "results": results, "grants_semantic_credit": False}
+                command["controller_receipts"] = receipts
+                rows = [self._machine_check_row(result,
+                        f"{state['workflow_path']}/pipeline-state.json#/active_assignment/capsule/context/diagnostic_checks/results/{index}",
+                        digest([command_id, index, result])) for index, result in enumerate(results)]
+                command["controller_machine_checks"] = {
+                    "candidate_tree_oid": current, "authority_digest": state["authority"]["digest"],
+                    "pipeline_runtime_digest": state["pipeline_runtime_digest"], "checks": rows,
+                    "pending_check_ids": [recipe_for(state, argv, index, self.timeout)["id"]
+                                         for index, argv in enumerate(active["commands"]) if index >= len(results)],
+                    "grants_manual_acceptance": False,
+                }
+            elif name == "read-admit":
+                path = payload.get("path")
+                if (active is None or not isinstance(path, str) or normalize_literal_path(path) != path
+                        or "*" in path or not isinstance(payload.get("reason"), str) or not payload["reason"].strip()):
+                    raise PipelineError("read admission requires an exact source and dependency reason")
+                if any(part.casefold() in {".git", ".agentic-pipeline", ".agentic-pipeline-v2"} for part in path.split("/")):
+                    raise PipelineError("read admission cannot access controller or foreign workflow paths")
+                if not safe_path(root, path, "read dependency", strict=True).is_file():
+                    raise PipelineError("read dependency must be an existing file")
+                command["controller"] = {"path": path}
+            elif name == "recover-capability":
+                validate_capability_recovery(state, command)
+            elif name == "reconcile":
+                if active is not None:
+                    raise PipelineError("external reconcile requires an idle assignment boundary")
+                packet = payload.get("packet")
+                binding = {"run_id": state["run_id"], "feature": state["feature"], "generation": state["generation"],
+                           "candidate_tree_oid": current, "authority_digest": state["authority"]["digest"]}
+                if (not isinstance(packet, dict) or set(packet) != set(binding) | {"paths"}
+                        or any(packet.get(key) != value for key, value in binding.items())):
+                    raise PipelineError("stale or malformed external reconcile binding")
+                drift = self._checkout_drift(state, root, current)
+                paths = packet["paths"]
+                if (not isinstance(paths, list) or not drift
+                        or [item.get("path") for item in paths if isinstance(item, dict)] != drift):
+                    raise PipelineError("reconcile must enumerate exactly the observed external paths")
+                for item in paths:
+                    if set(item) != {"path", "authorization", "provenance"} or any(not isinstance(v, str) or not v.strip() for v in item.values()):
+                        raise PipelineError("reconcile needs exact per-path authorization and provenance")
+                from .model import completed_slice_ids
+                completed = completed_slice_ids(state)
+                affected = []
+                for index, selected in enumerate(state["slices"]):
+                    rules = selected["allowed_paths"] + selected.get("read_paths", [])
+                    if any(not violations([path], rules) for path in drift):
+                        affected.append(index)
+                # Unmapped global inputs invalidate every slice conservatively.
+                all_rules = [rule for item in state["slices"] for rule in item["allowed_paths"] + item.get("read_paths", [])]
+                first = min(affected) if affected and not violations(drift, all_rules) else 0
+                command["controller"] = {"candidate_tree_oid": current, "retained_prefix": completed[:first]}
+            elif name == "rotate-owner":
+                if active is not None or not isinstance(payload.get("reason"), str) or not payload["reason"].strip():
+                    raise PipelineError("owner rotation requires idle state and durable handoff reason")
+            verify_authority(root, state["authority"])
+            if candidate_tree_oid(root) != current:
+                raise PipelineError("candidate changed while executing the bound action")
+            return self.store._dispatch_prechecked_locked(checked, command)
+
+    def _execute_checks(self, state, root, active, action_id, *, collect_independent=False):
+        results, new_receipts = [], {}
+        environment = _process_environment()
+        failed = False
+        for index, argv in enumerate(active["commands"]):
+            recipe = recipe_for(state, argv, index, self.timeout)
+            if failed and not (collect_independent and recipe["independent"]):
+                break
+            before = candidate_tree_oid(root)
+            binding = receipt_binding(state, before, recipe, environment)
+            receipt = state.get("execution", {}).get("receipts", {}).get(binding)
+            if receipt is not None:
+                result = deepcopy(receipt["result"])
+                result.update({"duration_ms": 0, "execution_reason": "unchanged_deterministic_inputs",
+                               "source_receipt": receipt["id"]})
+            else:
+                started = time.monotonic()
+                try:
+                    executable = shutil.which(argv[0]) if os.name == "nt" else None
+                    execution_argv = [executable, *argv[1:]] if executable else argv
+                    process = run_process_tree(execution_argv, cwd=root, env=environment,
+                                               timeout=recipe["timeout_seconds"])
+                    result = {"argv": argv, "returncode": process.returncode,
+                              "stdout_sha256": process.stdout_sha256, "stderr_sha256": process.stderr_sha256}
+                    if process.returncode != 0:
+                        result.update(_stderr_excerpt(process.stderr_tail,
+                                      raw_truncated=process.stderr_tail_truncated, environment=environment, project_root=root))
+                        stdout = _stderr_excerpt(getattr(process, "stdout_tail", b""),
+                                      raw_truncated=getattr(process, "stdout_tail_truncated", False),
+                                      environment=environment, project_root=root)
+                        result.update({key.replace("stderr", "stdout"): value for key, value in stdout.items()})
+                except OSError as exc:
+                    raw = str(exc).encode("utf-8", errors="replace")
+                    result = {"argv": argv, "returncode": TECHNICAL_FAILURE_RETURN_CODE,
+                              "stdout_sha256": _stream_digest(b""), "stderr_sha256": _stream_digest(raw)}
+                    result.update(_stderr_excerpt(raw, raw_truncated=False, environment=environment, project_root=root))
+                result.update({"duration_ms": max(0, int((time.monotonic() - started) * 1000)),
+                               "execution_reason": "environment_sensitive" if binding is None else "new_input_binding"})
+            result["check_id"] = recipe["id"]
+            after = candidate_tree_oid(root)
+            policy = repository_policy_changed(root, state["base_tree_oid"], after)
+            if policy:
+                raise PipelineError("planned command changed repository policy; perform a fresh init: " + ", ".join(policy))
+            if after != before:
+                raise PipelineError("planned command changed the Git candidate: " + ", ".join(changed_paths(root, before, after)))
+            if binding is not None and receipt_binding(state, after, recipe, environment) != binding:
+                raise PipelineError("verification dependencies changed during the planned command; repeat with stable inputs")
+            results.append(result)
+            if result["returncode"] == 0 and binding is not None:
+                new_receipts[binding] = {"binding": binding, "id": digest([action_id, index, binding]),
+                                         "result": deepcopy(result), "candidate_tree_oid": before}
+            if result["returncode"] != 0:
+                failed = True
+                # Containment/timeout or a failed prerequisite cannot license later work.
+                if result["returncode"] in {124, TECHNICAL_FAILURE_RETURN_CODE} or not recipe["independent"]:
+                    break
+        return results, new_receipts
 
     def complete(self, *, command_id: str, artifact_path: Path | None = None, expected_generation: int | None = None) -> dict[str, Any]:
         _require_expected_generation(expected_generation)
@@ -952,66 +1173,11 @@ class Controller:
             artifact = _worker_artifact(artifact, active["phase"], active["role"], required_ids)
             results = []
 
-            def run_checks(
-                checkout: Path, environment: dict[str, str],
-            ) -> None:
-                for argv in active["commands"]:
-                    before_command = candidate_tree_oid(checkout)
-                    try:
-                        executable = shutil.which(argv[0]) if os.name == "nt" else None
-                        execution_argv = [executable, *argv[1:]] if executable else argv
-                        result = run_process_tree(
-                            execution_argv, cwd=checkout, env=environment,
-                            timeout=self.timeout,
-                        )
-                        command_result = {
-                            "argv": argv, "returncode": result.returncode,
-                            "stdout_sha256": result.stdout_sha256,
-                            "stderr_sha256": result.stderr_sha256,
-                        }
-                        if result.returncode != 0:
-                            command_result.update(_stderr_excerpt(
-                                result.stderr_tail,
-                                raw_truncated=result.stderr_tail_truncated,
-                                environment=environment,
-                                project_root=root,
-                            ))
-                    except OSError as exc:
-                        raw_error = str(exc).encode("utf-8", errors="replace")
-                        command_result = {
-                            "argv": argv, "returncode": TECHNICAL_FAILURE_RETURN_CODE,
-                            "stdout_sha256": _stream_digest(b""),
-                            "stderr_sha256": _stream_digest(raw_error),
-                        }
-                        command_result.update(_stderr_excerpt(
-                            raw_error,
-                            raw_truncated=False,
-                            environment=environment,
-                            project_root=root,
-                        ))
-                    results.append(command_result)
-                    after_command = candidate_tree_oid(checkout)
-                    policy = repository_policy_changed(
-                        checkout, state["base_tree_oid"], after_command,
-                    )
-                    if policy:
-                        raise PipelineError(
-                            "planned command changed repository policy; perform a fresh init: "
-                            + ", ".join(policy)
-                        )
-                    if after_command != before_command:
-                        command_changes = changed_paths(
-                            checkout, before_command, after_command,
-                        )
-                        raise PipelineError(
-                            "planned command changed the Git candidate: "
-                            + ", ".join(command_changes)
-                        )
-                    if command_result["returncode"] != 0:
-                        break
-
-            if artifact["outcome"] != "blocked":
-                run_checks(root, _process_environment())
+            new_receipts = {}
+            if artifact["outcome"] == "pass":
+                results, new_receipts = self._execute_checks(state, root, active, command_id)
+            command["controller_receipts"] = new_receipts
+            command["controller_environment"] = verification_environment(active["commands"], _process_environment(), state=state)
             verify_authority(root, state["authority"])
             current = candidate_tree_oid(root)
             policy = repository_policy_changed(root, state["base_tree_oid"], current)

@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pipeline_v2.tests import test_core
 from pipeline_v2.checkout import candidate_tree_oid
-from pipeline_v2.model import PipelineError, ConflictError, compact_assignment_context, current_slice, journal_digest, status_view
+from pipeline_v2.model import PipelineError, ConflictError, compact_assignment_context, current_slice, digest, journal_digest, status_view
 from pipeline_v2.technical_decisions import technical_decisions_context
 
 
@@ -116,23 +116,29 @@ class TechnicalDecisionTests(unittest.TestCase):
         completed = self.h._complete("COMPLETE-reordered", {"outcome": "pass", "summary": "Verified corrected check ordering"})
         self.assertEqual(reversed_commands, [item["argv"] for item in completed["artifacts"]["engineering"]["controller"]["commands"]])
 
-    def test_blocker_is_recorded_as_unresolved_and_preserved_through_init(self):
-        self.apply(self.packet(additional_paths=["companion.asset"]))
+    def test_controller_blocker_is_archived_by_capability_recovery_preserving_overlay(self):
+        blocker_id = f"TD-BLOCK-{digest(current_slice(self.h.store.load())['id'])[:10]}-engineering"
+        self.apply(self.packet(additional_paths=["companion.asset"], entry={**self.entry(), "id": blocker_id}))
         (self.h.root / "companion.asset").write_text("preserved editor output", encoding="utf-8")
+        original_journal = deepcopy(self.h.store.load()["technical_decisions"])
+        original_scope = current_slice(self.h.store.load())
         blocked = self.h._complete("COMPLETE-block-technical", {
             "outcome": "blocked", "summary": "External prerequisite unavailable",
             "blocker": "Missing user-owned upload capability", "required_action": "Provide that capability"})
         journal = deepcopy(blocked["technical_decisions"])
+        self.assertEqual(original_scope, current_slice(blocked))
+        self.assertEqual(original_journal[blocker_id]["execution"], journal[blocker_id]["execution"])
         self.assertTrue(any(item["decision"].startswith("Unresolved:") for item in journal.values()))
         action = self.h.controller.status()["next_action"]
-        self.assertEqual("init", action["command"])
+        self.assertEqual("recover-capability", action["command"])
         self.assertTrue(action["user_input_required"])
-        self.h.controller.reconfigure({"name": "init", "id": action["command_id"],
-            "expected_generation": action["expected_generation"], "run_id": action["run_id"],
-            "feature": self.h.feature, "workflow_path": self.h.workflow_path, "project_root": str(self.h.root),
-            "authority_paths": action["authority"], "slices": action["slices"]})
-        self.assertEqual(journal, self.h.store.load()["technical_decisions"])
-        self.h._reach_engineering("-technical-resumed")
+        recovered = self.h.controller.control_action("recover-capability", command_id=action["command_id"],
+            expected_generation=action["expected_generation"], evidence={"binding": action["capability_binding"],
+                "prerequisite": "User-owned upload capability", "resolution": "The same authorized channel is available.",
+                "evidence": "Read-only capability probe succeeded.", "unchanged_dependencies": "Product and acceptance inputs unchanged."})
+        self.assertEqual(original_journal, recovered["technical_decisions"])
+        self.assertEqual(original_scope, current_slice(recovered))
+        self.assertEqual(blocked["artifacts"]["engineering"], recovered["history"][-1]["prior_artifacts"]["engineering"])
         issued = self.h.controller.next(command_id="NEXT-resumed-overlay")
         self.assertIn("companion.asset", issued["active_assignment"]["access"]["write"])
         self.assertEqual("preserved editor output", (self.h.root / "companion.asset").read_text())

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
-from .technical_decisions import journal_digest, journal_reference, validate_entry
+from .technical_decisions import journal_digest, journal_reference, validate_entry, semantic_journal_digest
+from .execution import metadata, owner_key, finding_updates, convergence_context
 
 from .checkout import authority_items_equal, matches, path_identity, violations as diff_violations
 from .legacy_gen53 import SCHEMA10_UNSUPPORTED_MESSAGE
@@ -14,6 +15,7 @@ from .model import (
     PHASES,
     ROLES,
     PipelineError,
+    WorkerArtifactValidationError,
     all_slices_completed,
     artifact_schema,
     assignment_identity,
@@ -28,6 +30,7 @@ from .model import (
     current_candidate,
     current_slice,
     default_assignment,
+    documentation_not_required_after_qa,
     effective_slice,
     digest,
     is_digest,
@@ -42,13 +45,15 @@ from .model import (
     qa_credit_complete,
     retained_engineering_paths,
     required_qa_identity_ids,
+    review_journal_changed,
     slice_records,
     slices_are_read_sealed,
     terminal_blocked_context,
+    validate_capability_recovery,
     validate_state,
 )
 
-COMMANDS = {"init", "status", "next", "complete", "answer", "accept", "migrate", "ready", "technical-observe", "technical-decision"}
+COMMANDS = {"init", "status", "next", "complete", "answer", "accept", "migrate", "ready", "technical-observe", "technical-decision", "check", "rotate-owner", "read-admit", "recover-capability", "reconcile"}
 WORKER_FORBIDDEN_KEYS = {
     "authority_digest", "base_checkout_sha256", "current_checkout_sha256", "checkout",
     "controller", "diff", "diff_sha256", "inventory", "commands", "tests", "receipts",
@@ -89,6 +94,15 @@ def _contains_forbidden(value: Any) -> str | None:
 def _worker_artifact(
     value: Any, phase: str, role: str, required_identity_ids: list[str] | None = None,
 ) -> dict[str, Any]:
+    try:
+        return _validate_worker_artifact(value, phase, role, required_identity_ids)
+    except PipelineError as exc:
+        raise WorkerArtifactValidationError(str(exc)) from exc
+
+
+def _validate_worker_artifact(
+    value: Any, phase: str, role: str, required_identity_ids: list[str] | None = None,
+) -> dict[str, Any]:
     schema = artifact_schema(phase, role)
     allowed = set(schema["allowed_keys"])
     required = set(schema["required_keys"])
@@ -122,7 +136,7 @@ def _worker_artifact(
     if phase == "review":
         findings = value.get("findings")
         if not isinstance(findings, list) or any(
-            not isinstance(item, dict) or set(item) != {"text", "severity", "kind"}
+            not isinstance(item, dict) or not {"text", "severity", "kind"} <= set(item) or set(item) - {"id", "text", "severity", "kind"}
             or any(not isinstance(item[key], str) or not item[key].strip() for key in item)
             for item in findings
         ):
@@ -131,6 +145,9 @@ def _worker_artifact(
             raise PipelineError("passing Review requires no findings")
         if value["outcome"] == "fail" and not findings:
             raise PipelineError("failed Review requires at least one finding")
+        explicit_ids = [item["id"] for item in findings if "id" in item]
+        if len(explicit_ids) != len(set(explicit_ids)):
+            raise PipelineError("duplicate Review finding IDs are not allowed")
     if phase == "qa":
         checks = value.get("checks")
         if not isinstance(checks, list) or any(
@@ -214,7 +231,21 @@ def _validate_controller(
             or not is_digest(item.get("stderr_sha256"))
         ):
             raise PipelineError("malformed controller command result")
-        keys = set(item)
+        metadata_keys = {"duration_ms", "check_id", "execution_reason", "source_receipt"}
+        keys = set(item) - metadata_keys
+        stdout_keys = {"stdout_excerpt", "stdout_excerpt_truncated", "stdout_excerpt_redacted"}
+        if keys & stdout_keys:
+            if not stdout_keys <= keys or item["returncode"] == 0:
+                raise PipelineError("malformed controller stdout excerpt")
+            if (not isinstance(item["stdout_excerpt"], str) or len(item["stdout_excerpt"].encode("utf-8")) > 4096
+                    or type(item["stdout_excerpt_truncated"]) is not bool or type(item["stdout_excerpt_redacted"]) is not bool):
+                raise PipelineError("malformed controller stdout excerpt")
+            keys -= stdout_keys
+        if "duration_ms" in item and (type(item["duration_ms"]) is not int or item["duration_ms"] < 0):
+            raise PipelineError("malformed command duration")
+        for key in ("check_id", "execution_reason", "source_receipt"):
+            if key in item and (not isinstance(item[key], str) or not item[key]):
+                raise PipelineError("malformed command telemetry")
         if item["returncode"] == 0:
             if keys != base_result:
                 raise PipelineError("successful controller command persisted failure-only evidence")
@@ -235,12 +266,12 @@ def _validate_controller(
     if failures:
         if len(failures) != 1 or failures[0][0] != len(results):
             raise PipelineError("controller command evidence continued after the first failure")
-    elif artifact["outcome"] != "blocked" and len(results) != len(active["commands"]):
+    elif artifact["outcome"] == "pass" and len(results) != len(active["commands"]):
         raise PipelineError("controller command evidence truncated a successful plan")
     if artifact["outcome"] == "blocked" and results:
         raise PipelineError("blocked worker evidence cannot contain command receipts")
     if (
-        artifact["outcome"] != "blocked"
+        artifact["outcome"] == "pass"
         and active["phase"] in {"engineering", "qa"} and not results
     ):
         raise PipelineError(f"{active['phase']} requires controller-run checks")
@@ -270,6 +301,8 @@ def _record(
     }
     if completed_actor:
         entry.update(completed_actor)
+    if command["name"] == "next":
+        entry["issued_identity"] = {key: command["assignment"][key] for key in ("id", "worker_id", "task")}
     state["history"].append(entry)
     validate_state(state)
     return state
@@ -401,12 +434,12 @@ def _verification_failure_context(
     if not isinstance(candidate, dict):
         return None
     failures = []
-    for phase in ("review", "qa"):
+    for phase in ("engineering", "review", "qa"):
         record = state["artifacts"].get(phase)
         worker = record.get("worker") if isinstance(record, dict) else None
         if (
             isinstance(worker, dict)
-            and record.get("candidate_binding") == candidate
+            and record.get("candidate" if phase == "engineering" else "candidate_binding") == candidate
             and (
                 worker.get("outcome") == "fail"
                 or isinstance(record.get("controller_failure"), dict)
@@ -416,7 +449,9 @@ def _verification_failure_context(
                 "phase": phase, "candidate": deepcopy(candidate),
                 "outcome": worker.get("outcome"),
             }
-            if phase == "review":
+            if phase == "engineering":
+                item["summary"] = worker.get("summary", "Engineering checks failed")
+            elif phase == "review":
                 item["findings"] = deepcopy(worker.get("findings", []))
             else:
                 item["checks"] = deepcopy(worker.get("checks", []))
@@ -424,6 +459,9 @@ def _verification_failure_context(
                 item["review_target"] = deepcopy(record["review_target"])
             if isinstance(record.get("controller_failure"), dict):
                 item["controller_failure"] = deepcopy(record["controller_failure"])
+            diagnostic = record.get("diagnostic_checks")
+            if isinstance(diagnostic, dict) and diagnostic.get("candidate_tree_oid") == candidate["candidate_tree_oid"]:
+                item["diagnostic_checks"] = deepcopy(diagnostic)
             failures.append((candidate["generation"], PHASES.index(phase), item))
     return max(failures, default=(0, 0, None))[-1]
 
@@ -536,6 +574,52 @@ def _retained_candidate_evidence(state: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _confirm_approved_plan(state: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+    """Record controller confirmation only; product verification remains open."""
+    epoch = state["generation"]
+    for phase in ("plan", "slice"):
+        identity = f"approved-{phase}-{state['authority']['digest'][:16]}-g{epoch}"
+        state["artifacts"][phase] = {
+            "assignment_id": identity,
+            "worker": {"outcome": "pass", "summary": "Exact approved authority and sealed scope confirmed by controller."},
+            "controller": deepcopy(baseline["controller"]),
+            "candidate_binding": None,
+            "technical_journal_digest": journal_digest(state.get("technical_decisions", {})),
+            "semantic_journal_digest": semantic_journal_digest(state.get("technical_decisions", {})),
+        }
+        state = _record(state, {"name": "confirm-approved", "id": identity}, phase,
+                        completed_actor={"actor_id": "controller", "phase": phase, "assignment_id": identity})
+    state["phase"] = "engineering"
+    return state
+
+
+def _runtime_rebind_can_confirm(state: dict[str, Any]) -> bool:
+    if pending(state["questions"]) or terminal_blocked_context(state) is not None:
+        return False
+    if state["phase"] not in {"plan", "slice"}:
+        return True
+    if (state["phase"] != "plan"
+            or state["artifacts"].get("plan", {}).get("assignment_id") != "controller-checkout-baseline"):
+        return False
+    # An older runtime may already have reset an idle downstream run to Plan.
+    # Follow only unchanged-authority/scope resets back to that boundary; a
+    # genuine upstream replan or interrupted worker must still be resolved.
+    for event in reversed(state["history"]):
+        if event.get("command") == "complete" and event.get("phase") in {"plan", "slice"}:
+            return False
+        if event.get("command") != "init" or event.get("result") != "authority_scope_reconfigured":
+            continue
+        prior = event.get("prior", {})
+        if (prior.get("authority_digest") != state["authority"]["digest"]
+                or prior.get("slices_digest") != digest(state["slices"])
+                or prior.get("open_questions") or prior.get("interrupted_assignment")
+                or prior.get("approved_plan_reuse_allowed") is False):
+            return False
+        if prior.get("phase") != "plan":
+            return prior.get("phase") in {"engineering", "review", "qa", "docs", "ready"}
+    return False
+
+
 def reduce(state: dict[str, Any] | None, command: dict[str, Any]) -> dict[str, Any]:
     """Public reducer entrypoint; replay/CAS validation cannot be bypassed."""
     return _reduce_command(state, command, None)
@@ -587,7 +671,10 @@ def _reduce_command(
                 work = deepcopy(state)
                 original = deepcopy(state["artifacts"])
                 record = deepcopy(original["qa"])
-                record["worker"] = _worker_artifact({"outcome": "fail", "checks": packet["checks"]}, "qa", "qa")
+                try:
+                    record["worker"] = _worker_artifact({"outcome": "fail", "checks": packet["checks"]}, "qa", "qa")
+                except WorkerArtifactValidationError as exc:
+                    raise PipelineError(str(exc)) from exc
                 record.pop("controller_failure", None)
                 # Rebind only noncredit remediation evidence; original QA remains in history.
                 record["candidate_binding"]["pipeline_runtime_digest"] = command["pipeline_runtime_digest"]
@@ -611,15 +698,24 @@ def _reduce_command(
                 base_tree_oid=command["controller_base"]["candidate_tree_oid"],
                 pipeline_runtime_digest=command["pipeline_runtime_digest"],
             )
-            unchanged_bindings = (
+            unchanged_authority_scope = (
                 authority_items_equal(
                     proposed["authority"]["items"], state["authority"]["items"],
                 )
                 and proposed["slices"] == state["slices"]
-                and proposed["pipeline_runtime_digest"] == state["pipeline_runtime_digest"]
             )
+            unchanged_bindings = (unchanged_authority_scope
+                                  and proposed["pipeline_runtime_digest"] == state["pipeline_runtime_digest"])
+            runtime_rebind = (unchanged_authority_scope and not unchanged_bindings
+                              and state["active_assignment"] is None
+                              and slices_are_read_sealed(state)
+                              and command.get("maintenance") is None and command.get("recovery") is None)
             if unchanged_bindings and terminal_blocked_context(state) is None:
                 raise PipelineError("reconfiguration did not change authority, scope, or runtime")
+            if (unchanged_bindings and terminal_blocked_context(state) is not None
+                    and command.get("recovery") is None
+                    and proposed["base_tree_oid"] == state["artifacts"][state["phase"]].get("controller", {}).get("candidate_tree_oid")):
+                raise PipelineError("unchanged blocked bindings require recover-capability with fresh prerequisite evidence")
             baseline = _controller_checkout_baseline(
                 proposed["authority"]["digest"], proposed["pipeline_runtime_digest"],
                 command.get("controller_base"),
@@ -636,6 +732,32 @@ def _reduce_command(
                 "artifact_phases": sorted(state["artifacts"]),
                 "question_ids": sorted(state["questions"]),
             }
+            if runtime_rebind:
+                prior["runtime_rebind"] = True
+                prior["approved_plan_reuse_allowed"] = _runtime_rebind_can_confirm(state)
+                prior["product_evidence"] = deepcopy({
+                    phase: record for phase, record in state["artifacts"].items()
+                    if phase in {"engineering", "review", "qa", "docs"}
+                })
+                failures = [failure for record in prior["product_evidence"].values()
+                            if (failure := _verification_failure_context(
+                                state, record.get("candidate") or record.get("candidate_binding"))) is not None]
+                if failures:
+                    prior["verification_failure"] = max(
+                        failures, key=lambda item: (item["candidate"]["generation"], PHASES.index(item["phase"])))
+                elif audit_candidate is None:
+                    for event in reversed(state["history"]):
+                        previous = event.get("prior", {})
+                        if event.get("command") != "init":
+                            continue
+                        failure = previous.get("verification_failure")
+                        if (previous.get("runtime_rebind")
+                                and previous.get("authority_digest") == state["authority"]["digest"]
+                                and previous.get("slices_digest") == digest(state["slices"])
+                                and isinstance(failure, dict)
+                                and failure["candidate"]["candidate_tree_oid"] == proposed["base_tree_oid"]):
+                            prior["verification_failure"] = deepcopy(failure)
+                        break
             if command.get("recovery") is not None:
                 prior["recovery"] = deepcopy(command["recovery"])
             active = state["active_assignment"]
@@ -671,10 +793,25 @@ def _reduce_command(
                 "pipeline_runtime_digest": proposed["pipeline_runtime_digest"],
                 "active_assignment": None, "slices": proposed["slices"],
                 "artifacts": retained_artifacts,
-                "questions": {},
+                "questions": deepcopy(state["questions"]) if runtime_rebind else {},
             })
+            unresolved_review_paths = sorted({path for paths in state.get("execution", {}).get("review_obligations", {}).values() for path in paths})
+            work.pop("execution", None)
+            if command.get("verification") is not None:
+                metadata(work)["verification"] = deepcopy(command["verification"])
+            if runtime_rebind:
+                for key in ("findings", "read_admissions"):
+                    metadata(work)[key] = deepcopy(state.get("execution", {}).get(key, {}))
+            if unresolved_review_paths:
+                # This is an outstanding read/verification obligation, not old
+                # product credit. Keep its original packet in history and bind
+                # it to the fresh epoch's first verification boundary.
+                metadata(work)["review_obligations"] = {work["slices"][0]["id"]: unresolved_review_paths}
             work = _record(work, command, "authority_scope_reconfigured")
             work["history"][-1]["prior"] = prior
+            if (runtime_rebind and _runtime_rebind_can_confirm(state)
+                    and command.get("verification", {}).get("confirm_approved_plan")):
+                work = _confirm_approved_plan(work, baseline)
             validate_state(work)
             return work
         value = new_state(
@@ -692,6 +829,10 @@ def _reduce_command(
         if baseline is not None:
             value["artifacts"]["plan"] = baseline
         value["history"].append({"id": command["id"], "command": name, "command_digest": command_intent_digest(command), "generation": 0, "result": "initialized"})
+        if command.get("verification") is not None:
+            metadata(value)["verification"] = deepcopy(command["verification"])
+            if command["verification"].get("confirm_approved_plan"):
+                value = _confirm_approved_plan(value, baseline)
         validate_state(value)
         return value
 
@@ -706,6 +847,115 @@ def _reduce_command(
         _consume_precondition_proof(proof, state, command)
     assert state is not None
     work = deepcopy(state)
+
+    if name == "check":
+        active = work["active_assignment"]
+        observed = command.get("controller", {})
+        if (active is None or active["phase"] not in {"engineering", "qa"}
+                or observed.get("assignment_id") != active["id"]
+                or not is_git_oid(observed.get("candidate_tree_oid"))):
+            raise PipelineError("diagnostic check requires the exact active Engineering or QA lease")
+        metadata(work)["receipts"].update(deepcopy(command.get("controller_receipts", {})))
+        active["capsule"]["context"]["diagnostic_checks"] = deepcopy(observed)
+        active["capsule"]["context"]["machine_checks"] = deepcopy(command["controller_machine_checks"])
+        return _record(work, command, "diagnostic_checks_completed")
+
+    if name == "rotate-owner":
+        if work["active_assignment"] is not None:
+            raise PipelineError("owner rotation requires an idle assignment boundary")
+        _require_text(command.get("reason"), "rotation reason")
+        metadata(work)["owners"].pop(owner_key(work), None)
+        return _record(work, command, "owner_retired")
+
+    if name == "read-admit":
+        active = work["active_assignment"]
+        if active is None:
+            raise PipelineError("read admission requires an active assignment")
+        path = command.get("controller", {}).get("path")
+        if not isinstance(path, str) or not path:
+            raise PipelineError("read admission requires a validated exact source")
+        admitted = metadata(work)["read_admissions"].setdefault(owner_key(work, "shared"), [])
+        if path not in admitted:
+            admitted.append(path)
+        active["access"]["read"] = list(dict.fromkeys(active["access"]["read"] + [path]))
+        return _record(work, command, "read_dependency_admitted")
+
+    if name == "recover-capability":
+        validate_capability_recovery(work, command)
+        phase = work["phase"]
+        prior = deepcopy(work["artifacts"][phase])
+        journal_change = prior.get("capability_blocker_journal")
+        if journal_change is not None:
+            if (not isinstance(journal_change, dict) or set(journal_change) != {"id", "entry", "previous"}
+                    or not isinstance(journal_change["id"], str) or not isinstance(journal_change["entry"], dict)):
+                raise PipelineError("invalid controller blocker journal recovery record")
+            try:
+                for entry in (journal_change["entry"], journal_change["previous"]):
+                    if entry is not None:
+                        validate_entry(entry, sealed=True)
+                        if entry["id"] != journal_change["id"]:
+                            raise ValueError("controller blocker journal identity changed")
+            except ValueError as exc:
+                raise PipelineError(str(exc)) from exc
+            journal = work.get("technical_decisions", {})
+            if journal.get(journal_change["id"]) != journal_change["entry"]:
+                raise PipelineError("controller blocker journal changed; capability recovery cannot undo semantic decisions")
+            if journal_change["previous"] is None:
+                journal.pop(journal_change["id"])
+            else:
+                journal[journal_change["id"]] = deepcopy(journal_change["previous"])
+        restored = work["artifacts"][phase]
+        restored["worker"]["outcome"] = "fail"
+        restored["worker"].pop("blocker", None)
+        restored["worker"].pop("required_action", None)
+        restored.pop("capability_blocker_journal", None)
+        archived = {phase: prior}
+        # Match the existing QA acceptance route for actual semantic changes.
+        # Pure capability restoration restores the prior journal and stays in QA.
+        if phase == "qa" and review_journal_changed(work):
+            work["phase"] = "review"
+            previous_review = work["artifacts"].pop("review", None)
+            if previous_review is not None:
+                archived["review"] = previous_review
+        result = _record(work, command, "capability_restored")
+        result["history"][-1]["prior_artifacts"] = archived
+        result["history"][-1]["evidence"] = deepcopy(command["evidence"])
+        result["history"][-1]["resume_phase"] = work["phase"]
+        return result
+
+    if name == "reconcile":
+        if work["active_assignment"] is not None:
+            raise PipelineError("checkout reconcile requires an idle assignment boundary")
+        observed = command["controller"]
+        prior = deepcopy(work["artifacts"])
+        candidate = {"base_tree_oid": observed["candidate_tree_oid"],
+                     "candidate_tree_oid": observed["candidate_tree_oid"], "changed_paths": [],
+                     "authority_digest": work["authority"]["digest"],
+                     "pipeline_runtime_digest": work["pipeline_runtime_digest"],
+                     "generation": work["generation"] + 1}
+        work["artifacts"] = {key: item for key, item in prior.items() if key in {"plan", "slice"}}
+        work["artifacts"]["engineering"] = {
+            "assignment_id": "reconciled-external-baseline", "candidate": candidate,
+            "worker": {"outcome": "fail", "summary": "External changes admitted; fresh product verification is required."},
+            "controller": {"authority_digest": work["authority"]["digest"],
+                           "pipeline_runtime_digest": work["pipeline_runtime_digest"],
+                           "base_tree_oid": observed["candidate_tree_oid"], "candidate_tree_oid": observed["candidate_tree_oid"],
+                           "changed_paths": [], "violations": [], "commands": []}}
+        work["phase"] = "engineering"
+        metadata(work)["receipts"] = {}
+        metadata(work)["reconciled_tree"] = observed["candidate_tree_oid"]
+        selected_id = work["slices"][min(len(observed["retained_prefix"]), len(work["slices"]) - 1)]["id"]
+        obligations = metadata(work).setdefault("review_obligations", {})
+        obligations[selected_id] = sorted(set(obligations.get(selected_id, [])) | {item["path"] for item in command["packet"]["paths"]})
+        # Record the prefix before validation, since it establishes current_slice.
+        work["generation"] += 1
+        work["history"].append({"id": command["id"], "command": name,
+                                "command_digest": command_intent_digest(command), "generation": work["generation"],
+                                "assignment_id": "reconciled-external-baseline",
+                                "result": "external_changes_reconciled", "retained_prefix": observed["retained_prefix"],
+                                "prior_artifacts": prior, "packet": deepcopy(command["packet"])})
+        validate_state(work)
+        return work
 
     if name in {"technical-observe", "technical-decision"}:
         active = work["active_assignment"]
@@ -749,7 +999,7 @@ def _reduce_command(
             isinstance(current_worker, dict) and current_worker.get("outcome") == "blocked"
             and current_record.get("assignment_id") != "controller-checkout-baseline"
         ):
-            raise PipelineError("blocked is terminal; archive this run and perform a fresh init")
+            raise PipelineError("blocked is terminal; resolve the prerequisite and use status-bound recover-capability with fresh evidence")
         spec = command.get("assignment")
         if not isinstance(spec, dict):
             raise PipelineError("assignment is required")
@@ -767,8 +1017,10 @@ def _reduce_command(
             item["actor_id"].strip().casefold()
             for item in work["history"] if isinstance(item.get("actor_id"), str)
         }
-        if worker_id.strip().casefold() in completed_ids:
-            raise PipelineError("worker ID must name a fresh session; completed actor IDs cannot be reused")
+        expected_owner = metadata(work)["owners"].get(owner_key(work))
+        if worker_id.strip().casefold() in completed_ids and worker_id != expected_owner:
+            raise PipelineError("worker ID belongs to another completed role or slice")
+        metadata(work)["owners"][owner_key(work)] = worker_id
         read = deepcopy(canonical["access"]["read"])
         write = deepcopy(canonical["access"]["write"])
         commands = deepcopy(canonical["checks"])
@@ -817,11 +1069,19 @@ def _reduce_command(
         context["current_slice"] = current_slice(work)
         context["technical_journal"] = journal_reference(work)
         context["technical_decisions"] = list(work.get("technical_decisions", {}).values())
+        if "capability_recovery" in canonical.get("context", {}):
+            context["capability_recovery"] = deepcopy(canonical["context"]["capability_recovery"])
         if phase == "review":
             context["review_target"] = deepcopy(canonical["context"]["review_target"])
+            if "required_identity_ids" in canonical["context"]:
+                context["required_identity_ids"] = deepcopy(canonical["context"]["required_identity_ids"])
         if phase == "qa":
             expected_context = canonical["context"]
             context.update(deepcopy(expected_context))
+            context["machine_checks"] = deepcopy(command.get("controller_machine_checks", {
+                "checks": [], "pending_check_ids": [f"command-{index + 1}" for index in range(len(commands))],
+                "grants_manual_acceptance": False,
+            }))
             prior_target = work["artifacts"].get("review", {}).get("review_target")
             if isinstance(prior_target, dict):
                 context["review_target"] = deepcopy(prior_target)
@@ -830,9 +1090,18 @@ def _reduce_command(
             context["verification_failure"] = verification_failure
         context["decisions"] = answered_decisions(work)
         context = compact_assignment_context(context, candidate, canonical_input=True)
+        convergence = convergence_context(work)
+        if convergence:
+            context["convergence"] = convergence
         if phase == "engineering" and candidate is None:
             for item in reversed(work["history"]):
                 prior = item.get("prior", {})
+                if prior.get("runtime_rebind"):
+                    if (prior.get("authority_digest") == work["authority"]["digest"]
+                            and prior.get("slices_digest") == digest(work["slices"])
+                            and isinstance(prior.get("verification_failure"), dict)):
+                        context["verification_failure"] = deepcopy(prior["verification_failure"])
+                    break
                 maintenance = prior.get("maintenance")
                 if not isinstance(maintenance, dict):
                     continue
@@ -891,26 +1160,44 @@ def _reduce_command(
             }
             for key in (
                 "stderr_excerpt", "stderr_excerpt_truncated", "stderr_excerpt_redacted",
+                "stdout_excerpt", "stdout_excerpt_truncated", "stdout_excerpt_redacted",
             ):
                 if key in controller_failure:
                     failure_capsule[key] = deepcopy(controller_failure[key])
         evidence = deepcopy(command["controller"])
+        metadata(work)["receipts"].update(deepcopy(command.get("controller_receipts", {})))
         for entry in artifact.get("technical_decisions", []):
             entry = deepcopy(entry)
             previous = work.get("technical_decisions", {}).get(entry["id"], {})
             if "execution" in previous:
                 entry["execution"] = deepcopy(previous["execution"])
             work.setdefault("technical_decisions", {})[entry["id"]] = entry
+        blocker_journal = None
         if artifact["outcome"] == "blocked" and not artifact.get("technical_decisions"):
             blocker_id = f"TD-BLOCK-{digest(current_slice(work)['id'])[:10]}-{active['phase']}"
+            previous_blocker = deepcopy(work.get("technical_decisions", {}).get(blocker_id))
             work.setdefault("technical_decisions", {})[blocker_id] = {
                 "id": blocker_id, "situation": artifact["blocker"],
                 "decision": "Unresolved: " + artifact["required_action"], "basis": artifact.get("summary", artifact["blocker"]),
                 "checks": [], "downstream": "Unresolved prerequisite; no passing credit. Resume only after the recorded prerequisite is resolved.",
             }
+            if previous_blocker is not None and "execution" in previous_blocker:
+                work["technical_decisions"][blocker_id]["execution"] = deepcopy(previous_blocker["execution"])
+            blocker_journal = {"id": blocker_id, "previous": previous_blocker,
+                               "entry": deepcopy(work["technical_decisions"][blocker_id])}
         questions = artifact.get("questions", [])
+        if active["phase"] == "review":
+            artifact = deepcopy(artifact)
+            artifact["findings"] = finding_updates(work, artifact["findings"])
         record = {"assignment_id": active["id"], "worker": deepcopy(artifact), "controller": evidence}
+        if blocker_journal is not None:
+            record["capability_blocker_journal"] = blocker_journal
+        diagnostic = active["capsule"]["context"].get("diagnostic_checks")
+        if isinstance(diagnostic, dict):
+            record["diagnostic_checks"] = deepcopy(diagnostic)
         record["technical_journal_digest"] = journal_digest(work.get("technical_decisions", {}))
+        record["semantic_journal_digest"] = semantic_journal_digest(work.get("technical_decisions", {}))
+        record["verification_environment"] = command.get("controller_environment")
         record["candidate_binding"] = deepcopy(active["capsule"].get("candidate"))
         if required_ids is not None:
             record["required_identity_ids"] = deepcopy(required_ids)
@@ -941,6 +1228,13 @@ def _reduce_command(
                 ))
         if failure_capsule is not None:
             record["controller_failure"] = failure_capsule
+        if active["phase"] == "docs" and evidence["changed_paths"]:
+            pure = set(work.get("execution", {}).get("verification", {}).get("pure_documentation_paths", []))
+            original_qa = work["artifacts"].get("qa")
+            if (pure and set(evidence["changed_paths"]) <= pure and qa_credit_complete(original_qa)
+                    and original_qa.get("candidate_binding") == record["candidate_binding"]
+                    and original_qa.get("semantic_journal_digest", original_qa.get("technical_journal_digest")) == record["semantic_journal_digest"]):
+                record["reusable_qa"] = deepcopy(original_qa)
         work["artifacts"][active["phase"]] = record
         for index, prompt in enumerate(questions if artifact["outcome"] == "pass" else [], 1):
             question_id = f"question-{work['generation'] + 1}-{index}"
@@ -1003,18 +1297,30 @@ def _reduce_command(
             proposed_slices = slice_records(
                 record["worker"].get("slices", work["slices"]), sealed=True,
             )
-            proposed_rules = [rule for item in proposed_slices for rule in effective_slice(work, item)["allowed_paths"]]
-            uncovered = [
-                path for path in retained_engineering_paths(work)
-                if not any(matches(path, rule) for rule in proposed_rules)
-            ]
-            if uncovered:
-                raise PipelineError(f"revised slices do not cover interrupted Engineering paths: {uncovered}")
+            # Retained history is automatically readable evidence. Requiring its
+            # paths as new writer permissions contradicts an exact approved plan.
+            # Every subsequent write still uses that plan's scope; Review keeps
+            # retained changes that belong to its current implementation target.
             work["slices"] = proposed_slices
         if phase not in NEXT_PHASE:
             raise PipelineError("ready has no acceptance transition")
         candidate = current_candidate(work)
-        if phase in {"qa", "docs"} and work["artifacts"].get("review", {}).get("technical_journal_digest", journal_digest({})) != journal_digest(work.get("technical_decisions", {})):
+        review_record = work["artifacts"].get("review", {})
+        if (phase == "review" and command.get("controller", {}).get("pure_documentation_qa") is True
+                and work["artifacts"].get("docs", {}).get("candidate") == candidate):
+            original = work["artifacts"]["docs"].get("reusable_qa")
+            if original and original.get("semantic_journal_digest", original.get("technical_journal_digest")) == semantic_journal_digest(work.get("technical_decisions", {})):
+                reused = deepcopy(original)
+                reused["reused_from"] = {"assignment_id": original["assignment_id"], "candidate_binding": original["candidate_binding"],
+                                       "reason": "approved pure-documentation delta; product inputs and verification environment unchanged"}
+                reused["candidate_binding"] = deepcopy(candidate)
+                reused["controller"]["base_tree_oid"] = candidate["candidate_tree_oid"]
+                reused["controller"]["candidate_tree_oid"] = candidate["candidate_tree_oid"]
+                reused["controller"]["changed_paths"] = []
+                work["artifacts"]["qa"] = reused
+                work["phase"] = "ready"
+                return _record(work, command, "pure_documentation_verified")
+        if phase in {"qa", "docs"} and review_journal_changed(work):
             work["phase"] = "review"
             work["artifacts"].pop("review", None)
         elif phase == "docs" and record.get("candidate") is not None:
@@ -1027,6 +1333,8 @@ def _reduce_command(
             work["phase"] = "ready"
         elif phase == "qa":
             completed_slice = current_slice(work)
+            closed_obligations = work.get("execution", {}).get("review_obligations", {}).pop(completed_slice["id"], [])
+            closed_review_id = work["artifacts"].get("review", {}).get("assignment_id")
             completed_index = next(
                 index for index, item in enumerate(work["slices"])
                 if item["id"] == completed_slice["id"]
@@ -1036,8 +1344,21 @@ def _reduce_command(
                 for stale in ("review", "qa", "docs", "ready"):
                     work["artifacts"].pop(stale, None)
             else:
-                work["phase"] = "docs"
-            result = _record(work, command, work["phase"])
+                no_docs_work = (
+                    "docs" not in work["artifacts"]
+                    and documentation_not_required_after_qa(work)
+                )
+                work["phase"] = "ready" if no_docs_work else "docs"
+            result = _record(
+                work, command,
+                "documentation_not_required" if work["phase"] == "ready" else work["phase"],
+            )
+            if closed_obligations:
+                result["history"][-1]["review_obligations_closed"] = {
+                    "paths": closed_obligations, "candidate": deepcopy(candidate),
+                    "review_assignment_id": closed_review_id,
+                    "qa_assignment_id": record["assignment_id"],
+                }
             if completed_slice["id"] not in completed_slice_ids(work):
                 result["history"][-1]["completed_slice_id"] = completed_slice["id"]
             validate_state(result)
@@ -1069,10 +1390,12 @@ def _reduce_command(
             raise PipelineError("live Git tree is not the current candidate")
         for phase in PHASES[:-1]:
             record = work["artifacts"].get(phase)
+            if phase == "docs" and record is None and documentation_not_required_after_qa(work):
+                continue
             if not isinstance(record, dict) or record.get("worker", {}).get("outcome") != "pass":
                 raise PipelineError(f"ready requires accepted {phase} evidence")
         for phase in ("review", "qa"):
-            if work["artifacts"][phase].get("technical_journal_digest", journal_digest({})) != journal_digest(work.get("technical_decisions", {})):
+            if work["artifacts"][phase].get("semantic_journal_digest", work["artifacts"][phase].get("technical_journal_digest", journal_digest({}))) != semantic_journal_digest(work.get("technical_decisions", {})):
                 raise PipelineError(f"{phase} is stale for the current technical journal")
             if work["artifacts"][phase].get("candidate_binding") != candidate:
                 raise PipelineError(f"{phase} is stale for the current candidate")

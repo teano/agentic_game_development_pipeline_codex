@@ -58,7 +58,8 @@ APPROVAL_RULES = (
 OUTPUT_RULES = (
     "During discovery, report only concrete important new decisions",
     "Do not require revision, ID, or SHA boilerplate in an interim response",
-    "At terminal handoff, return only:", "`PRD_READY: yes|no`",
+    "At terminal handoff, return these existing fields unchanged, as `task_result.payload` "
+    "when a caller binding is supplied or directly for a standalone call:", "`PRD_READY: yes|no`",
     "`NEXT_ACTION: $gamedev-specification`", "`NEXT_ACTION` is advisory routing data",
     "Do not invoke or delegate the next stage",
 )
@@ -156,8 +157,9 @@ class RequirementsInstructionContractTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 require(mutated, LANE_RULES)
         self.assertIn("stage-handoff-invariant.md", lanes)
-        thresholds = {f"{value}%" for value in (7 * 10, 9 * 10)}
-        self.assertTrue(thresholds.issubset(set(re.findall(r"\b\d{2}%", self.invariant))))
+        self.assertIn("useful working set", self.invariant)
+        self.assertIn("authority-contract.md", self.invariant)
+        self.assertNotRegex(self.invariant, r"\b(?:70|90)%")
         self.assertNotRegex(self.skill + self.contract, r"\b\d{1,3}%")
 
     def test_approval_and_output_mutations_fail_closed(self) -> None:
