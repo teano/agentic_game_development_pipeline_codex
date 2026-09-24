@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .checkout import safe_path
-from .delivery import director_brief, execute_step, export_assignment, read_delivery, read_file
+from .delivery import director_brief, execute_step, export_assignment, read_delivery, read_file, read_delivery_unit, share_work_evidence
 from .legacy_gen53 import load_schema10
 from .model import (
     PIPELINE_STATE_FILENAME,
@@ -62,7 +62,9 @@ def parser() -> argparse.ArgumentParser:
         description="Run the replay-safe seven-phase GameDev pipeline controller.",
     )
     value.add_argument("--root", type=Path, required=True)
-    value.add_argument("--brief", action="store_true", help="Return Director control facts without full worker input; place before the subcommand.")
+    projection = value.add_mutually_exclusive_group()
+    projection.add_argument("--brief", action="store_true", help="Compact control response (the default); place before the subcommand.")
+    projection.add_argument("--full", action="store_true", help="Explicit full control/debug view, including worker bodies; ordinary agent work uses compact responses.")
     value.add_argument(
         "--feature", required=True, type=feature_slug,
         help="lowercase feature slug selecting .agentic-pipeline/Workflows/<feature>",
@@ -72,6 +74,7 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("--id", required=True)
     init.add_argument("--run-id", required=True, help="Compact safe run identifier (letters, digits, dot, underscore, or hyphen).")
     init.add_argument("--authority", action="append", default=[], required=True)
+    init.add_argument("--qa-contract", type=Path, help="Workflow-local QA methods and assertion contract from approved sources.")
     init.add_argument("--verification", type=Path, help="Workflow-local exact runnable verification manifest.")
     init.add_argument("--slice", action="append", required=True); init.add_argument("--expected-generation", type=int)
     status = commands.add_parser("status", help="Return one executable action or terminal recovery fact.")
@@ -91,7 +94,10 @@ def parser() -> argparse.ArgumentParser:
     complete = commands.add_parser("complete", help="Validate the assigned semantic artifact and controller evidence.")
     complete.add_argument("--id", required=True); complete.add_argument("--expected-generation", type=int); complete.add_argument("--artifact", type=Path)
     answer = commands.add_parser("answer", help="Record a conservative controller decision for one open question.")
-    answer.add_argument("--id", required=True); answer.add_argument("--expected-generation", type=int, required=True); answer.add_argument("--question-id", required=True); answer.add_argument("--text", required=True)
+    answer.add_argument("--id", required=True); answer.add_argument("--expected-generation", type=int, required=True); answer.add_argument("--question-id", required=True)
+    answer_input = answer.add_mutually_exclusive_group(required=True)
+    answer_input.add_argument("--text", help="Answer an ordinary open clarification.")
+    answer_input.add_argument("--resolution", type=Path, help="Workflow-local JSON resolution for a bound no-progress hold.")
     accept = commands.add_parser("accept", help="Accept current passing phase evidence and advance.")
     accept.add_argument("--id", required=True); accept.add_argument("--expected-generation", type=int, required=True)
     migrate = commands.add_parser(
@@ -110,6 +116,17 @@ def parser() -> argparse.ArgumentParser:
     export = commands.add_parser("assignment-export", help="Export the exact active assignment; optionally deliver a same-worker delta.")
     export.add_argument("--baseline", help="Digest of a fully received previous assignment packet for this worker.")
     export.add_argument("--input", action="append", default=[], help="Selected exact project-relative input; records version without loading its body.")
+    unit = commands.add_parser("assignment-read", help="Read direct assignment fields and typed child selectors, following validated references.")
+    unit.add_argument("--digest", required=True, help="Full target packet digest; not a delta digest used as a retained baseline.")
+    unit.add_argument("--pointer", help="Logical RFC6901 selector; default /assignment, or /assignment/context/required_finding_conditions for work.")
+    unit.add_argument("--view", choices=("index", "unit", "value", "work", "bootstrap", "work-index", "work-item", "check-result", "section"), default="unit",
+                      help="Legacy unit/index/value/work stay available; bootstrap groups startup metadata; work-index selects exact required pairs; work-item, check-result and section support lossless text continuation.")
+    unit.add_argument("--finding-id", help="Exact required finding identity for work-item.")
+    unit.add_argument("--condition-id", help="Optional exact role-required condition within the selected finding.")
+    unit.add_argument("--baseline", help="work-item only: fully consumed and still retained same-owner packet; omit after lost context.")
+    unit.add_argument("--continuation", help="Exact returned page token; keep the same packet/view/selection/baseline.")
+    unit.add_argument("--limit", type=int, default=8192, help="Unicode characters per transport page, never a limit on required work.")
+    unit.add_argument("--format", choices=("text", "json"), default="text", help="Decoded readable output by default; json is the machine envelope.")
     delivery = commands.add_parser("delivery-read", help="Read one bounded page of an immutable delivery artifact.")
     delivery.add_argument("--digest", required=True)
     delivery.add_argument("--pointer", help="Optional exact JSON pointer selecting a full semantic section before pagination.")
@@ -131,6 +148,7 @@ def parser() -> argparse.ArgumentParser:
             operation.add_argument("--assignment-id", required=True)
             operation.add_argument("--quiescence", required=True)
             operation.add_argument("--collect-independent", action="store_true")
+            operation.add_argument("--with-delivery", action="store_true", help="After the normal committed check, export and read its bound check result; transport failure preserves the commit and read-only recovery.")
         elif name in {"rotate-owner", "read-admit"}:
             operation.add_argument("--reason", required=True)
             if name == "read-admit":
@@ -174,14 +192,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             except (OSError, json.JSONDecodeError) as exc:
                 raise PipelineError(f"cannot read product failure packet: {exc}") from exc
     if args.command == "init":
-        if args.verification is not None:
-            source = safe_path(root, args.verification, "verification manifest", strict=True)
+        for field in ("verification", "qa_contract"):
+            manifest = getattr(args, field)
+            if manifest is None:
+                continue
+            source = safe_path(root, manifest, field + " manifest", strict=True)
             if not source.is_relative_to(root / workflow):
-                raise PipelineError("verification manifest must be workflow-local")
+                raise PipelineError(field + " manifest must be workflow-local")
             try:
-                recovery["verification"] = json.loads(source.read_text(encoding="utf-8"))
+                recovery[field] = json.loads(source.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                raise PipelineError(f"cannot read verification manifest: {exc}") from exc
+                raise PipelineError(f"cannot read {field} manifest: {exc}") from exc
         state = Controller(store).reconfigure({"name": "init", "id": args.id, "expected_generation": args.expected_generation, "run_id": args.run_id, "feature": args.feature, "workflow_path": workflow, "project_root": str(root), "authority_paths": _pairs(args.authority, "authority"), "slices": _slices(args.slice), **recovery})
     elif args.command == "status":
         return Controller(store).status(**recovery)
@@ -197,7 +218,16 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     elif args.command == "complete":
         state = Controller(store).complete(command_id=args.id, artifact_path=args.artifact, expected_generation=args.expected_generation)
     elif args.command == "answer":
-        state = Controller(store).transition({"name": "answer", "id": args.id, "expected_generation": args.expected_generation, "question_id": args.question_id, "answer": args.text})
+        payload = {"answer": args.text}
+        if args.resolution is not None:
+            source = safe_path(root, args.resolution, "no-progress resolution packet", strict=True)
+            if not source.is_relative_to(root / workflow):
+                raise PipelineError("no-progress resolution packet must be workflow-local")
+            try:
+                payload = {"resolution": json.loads(source.read_text(encoding="utf-8"))}
+            except (OSError, json.JSONDecodeError) as exc:
+                raise PipelineError(f"cannot read no-progress resolution packet: {exc}") from exc
+        state = Controller(store).transition({"name": "answer", "id": args.id, "expected_generation": args.expected_generation, "question_id": args.question_id, **payload})
     elif args.command == "accept":
         state = Controller(store).transition({"name": "accept", "id": args.id, "expected_generation": args.expected_generation})
     elif args.command == "migrate":
@@ -218,6 +248,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         state = Controller(store).technical_action(command_id=args.id, expected_generation=args.expected_generation, packet=packet)
     elif args.command == "assignment-export":
         return export_assignment(root, Controller(store).status(), args.baseline, args.input)
+    elif args.command == "assignment-read":
+        return read_delivery_unit(root, workflow, args.digest, args.pointer, args.view,
+                                  finding_id=args.finding_id, condition_id=args.condition_id, baseline=args.baseline,
+                                  continuation=args.continuation, limit=args.limit)
     elif args.command == "delivery-read":
         return read_delivery(root, workflow, args.digest, args.offset, args.limit, args.pointer)
     elif args.command == "file-read":
@@ -240,6 +274,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 except (OSError, json.JSONDecodeError) as exc:
                     raise PipelineError(f"cannot read {key}: {exc}") from exc
         state = Controller(store).control_action(args.command, command_id=args.id, expected_generation=args.expected_generation, **payload)
+        if args.command == "check" and args.with_delivery:
+            return _check_delivery(root, state, args)
     else:  # pragma: no cover
         raise AssertionError(args.command)
     view = status_view(state)
@@ -248,17 +284,77 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     result = _run(args)
-    return director_brief(result) if getattr(args, "brief", False) else result
+    return result if getattr(args, "full", False) else director_brief(result)
+
+
+def _work_text_presentation(value: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Share only exact evidence strings already present in this response body."""
+    return share_work_evidence(value)
+
+
+def _render_assignment_unit(result: dict[str, Any]) -> str:
+    """Human output decodes the value once; it is never a JSON-text-in-JSON page."""
+    if result.get("format") == "pipeline-delivery-page-v1":
+        return json.dumps({key: value for key, value in result.items() if key != "text"},
+                          ensure_ascii=False, separators=(",", ":")) + "\n" + result["text"]
+    metadata = {key: value for key, value in result.items() if key not in {"value", "children"}}
+    body = result["value"] if "value" in result else result.get("children", [])
+    if result.get("view") == "work":
+        body, shared = _work_text_presentation(body)
+        if shared:
+            metadata["text_rendering"] = (
+                "Evidence objects with same_exact_text_as reuse the exact string at that RFC6901 fragment "
+                "in this response body; no additional read is required."
+            )
+    return (json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+            + "\n" + (body if isinstance(body, str) else json.dumps(body, ensure_ascii=False, indent=2)))
+
+
+def _check_delivery(root: Path, state: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """Compose transport only after native commit; no transport failure retries mutation."""
+    record = next(item for item in state["history"] if item.get("id") == args.id)
+    prefix = [sys.executable, str(Path(__file__).resolve().parents[1] / "pipeline_state.py"),
+              "--root", str(root), "--feature", args.feature]
+    response = {"format": "pipeline-check-delivery-v1", "committed": True,
+                "command": "check", "command_id": args.id, "assignment_id": args.assignment_id,
+                "expected_generation": args.expected_generation, "committed_generation": record["generation"],
+                "generation": state["generation"], "transport": {"status": "pending"},
+                "recovery": {"status_argv": [*prefix, "status"],
+                             "export_argv": [*prefix, "assignment-export"],
+                             "rule": "Check is committed. Recover transport read-only; never issue a new check for export/read/render failure. An uncertain original call is retried with the same ID and arguments."}}
+    try:
+        view = status_view(state)
+        response["next_action"] = director_brief(view)["next_action"]
+        if state["generation"] != record["generation"]:
+            response["transport"] = {"status": "cursor_advanced", "reason": "This check is recorded; current assignment input belongs to a later cursor. Inspect current status."}
+            return response
+        exported = export_assignment(root, view)
+        read_argv = [*prefix, "assignment-read", "--digest", exported["packet_digest"], "--view", "check-result"]
+        response["assignment_delivery"] = {key: exported[key] for key in
+                                           ("packet_digest", "generation", "assignment_id", "worker_id", "mode")}
+        response["recovery"]["read_argv"] = read_argv
+        page = read_delivery_unit(root, view["workflow_path"], exported["packet_digest"], view="check-result")
+        # Render before returning: a failure here still reports the committed cursor.
+        response["check_result"] = _render_assignment_unit(page)
+        response["transport"] = {"status": "delivered", "selection_complete": page["complete"],
+                                 "continuation": page["continuation"]}
+    except Exception as exc:
+        response["transport"] = {"status": "failed", "error": str(exc), "error_type": type(exc).__name__}
+    return response
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        result = run(parser().parse_args(argv))
+        args = parser().parse_args(argv)
+        result = run(args)
     except PipelineError as exc:
         from .execution import classify_error
         print(json.dumps(classify_error(exc), ensure_ascii=False), file=sys.stderr)
         return 2
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    if args.command == "assignment-read" and args.format == "text":
+        print(_render_assignment_unit(result))
+    else:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 
 

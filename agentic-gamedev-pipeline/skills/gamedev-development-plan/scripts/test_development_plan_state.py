@@ -817,9 +817,43 @@ Only the approved feature and named shared symbol are in scope.
             approved["approval"]["submitted_sha256"], submitted["submission"]["sha256"]
         )
 
-    def test_public_plan_lifecycle_seals_comma_space_paths_in_pipeline_init(self) -> None:
+    def use_instructional_context(self, *, legacy_headings: bool = False) -> None:
+        text = self.plan.read_text(encoding="utf-8")
+        text = re.sub(
+            r"(?m)^- (?:max_authority_files|max_evidence_files|max_total_files|"
+            r"max_payload_bytes|max_estimated_tokens|metric_scope|estimation_recipe):[^\n]*\n",
+            "",
+            text,
+        )
+        text = text.replace(
+            "## Context Budget\n\n",
+            "## Context Budget\n\n"
+            "Read relevant authority sections and evidence by locator; "
+            "continue the owner with deltas and checkpoint continuity risk.\n",
+            1,
+        )
+        if not legacy_headings:
+            text = text.replace("## Context Budget", "## Context Delivery").replace(
+                "### Context Capsule Budget", "### Context Capsule"
+            )
+        text = text.replace(
+            "### Verification and Exit Criteria",
+            "- delivery_instructions: Read source sections as needed and send changed evidence to the same owner.\n\n"
+            "### Verification and Exit Criteria",
+        )
+        self.plan.write_text(text, encoding="utf-8")
+
+    def test_public_plan_lifecycle_seals_legacy_comma_space_paths_in_pipeline_init(self) -> None:
+        self.assert_plan_lifecycle_seals_paths(instructional_context=False)
+
+    def test_public_plan_lifecycle_seals_instructional_context_without_estimates(self) -> None:
+        self.assert_plan_lifecycle_seals_paths(instructional_context=True)
+
+    def assert_plan_lifecycle_seals_paths(self, *, instructional_context: bool) -> None:
         self.initialize()
         self.write_plan()
+        if instructional_context:
+            self.use_instructional_context()
         for command in (
             ("validate-plan",),
             ("submit",),
@@ -872,8 +906,40 @@ Only the approved feature and named shared symbol are in scope.
             runtime["slices"][0]["read_paths"],
         )
 
+    def test_validate_plan_preserves_legacy_and_validates_explicit_qa_contract(self) -> None:
+        state = self.initialize()
+        self.write_plan()
+        original = self.plan.read_text(encoding="utf-8")
+        self.assertEqual("draft", controller.validate_plan(self.root, state)["status"])
+        self.assertEqual(original, self.plan.read_text(encoding="utf-8"))
+        ids = re.search(r"(?m)^- mandatory_identity_ids: (.+)$", original).group(1).split(", ")
+        source = self.plan.relative_to(self.root).as_posix() + "#verification-and-exit-criteria"
+        manifest = {"schema": 1, "confirm_approved_plan": True, "slices": {"SLICE-001": {
+            "identities": [{"id": identity, "source": source, "assertions": [{
+                "id": f"assertion-{index}", "expected": "Existing approved behavior.",
+                "methods": [{"id": "approved-check", "source": source,
+                             "description": "Existing approved observation method.",
+                             "capabilities": ["project-runtime"], "evidence_types": ["observation"]}],
+                "applicability": {"kind": "always", "condition": "always", "evidence_types": []},
+                "depends_on": [],
+            }]} for index, identity in enumerate(ids)]}}}
+
+        def write_manifest():
+            section = "## QA Acceptance Contract\n\n```json\n" + json.dumps(manifest) + "\n```\n\n"
+            self.plan.write_text(original.replace("## Slice SLICE-001", section + "## Slice SLICE-001", 1), encoding="utf-8")
+
+        write_manifest()
+        self.assertEqual("draft", controller.validate_plan(self.root, state)["status"])
+        manifest["slices"]["SLICE-001"]["identities"][0]["assertions"][0]["methods"][0]["source"] = "docs/unapproved.md#method"
+        write_manifest()
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "approved authority path"):
+            controller.validate_plan(self.root, state)
+
     def test_validate_plan_rejects_runtime_invalid_read_path_grammar(self) -> None:
-        invalid_paths = ("../outside", "src/**/nested.lua", "[docs/context.md]")
+        invalid_paths = (
+            "../outside", "src/**/nested.lua", "[docs/context.md]", "**",
+            "/outside", "C:/outside", "src/../outside", "src/*", ".",
+        )
         for invalid in invalid_paths:
             with self.subTest(invalid=invalid):
                 self.initialize()
@@ -890,7 +956,7 @@ Only the approved feature and named shared symbol are in scope.
                 )
                 result = self.cli("validate-plan")
                 self.assertEqual(2, result.returncode, msg=result.stdout or result.stderr)
-                self.assertIn("Context Capsule Budget authority_paths", result.stderr)
+                self.assertIn("Context Capsule authority_paths", result.stderr)
                 self.temp.cleanup()
                 self.setUp()
 
@@ -2470,18 +2536,6 @@ Only the approved feature and named shared symbol are in scope.
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "decision_ledger_path"):
             controller.command_validate(self.args())
 
-    def test_global_context_budget_requires_all_five_positive_limits(self) -> None:
-        self.initialize()
-        self.write_plan()
-        self.plan.write_text(
-            self.plan.read_text(encoding="utf-8").replace(
-                "- max_payload_bytes: 250000", "- max_payload_bytes: 0"
-            ),
-            encoding="utf-8",
-        )
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "limits must be positive"):
-            controller.command_validate(self.args())
-
     def test_slice_requires_coverage_documentation_and_capsule_contracts(self) -> None:
         self.initialize()
         self.write_plan()
@@ -2539,98 +2593,6 @@ Only the approved feature and named shared symbol are in scope.
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "at most three"):
             controller.command_validate(self.args())
 
-    def test_global_context_budget_rejects_duplicate_exact_limit(self) -> None:
-        self.initialize()
-        self.write_plan()
-        self.plan.write_text(
-            self.plan.read_text(encoding="utf-8").replace(
-                "- max_authority_files: 12",
-                "- max_authority_files: 12\n- max_authority_files: 11",
-                1,
-            ),
-            encoding="utf-8",
-        )
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "repeats numeric limit"):
-            controller.command_validate(self.args())
-
-    def test_global_context_budget_rejects_unsupported_numeric_limit(self) -> None:
-        self.initialize()
-        self.write_plan()
-        self.plan.write_text(
-            self.plan.read_text(encoding="utf-8").replace(
-                "- max_estimated_tokens: 60000",
-                "- max_estimated_tokens: 60000\n- max_transcript_bytes: 10",
-                1,
-            ),
-            encoding="utf-8",
-        )
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "unsupported numeric limit"):
-            controller.command_validate(self.args())
-
-    def test_slice_context_budget_cannot_exceed_global_authority_limit(self) -> None:
-        self.initialize()
-        self.write_plan()
-        text = self.plan.read_text(encoding="utf-8")
-        marker = text.index("### Context Capsule Budget")
-        before, after = text[:marker], text[marker:]
-        after = after.replace("- max_authority_files: 8", "- max_authority_files: 13", 1)
-        self.plan.write_text(before + after, encoding="utf-8")
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "exceeds global limits"):
-            controller.command_validate(self.args())
-
-    def test_slice_context_budget_cannot_exceed_global_payload_limit(self) -> None:
-        self.initialize()
-        self.write_plan()
-        text = self.plan.read_text(encoding="utf-8")
-        marker = text.index("### Context Capsule Budget")
-        before, after = text[:marker], text[marker:]
-        after = after.replace("- max_payload_bytes: 160000", "- max_payload_bytes: 250001", 1)
-        self.plan.write_text(before + after, encoding="utf-8")
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "exceeds global limits"):
-            controller.command_validate(self.args())
-
-    def test_slice_context_budget_rejects_duplicate_limit(self) -> None:
-        self.initialize()
-        self.write_plan()
-        text = self.plan.read_text(encoding="utf-8")
-        marker = text.index("### Context Capsule Budget")
-        before, after = text[:marker], text[marker:]
-        after = after.replace(
-            "- max_evidence_files: 12",
-            "- max_evidence_files: 12\n- max_evidence_files: 11",
-            1,
-        )
-        self.plan.write_text(before + after, encoding="utf-8")
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "repeats numeric limit"):
-            controller.command_validate(self.args())
-
-    def test_slice_context_budget_rejects_unsupported_numeric_limit(self) -> None:
-        self.initialize()
-        self.write_plan()
-        text = self.plan.read_text(encoding="utf-8")
-        marker = text.index("### Context Capsule Budget")
-        before, after = text[:marker], text[marker:]
-        after = after.replace(
-            "- max_estimated_tokens: 40000",
-            "- max_estimated_tokens: 40000\n- max_chat_messages: 5",
-            1,
-        )
-        self.plan.write_text(before + after, encoding="utf-8")
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "unsupported numeric limit"):
-            controller.command_validate(self.args())
-
-    def test_context_total_files_cannot_be_smaller_than_component_limit(self) -> None:
-        self.initialize()
-        self.write_plan()
-        self.plan.write_text(
-            self.plan.read_text(encoding="utf-8").replace(
-                "- max_total_files: 32", "- max_total_files: 10", 1
-            ),
-            encoding="utf-8",
-        )
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "cannot be smaller"):
-            controller.command_validate(self.args())
-
     def test_plan_rejects_prose_capability_prerequisites(self) -> None:
         self.initialize()
         self.write_plan()
@@ -2645,46 +2607,134 @@ Only the approved feature and named shared symbol are in scope.
         with self.assertRaisesRegex(controller.DevelopmentPlanError, "capability ID"):
             controller.command_validate(self.args())
 
-    def test_context_budget_requires_exact_metric_scope(self) -> None:
+    def test_legacy_context_estimates_do_not_gate_validation(self) -> None:
+        self.initialize()
+        cases = (
+            ("- max_payload_bytes: 250000", "- max_payload_bytes: 0"),
+            ("- max_authority_files: 8", "- max_authority_files: 13"),
+            ("- max_payload_bytes: 160000", "- max_payload_bytes: 250001"),
+            ("- max_total_files: 32", "- max_total_files: 1"),
+            ("- max_total_files: 20", "- max_total_files: 1"),
+            ("- metric_scope: capsule_plus_referenced_files\n", ""),
+            ("- metric_scope: capsule_plus_referenced_files", "- metric_scope: capsule_only"),
+        )
+        for old, replacement in cases:
+            with self.subTest(field=old, replacement=replacement):
+                self.write_plan()
+                self.plan.write_text(
+                    self.plan.read_text(encoding="utf-8").replace(old, replacement),
+                    encoding="utf-8",
+                )
+                before = self.plan.read_bytes()
+                self.assertEqual("draft", controller.command_validate(self.args())["status"])
+                self.assertEqual(before, self.plan.read_bytes())
+
+    def test_legacy_context_headings_work_without_numeric_fields(self) -> None:
         self.initialize()
         self.write_plan()
+        self.use_instructional_context(legacy_headings=True)
+        self.assertEqual("draft", controller.command_validate(self.args())["status"])
+        controller.command_submit(self.args())
+        controller.command_approve(
+            self.args(approved_by="user", approval_note="Approve exact instructional context")
+        )
+        approved_bytes = self.plan.read_bytes()
+        read_paths = controller._plan_contract.parse_slice_read_paths(
+            self.plan.read_text(encoding="utf-8")
+        )
+        self.assertEqual([
+            self.prd.relative_to(self.root).as_posix(),
+            self.spec.relative_to(self.root).as_posix(),
+            "tests/sample-feature/verification/SLICE-001-planned.json",
+            "src/contracts.lua",
+        ], read_paths["SLICE-001"])
+        self.assertEqual(approved_bytes, self.plan.read_bytes())
+
+    def test_context_delivery_requires_nonempty_instructions(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.use_instructional_context()
         self.plan.write_text(
-            self.plan.read_text(encoding="utf-8").replace(
-                "- metric_scope: capsule_plus_referenced_files\n", "", 1
-            ),
+            re.sub(r"(?ms)^## Context Delivery\n.*?(?=^## )", "## Context Delivery\n\n",
+                   self.plan.read_text(encoding="utf-8")),
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "metric_scope"):
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "missing or empty global section: Context Delivery"):
             controller.command_validate(self.args())
 
-    def test_context_budget_rejects_duplicate_metric_scope(self) -> None:
+    def test_context_alias_headings_cannot_shadow_each_other(self) -> None:
+        self.initialize()
+        cases = (
+            ("## Context Delivery", "## Context Budget\n\nDuplicate delivery.\n\n## Context Delivery"),
+            ("### Context Capsule", "### Context Capsule Budget\n\n- authority_paths: other/file\n- evidence_paths: other/evidence\n\n### Context Capsule"),
+        )
+        for old, replacement in cases:
+            with self.subTest(section=old):
+                self.write_plan()
+                self.use_instructional_context()
+                self.plan.write_text(
+                    self.plan.read_text(encoding="utf-8").replace(old, replacement, 1),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(controller.DevelopmentPlanError, "repeats section: Context"):
+                    controller.command_validate(self.args())
+
+    def test_sealed_context_parser_rejects_duplicate_alias_headings(self) -> None:
         self.initialize()
         self.write_plan()
+        self.use_instructional_context()
+        controller.command_submit(self.args())
+        controller.command_approve(
+            self.args(approved_by="user", approval_note="Approve exact instructional context")
+        )
+        text = self.plan.read_text(encoding="utf-8").replace(
+            "### Context Capsule",
+            "### Context Capsule Budget\n\n- authority_paths: other/file\n- evidence_paths: other/evidence\n\n### Context Capsule",
+            1,
+        )
+        with self.assertRaisesRegex(controller._plan_contract.PlanContractError, "repeats section: Context Capsule"):
+            controller._plan_contract.parse_slice_read_paths(text)
+
+    def test_context_capsule_rejects_duplicate_schema_fields(self) -> None:
+        self.initialize()
+        for field in ("authority_paths", "evidence_paths", "delivery_instructions", "max_evidence_files", "metric_scope"):
+            with self.subTest(field=field):
+                self.write_plan()
+                text = self.plan.read_text(encoding="utf-8")
+                marker = text.index("### Context Capsule Budget")
+                before, capsule = text[:marker], text[marker:]
+                if field == "delivery_instructions":
+                    capsule = capsule.replace("- authority_paths:", "- delivery_instructions: Relevant sections only.\n- authority_paths:", 1)
+                row = re.search(r"(?m)^- " + field + r": .+$", capsule).group(0)
+                self.plan.write_text(before + capsule.replace(row, row + "\n" + row, 1), encoding="utf-8")
+                with self.assertRaisesRegex(controller.DevelopmentPlanError, "repeats field: " + field):
+                    controller.command_validate(self.args())
+
+    def test_context_capsule_rejects_unsupported_schema_fields(self) -> None:
+        self.initialize()
+        self.write_plan()
+        self.use_instructional_context()
         self.plan.write_text(
             self.plan.read_text(encoding="utf-8").replace(
-                "- metric_scope: capsule_plus_referenced_files\n",
-                "- metric_scope: capsule_plus_referenced_files\n"
-                "- metric_scope: capsule_plus_referenced_files\n",
-                1,
+                "### Context Capsule\n", "### Context Capsule\n\n- unapproved_paths: other/file", 1
             ),
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "exactly one metric_scope"):
+        with self.assertRaisesRegex(controller.DevelopmentPlanError, "unsupported field: unapproved_paths"):
             controller.command_validate(self.args())
 
-    def test_context_budget_rejects_wrong_metric_scope(self) -> None:
+    def test_context_capsule_still_requires_both_read_scope_fields(self) -> None:
         self.initialize()
-        self.write_plan()
-        self.plan.write_text(
-            self.plan.read_text(encoding="utf-8").replace(
-                "- metric_scope: capsule_plus_referenced_files",
-                "- metric_scope: capsule_only",
-                1,
-            ),
-            encoding="utf-8",
-        )
-        with self.assertRaisesRegex(controller.DevelopmentPlanError, "metric_scope"):
-            controller.command_validate(self.args())
+        for field in ("authority_paths", "evidence_paths"):
+            with self.subTest(field=field):
+                self.write_plan()
+                self.use_instructional_context()
+                self.plan.write_text(
+                    re.sub(r"(?m)^- " + field + r": [^\n]*\n", "", self.plan.read_text(encoding="utf-8")),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(controller.DevelopmentPlanError, "lacks fields: " + field):
+                    controller.command_validate(self.args())
 
     def test_skill_metadata_is_explicit_only(self) -> None:
         skill_root = Path(__file__).resolve().parents[1]

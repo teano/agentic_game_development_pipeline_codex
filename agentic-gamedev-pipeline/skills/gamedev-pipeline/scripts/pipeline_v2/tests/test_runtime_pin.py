@@ -34,7 +34,9 @@ class RuntimePinTests(unittest.TestCase):
                 pin_runtime(destination)
 
             runtime = destination / "skills/gamedev-pipeline/scripts/pipeline_v2"
-            for target in (runtime / "model.py", destination / "skills/gamedev-pipeline/references/control-return.md"):
+            for target in (runtime / "model.py", runtime / "qa_contract.py", runtime / "finding_contract.py", runtime / "no_progress.py",
+                           destination / "skills/gamedev-pipeline/references/qa-acceptance-contract.md",
+                           destination / "skills/gamedev-pipeline/references/control-return.md"):
                 with self.subTest(target=target.name):
                     original = target.read_bytes()
                     try:

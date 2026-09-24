@@ -21,7 +21,7 @@ if str(SCRIPTS) not in sys.path:
 
 from pipeline_v2.cli import main, parser, run
 from pipeline_v2.checkout import candidate_tree_oid
-from pipeline_v2.delivery import director_brief, execute_step, export_assignment, json_patch, read_delivery, read_file
+from pipeline_v2.delivery import director_brief, execute_step, export_assignment, json_patch, read_delivery, read_delivery_unit, read_file
 from pipeline_v2.model import ROLES, PipelineError, canonical_bytes, digest
 from pipeline_v2.process_tree import ProcessEvidence
 
@@ -235,19 +235,24 @@ class DeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "inside the running bundle"):
             relocated.export_assignment(self.root, self.view)
 
-    def test_legacy_delivery_delta_adds_locator_with_integrity_and_unknown_roles_invent_no_path(self):
+    def test_legacy_delivery_uses_explicit_full_v2_fallback_and_unknown_roles_invent_no_path(self):
         full = export_assignment(self.root, self.view)
         legacy = self.receive(full["packet_digest"])
         legacy.pop("role_instructions")
         legacy.pop("project_root")
+        legacy.pop("references")
+        legacy["format"] = "pipeline-assignment-v1"
         payload = canonical_bytes(legacy)
         version = hashlib.sha256(payload).hexdigest()
         (self.root / self.workflow / "Delivery" / f"{version}.json").write_bytes(payload)
         exported = export_assignment(self.root, self.view, baseline=version)
-        delta = self.receive(exported["response_digest"])
-        self.assertEqual(["/project_root", "/role_instructions"], [item["path"] for item in delta["patch"]])
-        self.assertEqual(str(self.root.resolve()), delta["project_root"])
-        rebuilt = apply_patch(legacy, delta["patch"])
+        rebuilt = self.receive(exported["response_digest"])
+        self.assertEqual("full", exported["mode"])
+        self.assertEqual("legacy_packet_requires_full_v2", exported["fallback"]["reason"])
+        self.assertEqual("pipeline-assignment-v2", rebuilt["format"])
+        self.assertEqual(str(self.root.resolve()), rebuilt["project_root"])
+        self.assertNotIn("patch", rebuilt)
+        self.assertNotIn("baseline_digest", exported["dispatch"]["input"])
         self.assertEqual(exported["packet_digest"], hashlib.sha256(canonical_bytes(rebuilt)).hexdigest())
         self.assertEqual(legacy["assignment"], rebuilt["assignment"])
         for role in ("director", "../external/SKILL.md", "gamedev-engineering", "unknown"):
@@ -478,6 +483,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual({
             "assignment_id": "A-1", "candidate_tree_oid": "candidate-1",
             "grants_semantic_credit": False, "grants_manual_acceptance": False,
+            "pending_check_ids": ["not-run"],
             "results": [
                 {"check_id": "unit", "returncode": 0, "duration_ms": 321},
                 {"check_id": "partial", "returncode": 7},
@@ -485,7 +491,7 @@ class DeliveryTests(unittest.TestCase):
         }, projected)
         encoded = json.dumps(brief)
         for forbidden in ("secret output", "secret error", "argv", "execution_reason",
-                          "private_context", "pending_check_ids", '"overall"', '"outcome"'):
+                          "private_context", '"overall"', '"outcome"'):
             self.assertNotIn(forbidden, encoded)
         packet = self.receive(export_assignment(self.root, view)["packet_digest"])
         self.assertEqual(view["active_assignment"], packet["assignment"])
@@ -519,14 +525,13 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
         tree = candidate_tree_oid(self.root)
         with tempfile.TemporaryDirectory(prefix="foreign dispatch cwd ") as foreign:
             response = subprocess.run(
-                dispatch["launcher_argv"] + dispatch["controller_args"] + [
-                    "delivery-read", "--digest", dispatch["input"]["digest"],
-                    "--pointer", "/assignment", "--limit", "16384"],
+                dispatch["reader"]["value_argv_prefix"] + ["/assignment", "--format", "json"],
                 cwd=foreign, capture_output=True, text=True, encoding="utf-8", check=True,
             )
             page = json.loads(response.stdout)
-            self.assertTrue(page["complete"])
-            assignment = json.loads(page["text"])
+            self.assertTrue(page["unit_complete"])
+            self.assertFalse(page["delivery_complete"])
+            assignment = page["value"]
             self.assertEqual(dispatch["assignment_id"], assignment["id"])
             self.assertEqual(dispatch["worker_id"], assignment["worker_id"])
             self.assertEqual(str(self.root), dispatch["cwd"])
@@ -622,7 +627,8 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
                 for value in (view, brief, brief["assignment_delivery"], full, packet):
                     self.assertEqual(str(self.root), value["project_root"])
                     self.assertTrue(Path(value["project_root"]).is_absolute())
-                self.assertEqual(view["active_assignment"], packet["assignment"])
+                self.assertEqual(view["active_assignment"], read_delivery_unit(
+                    self.root, self.fixture.workflow_path, full["packet_digest"], "/assignment", "value")["value"])
                 access = deepcopy(packet["assignment"]["access"])
                 self.assertFalse((Path(packet["project_root"]) / "game.txt").exists())
                 self.assertEqual("Do not change this checkout", Path("game.txt").read_text(encoding="utf-8"))
@@ -948,7 +954,7 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
         self.assertEqual(first["active_assignment"]["id"], brief["active_assignment"]["id"])
         full_output = io.StringIO()
         with redirect_stdout(full_output):
-            self.assertEqual(0, main(prefix + ["status"]))
+            self.assertEqual(0, main(prefix + ["--full", "status"]))
         self.assertIn("UNCHANGED-REQUIRED-DETAIL", full_output.getvalue())
         second = decision("TD-SECOND", "Apply the exact small additional decision")
         self.assertEqual(2, second["technical_journal"]["count"])

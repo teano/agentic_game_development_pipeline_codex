@@ -13,7 +13,9 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from .technical_decisions import validate_entry
-from .execution import metadata, owner_key, recipe_for, receipt_binding, seal_verification, verification_environment
+from .model import seal_qa_contract
+from .execution import (metadata, owner_key, recipe_for, receipt_binding, seal_verification,
+                        verification_environment, execution_environment, machine_check_row, machine_check_inputs)
 
 from .checkout import (
     authority_items,
@@ -174,10 +176,7 @@ def _stream_digest(value: bytes) -> str:
 
 def _process_environment() -> dict[str, str]:
     """Keep Node/npm's optional compile cache out of the candidate checkout."""
-    environment = os.environ.copy()
-    environment["NODE_DISABLE_COMPILE_CACHE"] = "1"
-    environment.pop("NODE_COMPILE_CACHE", None)
-    return environment
+    return execution_environment()
 
 
 def _replace_literal(value: str, literal: str, replacement: str) -> tuple[str, bool]:
@@ -673,6 +672,8 @@ class Controller:
                 if replay is not None:
                     return replay
             current_action = status_view(state)["next_action"]
+            if current_action.get("result") == "no_progress_resolution_required":
+                raise PipelineError("no-progress hold forbids unchanged Engineering redispatch; submit the bound specialist resolution through answer")
             if (
                 current_action.get("command") != "next"
                 or command_id != current_action.get("command_id")
@@ -792,6 +793,15 @@ class Controller:
                         "init slices must match the controller-projected status action"
                     )
                 value["slices"] = proposed_slices
+            supplied_contract = value.get("qa_contract")
+            if supplied_contract is None and state is not None and authority_items_equal(proposed_items, state["authority"]["items"]):
+                supplied_contract = state.get("execution", {}).get("qa_contract")
+            contract = seal_qa_contract(root, proposed_items, value["slices"], supplied_contract)
+            if contract is not None:
+                value["qa_contract"] = contract
+            contract_changed = state is not None and contract != state.get("execution", {}).get("qa_contract")
+            if contract_changed and state["active_assignment"] is not None:
+                raise PipelineError("QA contract cannot change during an active assignment; finish or use authorized maintenance first")
             current = require_clean_head(root) if state is None else candidate_tree_oid(root)
             admit_baseline = False
             if state is not None:
@@ -857,12 +867,12 @@ class Controller:
                 terminal_recovery = terminal_blocked_context(state)
                 if (terminal_recovery is not None and not authority_changed and not scope_changed
                         and runtime_digest == state["pipeline_runtime_digest"]
-                        and recovery is None and not admit_baseline and product_failure is None):
+                        and recovery is None and not admit_baseline and product_failure is None and not contract_changed):
                     raise PipelineError("unchanged blocked bindings require recover-capability with fresh prerequisite evidence")
                 if (
                     authority_changed or scope_changed
                     or runtime_digest != state["pipeline_runtime_digest"]
-                    or terminal_recovery is not None
+                    or (terminal_recovery is not None and not contract_changed)
                 ):
                     expected = reconfiguration_action(
                         state, value["authority"]["items"], value.get("slices"),
@@ -929,6 +939,9 @@ class Controller:
             replay = self.store._replay_locked(command)
             if replay is not None:
                 return replay
+            if command.get("name") == "answer" and "resolution" in command:
+                from .no_progress import verify_resolution_sources
+                command["controller"] = {"resolution_sources": verify_resolution_sources(state, root, command)}
             if command.get("name") == "accept" and state["phase"] == "review":
                 original = state["artifacts"].get("docs", {}).get("reusable_qa")
                 if original is not None:
@@ -952,27 +965,11 @@ class Controller:
 
     @staticmethod
     def _machine_check_row(result, locator, receipt_id):
-        return {"id": result["check_id"], "outcome": "pass" if result["returncode"] == 0 else "fail",
-                "source_locator": locator, "receipt_id": receipt_id, "receipt_sha256": digest(result),
-                "returncode": result["returncode"], "stdout_sha256": result["stdout_sha256"],
-                "stderr_sha256": result["stderr_sha256"]}
+        return machine_check_row(result, locator, receipt_id)
 
     def _machine_check_inputs(self, state, tree):
         """Publish only currently applicable canonical machine receipts to QA."""
-        rows, pending = [], []
-        environment = _process_environment()
-        for index, argv in enumerate(current_slice(state)["planned_commands"]):
-            recipe = recipe_for(state, argv, index, self.timeout)
-            binding = receipt_binding(state, tree, recipe, environment)
-            receipt = state.get("execution", {}).get("receipts", {}).get(binding)
-            if receipt is None:
-                pending.append(recipe["id"])
-            else:
-                locator = f"{state['workflow_path']}/pipeline-state.json#/execution/receipts/{binding}"
-                rows.append(self._machine_check_row(receipt["result"], locator, receipt["id"]))
-        return {"candidate_tree_oid": tree, "authority_digest": state["authority"]["digest"],
-                "pipeline_runtime_digest": state["pipeline_runtime_digest"], "checks": rows,
-                "pending_check_ids": pending, "grants_manual_acceptance": False}
+        return machine_check_inputs(state, tree, _process_environment(), self.timeout)
 
     def control_action(self, name: str, *, command_id: str, expected_generation: int, **payload):
         """Bounded execution commands share the existing lock/CAS/reducer path."""
@@ -1040,6 +1037,11 @@ class Controller:
                 if (not isinstance(paths, list) or not drift
                         or [item.get("path") for item in paths if isinstance(item, dict)] != drift):
                     raise PipelineError("reconcile must enumerate exactly the observed external paths")
+                from .no_progress import no_progress_hold
+                if no_progress_hold(state) is not None:
+                    relevant = default_assignment(state)["access"]["read"]
+                    if not any(not violations([path], relevant) for path in drift):
+                        raise PipelineError("no-progress hold cannot be cleared by unrelated external changes; resolve the bound work basis")
                 for item in paths:
                     if set(item) != {"path", "authorization", "provenance"} or any(not isinstance(v, str) or not v.strip() for v in item.values()):
                         raise PipelineError("reconcile needs exact per-path authorization and provenance")
@@ -1170,7 +1172,7 @@ class Controller:
             )
             if required_ids is not None and active["capsule"]["context"].get("required_identity_ids") != required_ids:
                 raise PipelineError("QA assignment identities no longer match approved authority")
-            artifact = _worker_artifact(artifact, active["phase"], active["role"], required_ids)
+            artifact = _worker_artifact(artifact, active["phase"], active["role"], required_ids, state=state)
             results = []
 
             new_receipts = {}
