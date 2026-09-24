@@ -128,7 +128,7 @@ REQUIRED_GLOBAL_SECTIONS = {
     "Decision Ledger",
     "Coverage Strategy",
     "Documentation Strategy",
-    "Context Budget",
+    "Context Delivery",
 }
 REQUIRED_SLICE_SECTIONS = {
     "Vertical Outcome",
@@ -143,7 +143,7 @@ REQUIRED_SLICE_SECTIONS = {
     "Research Briefs",
     "Coverage Contract",
     "Documentation Contract",
-    "Context Capsule Budget",
+    "Context Capsule",
     "Verification and Exit Criteria",
     "Rollback and Recovery",
     "Downstream Consumers",
@@ -159,14 +159,6 @@ REQUIRED_SCOPE_FIELDS = {
     "verification_scope",
 }
 REQUIRED_RESEARCH_FIELDS = {"question", "paths", "exclusions", "evidence", "stop"}
-CONTEXT_LIMITS = {
-    "max_authority_files",
-    "max_evidence_files",
-    "max_total_files",
-    "max_payload_bytes",
-    "max_estimated_tokens",
-}
-CONTEXT_METRIC_SCOPE = "capsule_plus_referenced_files"
 APPROVAL_WAITING_STATES = {"awaiting_approval", "awaiting_user_approval"}
 APPROVAL_ACTOR_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
@@ -550,7 +542,13 @@ def section_map(body: str, level: int) -> dict[str, str]:
     pattern = re.compile(
         rf"(?ms)^{re.escape(prefix)} ([^\r\n]+)\r?\n(.*?)(?=^{re.escape(prefix)} |\Z)"
     )
-    return {name.strip(): content.strip() for name, content in pattern.findall(body)}
+    sections: dict[str, str] = {}
+    for name, content in pattern.findall(body):
+        name = _plan_contract.canonical_context_section(name.strip())
+        if name in sections:
+            raise DevelopmentPlanError(f"development plan repeats section: {name}")
+        sections[name] = content.strip()
+    return sections
 
 
 def slice_blocks(body: str) -> list[tuple[str, str]]:
@@ -573,6 +571,13 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
     except _plan_contract.PlanContractError as exc:
         raise DevelopmentPlanError(str(exc)) from exc
     errors: list[str] = []
+    try:
+        _plan_contract.parse_qa_contract(
+            plan.read_text(encoding="utf-8"),
+            source_paths={state["plan_path"], state["prd"]["path"], state["specification"]["path"]},
+        )
+    except _plan_contract.PlanContractError as exc:
+        errors.append(str(exc))
     try:
         exact_positive_plan_revision(
             plan.read_text(encoding="utf-8"), label="development plan"
@@ -678,41 +683,6 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
     if "planning controller internal" not in ledger_section.lower():
         errors.append("Decision Ledger must state the planning controller internal route")
 
-    def validate_context_budget(section: str, label: str) -> dict[str, int]:
-        found: dict[str, int] = {}
-        seen: set[str] = set()
-        for key, raw in re.findall(r"(?m)^\s*-\s*([a-z_]+):\s*([0-9]+)\s*$", section):
-            if key.startswith("max_") and key not in CONTEXT_LIMITS:
-                errors.append(f"{label} contains unsupported numeric limit: {key}")
-            if key in CONTEXT_LIMITS:
-                if key in seen:
-                    errors.append(f"{label} repeats numeric limit: {key}")
-                seen.add(key)
-                found[key] = int(raw)
-        missing = sorted(CONTEXT_LIMITS - set(found))
-        if missing:
-            errors.append(f"{label} lacks numeric limits: {', '.join(missing)}")
-        nonpositive = sorted(key for key, value in found.items() if value < 1)
-        if nonpositive:
-            errors.append(f"{label} limits must be positive: {', '.join(nonpositive)}")
-        if found.get("max_total_files", 0) < max(
-            found.get("max_authority_files", 0), found.get("max_evidence_files", 0)
-        ):
-            errors.append(f"{label} max_total_files cannot be smaller than a component file limit")
-        metric_scopes = re.findall(
-            r"(?m)^\s*-\s*metric_scope:\s*(\S(?:.*\S)?)\s*$", section
-        )
-        if len(metric_scopes) != 1:
-            errors.append(f"{label} requires exactly one metric_scope")
-        elif metric_scopes[0] != CONTEXT_METRIC_SCOPE:
-            errors.append(
-                f"{label} metric_scope must be {CONTEXT_METRIC_SCOPE}"
-            )
-        return found
-
-    global_context_budget = validate_context_budget(
-        global_sections.get("Context Budget", ""), "Context Budget"
-    )
     coverage_strategy = global_sections.get("Coverage Strategy", "")
     try:
         _plan_contract.parse_coverage_strategy(coverage_strategy)
@@ -759,7 +729,7 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
                 owned_section=sections.get("Owned Paths", ""),
                 expected_section=sections.get("Expected Paths", ""),
                 scope_section=sections.get("Scope Contract", ""),
-                context_section=sections.get("Context Capsule Budget", ""),
+                context_section=sections.get("Context Capsule", ""),
                 label=slice_id,
             )
             editable_paths_by_slice[slice_id] = path_contract["write_paths"]
@@ -1084,20 +1054,6 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
             )
         except _plan_contract.PlanContractError as exc:
             errors.append(str(exc))
-        capsule_budget = sections.get("Context Capsule Budget", "")
-        slice_context_budget = validate_context_budget(
-            capsule_budget, f"{slice_id} Context Capsule Budget"
-        )
-        exceeded = sorted(
-            key
-            for key, value in slice_context_budget.items()
-            if key in global_context_budget and value > global_context_budget[key]
-        )
-        if exceeded:
-            errors.append(
-                f"{slice_id} Context Capsule Budget exceeds global limits: "
-                + ", ".join(exceeded)
-            )
     try:
         require_complete_acceptance_coverage(
             slice_acceptance_by_id,

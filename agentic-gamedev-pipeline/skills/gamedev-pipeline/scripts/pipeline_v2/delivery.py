@@ -6,6 +6,7 @@ Offsets count Unicode code points in decoded UTF-8 text (not bytes or tokens).
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -73,8 +74,10 @@ status remains available; assignment-export is the lossless worker transport.
                     for item in results if isinstance(item, dict)
                 ]
             machine = context.get("machine_checks")
-            if isinstance(machine, dict) and "grants_manual_acceptance" in machine:
-                projected["grants_manual_acceptance"] = deepcopy(machine["grants_manual_acceptance"])
+            if isinstance(machine, dict):
+                for key in ("pending_check_ids", "grants_manual_acceptance"):
+                    if key in machine:
+                        projected[key] = deepcopy(machine[key])
             metadata["diagnostic_checks"] = projected
         observation = assignment.get("technical_observation")
         if isinstance(observation, dict):
@@ -163,6 +166,571 @@ def _load(root: Path, workflow: str, version: str) -> tuple[dict[str, Any], str]
     return value, text
 
 
+def _child_pointer(pointer: str, key: Any) -> str:
+    return pointer + "/" + str(key).replace("~", "~0").replace("/", "~1")
+
+
+def _pointer_parts(pointer: str) -> list[str]:
+    if not isinstance(pointer, str) or (pointer and not pointer.startswith("/")):
+        raise PipelineError("section pointer must be an empty or slash-prefixed JSON pointer")
+    parts = pointer[1:].split("/") if pointer else []
+    if any("~" in part.replace("~1", "").replace("~0", "") for part in parts):
+        raise PipelineError("section pointer contains an invalid RFC 6901 escape")
+    return [part.replace("~1", "/").replace("~0", "~") for part in parts]
+
+
+def _child_value(value: Any, part: str) -> Any:
+    try:
+        if isinstance(value, list):
+            if not part.isascii() or not part.isdigit() or (len(part) > 1 and part.startswith("0")):
+                raise ValueError("invalid array index")
+            return value[int(part)]
+        return value[part]
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise PipelineError("section pointer does not identify a value") from exc
+
+
+def _pointer_value(value: Any, pointer: str) -> Any:
+    for part in _pointer_parts(pointer):
+        value = _child_value(value, part)
+    return value
+
+
+def _transport_assignment(root: Path, workflow: str, packet: dict[str, Any]) -> list[dict[str, Any]]:
+    """Replace exact duplicate values only; canonical controller state is untouched."""
+    context = packet["assignment"].get("context")
+    references: dict[str, Any] = packet["references"]
+    resources = []
+    if not isinstance(context, dict):
+        return resources
+
+    def reference(parent: Any, key: Any, source: str, descriptor: dict[str, Any]) -> None:
+        parent[key] = {"$delivery_ref": source}
+        references[source] = descriptor
+
+    qa = context.get("qa_contract")
+    if isinstance(qa, dict) and qa.get("status") == "bound" and "definition" in qa:
+        if not isinstance(qa.get("binding"), dict):
+            raise PipelineError("bound QA delivery requires its existing contract binding")
+        resource = {"format": "pipeline-qa-definition-v1",
+                    **{key: packet[key] for key in ("project_root", "run_id", "feature")},
+                    "binding": deepcopy(qa["binding"]), "definition": qa["definition"]}
+        saved = _save(root, workflow, resource)
+        source = "/assignment/context/qa_contract/definition"
+        reference(qa, "definition", source, {"kind": "resource", "digest": saved["digest"], "pointer": "/definition"})
+        resources.append({**saved, "pointer": source})
+
+    convergence = context.get("convergence")
+    opened = convergence.get("open") if isinstance(convergence, dict) else None
+    failure = context.get("verification_failure")
+    findings = failure.get("findings") if isinstance(failure, dict) else None
+    if not isinstance(opened, dict):
+        return resources
+    originals = {canonical_bytes(item): _child_pointer("/assignment/context/convergence/open", key)
+                 for key, item in opened.items() if isinstance(item, dict)}
+    if isinstance(findings, list):
+        for index, finding in enumerate(findings):
+            target = originals.get(canonical_bytes(finding))
+            if target is not None:
+                reference(findings, index, f"/assignment/context/verification_failure/findings/{index}",
+                          {"kind": "local", "pointer": target})
+    statuses = convergence.get("condition_status")
+    if isinstance(statuses, dict):
+        for identity, rows in statuses.items():
+            finding = opened.get(identity)
+            if not isinstance(finding, dict) or not isinstance(finding.get("text"), str) or not isinstance(rows, dict):
+                continue
+            target = _child_pointer("/assignment/context/convergence/open", identity) + "/text"
+            for condition, row in rows.items():
+                if isinstance(row, dict) and row.get("evidence") == finding["text"]:
+                    source = _child_pointer(_child_pointer("/assignment/context/convergence/condition_status", identity), condition) + "/evidence"
+                    reference(row, "evidence", source, {"kind": "local", "pointer": target})
+    return resources
+
+
+def _same_owner(previous: dict[str, Any], packet: dict[str, Any], *, legacy: bool = False) -> bool:
+    return (isinstance(packet.get("project_root"), str) and isinstance(packet.get("assignment"), dict)
+            and all(previous.get(key) == packet.get(key) for key in ("run_id", "feature"))
+            and previous.get("project_root", packet["project_root"] if legacy else None) == packet["project_root"]
+            and isinstance(previous.get("assignment"), dict)
+            and all(previous["assignment"].get(key) == packet["assignment"].get(key) for key in ("role", "worker_id")))
+
+
+def _baseline_order(previous: dict[str, Any], packet: dict[str, Any]) -> None:
+    if (type(previous.get("generation")) is not int or type(packet.get("generation")) is not int
+            or previous["generation"] > packet["generation"]):
+        raise PipelineError("delivery baseline must not be newer than its target packet")
+
+
+def _apply_patch(document: dict[str, Any], patch: Any) -> Any:
+    """Validate/reconstruct the exported RFC 6902 subset without trusting its target digest."""
+    if not isinstance(patch, list):
+        raise PipelineError("delivery delta patch must be a list")
+    result = deepcopy(document)
+    for operation in patch:
+        if not isinstance(operation, dict) or operation.get("op") not in {"add", "remove", "replace"}:
+            raise PipelineError("delivery delta contains an unsupported patch operation")
+        op = operation["op"]
+        if set(operation) != ({"op", "path"} if op == "remove" else {"op", "path", "value"}):
+            raise PipelineError("delivery delta patch operation has invalid fields")
+        parts = _pointer_parts(operation["path"])
+        if not parts:
+            if op == "remove":
+                raise PipelineError("delivery delta cannot remove its document")
+            result = deepcopy(operation["value"])
+            continue
+        parent = result
+        for part in parts[:-1]:
+            parent = _child_value(parent, part)
+        key = parts[-1]
+        if isinstance(parent, list):
+            if not key.isascii() or not key.isdigit() or (len(key) > 1 and key.startswith("0")):
+                raise PipelineError("delivery delta has an invalid array index")
+            key = int(key)
+            if key > len(parent) or (op != "add" and key == len(parent)):
+                raise PipelineError("delivery delta array index is out of range")
+            if op == "add":
+                parent.insert(key, deepcopy(operation["value"]))
+                continue
+        elif not isinstance(parent, dict):
+            raise PipelineError("delivery delta target is not a container")
+        if op != "add" and (key not in parent if isinstance(parent, dict) else key >= len(parent)):
+            raise PipelineError("delivery delta target does not exist")
+        if op == "remove":
+            del parent[key]
+        else:
+            parent[key] = deepcopy(operation["value"])
+    return result
+
+
+class _DeliveryUnits:
+    """Resolve registered transport references; literal JSON objects stay literal."""
+
+    def __init__(self, root: Path, workflow: str, version: str):
+        self.root, self.workflow = root, workflow
+        self.packet, _ = _load(root, workflow, version)
+        self.packet_digest = version
+        self.provenance: list[dict[str, Any]] = []
+        if self.packet.get("format") == "pipeline-assignment-delta-v2":
+            delta = self.packet
+            self.packet_digest = delta.get("packet_digest")
+            self.packet, _ = _load(root, workflow, self.packet_digest)
+            previous, _ = _load(root, workflow, delta.get("baseline_digest"))
+            if (self.packet.get("format") != "pipeline-assignment-v2"
+                    or previous.get("format") != "pipeline-assignment-v2"
+                    or delta.get("project_root") != self.packet.get("project_root")
+                    or not _same_owner(previous, self.packet)):
+                raise PipelineError("delta baseline must belong to the same run, role and worker in this project_root")
+            _baseline_order(previous, self.packet)
+            rebuilt = _apply_patch(previous, delta.get("patch"))
+            if canonical_bytes(rebuilt) != canonical_bytes(self.packet):
+                raise PipelineError("delivery delta patch does not match its packet digest")
+            self.provenance.append({"kind": "delta", "digest": version,
+                                    "baseline_digest": delta["baseline_digest"], "packet_digest": self.packet_digest})
+        if self.packet.get("format") not in {"pipeline-assignment-v1", "pipeline-assignment-v2"}:
+            raise PipelineError("semantic delivery reader requires an assignment packet or a v2 delta")
+        project_root = self.packet.get("project_root")
+        if project_root != str(root.resolve()) and (project_root is not None or self.packet["format"] != "pipeline-assignment-v1"):
+            raise PipelineError("delivery packet belongs to a different project_root")
+        self.references = self.packet.get("references", {}) if self.packet["format"] == "pipeline-assignment-v2" else {}
+        if not isinstance(self.references, dict):
+            raise PipelineError("delivery references must be an object")
+        for source, descriptor in self.references.items():
+            if (not source.startswith("/assignment/") or not isinstance(descriptor, dict)
+                    or _pointer_value(self.packet, source) != {"$delivery_ref": source}):
+                raise PipelineError("delivery reference must identify its exact registered assignment slot")
+            if descriptor.get("kind") == "local":
+                if (set(descriptor) != {"kind", "pointer"} or not isinstance(descriptor["pointer"], str)
+                        or not descriptor["pointer"].startswith("/assignment/")):
+                    raise PipelineError("invalid packet-local delivery reference")
+                _pointer_parts(descriptor["pointer"])
+            elif descriptor.get("kind") == "resource":
+                if (set(descriptor) != {"kind", "digest", "pointer"}
+                        or source != "/assignment/context/qa_contract/definition" or descriptor["pointer"] != "/definition"
+                        or not is_digest(descriptor["digest"])):
+                    raise PipelineError("invalid QA resource delivery reference")
+            else:
+                raise PipelineError("unknown delivery reference kind")
+        self.resources: dict[str, Any] = {}
+
+    def _dereference(self, value: Any, pointer: str, stack: tuple[str, ...]) -> tuple[Any, str, bool]:
+        descriptor = self.references.get(pointer)
+        if descriptor is None:
+            return value, pointer, False
+        if pointer in stack:
+            raise PipelineError("packet-local delivery reference cycle")
+        provenance = {"source_pointer": pointer, **descriptor}
+        if provenance not in self.provenance:
+            self.provenance.append(provenance)
+        if descriptor["kind"] == "local":
+            return self.locate(descriptor["pointer"], stack + (pointer,))
+        version = descriptor["digest"]
+        if version not in self.resources:
+            resource, _ = _load(self.root, self.workflow, version)
+            qa = _pointer_value(self.packet, "/assignment/context/qa_contract")
+            if (resource.get("format") != "pipeline-qa-definition-v1"
+                    or any(resource.get(key) != self.packet.get(key) for key in ("project_root", "run_id", "feature"))
+                    or qa.get("status") != "bound" or not isinstance(qa.get("binding"), dict)
+                    or canonical_bytes(resource.get("binding")) != canonical_bytes(qa["binding"])
+                    or "definition" not in resource):
+                raise PipelineError("QA resource project/run/feature/contract binding does not match its assignment")
+            self.resources[version] = resource
+        return self.resources[version]["definition"], pointer, True
+
+    def locate(self, pointer: str, stack: tuple[str, ...] = ()) -> tuple[Any, str, bool]:
+        value, actual, external = self.packet, "", False
+        for part in _pointer_parts(pointer):
+            if not external:
+                value, actual, external = self._dereference(value, actual, stack)
+            value = _child_value(value, part)
+            actual = _child_pointer(actual, part)
+        return (value, actual, True) if external else self._dereference(value, actual, stack)
+
+    def expand(self, value: Any, pointer: str, external: bool, stack: tuple[str, ...] = ()) -> Any:
+        if external:
+            return deepcopy(value)
+        if pointer in self.references:
+            if pointer in stack:
+                raise PipelineError("packet-local delivery reference cycle")
+            resolved, actual, external = self._dereference(value, pointer, stack)
+            return self.expand(resolved, actual, external, stack + (pointer,))
+        if isinstance(value, dict):
+            return {key: self.expand(child, _child_pointer(pointer, key), False, stack) for key, child in value.items()}
+        if isinstance(value, list):
+            return [self.expand(child, _child_pointer(pointer, index), False, stack) for index, child in enumerate(value)]
+        return deepcopy(value)
+
+
+def _value_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    return {dict: "object", list: "array", str: "string", int: "number", float: "number"}.get(type(value), "unknown")
+
+
+_WORK_POINTER = "/assignment/context/required_finding_conditions"
+_REWORK_PHASES = {"engineer": "engineering", "reviewer": "review", "documentation_finisher": "docs"}
+
+
+def _required_work_roster(context: dict[str, Any], role: str) -> tuple[list[dict[str, Any]], str]:
+    """Check the exact existing inventory; legacy fallback never invents evidence."""
+    from .finding_contract import required_condition_roster
+    phase = _REWORK_PHASES.get(role) if isinstance(role, str) else None
+    if phase is None:
+        raise PipelineError("work view is available only to Engineer, Review and Documentation Finisher")
+    supplied = context.get("required_finding_conditions")
+    convergence = context.get("convergence")
+    if convergence is None:
+        if "required_finding_conditions" in context and supplied == []:
+            return [], "required_finding_conditions"
+        raise PipelineError("complete rework is unavailable: obtain a current assignment with its required roster and convergence")
+    if (not isinstance(convergence, dict) or not isinstance(convergence.get("open"), dict)
+            or not isinstance(convergence.get("condition_status"), dict)):
+        raise PipelineError("complete rework requires original open conditions and their independent results")
+    for finding_id, finding in convergence["open"].items():
+        if (not isinstance(finding, dict) or finding.get("id", finding_id) != finding_id
+                or not isinstance(finding.get("conditions"), list) or not finding["conditions"]):
+            raise PipelineError("complete rework cannot infer missing original finding conditions")
+        statuses = convergence["condition_status"].get(finding_id)
+        for condition in finding["conditions"]:
+            result = statuses.get(condition.get("id")) if (isinstance(statuses, dict) and isinstance(condition, dict)
+                      and isinstance(condition.get("id"), str)) else None
+            if (not isinstance(result, dict) or not isinstance(result.get("status"), str)
+                    or result["status"] not in {"resolved", "unresolved"}
+                    or not isinstance(result.get("evidence"), str) or not result["evidence"].strip()):
+                raise PipelineError("complete rework requires the latest independent status and non-empty evidence for every open finding condition")
+    expected = required_condition_roster(convergence, phase)
+    if "required_finding_conditions" not in context:
+        return expected, "legacy_convergence"
+    if canonical_bytes(supplied) != canonical_bytes(expected):
+        raise PipelineError("required rework roster or pointers do not match the exact role-specific convergence inventory")
+    return expected, "required_finding_conditions"
+
+
+def _read_work(reader: _DeliveryUnits, version: str, pointer: str | None) -> dict[str, Any]:
+    """Deliver complete current finding work, not the assignment's other obligations."""
+    if pointer not in {None, _WORK_POINTER}:
+        raise PipelineError("work view selects only /assignment/context/required_finding_conditions")
+    assignment = reader.packet.get("assignment", {})
+    context_value, actual, external = reader.locate("/assignment/context")
+    if not isinstance(context_value, dict):
+        raise PipelineError("complete rework requires an assignment context")
+    # Resolve only finding input. QA resources and unrelated histories are not
+    # needed to validate the roster or assemble the complete work presentation.
+    context = {key: deepcopy(context_value[key]) for key in ("required_finding_conditions",) if key in context_value}
+    if "convergence" in context_value:
+        value, actual, external = reader.locate("/assignment/context/convergence")
+        context["convergence"] = reader.expand(value, actual, external)
+    roster, source = _required_work_roster(context, assignment.get("role"))
+    findings: dict[str, dict[str, Any]] = {}
+    for row in roster:
+        finding_id = row["finding_id"]
+        finding_pointer = _child_pointer("/assignment/context/convergence/open", finding_id)
+        if finding_id not in findings:
+            value, actual, external = reader.locate(finding_pointer)
+            finding = reader.expand(value, actual, external)
+            findings[finding_id] = {
+                "finding_id": finding_id, "finding_pointer": finding_pointer,
+                "finding": {key: deepcopy(item) for key, item in finding.items() if key != "conditions"},
+                "conditions": [],
+            }
+        condition, actual, external = reader.locate(row["original_condition_pointer"])
+        condition = reader.expand(condition, actual, external)
+        result, actual, external = reader.locate(row["latest_independent_result_pointer"])
+        result = reader.expand(result, actual, external)
+        findings[finding_id]["conditions"].append({
+            **deepcopy(row), "original_condition": condition, "latest_independent_result": result,
+        })
+    return {"format": "pipeline-delivery-unit-v1", "version": version,
+            "packet_digest": reader.packet_digest, "pointer": _WORK_POINTER, "view": "work", "type": "object",
+            "roster_source": source, "required_condition_count": len(roster),
+            "work_complete": True, "unit_complete": False, "delivery_complete": False,
+            "value": {"assignment": {key: deepcopy(assignment[key]) for key in
+                ("id", "worker_id", "role", "task", "output_path") if key in assignment},
+                "findings": list(findings.values())}, "provenance": reader.provenance}
+
+
+_PAGED_VIEWS = {"bootstrap", "work-index", "work-item", "check-result", "section"}
+
+
+def share_work_evidence(value: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Exact text presentation only; reconstruct after collecting the entire selection."""
+    shown, shared = deepcopy(value), False
+    for finding_index, group in enumerate(shown["findings"]):
+        finding = group["finding"]
+        explanation = finding.get("text") if isinstance(finding, dict) else None
+        seen = ({explanation: f"#/findings/{finding_index}/finding/text"}
+                if isinstance(explanation, str) else {})
+        for condition_index, row in enumerate(group["conditions"]):
+            result = row["latest_independent_result"]
+            evidence = result["evidence"]
+            if not isinstance(evidence, str):
+                continue
+            if evidence in seen:
+                result["evidence"] = {"same_exact_text_as": seen[evidence]}
+                shared = True
+            else:
+                seen[evidence] = (f"#/findings/{finding_index}/conditions/{condition_index}"
+                                  "/latest_independent_result/evidence")
+    return shown, shared
+
+
+def _expanded(reader: _DeliveryUnits, pointer: str) -> Any:
+    value, actual, external = reader.locate(pointer)
+    return reader.expand(value, actual, external)
+
+
+def _bootstrap(reader: _DeliveryUnits) -> dict[str, Any]:
+    """Group complete startup metadata; retain explicit locators for every body."""
+    assignment = reader.packet["assignment"]
+    body = {key: _expanded(reader, _child_pointer("/assignment", key))
+            for key in assignment if key != "context"}
+    context = assignment.get("context", {})
+    if not isinstance(context, dict):
+        raise PipelineError("assignment startup requires an object context")
+    deferred = {"convergence", "technical_decisions", "verification_failure", "diagnostic_checks",
+                "machine_checks", "qa_previous_observations", "required_finding_conditions"}
+    metadata, sources = {}, []
+    for key, value in context.items():
+        pointer = _child_pointer("/assignment/context", key)
+        if key == "qa_contract" and isinstance(value, dict):
+            metadata[key] = {field: _expanded(reader, _child_pointer(pointer, field))
+                             for field in value if field != "definition"}
+            if "definition" in value:
+                sources.append({"pointer": pointer + "/definition", "view": "section"})
+        elif key in deferred:
+            # Empty values convey their complete absence without a navigation call.
+            if value in ([], {}):
+                metadata[key] = deepcopy(value)
+            else:
+                sources.append({"pointer": pointer, "view": "section"})
+            if key == "machine_checks" and isinstance(value, dict):
+                metadata[key] = {field: deepcopy(item) for field, item in value.items() if field != "checks"}
+        else:
+            metadata[key] = _expanded(reader, pointer)
+    body["context"] = metadata
+    result = {"assignment": body, "sources": sources,
+              "selected_inputs": deepcopy(reader.packet.get("selected_inputs", []))}
+    if "role_instructions" in reader.packet:
+        result["role_instructions"] = deepcopy(reader.packet["role_instructions"])
+    if assignment.get("role") in _REWORK_PHASES and (
+            context.get("required_finding_conditions") or context.get("convergence", {}).get("open")):
+        result["required_work"] = {"view": "work-index", "pointer": _WORK_POINTER}
+    return result
+
+
+def _selected_work(reader: _DeliveryUnits, version: str, view: str,
+                   finding_id: str | None, condition_id: str | None,
+                   baseline: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    work = _read_work(reader, version, None)
+    groups = work["value"]["findings"]
+    roster = [{key: row[key] for key in ("finding_id", "condition_id", "original_condition_pointer",
+                                       "latest_independent_result_pointer")}
+              for group in groups for row in group["conditions"]]
+    details = {"roster_digest": hashlib.sha256(canonical_bytes(roster)).hexdigest(),
+               "required_condition_count": len(roster), "roster_source": work["roster_source"],
+               "work_complete": False}
+    if view == "work-index":
+        return {"assignment": work["value"]["assignment"], "roster": roster}, details
+    if not isinstance(finding_id, str) or not finding_id:
+        raise PipelineError("work-item requires an exact finding-id from the current work-index")
+    selected = [deepcopy(group) for group in groups if group["finding_id"] == finding_id]
+    if not selected:
+        raise PipelineError("finding-id is not in the exact current required roster")
+    group = selected[0]
+    if condition_id is not None:
+        group["conditions"] = [row for row in group["conditions"] if row["condition_id"] == condition_id]
+        if not group["conditions"]:
+            raise PipelineError("condition-id is not in the exact current role-specific required roster")
+    details["selected_condition_count"] = len(group["conditions"])
+    body = {"assignment": work["value"]["assignment"], "findings": selected}
+    if baseline is not None:
+        retained = _DeliveryUnits(reader.root, reader.workflow, baseline)
+        if retained.packet_digest != baseline or not _same_owner(retained.packet, reader.packet):
+            raise PipelineError("retained baseline must be a full packet of the same run, role and worker")
+        _baseline_order(retained.packet, reader.packet)
+        # Validate complete accessible baseline material, not just an old digest.
+        _expanded(retained, "/assignment")
+        prior_context = retained.packet["assignment"].get("context", {})
+        current_context = reader.packet["assignment"].get("context", {})
+        prior_binding = prior_context.get("qa_contract", {}).get("binding")
+        current_binding = current_context.get("qa_contract", {}).get("binding")
+        if canonical_bytes(prior_binding) != canonical_bytes(current_binding):
+            raise PipelineError("retained baseline authority/QA binding changed; read full current originals")
+        refs = []
+        originals = [("/findings/0/finding", group["finding_pointer"], group["finding"], True)]
+        originals.extend((f"/findings/0/conditions/{index}/original_condition", row["original_condition_pointer"],
+                          row["original_condition"], False) for index, row in enumerate(group["conditions"]))
+        for source, target, current, finding_metadata in originals:
+            try:
+                previous = _expanded(retained, target)
+            except PipelineError:
+                continue  # New or reindexed original: deliver current bytes in full.
+            if finding_metadata and isinstance(previous, dict):
+                previous = {key: value for key, value in previous.items() if key != "conditions"}
+            if canonical_bytes(previous) != canonical_bytes(current):
+                continue
+            parts = _pointer_parts(source)
+            parent = body
+            for part in parts[:-1]:
+                parent = _child_value(parent, part)
+            parent[parts[-1]] = None
+            refs.append({"source_pointer": source, "packet_digest": baseline, "pointer": target,
+                         **({"omit_fields": ["conditions"]} if finding_metadata else {})})
+        if refs:
+            body["retained_originals"] = refs
+            details["baseline_digest"] = baseline
+    return body, details
+
+
+def _semantic_page(body: Any, metadata: dict[str, Any], continuation: str | None, limit: int) -> dict[str, Any]:
+    """Page serialized text, including inside strings, with immutable reconstruction bindings."""
+    text = json.dumps(body, ensure_ascii=False, indent=2)
+    content_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    binding = hashlib.sha256(canonical_bytes({**metadata, "content_digest": content_digest})).hexdigest()
+    offset = 0
+    if continuation is not None:
+        try:
+            token = json.loads(base64.b64decode(continuation.encode("ascii"), altchars=b"-_", validate=True))
+        except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            raise PipelineError("invalid delivery continuation; restart this exact selection") from exc
+        if (not isinstance(token, dict) or set(token) != {"binding", "offset"}
+                or token["binding"] != binding or type(token["offset"]) is not int
+                or not 0 < token["offset"] < len(text)):
+            raise PipelineError("continuation does not match this exact packet, selection, baseline and content")
+        offset = token["offset"]
+    page = text_page(text, metadata["version"], offset, limit)
+    next_token = None
+    if page["next_offset"] is not None:
+        next_token = base64.urlsafe_b64encode(canonical_bytes({"binding": binding, "offset": page["next_offset"]})).decode("ascii")
+    return {**metadata, **page, "content_digest": content_digest,
+            "page_digest": hashlib.sha256(page["text"].encode("utf-8")).hexdigest(),
+            "continuation": next_token, "unit_complete": False, "delivery_complete": False,
+            "serialization": "JSON text fragment; concatenate contiguous pages before decoding; complete marks selection end only"}
+
+
+def read_delivery_unit(root: Path, workflow: str, digest: str, pointer: str | None = None,
+                       view: str = "index", *, finding_id: str | None = None,
+                       condition_id: str | None = None, baseline: str | None = None,
+                       continuation: str | None = None, limit: int = 8192) -> dict[str, Any]:
+    """Read one decoded logical unit. Its completeness is never a global read receipt."""
+    if view not in {"index", "unit", "value", "work"} | _PAGED_VIEWS:
+        raise PipelineError("unknown delivery unit view")
+    if view not in _PAGED_VIEWS and (continuation is not None or limit != 8192):
+        raise PipelineError("continuation and limit require a paged semantic view")
+    if view != "work-item" and any(item is not None for item in (finding_id, condition_id, baseline)):
+        raise PipelineError("finding-id, condition-id and retained baseline require work-item")
+    reader = _DeliveryUnits(root, workflow, digest)
+    if view in _PAGED_VIEWS:
+        if view != "section" and pointer not in {None, "/assignment" if view in {"bootstrap", "check-result"} else _WORK_POINTER}:
+            raise PipelineError("semantic view has a fixed pointer; use section for an arbitrary exact pointer")
+        if pointer is None:
+            pointer = _WORK_POINTER if view in {"work-index", "work-item"} else "/assignment"
+        details = {}
+        if view in {"bootstrap", "check-result"}:
+            body = _bootstrap(reader)
+            if view == "check-result":
+                context = reader.packet["assignment"].get("context", {})
+                body["check_context"] = {key: _expanded(reader, _child_pointer("/assignment/context", key))
+                                         for key in ("diagnostic_checks", "machine_checks") if key in context}
+                if not body["check_context"]:
+                    raise PipelineError("check-result requires committed diagnostic or machine check context")
+        elif view in {"work-index", "work-item"}:
+            body, details = _selected_work(reader, digest, view, finding_id, condition_id, baseline)
+            if view == "work-item":
+                body, shared = share_work_evidence(body)
+                if shared:
+                    details["text_rendering"] = ("After concatenating all selection pages, evidence same_exact_text_as "
+                        "fragments identify literal strings in that reconstructed body; expand exactly, never infer evidence")
+        else:
+            body = _expanded(reader, pointer)
+        metadata = {"format": "pipeline-delivery-page-v1", "version": digest, "packet_digest": reader.packet_digest,
+                    "view": view, "pointer": pointer, **details,
+                    **({"finding_id": finding_id} if finding_id is not None else {}),
+                    **({"condition_id": condition_id} if condition_id is not None else {}),
+                    **({"baseline_digest": baseline} if baseline is not None else {})}
+        return _semantic_page(body, metadata, continuation, limit)
+    if view == "work":
+        return _read_work(reader, digest, pointer)
+    pointer = "/assignment" if pointer is None else pointer
+    value, actual, external = reader.locate(pointer)
+    response: dict[str, Any] = {"format": "pipeline-delivery-unit-v1", "version": digest,
+        "packet_digest": reader.packet_digest, "pointer": pointer, "view": view, "type": _value_type(value),
+        "unit_complete": view == "value", "delivery_complete": False}
+    if view == "value" or (view == "unit" and not isinstance(value, (dict, list))):
+        response["value"] = reader.expand(value, actual, external)
+        response["unit_complete"] = True
+    else:
+        children = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else []
+        response["children"] = []
+        response["unit_complete"] = view == "unit"
+        for key, child in children:
+            logical = _child_pointer(pointer, key)
+            resolved, _, _ = reader.locate(logical)
+            item = {"selector": str(key), "pointer": logical, "type": _value_type(resolved)}
+            if isinstance(resolved, dict) and isinstance(resolved.get("id"), (str, int)):
+                item["id"] = resolved["id"]
+            if view == "unit":
+                if isinstance(resolved, dict):
+                    for identity_key in ("finding_id", "condition_id"):
+                        if isinstance(resolved.get(identity_key), str):
+                            item[identity_key] = resolved[identity_key]
+                source = _child_pointer(actual, key)
+                reference = None if external else reader.references.get(source)
+                if reference is not None:
+                    # Keep exact duplicate text at its existing target instead of
+                    # replaying it whenever a condition/status container is read.
+                    item["reference"] = {"source_pointer": source, **deepcopy(reference)}
+                elif not isinstance(resolved, (dict, list)):
+                    item["value"] = deepcopy(resolved)
+                if "value" not in item:
+                    response["unit_complete"] = False
+            response["children"].append(item)
+    response["provenance"] = reader.provenance
+    return response
+
+
 def _verification_exit_criteria_locator(
     root: Path, view: dict[str, Any], assignment: dict[str, Any],
 ) -> dict[str, Any] | None:
@@ -246,6 +814,13 @@ def _dispatch_descriptor(root: Path, view: dict[str, Any], packet: dict[str, Any
     input_path = safe_path(root, response["path"], "assignment delivery", strict=True)
     output_path = safe_path(root, assignment["output_path"], "assigned artifact")
     reference = {"packet_digest": saved["digest"]}
+    reader_argv = [sys.executable, str(launcher), "--root", packet["project_root"],
+                   "--feature", view["feature"], "assignment-read", "--digest", saved["digest"]]
+    context = assignment.get("context", {})
+    roster = context.get("required_finding_conditions") if isinstance(context, dict) else None
+    convergence = context.get("convergence") if isinstance(context, dict) else None
+    has_rework = assignment.get("role") in _REWORK_PHASES and (
+        bool(roster) or (isinstance(convergence, dict) and bool(convergence.get("open"))))
     descriptor = {
         "format": "pipeline-dispatch-v1",
         "run_id": view["run_id"], "feature": view["feature"],
@@ -257,6 +832,26 @@ def _dispatch_descriptor(root: Path, view: dict[str, Any], packet: dict[str, Any
         "input": {"mode": mode, "path": str(input_path), "digest": response["digest"],
                   "packet_path": str(packet_path), "packet_digest": saved["digest"],
                   **({"baseline_digest": baseline} if baseline is not None else {})},
+        "reader": {"command": "assignment-read", "packet_format": packet["format"],
+                   "default_view": "bootstrap",
+                   "bootstrap_argv": [*reader_argv, "--view", "bootstrap"],
+                   **({"work_argv": [*reader_argv, "--view", "work"],
+                       "work_index_argv": [*reader_argv, "--view", "work-index"],
+                       "work_item_argv_prefix": [*reader_argv, "--view", "work-item", "--finding-id"],
+                       "work_scope": "index is navigation only; consume every exact required pair through work-item and all continuations, retaining original context and latest independent results"}
+                      if has_rework else {}),
+                   "section_argv_prefix": [*reader_argv, "--view", "section", "--pointer"],
+                   "continuation_usage": "repeat the same selection with --continuation TOKEN; concatenate contiguous JSON text fragments and verify content_digest; page size is never a work quota",
+                   "unit_argv_prefix": [*reader_argv, "--view", "unit", "--pointer"],
+                   "index_argv": [*reader_argv, "--view", "index"],
+                   "value_argv_prefix": [*reader_argv, "--view", "value", "--pointer"],
+                   "value_usage": "recursive machine/debug-only route; use --format json for scripts, not for ordinary worker navigation",
+                   "selector_argument": "append one exact child pointer from a structural unit or logical index",
+                   "navigation": "start with bootstrap_argv and finish its pages; identity/access/schema/checks/current slice are grouped; follow exact source locators and required work roster; lost retention requires full reads without --baseline",
+                   "required_resources": [{"pointer": pointer, "digest": item["digest"]}
+                       for pointer, item in packet.get("references", {}).items() if item["kind"] == "resource"],
+                   "completeness": "full delivery requires the manifest and all referenced operative values; index, digest and unit reads are not a global read receipt",
+                   "delta_rule": "apply every RFC 6902 operation including removals only to the exact retained same-worker baseline; logical reads select the full target packet"},
         "scope": {**reference, "pointer": "/assignment/access"},
         "output": {"path": str(output_path), "relative_path": assignment["output_path"],
                    "write_authority": "issued_exact_terminal_artifact",
@@ -293,33 +888,43 @@ def export_assignment(root: Path, view: dict[str, Any], baseline: str | None = N
             selected.append({"path": relative, "version": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)})
         except OSError as exc:
             raise PipelineError(f"cannot inspect selected input: {exc}") from exc
-    packet = {"format": "pipeline-assignment-v1", "run_id": view["run_id"], "feature": view["feature"],
+    packet = {"format": "pipeline-assignment-v2", "run_id": view["run_id"], "feature": view["feature"],
               "project_root": project_root,
-              "generation": view["generation"], "assignment": assignment, "selected_inputs": selected}
+              "generation": view["generation"], "assignment": deepcopy(assignment), "selected_inputs": selected,
+              "references": {}}
     instructions = _role_instructions(assignment.get("role"))
     if instructions is not None:
         packet["role_instructions"] = instructions
     workflow = view["workflow_path"]
+    previous = None
+    fallback = None
+    if baseline is not None:
+        previous, _ = _load(root, workflow, baseline)
+        legacy = previous.get("format") == "pipeline-assignment-v1"
+        if (previous.get("format") not in {"pipeline-assignment-v1", "pipeline-assignment-v2"}
+                or not _same_owner(previous, packet, legacy=legacy)):
+            raise PipelineError("delta baseline must belong to the same run, role and worker in this project_root")
+        _baseline_order(previous, packet)
+        if legacy:
+            fallback = {"reason": "legacy_packet_requires_full_v2", "baseline_digest": baseline,
+                        "baseline_format": previous["format"]}
+        else:
+            # A retained digest alone is not sufficient if its referenced material is corrupt.
+            read_delivery_unit(root, workflow, baseline, "/assignment", "value")
+    resources = _transport_assignment(root, workflow, packet)
     saved = _save(root, workflow, packet)
-    if baseline is None:
+    if baseline is None or fallback is not None:
         response = saved
         mode = "full"
     else:
-        previous, _ = _load(root, workflow, baseline)
-        if (previous.get("format") != packet["format"] or previous.get("run_id") != packet["run_id"]
-                or previous.get("feature") != packet["feature"]
-                or previous.get("project_root", project_root) != project_root
-                or previous.get("assignment", {}).get("role") != assignment["role"]
-                or previous.get("assignment", {}).get("worker_id") != assignment["worker_id"]):
-            raise PipelineError("delta baseline must belong to the same run, role and worker in this project_root")
-        response = _save(root, workflow, {"format": "pipeline-assignment-delta-v1", "baseline_digest": baseline,
+        response = _save(root, workflow, {"format": "pipeline-assignment-delta-v2", "baseline_digest": baseline,
             "packet_digest": saved["digest"], "project_root": project_root,
             "patch": json_patch(previous, packet)})
         mode = "delta"
     source_bytes = sum(item["bytes"] for item in selected)
     context = assignment.get("context", {})
     sections = [
-        {"name": key, "pointer": "/assignment/context/" + key,
+        {"name": key, "pointer": _child_pointer("/assignment/context", key),
          "bytes": len(canonical_bytes(value))}
         for key, value in context.items()
     ] if isinstance(context, dict) else []
@@ -330,18 +935,21 @@ def export_assignment(root: Path, view: dict[str, Any], baseline: str | None = N
     ] if isinstance(decisions, list) else []
     working_set = {"packet_bytes": saved["bytes"], "transport_bytes": response["bytes"],
         "selected_source_bytes": source_bytes, "selected_source_count": len(selected),
-        "estimated_tokens": (saved["bytes"] + source_bytes + 3) // 4,
+        "required_resource_bytes": sum(item["bytes"] for item in resources),
+        "required_resources": resources,
+        "estimated_tokens": (saved["bytes"] + source_bytes + sum(item["bytes"] for item in resources) + 3) // 4,
         "measurement": "UTF-8 bytes/4 estimate; excludes conversation, tools and system context",
         "context_sections": sections, "technical_decision_index": journal_index}
     locator = _verification_exit_criteria_locator(root, view, assignment)
     if locator is not None:
         working_set["verification_exit_criteria"] = locator
-    dispatch = _dispatch_descriptor(root, view, packet, saved, response, mode, baseline)
+    dispatch = _dispatch_descriptor(root, view, packet, saved, response, mode, baseline if mode == "delta" else None)
     return {"mode": mode, "packet_digest": saved["digest"], "response_digest": response["digest"],
             "path": response["path"], "characters": response["characters"], "assignment_id": assignment["id"],
             "worker_id": assignment["worker_id"], "project_root": project_root,
             **({"role_instructions": instructions} if instructions is not None else {}),
             "generation": view["generation"], "delivery_complete": False,
+            **({"fallback": fallback} if fallback is not None else {}),
             "working_set": working_set, "dispatch": dispatch}
 
 

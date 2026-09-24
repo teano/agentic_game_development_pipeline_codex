@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import re
 from pathlib import Path
 from typing import Any, Callable
@@ -10,6 +12,67 @@ from typing import Any, Callable
 
 class PlanContractError(ValueError):
     pass
+
+
+def parse_qa_contract(
+    text: str, *, required: bool = False, source_paths: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """Read the canonical optional QA manifest without rewriting legacy plans.
+
+    Missing historical contracts return None, never fabricated method authority.
+    Runtime may bind an explicit manifest to the same immutable approved inputs.
+    """
+    meta, body = parse_development_plan_frontmatter(text)
+    headings = list(re.finditer(r"(?m)^## (\S(?:.*\S)?)\s*$", body))
+    matches = [(index, heading) for index, heading in enumerate(headings)
+               if heading.group(1) == "QA Acceptance Contract"]
+    if not matches:
+        if required:
+            raise PlanContractError("development plan requires QA Acceptance Contract or an explicit authority-bound runtime contract")
+        return None
+    if len(matches) != 1:
+        raise PlanContractError("development plan repeats QA Acceptance Contract")
+    index, heading = matches[0]
+    end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
+    section = body[heading.end():end].strip()
+    match = re.fullmatch(r"```json\r?\n(.*?)\r?\n```", section, re.DOTALL)
+    if match is None:
+        raise PlanContractError("QA Acceptance Contract must contain exactly one fenced JSON manifest")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise PlanContractError(f"QA Acceptance Contract repeats JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(match.group(1), object_pairs_hook=unique_object)
+    except (ValueError, TypeError) as exc:
+        raise PlanContractError(f"QA Acceptance Contract has invalid JSON: {exc}") from exc
+    required_by_slice: dict[str, list[str]] = {}
+    for slice_match in re.finditer(r"(?ms)^## Slice ([A-Za-z0-9][A-Za-z0-9._-]*)\r?\n(.*?)(?=^## |\Z)", body):
+        slice_id, block = slice_match.groups()
+        if slice_id in required_by_slice:
+            raise PlanContractError(f"QA Acceptance Contract repeats slice: {slice_id}")
+        coverage = re.findall(r"(?ms)^### Coverage Contract\r?\n(.*?)(?=^### |\Z)", block)
+        values = re.findall(r"(?m)^- mandatory_identity_ids: (\S(?:.*\S)?)\s*$", coverage[0]) if len(coverage) == 1 else []
+        if len(values) != 1:
+            raise PlanContractError(f"{slice_id} requires exactly one mandatory_identity_ids row for QA contract binding")
+        required_by_slice[slice_id] = parse_mandatory_identity_ids(values[0], label=f"{slice_id} mandatory_identity_ids")
+    if len(required_by_slice) != int(meta["slice_count"]):
+        raise PlanContractError("QA Acceptance Contract slice_count does not match Slice sections")
+    module_path = Path(__file__).resolve().parents[1] / "skills" / "gamedev-pipeline" / "scripts" / "pipeline_v2" / "qa_contract.py"
+    spec = importlib.util.spec_from_file_location("gamedev_planning_qa_contract", module_path)
+    if spec is None or spec.loader is None:
+        raise PlanContractError("Cannot load the canonical QA contract")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        return module.validate_contract(value, required_by_slice, source_paths=source_paths)
+    except module.QAContractError as exc:
+        raise PlanContractError(str(exc)) from exc
 
 
 BASE_SCALARS = {
@@ -205,16 +268,23 @@ def parse_exact_contract_rows(
     return result
 
 
-CONTEXT_CAPSULE_KEYS = {
+CONTEXT_CAPSULE_KEYS = {"authority_paths", "evidence_paths"}
+LEGACY_CONTEXT_ESTIMATE_KEYS = {
     "max_authority_files",
     "max_evidence_files",
     "max_total_files",
     "max_payload_bytes",
     "max_estimated_tokens",
     "metric_scope",
-    "authority_paths",
-    "evidence_paths",
 }
+
+
+def canonical_context_section(name: str) -> str:
+    """Accept historical headings without rewriting approved plan bytes."""
+    return {
+        "Context Budget": "Context Delivery",
+        "Context Capsule Budget": "Context Capsule",
+    }.get(name, name)
 
 
 def _controller_read_path(value: str, label: str) -> str:
@@ -251,6 +321,7 @@ def parse_context_capsule_read_paths(
         section,
         label=label,
         scalar_keys=CONTEXT_CAPSULE_KEYS,
+        optional_keys=LEGACY_CONTEXT_ESTIMATE_KEYS | {"delivery_instructions"},
     )
     combined: list[str] = []
     for key in ("authority_paths", "evidence_paths"):
@@ -345,7 +416,7 @@ def parse_slice_path_contract(
             + ", ".join(overlap)
         )
     read_paths = parse_context_capsule_read_paths(
-        context_section, label=f"{label} Context Capsule Budget"
+        context_section, label=f"{label} Context Capsule"
     )
     missing = [
         path
@@ -381,7 +452,7 @@ def parse_slice_path_contracts(
         "Owned Paths",
         "Expected Paths",
         "Scope Contract",
-        "Context Capsule Budget",
+        "Context Capsule",
     )
     for index, match in enumerate(matches):
         slice_id = match.group(1)
@@ -392,7 +463,7 @@ def parse_slice_path_contracts(
         headings = list(re.finditer(r"(?m)^### (\S(?:.*\S)?)\s*$", block))
         sections: dict[str, str] = {}
         for heading_index, heading in enumerate(headings):
-            name = heading.group(1)
+            name = canonical_context_section(heading.group(1))
             section_end = (
                 headings[heading_index + 1].start()
                 if heading_index + 1 < len(headings)
@@ -412,7 +483,7 @@ def parse_slice_path_contracts(
             owned_section=sections["Owned Paths"],
             expected_section=sections["Expected Paths"],
             scope_section=sections["Scope Contract"],
-            context_section=sections["Context Capsule Budget"],
+            context_section=sections["Context Capsule"],
             label=f"{label} {slice_id}",
         )
         if include_qa:

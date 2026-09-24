@@ -283,9 +283,9 @@ class ExecutionCycleTests(unittest.TestCase):
             self.assertIn("dependency.txt", engineer["access"]["read"])
             self.assertNotIn("dependency.txt", engineer["access"]["write"])
             context = engineer["capsule"]["context"]
-            self.assertEqual([finding], context["verification_failure"]["findings"])
+            self.assertEqual(original["worker"]["findings"], context["verification_failure"]["findings"])
             self.assertEqual(original["candidate_binding"], context["verification_failure"]["candidate"])
-            self.assertEqual(finding, context["convergence"]["open"]["F-REBIND"])
+            self.assertEqual(original["worker"]["findings"][0], context["convergence"]["open"]["F-REBIND"])
             self.assertIsNone(current_candidate(result))
 
     def test_runtime_rebind_preserves_external_review_obligation_and_qa_evidence(self):
@@ -325,6 +325,7 @@ class ExecutionCycleTests(unittest.TestCase):
     def test_engineering_failure_delivered_and_same_owner_reused(self):
         self.h._reach_engineering()
         first = self.issue()["active_assignment"]
+        (self.h.root / "game.txt").write_text("Implemented candidate requiring compiler correction.\n", encoding="utf-8")
         failure = ProcessEvidence(1, digest("failure"), digest(""), b"compiler failed", False)
         with mock.patch("pipeline_v2.runner.run_process_tree", return_value=failure):
             self.h._complete("ENGINEERING-FAILED", {"outcome": "pass", "summary": "Assigned edit completed."})
@@ -339,7 +340,8 @@ class ExecutionCycleTests(unittest.TestCase):
         before = self.h.store.path.read_bytes()
         self.h.controller.next(command_id=last["id"], expected_generation=last["generation"] - 1)
         self.assertEqual(before, self.h.store.path.read_bytes())
-        self.h._complete("CHECKPOINT-REPLAY", {"outcome": "fail", "summary": "Handing off without another test run."})
+        (self.h.root / "game.txt").write_text("Partial compiler correction; remaining work is recorded.\n", encoding="utf-8")
+        self.h._complete("CHECKPOINT-REPLAY", {"outcome": "fail", "summary": "Handing off partial work without another test run."})
         self.action("rotate-owner", "ROTATE-REPLAY", reason="Checkpoint records the exact current assignment.")
         self.issue()
         before = self.h.store.path.read_bytes()
@@ -349,6 +351,7 @@ class ExecutionCycleTests(unittest.TestCase):
     def test_semantic_fail_skips_checks_and_owner_rotation_is_explicit(self):
         self.h._reach_engineering()
         first = self.issue()["active_assignment"]
+        (self.h.root / "game.txt").write_text("Partial implementation saved at the handoff boundary.\n", encoding="utf-8")
         with mock.patch("pipeline_v2.runner.run_process_tree") as process:
             self.h._complete("INCOMPLETE", {"outcome": "fail", "summary": "Checkpoint: implementation incomplete; exact remaining work is recorded."})
             process.assert_not_called()
@@ -437,7 +440,7 @@ class ExecutionCycleTests(unittest.TestCase):
 
     def test_duplicate_finding_ids_rejected_and_generated_duplicates_are_lossless(self):
         finding = {"id": "F-1", "text": "First supported defect", "severity": "high", "kind": "correctness"}
-        with self.assertRaisesRegex(PipelineError, "duplicate Review finding IDs"):
+        with self.assertRaisesRegex(PipelineError, "duplicate Review finding ID"):
             _worker_artifact({"outcome": "fail", "findings": [finding, {**finding, "text": "Second supported defect"}]}, "review", "reviewer")
         no_id = {key: value for key, value in finding.items() if key != "id"}
         findings = finding_updates(self.h.store.load(), [no_id, no_id])
@@ -594,6 +597,7 @@ class ExecutionCycleTests(unittest.TestCase):
             recipe["independent"] = True
         self.restart(manifest)
         active = self.issue()["active_assignment"]
+        (h.root / "game.txt").write_text("Implemented candidate exposing two independent failures.\n", encoding="utf-8")
         failure = ProcessEvidence(1, digest("failed"), digest("stderr"), b"Independent test failure", False)
         with mock.patch("pipeline_v2.runner.run_process_tree", return_value=failure) as process:
             state = self.action("check", "CHECK-BATCH", assignment_id=active["id"], quiescence="Writer paused.", collect_independent=True)

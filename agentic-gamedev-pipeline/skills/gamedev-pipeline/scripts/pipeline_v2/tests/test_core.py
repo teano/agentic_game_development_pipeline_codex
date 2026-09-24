@@ -26,13 +26,23 @@ from pipeline_v2.checkout import (
     authority_items, candidate_tree_oid, changed_paths, file_sha256, matches,
     pipeline_runtime_digest, repository_policy_changed, require_clean_head,
 )
-from pipeline_v2.cli import parser as cli_parser, run as cli_run
+from pipeline_v2.cli import parser as cli_parser, run as _cli_run
 from pipeline_v2.legacy_gen53 import import_schema10
 from pipeline_v2.model import ConflictError, PHASES, ROLES, PipelineError, artifact_schema, assignment_output_path, command_intent_digest, current_candidate, current_slice, default_assignment, digest, normalize_rule, retained_engineering_paths, status_view, validate_state
 from pipeline_v2.process_tree import ProcessEvidence
 from pipeline_v2.reducer import COMMANDS, reduce
 from pipeline_v2.runner import Controller
 from pipeline_v2.transaction import StateStore
+
+
+def cli_run(args):
+    """Legacy state-shaped CLI assertions request the explicit compatibility view.
+
+    Default compact CLI behavior is covered independently in test_worker_delivery_cli.
+    """
+    if not getattr(args, "brief", False):
+        args.full = True
+    return _cli_run(args)
 
 
 class _CanonicalTestController(Controller):
@@ -68,6 +78,8 @@ class _CanonicalTestController(Controller):
 
 
 class PipelineV2CoreTests(unittest.TestCase):
+    include_qa_contract = True
+
     def test_qa_technical_question_requires_fresh_qa_before_credit_and_ready(self) -> None:
         self._reach_candidate()
         self._review_pass("review-before-qa-question")
@@ -646,6 +658,22 @@ None.
         reads = reads or {item["id"]: item["allowed_paths"] for item in slices}
         return [deepcopy(item) | {"read_paths": deepcopy(reads[item["id"]])} for item in slices]
 
+    @staticmethod
+    def _fixture_qa_contract(slices: list[dict]) -> dict:
+        """Explicit generic test authority, not synthesized production acceptance."""
+        return {"schema": 1, "confirm_approved_plan": True, "slices": {
+            item["id"]: {"identities": [
+                {"id": f"{prefix}-{item['id']}-{suffix}", "source": "requirements.md#Acceptance-Criteria",
+                 "assertions": [{"id": f"{prefix}-{item['id']}-OBSERVED",
+                     "expected": "Observe the assigned result.",
+                     "methods": [{"id": "observe-assigned-result", "source": "requirements.md#Acceptance-Criteria",
+                                  "description": "Observe the assigned result.", "capabilities": ["assigned-observation"],
+                                  "evidence_types": ["observation"]}],
+                     "applicability": {"kind": "always", "condition": "always", "evidence_types": []},
+                     "depends_on": []}]}
+                for prefix, suffix in (("AUTO", "CORE"), ("MANUAL", "RUNTIME"))]}
+            for item in slices}}
+
     def _write_approved_plan(
         self, slices: list[dict], *, reads: dict[str, list[str]] | None = None,
         revision: int = 1, documentation_policy: str | None = None,
@@ -742,6 +770,11 @@ None.
                 f"- derived_post_qa: {derived_documentation}\n"
                 "- source_rule: approved test authority\n\n"
             )
+        qa_contract_section = ""
+        if self.include_qa_contract:
+            qa_contract_section = "## QA Acceptance Contract\n\n```json\n" + json.dumps(
+                self._fixture_qa_contract(slices), indent=2,
+            ) + "\n```\n\n"
         text = (
             "---\n"
             "document_type: development-plan\n"
@@ -764,6 +797,7 @@ None.
             "---\n"
             "# Test plan\n\n"
             + documentation_strategy
+            + qa_contract_section
             + "\n".join(sections)
         )
         (self.root / "plan.md").write_text(text, encoding="utf-8")
@@ -806,6 +840,30 @@ None.
         return path
 
     def _complete(self, command_id: str, artifact: dict, *, artifact_path: Path | None = None) -> dict:
+        # Positive lifecycle setup explicitly models per-condition worker claims.
+        # Direct _write_artifact/Controller.complete probes stay byte-for-byte raw.
+        artifact = deepcopy(artifact)
+        state = self.store.load()
+        phase = (state.get("active_assignment") or {}).get("phase")
+        if (phase == "qa" and artifact.get("outcome") == "blocked" and artifact.get("checks") == []
+                and state.get("execution", {}).get("qa_contract") is not None):
+            artifact["checks"] = self._qa_checks(artifact["blocker"], outcome="not_run")
+        if phase == "review" and isinstance(artifact.get("findings"), list):
+            for finding in artifact["findings"]:
+                if (isinstance(finding, dict) and "conditions" not in finding
+                        and all(isinstance(finding.get(key), str) and finding[key].strip()
+                                for key in ("text", "severity", "kind"))):
+                    finding["conditions"] = [{"id": "C1", "text": finding["text"]}]
+        if phase in {"engineering", "docs", "review"} and "finding_resolutions" not in artifact:
+            from pipeline_v2.finding_contract import current_record, required_conditions
+            conditions = required_conditions(current_record(state), phase)
+            if conditions:
+                resolved = "resolved" if phase == "review" else "addressed"
+                artifact["finding_resolutions"] = [
+                    {"finding_id": finding_id, "condition_id": condition_id,
+                     "status": resolved if artifact.get("outcome") == "pass" else "unresolved",
+                     "evidence": f"Lifecycle fixture {phase} explicitly reports {finding_id}/{condition_id}: {artifact.get('outcome')}."}
+                    for finding_id, condition_id in sorted(conditions)]
         assigned = self._write_artifact(artifact)
         return self.controller.complete(command_id=command_id, artifact_path=artifact_path or assigned)
 
@@ -934,11 +992,32 @@ None.
         return self._accept(worker)
 
     def _qa_checks(self, evidence: str, outcome: str = "pass") -> list[dict]:
-        slice_id = current_slice(self.store.load())["id"]
-        return [
-            {"id": f"{prefix}-{slice_id}-{suffix}", "outcome": outcome, "evidence": evidence}
-            for prefix, suffix in (("AUTO", "CORE"), ("MANUAL", "RUNTIME"))
-        ]
+        state = self.store.load()
+        slice_id = current_slice(state)["id"]
+        contract = state.get("execution", {}).get("qa_contract")
+        if contract is None:
+            if self.include_qa_contract:
+                raise AssertionError("positive QA lifecycle fixture requires its explicit bound contract")
+            return [{"id": f"{prefix}-{slice_id}-{suffix}", "outcome": outcome, "evidence": evidence}
+                    for prefix, suffix in (("AUTO", "CORE"), ("MANUAL", "RUNTIME"))]
+        checks = []
+        for identity in contract["slices"][slice_id]["identities"]:
+            results = []
+            for assertion in identity["assertions"]:
+                method = assertion["methods"][0]
+                result = {"id": assertion["id"], "outcome": outcome,
+                          "method_id": method["id"] if outcome != "not_run" else None,
+                          "environment": "Explicit native lifecycle test fixture.",
+                          "evidence": [{"type": kind, "ref": f"fixture:{identity['id']}/{assertion['id']}",
+                                        "observation": evidence} for kind in method["evidence_types"]]}
+                if outcome == "not_run":
+                    result["evidence"] = []
+                    result["reason"] = {"kind": "capability_unavailable", "detail": evidence,
+                                        "refs": list(dict.fromkeys(capability for candidate in assertion["methods"]
+                                                                   for capability in candidate["capabilities"]))}
+                results.append(result)
+            checks.append({"id": identity["id"], "outcome": outcome, "evidence": evidence, "assertions": results})
+        return checks
 
     def _docs_no_change(self, worker: str) -> dict:
         self.controller.next(

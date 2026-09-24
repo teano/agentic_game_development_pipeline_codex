@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 from .technical_decisions import journal_digest, journal_reference, validate_entry, semantic_journal_digest
-from .execution import metadata, owner_key, finding_updates, convergence_context
+from .execution import metadata, owner_key, finding_updates, convergence_context, record_finding_resolutions
 
 from .checkout import authority_items_equal, matches, path_identity, violations as diff_violations
 from .legacy_gen53 import SCHEMA10_UNSUPPORTED_MESSAGE
@@ -50,6 +50,7 @@ from .model import (
     slices_are_read_sealed,
     terminal_blocked_context,
     validate_capability_recovery,
+    qa_contract_context,
     validate_state,
 )
 
@@ -67,6 +68,37 @@ def _require_text(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise PipelineError(f"{label} is required")
     return value.strip()
+
+
+def _bind_qa_contract(state: dict[str, Any], contract: Any) -> None:
+    if contract is not None:
+        metadata(state)["qa_contract"] = deepcopy(contract)
+        metadata(state)["qa_contract_binding"] = {
+            "authority_digest": state["authority"]["digest"], "contract_digest": digest(contract),
+        }
+
+
+def _restore_blocker_journal(work: dict[str, Any], prior: dict[str, Any]) -> None:
+    journal_change = prior.get("capability_blocker_journal")
+    if journal_change is not None:
+        if (not isinstance(journal_change, dict) or set(journal_change) != {"id", "entry", "previous"}
+                or not isinstance(journal_change["id"], str) or not isinstance(journal_change["entry"], dict)):
+            raise PipelineError("invalid controller blocker journal recovery record")
+        try:
+            for entry in (journal_change["entry"], journal_change["previous"]):
+                if entry is not None:
+                    validate_entry(entry, sealed=True)
+                    if entry["id"] != journal_change["id"]:
+                        raise ValueError("controller blocker journal identity changed")
+        except ValueError as exc:
+            raise PipelineError(str(exc)) from exc
+        journal = work.get("technical_decisions", {})
+        if journal.get(journal_change["id"]) != journal_change["entry"]:
+            raise PipelineError("controller blocker journal changed; capability recovery cannot undo semantic decisions")
+        if journal_change["previous"] is None:
+            journal.pop(journal_change["id"])
+        else:
+            journal[journal_change["id"]] = deepcopy(journal_change["previous"])
 
 
 def _require_expected_generation(command: dict[str, Any]) -> None:
@@ -92,10 +124,28 @@ def _contains_forbidden(value: Any) -> str | None:
 
 
 def _worker_artifact(
-    value: Any, phase: str, role: str, required_identity_ids: list[str] | None = None,
+    value: Any, phase: str, role: str, required_identity_ids: list[str] | None = None, *, state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
-        return _validate_worker_artifact(value, phase, role, required_identity_ids)
+        result = _validate_worker_artifact(value, phase, role, required_identity_ids)
+        if state is not None:
+            from .finding_contract import validate_artifact
+            validate_artifact(state, phase, result)
+            if phase == "qa":
+                from .qa_contract import validate_results
+                contract = qa_contract_context(state)
+                issued = state["active_assignment"]["capsule"]["context"].get("qa_contract")
+                if issued != contract:
+                    raise PipelineError("QA assignment contract no longer matches sealed authority")
+                if contract["status"] != "bound":
+                    if result["outcome"] != "blocked":
+                        raise PipelineError("QA contract is unresolved; bind approved methods before PASS")
+                else:
+                    try:
+                        validate_results(result["checks"], contract["definition"], outcome=result["outcome"])
+                    except ValueError as exc:
+                        raise PipelineError(str(exc)) from exc
+        return result
     except PipelineError as exc:
         raise WorkerArtifactValidationError(str(exc)) from exc
 
@@ -133,25 +183,22 @@ def _validate_worker_artifact(
     for key in ("assumptions",):
         if key in value and any(not isinstance(item, str) or not item.strip() for item in value[key]):
             raise PipelineError(f"worker {key} must contain non-empty strings")
+    if "finding_resolutions" in value:
+        from .finding_contract import validate_resolutions
+        validate_resolutions(value["finding_resolutions"], phase)
     if phase == "review":
-        findings = value.get("findings")
-        if not isinstance(findings, list) or any(
-            not isinstance(item, dict) or not {"text", "severity", "kind"} <= set(item) or set(item) - {"id", "text", "severity", "kind"}
-            or any(not isinstance(item[key], str) or not item[key].strip() for key in item)
-            for item in findings
-        ):
-            raise PipelineError("review findings must be objects with text, severity, and kind")
-        if value["outcome"] == "pass" and findings:
+        from .finding_contract import validate_findings
+        validate_findings(value.get("findings"), require_conditions=False)
+        if value["outcome"] == "pass" and value["findings"]:
             raise PipelineError("passing Review requires no findings")
-        if value["outcome"] == "fail" and not findings:
-            raise PipelineError("failed Review requires at least one finding")
-        explicit_ids = [item["id"] for item in findings if "id" in item]
-        if len(explicit_ids) != len(set(explicit_ids)):
-            raise PipelineError("duplicate Review finding IDs are not allowed")
+        if value["outcome"] == "fail" and not value["findings"] and not any(
+            row.get("status") == "unresolved" for row in value.get("finding_resolutions", []) if isinstance(row, dict)
+        ):
+            raise PipelineError("failed Review requires at least one finding or unresolved prior condition")
     if phase == "qa":
         checks = value.get("checks")
         if not isinstance(checks, list) or any(
-            not isinstance(item, dict) or set(item) != {"id", "outcome", "evidence"}
+            not isinstance(item, dict) or not {"id", "outcome", "evidence"} <= set(item) or set(item) - {"id", "outcome", "evidence", "assertions"}
             or not isinstance(item.get("id"), str) or not item["id"].strip()
             or item.get("outcome") not in {"pass", "fail", "not_run"}
             or not isinstance(item.get("evidence"), str) or not item["evidence"].strip()
@@ -166,9 +213,10 @@ def _validate_worker_artifact(
         if required_identity_ids is not None:
             if set(identities) - set(required_identity_ids):
                 raise PipelineError("QA checks contain identities outside the approved assignment")
-            if value["outcome"] == "pass" and not qa_coverage_complete({
-                "required_identity_ids": required_identity_ids, "worker": value,
-            }):
+            if value["outcome"] == "pass" and (
+                set(identities) != set(required_identity_ids)
+                or any(item["outcome"] != "pass" for item in checks)
+            ):
                 raise PipelineError("QA pass requires the exact mandatory identity set with every outcome pass")
     if value["outcome"] == "blocked":
         _require_text(value.get("blocker"), "blocker")
@@ -706,6 +754,39 @@ def _reduce_command(
             )
             unchanged_bindings = (unchanged_authority_scope
                                   and proposed["pipeline_runtime_digest"] == state["pipeline_runtime_digest"])
+            contract_changed = command.get("qa_contract") != state.get("execution", {}).get("qa_contract")
+            if unchanged_bindings and contract_changed:
+                if state["active_assignment"] is not None or pending(state["questions"]):
+                    raise PipelineError("QA contract binding requires an idle assignment and resolved questions")
+                if command.get("qa_contract") is None:
+                    raise PipelineError("QA contract cannot be removed from unchanged authority")
+                old_definitions = state.get("execution", {}).get("qa_contract", {}).get("slices", {})
+                for completed_id in completed_slice_ids(state):
+                    if old_definitions.get(completed_id) != command["qa_contract"]["slices"].get(completed_id):
+                        raise PipelineError("QA contract changes completed slices; use approved reconvergence before reusing their acceptance")
+                candidate = current_candidate(state)
+                if candidate is not None and command["controller_base"]["candidate_tree_oid"] != candidate["candidate_tree_oid"]:
+                    raise PipelineError("QA contract binding cannot admit product drift")
+                work = deepcopy(state)
+                prior_artifacts = deepcopy({key: work["artifacts"][key] for key in ("review", "qa", "docs", "ready") if key in work["artifacts"]})
+                prior_contract = deepcopy(state.get("execution", {}).get("qa_contract"))
+                _bind_qa_contract(work, command["qa_contract"])
+                prior_qa = prior_artifacts.get("qa", {})
+                if (prior_qa.get("qa_contract") or {}).get("status") == "unresolved":
+                    _restore_blocker_journal(work, prior_qa)
+                if candidate is not None and state["phase"] in {"review", "qa", "docs", "ready"}:
+                    # Reassess the normalized methods independently; retain the
+                    # implementation and current product tree, never old QA credit.
+                    for key in ("review", "qa", "docs", "ready"):
+                        work["artifacts"].pop(key, None)
+                    engineering = work["artifacts"].get("engineering", {}).get("candidate")
+                    if engineering != candidate:
+                        raise PipelineError("QA contract rebinding after documentation changes requires the normal approved reconvergence route")
+                    work["phase"] = "review"
+                work = _record(work, command, "qa_contract_bound")
+                work["history"][-1].update({"prior_artifacts": prior_artifacts, "prior_qa_contract": prior_contract})
+                validate_state(work)
+                return work
             runtime_rebind = (unchanged_authority_scope and not unchanged_bindings
                               and state["active_assignment"] is None
                               and slices_are_read_sealed(state)
@@ -799,6 +880,7 @@ def _reduce_command(
             work.pop("execution", None)
             if command.get("verification") is not None:
                 metadata(work)["verification"] = deepcopy(command["verification"])
+            _bind_qa_contract(work, command.get("qa_contract"))
             if runtime_rebind:
                 for key in ("findings", "read_admissions"):
                     metadata(work)[key] = deepcopy(state.get("execution", {}).get(key, {}))
@@ -833,6 +915,7 @@ def _reduce_command(
             metadata(value)["verification"] = deepcopy(command["verification"])
             if command["verification"].get("confirm_approved_plan"):
                 value = _confirm_approved_plan(value, baseline)
+        _bind_qa_contract(value, command.get("qa_contract"))
         validate_state(value)
         return value
 
@@ -884,26 +967,7 @@ def _reduce_command(
         validate_capability_recovery(work, command)
         phase = work["phase"]
         prior = deepcopy(work["artifacts"][phase])
-        journal_change = prior.get("capability_blocker_journal")
-        if journal_change is not None:
-            if (not isinstance(journal_change, dict) or set(journal_change) != {"id", "entry", "previous"}
-                    or not isinstance(journal_change["id"], str) or not isinstance(journal_change["entry"], dict)):
-                raise PipelineError("invalid controller blocker journal recovery record")
-            try:
-                for entry in (journal_change["entry"], journal_change["previous"]):
-                    if entry is not None:
-                        validate_entry(entry, sealed=True)
-                        if entry["id"] != journal_change["id"]:
-                            raise ValueError("controller blocker journal identity changed")
-            except ValueError as exc:
-                raise PipelineError(str(exc)) from exc
-            journal = work.get("technical_decisions", {})
-            if journal.get(journal_change["id"]) != journal_change["entry"]:
-                raise PipelineError("controller blocker journal changed; capability recovery cannot undo semantic decisions")
-            if journal_change["previous"] is None:
-                journal.pop(journal_change["id"])
-            else:
-                journal[journal_change["id"]] = deepcopy(journal_change["previous"])
+        _restore_blocker_journal(work, prior)
         restored = work["artifacts"][phase]
         restored["worker"]["outcome"] = "fail"
         restored["worker"].pop("blocker", None)
@@ -926,6 +990,11 @@ def _reduce_command(
     if name == "reconcile":
         if work["active_assignment"] is not None:
             raise PipelineError("checkout reconcile requires an idle assignment boundary")
+        from .no_progress import no_progress_hold
+        if no_progress_hold(work) is not None:
+            relevant = default_assignment(work)["access"]["read"]
+            if not any(not diff_violations([row["path"]], relevant) for row in command["packet"]["paths"]):
+                raise PipelineError("no-progress hold cannot be cleared by unrelated external changes; resolve the bound work basis")
         observed = command["controller"]
         prior = deepcopy(work["artifacts"])
         candidate = {"base_tree_oid": observed["candidate_tree_oid"],
@@ -991,6 +1060,9 @@ def _reduce_command(
     if name == "next":
         if work["phase"] == "ready" or work["active_assignment"] is not None:
             raise PipelineError("no next assignment is available")
+        from .no_progress import no_progress_hold
+        if no_progress_hold(work) is not None:
+            raise PipelineError("no-progress hold forbids unchanged Engineering redispatch; submit the bound specialist resolution through answer")
         if pending(work["questions"]):
             raise PipelineError("questions must be resolved first")
         current_record = work["artifacts"].get(work["phase"])
@@ -1066,6 +1138,11 @@ def _reduce_command(
         if phase == "qa" and context not in ({}, canonical["context"]):
             raise PipelineError("QA required identities are controller-derived")
         context = deepcopy(context)
+        for field in ("acceptance_contract_version", "qa_contract", "qa_previous_observations"):
+            if field in canonical.get("context", {}):
+                context[field] = deepcopy(canonical["context"][field])
+            else:
+                context.pop(field, None)
         context["current_slice"] = current_slice(work)
         context["technical_journal"] = journal_reference(work)
         context["technical_decisions"] = list(work.get("technical_decisions", {}).values())
@@ -1140,7 +1217,7 @@ def _reduce_command(
         )
         if required_ids is not None and active["capsule"]["context"].get("required_identity_ids") != required_ids:
             raise PipelineError("QA assignment identities no longer match approved authority")
-        artifact = _worker_artifact(command.get("artifact"), active["phase"], active["role"], required_ids)
+        artifact = _worker_artifact(command.get("artifact"), active["phase"], active["role"], required_ids, state=work)
         if active["capsule"]["context"].get("technical_journal", {}).get("sha256", journal_digest({})) != journal_digest(work.get("technical_decisions", {})):
             raise PipelineError("assignment technical journal is stale")
         forbidden = _contains_forbidden(artifact)
@@ -1188,7 +1265,9 @@ def _reduce_command(
         questions = artifact.get("questions", [])
         if active["phase"] == "review":
             artifact = deepcopy(artifact)
-            artifact["findings"] = finding_updates(work, artifact["findings"])
+            artifact["findings"] = finding_updates(work, artifact["findings"], artifact.get("finding_resolutions", []), outcome=artifact["outcome"])
+        elif active["phase"] in {"engineering", "docs"}:
+            record_finding_resolutions(work, active["phase"], artifact)
         record = {"assignment_id": active["id"], "worker": deepcopy(artifact), "controller": evidence}
         if blocker_journal is not None:
             record["capability_blocker_journal"] = blocker_journal
@@ -1201,6 +1280,7 @@ def _reduce_command(
         record["candidate_binding"] = deepcopy(active["capsule"].get("candidate"))
         if required_ids is not None:
             record["required_identity_ids"] = deepcopy(required_ids)
+            record["qa_contract"] = deepcopy(active["capsule"]["context"].get("qa_contract"))
         review_scope = active["capsule"]["context"].get("review_target")
         if active["phase"] in {"review", "qa"} and isinstance(review_scope, dict):
             record["review_target"] = deepcopy(review_scope)
@@ -1271,6 +1351,11 @@ def _reduce_command(
         })
 
     if name == "answer":
+        from .no_progress import no_progress_hold, record_resolution
+        hold = no_progress_hold(work)
+        if hold is not None or "resolution" in command:
+            question_id = record_resolution(work, command)
+            return _record(work, command, question_id)
         question_id = _require_text(command.get("question_id"), "question id")
         item = work["questions"].get(question_id)
         if not item or item["status"] != "open":

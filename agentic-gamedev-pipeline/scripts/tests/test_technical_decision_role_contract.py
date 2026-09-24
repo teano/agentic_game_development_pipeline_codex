@@ -17,6 +17,7 @@ SKILLS = BUNDLE / "skills"
 sys.path.insert(0, str(SKILLS / "gamedev-pipeline" / "scripts"))
 from pipeline_v2.model import PipelineError, ROLES, artifact_schema, compact_assignment_context, journal_digest
 from pipeline_v2.reducer import _worker_artifact
+from test_role_policy_alignment import reachable_markdown
 
 
 def decision() -> dict:
@@ -121,8 +122,16 @@ class TechnicalDecisionRoleContractTests(unittest.TestCase):
                     links = re.findall(r"\]\(([^)]*technical-decisions\.md)#role-responsibilities\)", dispatch)
                     self.assertEqual([policy], [(router.parent / link).resolve() for link in links])
                 else:
-                    links = re.findall(r"\]\(([^)]+technical-decisions\.md)\)", source.read_text(encoding="utf-8"))
-                    self.assertEqual([policy], [(source.parent / link).resolve() for link in links])
+                    links = re.findall(r"\]\(([^)]+technical-decisions\.md)(?:#([^)]+))?\)", source.read_text(encoding="utf-8"))
+                    self.assertIn(policy, reachable_markdown(source))
+                    self.assertTrue(all((source.parent / link).resolve() == policy for link, _ in links))
+                    headings = {
+                        re.sub(r"[^a-z0-9 -]", "", heading.lower()).strip().replace(" ", "-")
+                        for heading in re.findall(r"(?m)^#{1,6} (.+)$", policy.read_text(encoding="utf-8"))
+                    }
+                    for _, anchor in links:
+                        if anchor:
+                            self.assertIn(anchor, headings)
                 prompt = (source.parent / "agents/openai.yaml").read_text(encoding="utf-8")
                 self.assertRegex(prompt, "technical-decision")
         self.assertTrue(policy.is_file())
@@ -137,12 +146,17 @@ class TechnicalDecisionRoleContractTests(unittest.TestCase):
         self.assertFalse(context["technical_journal"]["requires_current_journal_read"])
         self.assertEqual(records, context["technical_decisions"])
         self.assertEqual(len(records) - len(context["technical_decisions"]), context["technical_journal"]["omitted_entry_count"])
-        for name in ("technical-decisions.md", "stage-handoff-invariant.md"):
-            with self.subTest(reference=name):
-                text = (SKILLS / "gamedev-pipeline/references" / name).read_text(encoding="utf-8")
-                self.assertIn("context.technical_journal.requires_current_journal_read", text)
-                self.assertIn("before implementation or judgment", text)
-                self.assertIn("canonical current", text)
+        references = SKILLS / "gamedev-pipeline/references"
+        policy = (references / "technical-decisions.md").read_text(encoding="utf-8")
+        self.assertIn("context.technical_journal.requires_current_journal_read", policy)
+        self.assertIn("before implementation or judgment", policy)
+        self.assertIn("canonical current", policy)
+        # The shared handoff routes to this complete canonical rule rather than
+        # duplicating its prose and creating a second norm to keep synchronized.
+        handoff = (references / "stage-handoff-invariant.md").read_text(encoding="utf-8")
+        self.assertIn("requires_current_journal_read:true", handoff)
+        self.assertIn("(technical-decisions.md#current-journal)", handoff)
+        self.assertIn("## Current journal", policy)
 
 
 if __name__ == "__main__":

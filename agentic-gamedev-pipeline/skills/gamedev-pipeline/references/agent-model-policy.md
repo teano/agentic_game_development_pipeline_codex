@@ -28,7 +28,7 @@ Choose the row for the actual assigned work. Rows do not create roles, activate 
 | Specification Proofreader | `gpt-6-astra` | `low` | Independently compare exact specification bytes with approved scope. |
 | Specification helper semantic review or post-fix verification worker, when its existing route delegates one | `gpt-6-astra` | `low` | Independently check helper output against the exact request; use the Proofreader setting. |
 | Specification repository-research helper | `gpt-5.6-terra` | `high` | Answer a bounded project-evidence question. |
-| Development Plan Planning Analyst | `gpt-6-astra` | `high` | Analyze coupling, seams, dependencies, context budgets and coverage. |
+| Development Plan Planning Analyst | `gpt-6-astra` | `high` | Analyze coupling, seams, dependencies, scoped context delivery and coverage. |
 | Runtime Plan (`planner`) | `gpt-6-astra` | `high` | Confirm approved intent and unresolved product decisions. |
 | Runtime Slice (`slicer`) | `gpt-5.6-terra` | `high` | Confirm bounded approved scope and retained-path coverage. |
 | Engineering (`engineer`) | `gpt-5.6-terra` | `xhigh` | Implement the assigned game slice and coupled tests. |

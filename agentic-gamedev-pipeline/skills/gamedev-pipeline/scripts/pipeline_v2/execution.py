@@ -33,13 +33,22 @@ def validate_metadata(value, *, error_type=None, digest_validator=None):
         error_type, digest_validator = PipelineError, is_digest
     PipelineError, is_digest = error_type, digest_validator
     required = {"version", "owners", "receipts", "read_admissions", "findings"}
-    optional = {"verification", "rotation", "reconciled_tree", "review_obligations"}
+    optional = {"verification", "rotation", "reconciled_tree", "review_obligations", "qa_contract", "qa_contract_binding"}
     if (not isinstance(value, dict) or not required <= set(value)
             or set(value) - required - optional or value["version"] != 1):
         raise PipelineError("execution metadata must use version 1")
     for key in required - {"version"}:
         if not isinstance(value[key], dict):
             raise PipelineError(f"execution {key} must be an object")
+    if ("qa_contract" in value) != ("qa_contract_binding" in value):
+        raise PipelineError("QA contract and binding must be present together")
+    if "qa_contract" in value:
+        binding = value["qa_contract_binding"]
+        if (not isinstance(value["qa_contract"], dict) or not isinstance(binding, dict)
+                or set(binding) != {"authority_digest", "contract_digest"}
+                or any(not is_digest(binding[key]) for key in binding)
+                or binding["contract_digest"] != _digest(value["qa_contract"])):
+            raise PipelineError("QA contract binding must contain valid authority and exact contract digests")
     for key, receipt in value["receipts"].items():
         if (not is_digest(key) or not isinstance(receipt, dict)
                 or receipt.get("binding") != key or not isinstance(receipt.get("result"), dict)
@@ -150,6 +159,44 @@ persisted, and a missing executable never receives a reusable identity.
                     "executable_sha256": executable_hash, "environment": _digest(environment), "dependencies": dependencies})
 
 
+def execution_environment():
+    """Use the same effective environment for execution and receipt eligibility."""
+    environment = os.environ.copy()
+    environment["NODE_DISABLE_COMPILE_CACHE"] = "1"
+    environment.pop("NODE_COMPILE_CACHE", None)
+    return environment
+
+
+def machine_check_row(result, locator, receipt_id):
+    return {"id": result["check_id"], "outcome": "pass" if result["returncode"] == 0 else "fail",
+            "source_locator": locator, "receipt_id": receipt_id, "receipt_sha256": _digest(result),
+            "returncode": result["returncode"], "stdout_sha256": result["stdout_sha256"],
+            "stderr_sha256": result["stderr_sha256"]}
+
+
+def machine_check_inputs(state, tree, environment, default_timeout=600):
+    """Project currently applicable canonical receipts without executing a check.
+
+    Review and QA share the same conservative receipt eligibility; source locators
+    identify provenance and never grant access to controller state.
+    """
+    from .model import current_slice
+    rows, pending = [], []
+    for index, argv in enumerate(current_slice(state)["planned_commands"]):
+        recipe = recipe_for(state, argv, index, default_timeout)
+        binding = receipt_binding(state, tree, recipe, environment)
+        receipt = state.get("execution", {}).get("receipts", {}).get(binding)
+        if receipt is None:
+            pending.append(recipe["id"])
+        else:
+            locator = f"{state['workflow_path']}/pipeline-state.json#/execution/receipts/{binding}"
+            rows.append(machine_check_row(receipt["result"], locator, receipt["id"]))
+    return {"candidate_tree_oid": tree, "authority_digest": state["authority"]["digest"],
+            "pipeline_runtime_digest": state["pipeline_runtime_digest"], "checks": rows,
+            "pending_check_ids": pending, "grants_manual_acceptance": False,
+            "grants_semantic_credit": False}
+
+
 def verification_environment(commands, environment, *, state=None):
     from .checkout import file_sha256
     tools = []
@@ -172,39 +219,33 @@ def verification_environment(commands, environment, *, state=None):
     return _digest([tools, dependencies, environment])
 
 
-def finding_updates(state, findings):
-    """Stable identities, explicit resolution, and a bounded no-progress signal."""
+def finding_updates(state, findings, resolutions=None, *, outcome=None):
+    """Apply independent per-condition Review results without implicit closure."""
     from .model import current_slice
+    from .finding_contract import prepare_review_update
     store = metadata(state)["findings"]
     key = owner_key(state, "review")
-    previous = store.get(key, {"open": {}, "resolved": [], "repeat_count": 0})
-    current = {}
-    for finding in findings:
-        item = deepcopy(finding)
-        generated = "id" not in item
-        base = item.setdefault("id", "F-" + _digest({k: v for k, v in item.items() if k != "id"})[:16])
-        identity = base
-        suffix = 2
-        while identity in current:
-            if not generated:
-                from .model import PipelineError
-                raise PipelineError("duplicate Review finding ID; assign a distinct ID to each operative finding")
-            identity = f"{base}-{suffix}"
-            suffix += 1
-        item["id"] = identity
-        current[identity] = item
-    resolved = list(dict.fromkeys(previous.get("resolved", []) + sorted(set(previous["open"]) - set(current))))
-    same = bool(current) and current == previous["open"]
-    store[key] = {"slice_id": current_slice(state)["id"], "open": current, "resolved": resolved,
-                  "repeat_count": previous.get("repeat_count", 0) + 1 if same else 0}
-    return list(current.values())
+    updated = prepare_review_update(store.get(key), findings, resolutions, outcome=outcome)
+    updated["slice_id"] = current_slice(state)["id"]
+    store[key] = updated
+    return list(deepcopy(updated["open"]).values())
+
+
+def record_finding_resolutions(state, phase, artifact):
+    from .finding_contract import record_repair_claims
+    record_repair_claims(state, phase, artifact)
 
 
 def convergence_context(state):
+    from .finding_contract import normalized_record
     value = state.get("execution", {}).get("findings", {}).get(owner_key(state, "review"))
     if not value:
         return None
-    return {**deepcopy(value), "requires_cause_analysis": value["repeat_count"] >= 2}
+    value = normalized_record(value)
+    # Retain closed originals in state; deliver current originals only once.
+    value.pop("retained", None)
+    value["condition_status"] = {key: rows for key, rows in value["condition_status"].items() if key in value["open"]}
+    return {**value, "requires_cause_analysis": value["repeat_count"] >= 2}
 
 
 def classify_error(error):
@@ -214,6 +255,9 @@ def classify_error(error):
     if getattr(error, "worker_artifact_validation", False):
         return {"error": text, "category": "artifact_format", "retryable": False,
                 "required_action": "Correct only the same owned output artifact truthfully and resubmit."}
+    if "no-progress" in lower:
+        return {"error": text, "category": "no_progress", "retryable": False,
+                "required_action": "Read current status and route the bound resolution to the responsible specialist; do not redispatch unchanged work."}
     rules = [
         (("stale", "generation", "already used", "lock is busy"), "stale_action", True, "Read current status; replay the original identity after an uncertain response."),
         (("runtime changed", "manifest file", "controller evidence", "proof"), "runtime_incident", False, "Stop product work and use separately authorized runtime maintenance."),

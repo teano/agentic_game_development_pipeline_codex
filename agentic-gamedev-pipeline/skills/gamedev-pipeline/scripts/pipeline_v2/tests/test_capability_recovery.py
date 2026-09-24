@@ -66,7 +66,9 @@ class CapabilityRecoveryTests(unittest.TestCase):
         return deepcopy(self.h.store.load()["active_assignment"])
 
     def block(self, decisions=None):
-        self.complete({"outcome": "blocked", "checks": [], "blocker": "Authorized external channel unavailable.",
+        self.complete({"outcome": "blocked",
+                       "checks": self.h._qa_checks("Authorized external channel unavailable.", outcome="not_run"),
+                       "blocker": "Authorized external channel unavailable.",
                        "required_action": "Restore the same authorized channel.",
                        **({"technical_decisions": decisions} if decisions else {})})
         return self.h.store.load()

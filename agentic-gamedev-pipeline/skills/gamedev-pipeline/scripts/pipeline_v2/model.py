@@ -75,7 +75,7 @@ _ARTIFACT_SHAPES = {
         },
     ),
     "engineering": (
-        ("outcome", "summary", "questions", "assumptions", "blocker", "required_action", "technical_decisions"),
+        ("outcome", "summary", "questions", "assumptions", "blocker", "required_action", "technical_decisions", "finding_resolutions"),
         ("outcome", "summary"),
         {
             "summary": "non-empty string", "questions[]": "non-empty string",
@@ -86,15 +86,15 @@ _ARTIFACT_SHAPES = {
         },
     ),
     "review": (
-        ("outcome", "findings", "questions", "blocker", "required_action"),
+        ("outcome", "findings", "questions", "blocker", "required_action", "finding_resolutions"),
         ("outcome", "findings"),
         {
             "findings[]": {
-                "allowed_keys": ["id", "text", "severity", "kind"],
-                "required_keys": ["text", "severity", "kind"],
-                "values": "non-empty strings",
+                "allowed_keys": ["id", "text", "severity", "kind", "conditions"],
+                "required_keys": ["text", "severity", "kind", "conditions"],
+                "values": "non-empty strings; conditions is a non-empty list of exact {id,text} objects with stable IDs",
             },
-            "findings": "empty on pass; non-empty on fail",
+            "findings": "new findings; empty on pass; fail requires a new finding or an unresolved prior condition",
             "questions[]": "non-empty string",
             "blocker": "non-empty string only and always when blocked",
             "required_action": "non-empty string only and always when blocked",
@@ -105,20 +105,20 @@ _ARTIFACT_SHAPES = {
         ("outcome", "checks"),
         {
             "checks[]": {
-                "allowed_keys": ["id", "outcome", "evidence"],
-                "required_keys": ["id", "outcome", "evidence"],
+                "allowed_keys": ["id", "outcome", "evidence", "assertions"],
+                "required_keys": ["id", "outcome", "evidence", "assertions"],
                 "id": "one exact context.required_identity_ids entry, without duplicates",
                 "outcome": "pass|fail|not_run",
-                "evidence": "non-empty observed execution evidence; distinguish the actual integration from substitutes",
+                "evidence": "non-empty string describing observed execution evidence; distinguish the actual integration from substitutes",
             },
-            "checks": "pass requires the exact required identity set, all with outcome pass; blocked may contain partial observations",
+            "checks": "exact identity and assertion inventory on every outcome; methods/evidence/reasons follow context.qa_contract; unresolved contract permits only blocked without credit",
             "blocker": "non-empty string only and always when blocked",
             "required_action": "non-empty string only and always when blocked",
             "questions[]": "non-empty string",
         },
     ),
     "docs": (
-        ("outcome", "summary", "questions", "blocker", "required_action"),
+        ("outcome", "summary", "questions", "blocker", "required_action", "finding_resolutions"),
         ("outcome", "summary"),
         {
             "summary": "non-empty string", "questions[]": "non-empty string",
@@ -278,12 +278,28 @@ def artifact_schema(phase: str, role: str | None = None) -> dict[str, Any]:
     if phase not in _ARTIFACT_SHAPES or (role is not None and role != ROLES[phase]):
         raise PipelineError("artifact schema requires a known phase/role")
     allowed, required, shapes = _ARTIFACT_SHAPES[phase]
-    return {
+    result = {
         "allowed_keys": list(dict.fromkeys([*allowed, "technical_decisions"])),
         "required_keys": list(required),
         "outcome_enum": ["pass", "fail", "blocked"],
         "item_shapes": {**deepcopy(shapes), "technical_decisions[]": "current TD-* entries: id, situation, decision, basis, checks[], downstream, optional overrides exact reference and diagnostic-only observations[]; execution is controller-owned"},
     }
+    if phase in {"engineering", "docs", "review"}:
+        result["item_shapes"]["finding_resolutions[]"] = {
+            "required_keys": ["finding_id", "condition_id", "status", "evidence"],
+            "status": "resolved|unresolved" if phase == "review" else "addressed|unresolved",
+            "coverage": "every condition of each open finding for Review; every unresolved condition for its remediation owner",
+            "evidence": "non-empty current change/observation/proof reference; claims do not close a finding",
+        }
+    if phase == "qa":
+        result["item_shapes"]["checks[]"]["assertions"] = {
+            "required_keys": ["id", "outcome", "method_id", "environment", "evidence"],
+            "optional_keys": ["reason"],
+            "outcome": "pass|fail|not_run|not_applicable",
+            "evidence[]": "exact {type,ref,observation}; types prescribed by context.qa_contract.definition",
+            "reason": "{kind,detail,refs[]} required for not_run; kind capability_unavailable|dependency_unsatisfied|authority_unresolved|verification_incomplete; verification_incomplete names every approved method alternative and requires verification-gap evidence; containing identity fails without claiming execution",
+        }
+    return result
 
 
 def _has_legacy_omission(value: Any) -> bool:
@@ -312,7 +328,8 @@ def _mark_journal_completeness(context: dict[str, Any]) -> None:
 
 def answered_decisions(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Answered controller questions remain operative until explicit reconfiguration."""
-    return [{"id": key, "phase": item["phase"], "prompt": item["prompt"], "answer": item["answer"]}
+    return [{"id": key, "phase": item["phase"], "prompt": item["prompt"], "answer": item["answer"],
+             **({"resolution": deepcopy(item["resolution"])} if "resolution" in item else {})}
             for key, item in sorted(state.get("questions", {}).items())
             if item.get("status") == "answered"]
 
@@ -372,7 +389,7 @@ def compact_assignment_context(
     """
     lossless_format = canonical_input or source.get("delivery_version") == 1
     context: dict[str, Any] = {"delivery_version": 1}
-    for key in ("convergence", "diagnostic_checks", "machine_checks", "capability_recovery"):
+    for key in ("convergence", "diagnostic_checks", "machine_checks", "capability_recovery", "acceptance_contract_version", "qa_contract", "qa_previous_observations"):
         if key in source:
             context[key] = deepcopy(source[key])
     if isinstance(source.get("technical_journal"), dict):
@@ -450,6 +467,38 @@ def literal_paths_valid(value: Any) -> bool:
         return all(normalize_literal_path(path) == path for path in value)
     except PipelineError:
         return False
+
+
+def _legacy_artifact_schemas(phase: str, role: str) -> list[dict[str, Any]]:
+    """Permit reading pre-contract snapshots for controlled runtime maintenance."""
+    legacy = artifact_schema(phase, role)
+    previous_descriptions = []
+    if phase == "qa":
+        previous_reason = deepcopy(legacy)
+        previous_reason["item_shapes"]["checks[]"]["assertions"]["reason"] = (
+            "{kind,detail,refs[]} required for not_run; kind capability_unavailable|dependency_unsatisfied|authority_unresolved"
+        )
+        previous_descriptions.append(deepcopy(previous_reason))
+        previous_reason["item_shapes"]["checks[]"]["evidence"] = "non-empty observed execution evidence; distinguish the actual integration from substitutes"
+        previous_descriptions.append(previous_reason)
+        legacy["item_shapes"]["checks[]"]["evidence"] = "non-empty observed execution evidence; distinguish the actual integration from substitutes"
+        previous_descriptions.append(deepcopy(legacy))
+    if "finding_resolutions" in legacy["allowed_keys"]:
+        legacy["allowed_keys"].remove("finding_resolutions")
+        legacy["item_shapes"].pop("finding_resolutions[]", None)
+    if phase == "review":
+        legacy["item_shapes"]["findings[]"] = {"allowed_keys": ["id", "text", "severity", "kind"], "required_keys": ["text", "severity", "kind"], "values": "non-empty strings"}
+        legacy["item_shapes"]["findings"] = "empty on pass; non-empty on fail"
+    if phase == "qa":
+        legacy["item_shapes"]["checks[]"].pop("assertions", None)
+        for key in ("allowed_keys", "required_keys"):
+            legacy["item_shapes"]["checks[]"][key].remove("assertions")
+        legacy["item_shapes"]["checks"] = "pass requires the exact required identity set, all with outcome pass; blocked may contain partial observations"
+    older = deepcopy(legacy)
+    older["item_shapes"]["technical_decisions[]"] = "current TD-* entries: id, situation, decision, basis, checks[], downstream, optional overrides exact reference; execution is controller-owned"
+    if phase == "review":
+        older["item_shapes"]["findings[]"]["allowed_keys"].remove("id")
+    return [legacy, older, *previous_descriptions]
 
 
 def normalize_read_rule(value: str) -> str:
@@ -892,7 +941,7 @@ def qa_coverage_complete(record: Any) -> bool:
         or len(expected) != len(set(expected))
         or not isinstance(checks, list)
         or any(
-            not isinstance(item, dict) or set(item) != {"id", "outcome", "evidence"}
+            not isinstance(item, dict) or set(item) != {"id", "outcome", "evidence", "assertions"}
             or not isinstance(item.get("id"), str)
             or item.get("outcome") != "pass"
             or not isinstance(item.get("evidence"), str) or not item["evidence"].strip()
@@ -900,7 +949,17 @@ def qa_coverage_complete(record: Any) -> bool:
         )
     ):
         return False
-    return len(checks) == len(expected) and {item["id"] for item in checks} == set(expected)
+    if len(checks) != len(expected) or {item["id"] for item in checks} != set(expected):
+        return False
+    contract = record.get("qa_contract", {})
+    if contract.get("status") != "bound":
+        return False
+    from .qa_contract import validate_results
+    try:
+        validate_results(checks, contract["definition"], outcome="pass")
+    except (ValueError, KeyError, TypeError):
+        return False
+    return True
 
 
 def qa_credit_complete(record: Any) -> bool:
@@ -1255,6 +1314,13 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
         read = list(dict.fromkeys(read + [f"{state['workflow_path']}/pipeline-state.json"]))
     additions = state.get("execution", {}).get("read_admissions", {}).get(owner_key(state, "shared"), [])
     read = list(dict.fromkeys(read + additions))
+    # A bound clarification remains inspectable by Engineering and independent
+    # verification. Its exact evidence source gains read access, never writes.
+    resolution_sources = [row["path"] for question in state["questions"].values()
+                          if question.get("status") == "answered"
+                          and question.get("resolution", {}).get("binding", {}).get("authority_digest") == state["authority"]["digest"]
+                          for row in question["resolution"]["evidence"]]
+    read = list(dict.fromkeys(read + resolution_sources))
     assignment = {
         "id": assignment_id,
         "worker_id": identity["worker_id"],
@@ -1269,6 +1335,28 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
         assignment["context"]["required_identity_ids"] = required_qa_identity_ids(state)
     if phase == "qa":
         assignment["context"] = {"required_identity_ids": required_qa_identity_ids(state)}
+    if phase in {"engineering", "review", "qa", "docs"}:
+        assignment.setdefault("context", {})["acceptance_contract_version"] = 1
+    if phase in {"engineering", "qa"} or (phase == "review" and target["kind"] == "current_slice_implementation"):
+        assignment.setdefault("context", {})["qa_contract"] = qa_contract_context(state)
+    if phase == "qa":
+        previous = state.get("artifacts", {}).get("qa", {})
+        if not previous:
+            for event in reversed(state["history"]):
+                if event.get("command") == "init" and event.get("result") != "qa_contract_bound":
+                    break
+                prior = event.get("prior_artifacts", {}).get("qa", {})
+                if prior.get("candidate_binding") == current_candidate(state):
+                    previous = prior
+                    break
+        if previous.get("worker", {}).get("checks"):
+            assignment["context"]["qa_previous_observations"] = {
+                "checks": deepcopy(previous["worker"]["checks"]),
+                "candidate_binding": deepcopy(previous.get("candidate_binding")),
+                "qa_contract": deepcopy(previous.get("qa_contract")),
+                "grants_credit": False,
+                "reuse_rule": "Historical observations only. Revalidate current environment and every required assertion; no automatic manual credit.",
+            }
     for index in range(len(state["history"]) - 1, -1, -1):
         event = state["history"][index]
         if event.get("command") == "init":
@@ -1309,6 +1397,38 @@ def required_qa_identity_ids(state: dict[str, Any]) -> list[str]:
         raise PipelineError(f"QA requires the exact approved mandatory identity inventory: {exc}") from exc
 
 
+def seal_qa_contract(root: Path, authority_items: dict[str, Any], slices: list[dict[str, Any]], supplied: Any = None) -> dict[str, Any] | None:
+    from .qa_contract import validate_contract
+    try:
+        text = (root / authority_items["plan"]["path"]).read_text(encoding="utf-8")
+        paths = {item["path"] for item in authority_items.values()}
+        inventories = _PLAN_CONTRACT.parse_slice_path_contracts(text, include_qa=True)
+        expected = {item["id"]: inventories[item["id"]]["mandatory_identity_ids"] for item in slices}
+        embedded = _PLAN_CONTRACT.parse_qa_contract(text, source_paths=paths)
+        if embedded is not None and supplied is not None and supplied != embedded:
+            raise PipelineError("QA contract cannot override methods in the approved plan")
+        value = embedded if embedded is not None else supplied
+        return None if value is None else validate_contract(value, expected, source_paths=paths)
+    except (ValueError, KeyError, OSError, UnicodeError) as exc:
+        raise PipelineError(f"invalid approved QA contract: {exc}") from exc
+
+
+def qa_contract_context(state: dict[str, Any]) -> dict[str, Any]:
+    """Expose the same sealed acceptance definition to writers and independent assessors."""
+    from .qa_contract import contract_digest, slice_contract
+    execution = state.get("execution", {})
+    contract = execution.get("qa_contract")
+    binding = execution.get("qa_contract_binding")
+    if contract is None:
+        return {"status": "unresolved", "required_action": "Bind the source-grounded QA contract with init --qa-contract; preserve approved PRD/SPEC/PLAN. No method-verified PASS before binding."}
+    expected = {"authority_digest": state["authority"]["digest"], "contract_digest": contract_digest(contract)}
+    if binding != expected:
+        raise PipelineError("QA contract authority binding is stale; explicitly rebind from current approved sources")
+    selected = current_slice(state)["id"]
+    return {"status": "bound", "definition": slice_contract(contract, selected),
+            "binding": {**expected, "slice_id": selected}}
+
+
 def next_action(state: dict[str, Any]) -> dict[str, Any]:
     """Return one deterministic controller route with no caller-authored bookkeeping."""
     generation = state["generation"]
@@ -1335,6 +1455,10 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
                 "with its exact capability_binding as binding to recover-capability. Until then remain blocked."
             ),
         }
+    from .no_progress import no_progress_hold, resolution_action
+    hold = no_progress_hold(state)
+    if hold is not None:
+        return resolution_action(state, hold)
     open_questions = pending(state["questions"])
     if open_questions:
         question_id = open_questions[0]
@@ -1386,6 +1510,9 @@ def validate_state(state: dict[str, Any]) -> None:
         raise PipelineError("state must use the compact schema-4 shape")
     if "execution" in state:
         _validate_execution_metadata(state["execution"], error_type=PipelineError, digest_validator=is_digest)
+        binding = state["execution"].get("qa_contract_binding")
+        if binding is not None and binding["authority_digest"] != state["authority"]["digest"]:
+            raise PipelineError("QA contract is not bound to the current approved authority")
     try:
         validate_journal(state.get("technical_decisions", {}))
     except ValueError as exc:
@@ -1493,6 +1620,15 @@ def validate_state(state: dict[str, Any]) -> None:
             or (item.get("status") == "answered" and not isinstance(item.get("answer"), str))
         ):
             raise PipelineError("question has an invalid shape")
+        if "resolution" in item:
+            from .no_progress import validate_resolution_record, validate_source_identities
+            from .checkout import path_identity
+            validate_resolution_record(item["resolution"])
+            validate_source_identities(item["resolution"], item.get("resolution_sources"))
+            if item["status"] != "answered" or item["answer"] != item["resolution"]["answer"].strip():
+                raise PipelineError("no-progress question must retain its exact answered resolution")
+            if item["resolution"]["binding"]["project_root"] != path_identity(state["project_root"]):
+                raise PipelineError("no-progress resolution belongs to another project root")
     for item in state["history"]:
         if (
             not isinstance(item, dict) or not isinstance(item.get("id"), str)
@@ -1527,11 +1663,7 @@ def validate_state(state: dict[str, Any]) -> None:
         if "output_path" in active and active["output_path"] != assignment_output_path(active, state["feature"]):
             raise PipelineError("active_assignment output path is not controller-derived")
         if "artifact_schema" in active and active["artifact_schema"] != artifact_schema(active["phase"], active["role"]):
-            legacy = artifact_schema(active["phase"], active["role"])
-            legacy["item_shapes"]["technical_decisions[]"] = "current TD-* entries: id, situation, decision, basis, checks[], downstream, optional overrides exact reference; execution is controller-owned"
-            if active["phase"] == "review":
-                legacy["item_shapes"]["findings[]"]["allowed_keys"].remove("id")
-            if active["artifact_schema"] != legacy:
+            if active["artifact_schema"] not in _legacy_artifact_schemas(active["phase"], active["role"]):
                 raise PipelineError("active_assignment artifact schema is not controller-derived; use authorized maintenance/reinit")
         if "technical_observation" in active:
             observation = active["technical_observation"]
@@ -1572,6 +1704,22 @@ def _active_assignment_view(
     """Project the recoverable worker packet without controller bookkeeping."""
     bound_candidate = active["capsule"].get("candidate")
     context = required_assignment_context(state, active)
+    if active["phase"] in {"engineering", "review", "docs"}:
+        from .execution import convergence_context
+        from .finding_contract import required_condition_roster
+        convergence = convergence_context(state)
+        if convergence is not None:
+            context["convergence"] = convergence
+        context["required_finding_conditions"] = required_condition_roster(convergence, active["phase"])
+    if active["phase"] == "review":
+        from .execution import execution_environment, machine_check_inputs
+        # Observation only: a Review lease gains neither executable commands nor
+        # state-file read access. Never forward a stale capsule's machine proof.
+        context.pop("machine_checks", None)
+        if isinstance(bound_candidate, dict) and bound_candidate == current_candidate(state):
+            context["machine_checks"] = machine_check_inputs(
+                state, bound_candidate["candidate_tree_oid"], execution_environment(),
+            )
     selected = context.get("current_slice")
     if (
         active["phase"] == "review"
@@ -1600,6 +1748,8 @@ def _active_assignment_view(
 def status_view(state: dict[str, Any]) -> dict[str, Any]:
     validate_state(state)
     active = state["active_assignment"]
+    from .no_progress import no_progress_hold
+    hold = no_progress_hold(state)
     return {
         "project_root": state["project_root"],
         "run_id": state["run_id"],
@@ -1609,7 +1759,7 @@ def status_view(state: dict[str, Any]) -> dict[str, Any]:
         "phase": state["phase"],
         "active_assignment": _active_assignment_view(state, active) if active else None,
         "candidate": current_candidate(state),
-        "open_questions": pending(state["questions"]),
+        "open_questions": pending(state["questions"]) + ([hold["question_id"]] if hold is not None else []),
         "ready": production_ready(state),
         "technical_journal": journal_reference(state),
         "next_action": next_action(state),

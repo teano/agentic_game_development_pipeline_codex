@@ -46,23 +46,52 @@ Feature scope, non-goals, protected systems, and authorized shared boundaries.
 - automation_feasibility: exact boundary
 - capability_prerequisites: project-runtime-capability
 
+## QA Acceptance Contract
+
+```json
+{
+  "schema": 1,
+  "confirm_approved_plan": true,
+  "slices": {
+    "SLICE-001": {
+      "identities": [
+        {
+          "id": "AUTO-SLICE-001-CORE",
+          "source": "PLAN_PATH#verification-and-exit-criteria",
+          "assertions": [{
+            "id": "core-behavior",
+            "expected": "Exact approved observable core behavior.",
+            "methods": [{"id": "approved-core-check", "source": "PLAN_PATH#verification-and-exit-criteria", "description": "Exact approved executable check and observable acceptance result.", "capabilities": ["planned-check-runner"], "evidence_types": ["bound-machine-receipt"]}],
+            "applicability": {"kind": "always", "condition": "always", "evidence_types": []},
+            "depends_on": []
+          }]
+        },
+        {
+          "id": "MANUAL-SLICE-001-RUNTIME",
+          "source": "PLAN_PATH#verification-and-exit-criteria",
+          "assertions": [{
+            "id": "runtime-behavior",
+            "expected": "Exact approved externally observed runtime behavior.",
+            "methods": [{"id": "approved-runtime-observation", "source": "PLAN_PATH#verification-and-exit-criteria", "description": "Exact approved interaction, method and observable acceptance result.", "capabilities": ["project-runtime-capability"], "evidence_types": ["runtime-observation"]}],
+            "applicability": {"kind": "always", "condition": "always", "evidence_types": []},
+            "depends_on": []
+          }]
+        }
+      ]
+    }
+  }
+}
+```
+
 ## Documentation Strategy
 
 - normative_pre_review: exact behavior-defining paths | not_required with policy evidence
 - derived_post_qa: exact support paths | not_required with policy evidence
 - source_rule: active DEC/PRD/spec IDs and exact verified evidence only
 
-## Context Budget
+## Context Delivery
 
-Working-set estimates for the Director and workers; numeric validation does not measure or enforce actual runtime context.
-
-- max_authority_files: 12
-- max_evidence_files: 20
-- max_total_files: 32
-- max_payload_bytes: 250000
-- max_estimated_tokens: 60000
-- metric_scope: capsule_plus_referenced_files
-- estimation_recipe: ceil((canonical capsule UTF-8 bytes + exact referenced authority/evidence bytes) / 4)
+Describe the smallest relevant working set, exact source locators and sections/pages to read as needed. Continue the same owner with changed facts and evidence deltas; checkpoint when context continuity is at risk. Record any explicit user limit with its source and scope; do not invent file, byte, or token caps.
 
 ## Integration Milestones
 
@@ -144,18 +173,11 @@ For a legitimately isolated slice, replace both touchpoint rows above with the e
 
 Include applicable current technical decisions as verified context; a journal claim alone does not prove an implemented behavior or authorize a normative promise.
 
-### Context Capsule Budget
+### Context Capsule
 
-- max_authority_files: 8
-- max_evidence_files: 12
-- max_total_files: 20
-- max_payload_bytes: 160000
-- max_estimated_tokens: 40000
-- metric_scope: capsule_plus_referenced_files
 - authority_paths: exact bounded paths
 - evidence_paths: exact bounded paths
-
-Count delivered technical-journal entries and their referenced evidence in these estimates. The controller supplies the journal packet; do not add controller-state files to candidate edit scope or use TD-* as DEC-* amendment authority.
+- delivery_instructions: Relevant source sections/pages, current technical-journal records and evidence; send same-owner deltas and checkpoint if continuity is at risk. The controller supplies the journal packet; controller-state files are not candidate edits and TD-* is not DEC-* authority.
 
 ### Verification and Exit Criteria
 
