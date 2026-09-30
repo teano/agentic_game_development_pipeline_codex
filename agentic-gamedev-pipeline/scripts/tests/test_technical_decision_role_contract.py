@@ -6,6 +6,7 @@ judgment or to replace end-to-end controller transition and fresh-worker probes.
 from __future__ import annotations
 
 from copy import deepcopy
+import importlib.util
 from pathlib import Path
 import re
 import sys
@@ -17,7 +18,17 @@ SKILLS = BUNDLE / "skills"
 sys.path.insert(0, str(SKILLS / "gamedev-pipeline" / "scripts"))
 from pipeline_v2.model import PipelineError, ROLES, artifact_schema, compact_assignment_context, journal_digest
 from pipeline_v2.reducer import _worker_artifact
-from test_role_policy_alignment import reachable_markdown
+
+# The canonical bundle runner imports test files under unique module names;
+# resolve this test-local helper by its exact sibling file, not process sys.path.
+_policy_spec = importlib.util.spec_from_file_location(
+    __name__ + "_policy_helpers", Path(__file__).with_name("test_role_policy_alignment.py")
+)
+if _policy_spec is None or _policy_spec.loader is None:
+    raise ImportError("Cannot load the test-local instruction reachability helper")
+_policy_helpers = importlib.util.module_from_spec(_policy_spec)
+_policy_spec.loader.exec_module(_policy_helpers)
+reachable_markdown = _policy_helpers.reachable_markdown
 
 
 def decision() -> dict:

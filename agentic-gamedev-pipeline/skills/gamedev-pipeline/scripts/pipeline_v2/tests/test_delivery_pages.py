@@ -237,26 +237,33 @@ class DeliveryPageTests(unittest.TestCase):
 
 
 class CommittedDeliveryTests(unittest.TestCase):
-    def test_export_and_render_failure_retain_cursor_and_read_only_recovery(self):
+    def test_export_failure_retains_cursor_and_success_avoids_inline_read_render(self):
         args = parser().parse_args(["--root", str(Path.cwd()), "--feature", "test", "check", "--id", "CHECK-1",
             "--expected-generation", "8", "--assignment-id", "A-1", "--quiescence", "stopped", "--with-delivery"])
         state = {"generation": 9, "history": [{"id": "CHECK-1", "generation": 9}]}
         view = {"generation": 9, "workflow_path": ".agentic-pipeline/Workflows/test", "next_action": {"command": "complete", "expected_generation": 9, "command_id": "NEXT-9"}}
         exported = {"packet_digest": "a" * 64, "generation": 9, "assignment_id": "A-1", "worker_id": "W-1", "mode": "full"}
-        for failed in ("export_assignment", "read_delivery_unit", "_render_assignment_unit"):
-            with self.subTest(stage=failed), mock.patch("pipeline_v2.cli.status_view", return_value=view), \
-                 mock.patch("pipeline_v2.cli.export_assignment", return_value=exported), \
-                 mock.patch("pipeline_v2.cli.read_delivery_unit", return_value={"complete": True, "continuation": None}), \
-                 mock.patch("pipeline_v2.cli._render_assignment_unit", return_value="rendered"), \
-                 mock.patch("pipeline_v2.cli." + failed, side_effect=RuntimeError("transport broke")):
-                result = _check_delivery(Path.cwd(), state, args)
-            self.assertTrue(result["committed"])
-            self.assertEqual(9, result["committed_generation"])
-            self.assertEqual(view["next_action"], result["next_action"])
-            self.assertEqual("failed", result["transport"]["status"])
-            self.assertEqual("assignment-export", result["recovery"]["export_argv"][-1])
-            if failed != "export_assignment":
-                self.assertIn("check-result", result["recovery"]["read_argv"])
+        with mock.patch("pipeline_v2.cli.status_view", return_value=view), \
+             mock.patch("pipeline_v2.cli.export_assignment", side_effect=RuntimeError("transport broke")):
+            result = _check_delivery(Path.cwd(), state, args)
+        self.assertTrue(result["committed"])
+        self.assertEqual(9, result["committed_generation"])
+        self.assertEqual(view["next_action"], result["next_action"])
+        self.assertEqual("failed", result["transport"]["status"])
+        self.assertEqual("assignment-export", result["recovery"]["export_argv"][-1])
+        with mock.patch("pipeline_v2.cli.status_view", return_value=view), \
+             mock.patch("pipeline_v2.cli.export_assignment", return_value=exported), \
+             mock.patch("pipeline_v2.cli.read_delivery_unit") as read, \
+             mock.patch("pipeline_v2.cli._render_assignment_unit") as render:
+            delivered = _check_delivery(Path.cwd(), state, args)
+            read.assert_not_called()
+            render.assert_not_called()
+        self.assertEqual("delivered", delivered["transport"]["status"])
+        self.assertFalse(delivered["transport"]["content_included"])
+        self.assertNotIn("check_result", delivered)
+        self.assertIn("check-context", delivered["recovery"]["read_argv"])
+        self.assertIn("text", delivered["recovery"]["read_argv"])
+        self.assertIn("exec_command", delivered["recovery"]["read"])
         state["generation"] = 11
         with mock.patch("pipeline_v2.cli.status_view", return_value={**view, "generation": 11}), \
              mock.patch("pipeline_v2.cli.export_assignment") as export:

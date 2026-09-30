@@ -11,14 +11,31 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 import tempfile
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import unquote, urlsplit
 
 from .checkout import matches, safe_path
 from .model import ROLES, PipelineError, canonical_bytes, is_digest, normalize_literal_path, status_view
+
+
+def host_read_command(argv: list[str], root: Path, *, windows: bool | None = None) -> dict[str, str]:
+    """Quote an existing read invocation, never infer environment or authority."""
+    windows = os.name == "nt" if windows is None else windows
+    if windows:
+        command = "& " + " ".join("'" + str(argument).replace("'", "''") + "'" for argument in argv)
+        shell = "powershell"
+    else:
+        command, shell = shlex.join([str(argument) for argument in argv]), "/bin/sh"
+    return {"cmd": command, "shell": shell, "workdir": str(root)}
+
+
+def _read_handle(argv, root):
+    return {"exec_command": host_read_command(argv, root)}
 
 
 def _role_instructions(role: str | None) -> dict[str, str] | None:
@@ -39,7 +56,7 @@ def _role_instructions(role: str | None) -> dict[str, str] | None:
         raise PipelineError("assigned role instruction source must exist inside the running bundle")
     locator = {"role": role, "path": str(path)}
     if role in {"planner", "slicer"}:
-        locator["section"] = "Assignment and artifact boundaries"
+        locator["section"] = "Runtime Plan and Slice"
     return locator
 
 
@@ -91,8 +108,58 @@ status remains available; assignment-export is the lossless worker transport.
     action = result["next_action"]
     if isinstance(action.get("assignment"), dict):
         action["assignment"] = identity(action["assignment"])
+    invocation = public_action_invocation(view)
+    if invocation is not None:
+        action["invocation"] = invocation
     result["view"] = "director-brief"
     return result
+
+
+def public_action_invocation(view: dict[str, Any]) -> dict[str, Any] | None:
+    """Project the current public action into exact argv and missing input shape.
+
+    This supplies syntax only. It neither grants recovery/semantic authority nor
+    selects missing evidence, and it never infers a newer action identity.
+    """
+    action = view.get("next_action", {})
+    root, feature = view.get("project_root"), view.get("feature")
+    if not root or not feature or not action.get("command_id") or "expected_generation" not in action:
+        return None
+    prefix = [sys.executable, str(Path(__file__).resolve().parents[1] / "pipeline_state.py"),
+              "--root", root, "--feature", feature, "--brief"]
+    command = action.get("command")
+    if command in {"next", "complete", "accept"}:
+        return {"argv": [*prefix, "step", "--expected-generation", str(action["expected_generation"]),
+                         "--action-id", action["command_id"], "--through-handoff"]}
+    argv = [*prefix, command, "--id", action["command_id"],
+            "--expected-generation", str(action["expected_generation"])]
+    if command == "ready":
+        return {"argv": argv}
+    if command == "recover-capability":
+        return {"argv_prefix": [*argv, "--evidence"], "input": {
+            "kind": "workflow_json_file", "field_sources": {"binding": "/capability_binding"},
+            "source": "current next_action; copy the complete exact field, never infer its content",
+            "required_fields": {key: "non-empty factual string supplied by the responsible specialist"
+                                for key in ("prerequisite", "resolution", "evidence", "unchanged_dependencies")},
+            "authority": "Requires a real prerequisite change; filled binding is not evidence or permission."}}
+    if command == "init":
+        sources = {"id": "/command_id", "expected_generation": "/expected_generation", "run_id": "/run_id",
+                   "authority_paths": "/authority", "slices": "/slices"}
+        sources.update({key: "/" + key for key in ("recovery", "maintenance", "product_failure") if key in action})
+        return {"argv_prefix": [*prefix, "init", "--request"], "input": {
+            "kind": "workflow_json_file", "field_sources": sources, "required_fields": {},
+            "source": "current next_action; copy complete exact fields, never parse plan prose or duplicate it in control responses",
+            "authority": "Preserve the current action's authorization and recovery boundary; no new approval is inferred."}}
+    if command == "answer":
+        argv += ["--question-id", action["question_id"]]
+        if "no_progress_binding" in action:
+            return {"argv_prefix": [*argv, "--resolution"], "input": {
+                "kind": "workflow_json_file", "field_sources": {"binding": "/no_progress_binding"},
+                "schema_pointer": "/resolution_schema", "source": "current next_action",
+                "authority": "Responsible specialist supplies the source-supported resolution."}}
+        return {"argv_prefix": [*argv, "--text"], "input": {
+            "kind": "single_argument", "authority": "Responsible specialist supplies the actual authorized answer."}}
+    return None
 
 
 def json_patch(before: Any, after: Any, path: str = "") -> list[dict[str, Any]]:
@@ -491,7 +558,40 @@ def _read_work(reader: _DeliveryUnits, version: str, pointer: str | None) -> dic
                 "findings": list(findings.values())}, "provenance": reader.provenance}
 
 
-_PAGED_VIEWS = {"bootstrap", "work-index", "work-item", "check-result", "section"}
+_PAGED_VIEWS = {"bootstrap", "work-index", "work-item", "qa-index", "qa-assertion", "check-result", "check-context", "section"}
+_QA_POINTER = "/assignment/context/qa_contract/definition"
+
+
+def _qa_selection(reader: _DeliveryUnits, view: str, assertion_ids: list[str], identity_id=None) -> dict[str, Any]:
+    from .qa_contract import expand_slice_contract, selected_contract, resolve_assertion_selection, QAContractError
+    try:
+        definition = expand_slice_contract(_expanded(reader, _QA_POINTER))
+    except QAContractError as exc:
+        raise PipelineError(str(exc)) from exc
+    identities = definition["identities"]
+    if view == "qa-index":
+        prefix = [sys.executable, str(Path(__file__).resolve().parents[1] / "pipeline_state.py"),
+                  "--root", str(reader.root), "--feature", reader.packet["feature"]]
+        inventory = []
+        for item in identities:
+            entry = {"id": item["id"], "source": item["source"],
+                     "assertion_ids": [row["id"] for row in item["assertions"]]}
+            if reader.packet["assignment"].get("role") == "qa":
+                entry["prepare"] = _read_handle([*prefix, "qa-prepare", "--assignment-id", reader.packet["assignment"]["id"],
+                                                "--format", "text", "--assemble", "--identity-id", item["id"]], reader.root)
+            else:
+                entry["read"] = _read_handle([*prefix, "assignment-read", "--digest", reader.packet_digest,
+                    "--view", "qa-assertion", "--format", "text", "--assemble", "--identity-id", item["id"]], reader.root)
+            inventory.append(entry)
+        return {"identities": inventory,
+                "assertion_count": sum(len(item["assertions"]) for item in identities),
+                "selection": "The ready handle selects its exact identity, not a required assessment batch. For a coherent subset, use repeated --assertion-id with the exact assertion_ids listed here; do not combine selectors or construct identity/assertion IDs. Every required identity remains in this index."}
+    try:
+        assertion_ids = resolve_assertion_selection(definition, assertion_ids, identity_id=identity_id)
+    except QAContractError as exc:
+        raise PipelineError(str(exc)) from exc
+    return {**selected_contract(definition, assertion_ids),
+            "method_id_rule": "Read each referenced full method definition in this response. Use its id for assessments and method reasons; reference keys are not semantic IDs."}
 
 
 def share_work_evidence(value: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -624,12 +724,14 @@ def _selected_work(reader: _DeliveryUnits, version: str, view: str,
     return body, details
 
 
-def _semantic_page(body: Any, metadata: dict[str, Any], continuation: str | None, limit: int) -> dict[str, Any]:
+def _semantic_page(body: Any, metadata: dict[str, Any], continuation: str | None, limit: int,
+                   *, raw_text: bool = False, offset: int = 0) -> dict[str, Any]:
     """Page serialized text, including inside strings, with immutable reconstruction bindings."""
-    text = json.dumps(body, ensure_ascii=False, indent=2)
+    text = body if raw_text else json.dumps(body, ensure_ascii=False, indent=2)
+    if raw_text:
+        metadata = {**metadata, "serialization_kind": "text"}
     content_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     binding = hashlib.sha256(canonical_bytes({**metadata, "content_digest": content_digest})).hexdigest()
-    offset = 0
     if continuation is not None:
         try:
             token = json.loads(base64.b64decode(continuation.encode("ascii"), altchars=b"-_", validate=True))
@@ -647,12 +749,78 @@ def _semantic_page(body: Any, metadata: dict[str, Any], continuation: str | None
     return {**metadata, **page, "content_digest": content_digest,
             "page_digest": hashlib.sha256(page["text"].encode("utf-8")).hexdigest(),
             "continuation": next_token, "unit_complete": False, "delivery_complete": False,
-            "serialization": "JSON text fragment; concatenate contiguous pages before decoding; complete marks selection end only"}
+            "serialization": ("Exact source text fragment" if raw_text else "JSON text fragment") +
+                " in the machine envelope text field; use --format json and --assemble for exact reconstruction; complete marks selection end only"}
+
+
+def assemble_delivery_pages(read_page: Callable[[str | None], dict[str, Any]]) -> dict[str, Any]:
+    """Consume one exact selection, checking every fragment before decoding it.
+
+    The callback transports decoded JSON envelopes, never human stdout. No
+    stripping or newline normalization is allowed: whitespace belongs to the
+    content digest. This read does not acknowledge any other selection or work.
+    """
+    variable = {"text", "offset", "end_offset", "complete", "next_offset", "page_digest", "continuation"}
+    first, fixed, parts, tokens = None, None, [], set()
+    continuation, offset = None, 0
+    while True:
+        try:
+            page = read_page(continuation)
+        except StopIteration as exc:
+            raise PipelineError("assembly ended before its required continuation") from exc
+        if not isinstance(page, dict) or page.get("format") not in {"pipeline-delivery-page-v1", "pipeline-source-page-v1"}:
+            raise PipelineError("assembly requires a semantic JSON page envelope")
+        metadata = {key: value for key, value in page.items() if key not in variable}
+        if first is None:
+            first, fixed = page, metadata
+            digest_keys = ("content_digest", "version") + (("packet_digest",) if page["format"] == "pipeline-delivery-page-v1" else ())
+            if any(not is_digest(page.get(key)) for key in digest_keys):
+                raise PipelineError("assembly requires exact content and packet digests")
+        elif metadata != fixed:
+            raise PipelineError("assembly page binding or selection changed")
+        text, end, total = page.get("text"), page.get("end_offset"), page.get("total_characters")
+        if (type(page.get("offset")) is not int or page["offset"] != offset
+                or type(end) is not int or type(total) is not int or total < 0
+                or not isinstance(text, str) or end - offset != len(text)
+                or not offset <= end <= total or (end == offset and total != 0)):
+            raise PipelineError("assembly requires contiguous complete fragments with exact lengths")
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != page.get("page_digest"):
+            raise PipelineError("assembly page digest does not match exact text")
+        complete, token = page.get("complete"), page.get("continuation")
+        if type(complete) is not bool or complete != (end == total):
+            raise PipelineError("assembly completion does not match selection length")
+        if complete:
+            if token is not None or page.get("next_offset") is not None:
+                raise PipelineError("completed assembly must not contain a continuation")
+        elif (not isinstance(token, str) or not token or token in tokens
+              or type(page.get("next_offset")) is not int or page["next_offset"] != end):
+            raise PipelineError("assembly requires a progressing bound continuation")
+        parts.append(text)
+        offset = end
+        if complete:
+            break
+        tokens.add(token)
+        continuation = token
+    text = "".join(parts)
+    if hashlib.sha256(text.encode("utf-8")).hexdigest() != first["content_digest"]:
+        raise PipelineError("assembly content digest does not match exact selection")
+    if first.get("serialization_kind") == "text":
+        value = text
+    else:
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise PipelineError(f"assembled selection is not valid JSON: {exc}") from exc
+    return {**fixed, "format": "pipeline-source-unit-v1" if first["format"] == "pipeline-source-page-v1" else "pipeline-delivery-unit-v1", "value": value,
+            "assembled_pages": len(parts), "selection_complete": True,
+            "unit_complete": True, "delivery_complete": False,
+            "serialization": "Decoded exact selection; no global work or delivery read credit"}
 
 
 def read_delivery_unit(root: Path, workflow: str, digest: str, pointer: str | None = None,
                        view: str = "index", *, finding_id: str | None = None,
                        condition_id: str | None = None, baseline: str | None = None,
+                       assertion_ids: list[str] | None = None, identity_id: str | None = None,
                        continuation: str | None = None, limit: int = 8192) -> dict[str, Any]:
     """Read one decoded logical unit. Its completeness is never a global read receipt."""
     if view not in {"index", "unit", "value", "work"} | _PAGED_VIEWS:
@@ -661,21 +829,36 @@ def read_delivery_unit(root: Path, workflow: str, digest: str, pointer: str | No
         raise PipelineError("continuation and limit require a paged semantic view")
     if view != "work-item" and any(item is not None for item in (finding_id, condition_id, baseline)):
         raise PipelineError("finding-id, condition-id and retained baseline require work-item")
+    if (assertion_ids or identity_id is not None) and view != "qa-assertion":
+        raise PipelineError("assertion-id and identity-id require the qa-assertion view")
     reader = _DeliveryUnits(root, workflow, digest)
     if view in _PAGED_VIEWS:
-        if view != "section" and pointer not in {None, "/assignment" if view in {"bootstrap", "check-result"} else _WORK_POINTER}:
+        fixed_pointer = (_QA_POINTER if view in {"qa-index", "qa-assertion"} else
+                         _WORK_POINTER if view in {"work-index", "work-item"} else "/assignment")
+        if view != "section" and pointer not in {None, fixed_pointer}:
             raise PipelineError("semantic view has a fixed pointer; use section for an arbitrary exact pointer")
         if pointer is None:
-            pointer = _WORK_POINTER if view in {"work-index", "work-item"} else "/assignment"
+            pointer = fixed_pointer
         details = {}
-        if view in {"bootstrap", "check-result"}:
-            body = _bootstrap(reader)
-            if view == "check-result":
+        if view in {"bootstrap", "check-result", "check-context"}:
+            body = (_bootstrap(reader) if view != "check-context" else {
+                "assignment": {key: deepcopy(reader.packet["assignment"][key])
+                               for key in ("id", "worker_id", "role", "output_path")
+                               if key in reader.packet["assignment"]},
+                "generation": reader.packet["generation"],
+            })
+            if view in {"check-result", "check-context"}:
                 context = reader.packet["assignment"].get("context", {})
                 body["check_context"] = {key: _expanded(reader, _child_pointer("/assignment/context", key))
                                          for key in ("diagnostic_checks", "machine_checks") if key in context}
                 if not body["check_context"]:
-                    raise PipelineError("check-result requires committed diagnostic or machine check context")
+                    raise PipelineError("check-result/check-context requires committed diagnostic or machine check context")
+        elif view in {"qa-index", "qa-assertion"}:
+            body = _qa_selection(reader, view, assertion_ids or [], identity_id)
+            if assertion_ids:
+                details["assertion_ids"] = list(assertion_ids)
+            if identity_id is not None:
+                details["identity_id"] = identity_id
         elif view in {"work-index", "work-item"}:
             body, details = _selected_work(reader, digest, view, finding_id, condition_id, baseline)
             if view == "work-item":
@@ -815,7 +998,8 @@ def _dispatch_descriptor(root: Path, view: dict[str, Any], packet: dict[str, Any
     output_path = safe_path(root, assignment["output_path"], "assigned artifact")
     reference = {"packet_digest": saved["digest"]}
     reader_argv = [sys.executable, str(launcher), "--root", packet["project_root"],
-                   "--feature", view["feature"], "assignment-read", "--digest", saved["digest"]]
+                   "--feature", view["feature"], "assignment-read", "--digest", saved["digest"], "--format", "json"]
+    assembled = [*reader_argv[:-1], "text", "--assemble"]
     context = assignment.get("context", {})
     roster = context.get("required_finding_conditions") if isinstance(context, dict) else None
     convergence = context.get("convergence") if isinstance(context, dict) else None
@@ -834,20 +1018,32 @@ def _dispatch_descriptor(root: Path, view: dict[str, Any], packet: dict[str, Any
                   **({"baseline_digest": baseline} if baseline is not None else {})},
         "reader": {"command": "assignment-read", "packet_format": packet["format"],
                    "default_view": "bootstrap",
-                   "bootstrap_argv": [*reader_argv, "--view", "bootstrap"],
-                   **({"work_argv": [*reader_argv, "--view", "work"],
-                       "work_index_argv": [*reader_argv, "--view", "work-index"],
-                       "work_item_argv_prefix": [*reader_argv, "--view", "work-item", "--finding-id"],
-                       "work_scope": "index is navigation only; consume every exact required pair through work-item and all continuations, retaining original context and latest independent results"}
+                   "format": "text",
+                   "bootstrap_argv": [*assembled, "--view", "bootstrap"],
+                   "bootstrap": _read_handle([*assembled, "--view", "bootstrap"], root),
+                   **({"work_index_argv": [*assembled, "--view", "work-index"],
+                       "work_item_argv_prefix": [*assembled, "--view", "work-item", "--finding-id"],
+                       "work_scope": "index is navigation only; consume every exact required pair through work-item, retaining original context and latest independent results"}
                       if has_rework else {}),
-                   "section_argv_prefix": [*reader_argv, "--view", "section", "--pointer"],
-                   "continuation_usage": "repeat the same selection with --continuation TOKEN; concatenate contiguous JSON text fragments and verify content_digest; page size is never a work quota",
-                   "unit_argv_prefix": [*reader_argv, "--view", "unit", "--pointer"],
-                   "index_argv": [*reader_argv, "--view", "index"],
-                   "value_argv_prefix": [*reader_argv, "--view", "value", "--pointer"],
-                   "value_usage": "recursive machine/debug-only route; use --format json for scripts, not for ordinary worker navigation",
+                   "section_argv_prefix": [*assembled, "--view", "section", "--pointer"],
+                   "source_argv_prefix": [sys.executable, str(launcher), "--root", packet["project_root"],
+                       "--feature", view["feature"], "file-read", "--format", "text", "--assemble", "--path"],
+                   **({"qa_index_argv": [*assembled, "--view", "qa-index"],
+                       "qa_index": _read_handle([*assembled, "--view", "qa-index"], root),
+                       "qa_assertion_argv_prefix": [*assembled, "--view", "qa-assertion", "--assertion-id"],
+                       **({"qa_prepare_argv_prefix": [sys.executable, str(launcher), "--root", packet["project_root"],
+                           "--feature", view["feature"], "qa-prepare", "--assignment-id", assignment["id"],
+                           "--format", "text", "--assemble", "--assertion-id"]} if assignment.get("role") == "qa" else {}),
+                       "qa_navigation": "Select actual case groups. QA uses qa-prepare for complete obligations, alternatives, producers and editable input in one response; Engineer/Review read exact obligations through qa-assertion."}
+                      if isinstance(context.get("qa_contract"), dict) and context["qa_contract"].get("status") == "bound" else {}),
+                   "advanced": {"unit_argv_prefix": [*reader_argv, "--view", "unit", "--pointer"],
+                       "index_argv": [*reader_argv, "--view", "index"],
+                       "value_argv_prefix": [*reader_argv, "--view", "value", "--pointer"],
+                       **({"work_argv": [*reader_argv, "--view", "work"]} if has_rework else {}),
+                       "paged_argv": reader_argv,
+                       "usage": "Legacy/debug readers and exact page continuation; normal semantic readers already assemble. --output saves only the selected body and grants no read credit."},
                    "selector_argument": "append one exact child pointer from a structural unit or logical index",
-                   "navigation": "start with bootstrap_argv and finish its pages; identity/access/schema/checks/current slice are grouped; follow exact source locators and required work roster; lost retention requires full reads without --baseline",
+                   "navigation": "execute bootstrap_argv as supplied; identity/access/schema/checks/current slice are grouped; follow exact source locators and required work roster; lost retention requires full reads without --baseline",
                    "required_resources": [{"pointer": pointer, "digest": item["digest"]}
                        for pointer, item in packet.get("references", {}).items() if item["kind"] == "resource"],
                    "completeness": "full delivery requires the manifest and all referenced operative values; index, digest and unit reads are not a global read receipt",
@@ -863,6 +1059,10 @@ def _dispatch_descriptor(root: Path, view: dict[str, Any], packet: dict[str, Any
     }
     if "role_instructions" in packet:
         descriptor["role_instructions"] = deepcopy(packet["role_instructions"])
+        descriptor["role_instructions"]["read_argv"] = [sys.executable, str(launcher), "--root", packet["project_root"],
+            "--feature", view["feature"], "file-read", "--instruction", assignment["role"], "--format", "text", "--assemble",
+            *(["--section", descriptor["role_instructions"]["section"]] if "section" in descriptor["role_instructions"] else [])]
+        descriptor["role_instructions"]["exec_command"] = host_read_command(descriptor["role_instructions"]["read_argv"], root)
     return descriptor
 
 
@@ -987,15 +1187,158 @@ def read_delivery(root: Path, workflow: str, version: str, offset: int = 0, limi
     return {"pointer": pointer, **text_page(text, version, offset, limit)}
 
 
-def read_file(root: Path, view: dict[str, Any], relative: str, *, version: str | None = None,
-              offset: int = 0, limit: int = 8192) -> dict[str, Any]:
-    assignment = view.get("active_assignment")
-    if assignment is None or view["next_action"].get("command") != "complete":
-        raise PipelineError("file read requires a live active assignment with no recovery boundary")
-    relative = normalize_literal_path(relative)
-    if not any(matches(relative, rule) for rule in assignment["access"]["read"]):
-        raise PipelineError("file is outside the active assignment read access")
-    target = safe_path(root, relative, "selected input", strict=True)
+def _instruction_path(instruction: str, relative: str | None) -> Path:
+    """Read only the selected installed entry and its explicit local Markdown links."""
+    bundle = Path(__file__).resolve().parents[4]
+    if instruction == "director":
+        entry = bundle / "skills/gamedev-pipeline/SKILL.md"
+    elif instruction in ROLES.values():
+        entry = Path(_role_instructions(instruction)["path"])
+    elif re.fullmatch(r"gamedev-[a-z0-9-]+", instruction or ""):
+        entry = bundle / "skills" / instruction / "SKILL.md"
+    else:
+        raise PipelineError("instruction must name an existing bundle role or exact gamedev-* skill")
+    entry = safe_path(bundle, entry, "instruction entry", strict=True)
+    target = entry if relative is None else safe_path(bundle,
+        Path(relative) if Path(relative).is_absolute() else entry.parent / relative,
+        "instruction source", strict=True)
+    if target.suffix.lower() != ".md":
+        raise PipelineError("instruction reading is limited to explicitly linked bundle Markdown")
+    pending, visited = [entry], set()
+    while pending:
+        current = pending.pop()
+        if current == target:
+            return target
+        if current in visited:
+            continue
+        visited.add(current)
+        try:
+            text = current.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise PipelineError(f"cannot read instruction link source: {exc}") from exc
+        for locator in re.findall(r"\]\(([^)]+)\)", text):
+            locator = locator.strip().strip("<>")
+            try:
+                parsed = urlsplit(locator)
+            except ValueError:
+                continue
+            if parsed.scheme or parsed.netloc or not parsed.path:
+                continue
+            path = (current.parent / unquote(parsed.path)).resolve()
+            if not path.is_relative_to(bundle) or path.suffix.lower() != ".md" or not path.is_file():
+                continue
+            pending.append(safe_path(bundle, path, "linked instruction", strict=True))
+    raise PipelineError("instruction source is not the selected entry or one of its explicit bundle Markdown links")
+
+
+def _markdown_prose(text):
+    fence = None
+    for number, row in enumerate(text.splitlines(keepends=True), 1):
+        marker = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})([^\r\n]*)", row)
+        if marker:
+            token = (marker.group(1)[0], len(marker.group(1)))
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and token[1] >= fence[1] and not marker.group(2).strip():
+                fence = None
+            continue
+        if fence is None:
+            yield number, row
+
+
+def _markdown_headings(text):
+    headings = []
+    for number, row in _markdown_prose(text):
+        match = re.match(r"^(#{1,6})[ \t]+([^\r\n]*)", row.lstrip("\ufeff"))
+        if match:
+            title = re.sub(r"[ \t]+#+[ \t]*$", "", match.group(2)).strip()
+            headings.append((number, len(match.group(1)), title))
+    return headings
+
+
+def _instruction_link_reads(root, feature, instruction, current, selected):
+    """Resolve only actual selected Markdown links; no policy or instruction index."""
+    prefix = [sys.executable, str(Path(__file__).resolve().parents[1] / "pipeline_state.py"),
+              "--root", str(root), "--feature", feature, "file-read", "--instruction", instruction,
+              "--format", "text", "--assemble"]
+    reads, known = [], {}
+    for _, line in _markdown_prose(selected):
+        for label, href in re.findall(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)", line):
+            link = {"label": label, "href": href}
+            try:
+                parsed = urlsplit(href.strip().strip("<>"))
+                if parsed.scheme or parsed.netloc or parsed.query:
+                    continue
+                target = _instruction_path(instruction, str((current.parent / unquote(parsed.path)).resolve()) if parsed.path else str(current))
+                raw = target.read_bytes()
+                text, version = raw.decode("utf-8"), hashlib.sha256(raw).hexdigest()
+                first, last = 1, max(1, len(text.splitlines()))
+                if parsed.fragment:
+                    # Canonical bundle ATX anchors. Ambiguity or an unsupported
+                    # anchor is explicit; never fall back to the whole manual.
+                    anchor = unquote(parsed.fragment)
+                    headings = _markdown_headings(text)
+                    matching = [row for row in headings if re.sub(r"[^\w\- ]", "", row[2].lower()).replace(" ", "-") == anchor]
+                    if len(matching) != 1:
+                        raise PipelineError("linked anchor must identify exactly one current heading")
+                    first, level, _ = matching[0]
+                    last = next((number - 1 for number, depth, _ in headings if number > first and depth <= level), last)
+                key = (str(target), version, first, last)
+                if key in known:
+                    if link not in known[key]["links"]:
+                        known[key]["links"].append(link)
+                    continue
+                row = {"links": [link], "source": {"path": str(target), "sha256": version, "start_line": first, "end_line": last},
+                       "exec_command": host_read_command([*prefix, "--path", str(target), "--version", version,
+                                                           "--lines", f"{first}:{last}"], root)}
+                known[key] = row
+                reads.append(row)
+            except (PipelineError, OSError, UnicodeError, ValueError) as exc:
+                reads.append({"links": [link], "error": str(exc)})
+    return reads
+
+
+def _source_selection(text: str, section: str | None, lines: tuple[int, int] | None) -> tuple[str, int, int]:
+    rows = text.splitlines(keepends=True)
+    if not rows:
+        rows = [""]
+    if section is not None and lines is not None:
+        raise PipelineError("source section and line range are mutually exclusive")
+    first, last = 1, len(rows)
+    if lines is not None:
+        first, last = lines
+        if type(first) is not int or type(last) is not int or not 1 <= first <= last <= len(rows):
+            raise PipelineError(f"source lines must be an inclusive range within 1:{len(rows)}")
+    elif section is not None:
+        wanted = re.sub(r"^#{1,6}[ \t]+", "", section).strip()
+        headings = _markdown_headings(text)
+        matches_found = [item for item in headings if item[2] == wanted]
+        if len(matches_found) != 1:
+            raise PipelineError("source heading must match exactly once; use --lines for duplicates (matching lines: " +
+                                ", ".join(str(item[0]) for item in matches_found) + ")")
+        first, level, _ = matches_found[0]
+        last = next((number - 1 for number, depth, _ in headings if number > first and depth <= level), len(rows))
+    return "".join(rows[first - 1:last]), first, last
+
+
+def read_file(root: Path, view: dict[str, Any] | None, relative: str | None, *, version: str | None = None,
+              offset: int = 0, limit: int = 8192, continuation: str | None = None,
+              section: str | None = None, lines: tuple[int, int] | None = None,
+              instruction: str | None = None, feature: str | None = None) -> dict[str, Any]:
+    assignment = None
+    if instruction is not None:
+        target = _instruction_path(instruction, relative)
+        relative = str(target)
+    else:
+        assignment = (view or {}).get("active_assignment")
+        if assignment is None or view["next_action"].get("command") != "complete":
+            raise PipelineError("file read requires a live active assignment with no recovery boundary")
+        relative = normalize_literal_path(relative)
+        if not any(matches(relative, rule) for rule in assignment["access"]["read"]):
+            raise PipelineError("file is outside the active assignment read access")
+        target = safe_path(root, relative, "selected input", strict=True)
+    if continuation is not None and offset:
+        raise PipelineError("source continuation and numeric offset are mutually exclusive")
     if offset and version is None:
         raise PipelineError("continuation reads require the previous page version")
     try:
@@ -1006,7 +1349,17 @@ def read_file(root: Path, view: dict[str, Any], relative: str, *, version: str |
         text = payload.decode("utf-8")
     except (OSError, UnicodeError) as exc:
         raise PipelineError(f"cannot read selected UTF-8 input: {exc}") from exc
-    return {"path": relative, "assignment_id": assignment["id"], **text_page(text, actual, offset, limit)}
+    text, first, last = _source_selection(text, section, lines)
+    metadata = {"format": "pipeline-source-page-v1", "path": relative, "version": actual,
+                "source": {"path": relative, "sha256": actual, "start_line": first, "end_line": last},
+                **({"assignment_id": assignment["id"]} if assignment else {"instruction": instruction})}
+    if assignment is not None:
+        from .qa_contract import source_reference
+        metadata["evidence_origin"] = {"ref": source_reference(metadata["source"]), "source": deepcopy(metadata["source"])}
+        metadata["semantic_credit"] = False
+    elif feature is not None:
+        metadata["linked_reads"] = _instruction_link_reads(root, feature, instruction, target, text)
+    return _semantic_page(text, metadata, continuation, limit, raw_text=True, offset=offset)
 
 
 def execute_step(controller: Any, root: Path, expected_generation: int, action_id: str,

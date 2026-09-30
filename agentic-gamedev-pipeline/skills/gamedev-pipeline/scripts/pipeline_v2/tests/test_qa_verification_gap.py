@@ -1,5 +1,6 @@
 """Truthful repair routing for absent acceptance evidence, without false execution."""
 from copy import deepcopy
+import hashlib
 import unittest
 
 from pipeline_v2.qa_contract import QAContractError, validate_results
@@ -8,7 +9,7 @@ from pipeline_v2.tests.test_qa_contract import sample_contract, passing_checks
 from pipeline_v2.tests import test_acceptance_integration as integration_fixtures
 
 
-def mark_gap(check, assertion=0, methods=None):
+def mark_gap(check, assertion=0, methods=None, *, root=None, expected=None):
     row = check["assertions"][assertion]
     row.update(outcome="not_run", method_id=None,
         evidence=[{"type": "verification-gap", "ref": "tests/current-suite:required-reset-case",
@@ -17,6 +18,15 @@ def mark_gap(check, assertion=0, methods=None):
                 "detail": "The delivered checks do not execute the approved mandatory reset case; the existing method alternatives supply no equivalent proof.",
                 "refs": methods or ["observed-action"]})
     check["outcome"] = "fail"
+    if root is not None:
+        from pipeline_v2.qa_contract import source_reference
+        source = {"path": "game.txt", "sha256": hashlib.sha256((root / "game.txt").read_bytes()).hexdigest()}
+        ref = source_reference(source)
+        row["evidence"][0].update(ref=ref, source=source)
+        row["reason"]["repair"] = {"owner": "engineering", "target": "tests/reset_test.py",
+            "missing_obligation": "Add the omitted executable reset observation.",
+            "attempted_method_ids": methods or ["observed-action"], "evidence_refs": [ref]}
+        row["assessment"] = {"expected": expected, "observed": "The inspected current source lacks the executable reset observation.", "comparison": "insufficient"}
 
 
 class VerificationGapContractTests(unittest.TestCase):
@@ -97,7 +107,7 @@ class VerificationGapNativeTests(unittest.TestCase):
         validate_state(previous)
         self.assertEqual("qa", status_view(previous)["phase"])
         checks = integration_fixtures.checks_for(h.contract)
-        mark_gap(checks[0])
+        mark_gap(checks[0], root=h.h.root, expected=h.contract["slices"]["SLICE-1"]["identities"][0]["assertions"][0]["expected"])
         result = h.submit({"outcome": "fail", "checks": checks})
         self.assertEqual("engineering", result["phase"])
         self.assertIsNone(result["active_assignment"])

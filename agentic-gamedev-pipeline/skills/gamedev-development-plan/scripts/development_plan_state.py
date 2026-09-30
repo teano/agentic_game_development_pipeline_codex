@@ -154,8 +154,6 @@ REQUIRED_SCOPE_FIELDS = {
     "shared_touchpoints",
     "excluded_components",
     "excluded_paths",
-    "max_product_files",
-    "max_product_lines_changed",
     "verification_scope",
 }
 REQUIRED_RESEARCH_FIELDS = {"question", "paths", "exclusions", "evidence", "stop"}
@@ -960,10 +958,11 @@ def validate_plan(root: Path, state: dict[str, Any], required_status: str = "dra
             )
         except _plan_contract.PlanContractError as exc:
             errors.append(str(exc))
-        for budget in ("max_product_files", "max_product_lines_changed"):
-            match = re.search(rf"(?m)^\s*-\s*{budget}:\s*([0-9]+)\s*$", scope)
-            if not match or int(match.group(1)) < 1:
-                errors.append(f"{slice_id} {budget} must be a positive integer")
+        for estimate in ("max_product_files", "max_product_lines_changed"):
+            values = re.findall(rf"(?m)^[ \t]*-[ \t]*{estimate}:[ \t]*([^\r\n]*)$", scope)
+            if values and (len(values) != 1 or not re.fullmatch(r"[0-9]+", values[0].strip())
+                           or int(values[0].strip()) < 1):
+                errors.append(f"{slice_id} optional {estimate} must be one positive integer")
 
         research_section = sections.get("Research Briefs", "")
         research_rows = re.findall(

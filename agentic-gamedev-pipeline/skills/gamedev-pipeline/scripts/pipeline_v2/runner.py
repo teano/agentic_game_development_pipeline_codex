@@ -15,7 +15,7 @@ from typing import Any
 from .technical_decisions import validate_entry
 from .model import seal_qa_contract
 from .execution import (metadata, owner_key, recipe_for, receipt_binding, seal_verification,
-                        verification_environment, execution_environment, machine_check_row, machine_check_inputs)
+                        verification_environment, execution_environment, machine_check_row, machine_check_inputs, executable_identity)
 
 from .checkout import (
     authority_items,
@@ -236,6 +236,335 @@ class Controller:
     def __init__(self, store: StateStore, *, timeout: float = 600.0):
         self.store = store
         self.timeout = timeout
+
+    @staticmethod
+    def _evidence_binding(state, root, tree=None):
+        active = state.get("active_assignment")
+        if not isinstance(active, dict):
+            raise PipelineError("product execution capture requires the current active assignment")
+        return {"kind": "assignment", "project_root": str(root), "feature": state["feature"],
+                "run_id": state["run_id"], "assignment_id": active["id"], "phase": active["phase"],
+                "slice_id": current_slice(state)["id"], "authority_digest": state["authority"]["digest"],
+                "pipeline_runtime_digest": state["pipeline_runtime_digest"],
+                "candidate_tree_oid": tree or candidate_tree_oid(root)}
+
+    def _preflight_evidence_binding(self, request):
+        if (not isinstance(request.get("project_root"), str) or not request["project_root"].strip()
+                or not isinstance(request.get("authority_paths"), dict)):
+            raise PipelineError("preflight evidence requires exact project_root, feature and authority_paths")
+        root = canonical_project_root(request.get("project_root"))
+        feature = feature_slug(request.get("feature"))
+        self.store.validate_project_location(root, feature)
+        paths = request.get("authority_paths")
+        from .model import authority_record
+        authority = authority_record(authority_items(root, paths))
+        return root, feature, {"kind": "preflight", "project_root": str(root), "feature": feature,
+                              "authority_digest": authority["digest"], "authority_paths": paths,
+                              "pipeline_runtime_digest": pipeline_runtime_digest(),
+                              "candidate_tree_oid": candidate_tree_oid(root)}
+
+    def evidence_begin(self, request):
+        from .execution_evidence import begin
+        if not isinstance(request, dict):
+            raise PipelineError("evidence request must be an object")
+        with self.store.transaction():
+            if request.get("preflight") is True:
+                if "assignment_id" in request:
+                    raise PipelineError("preflight capture cannot invent a native assignment id")
+                root, feature, binding = self._preflight_evidence_binding(request)
+            else:
+                state, root = self._loaded()
+                self._verify_live_checkout(state, root)
+                feature, binding = state["feature"], self._evidence_binding(state, root)
+                if request.get("assignment_id") != binding["assignment_id"]:
+                    raise PipelineError("evidence begin requires the exact current assignment_id")
+            return begin(root, feature, request, binding)
+
+    def _evidence_location(self):
+        # StateStore is already fixed by the public root/feature selector. A
+        # pre-init probe uses the same canonical location without inventing state.
+        directory = self.store.path.parent
+        feature = feature_slug(directory.name)
+        root = canonical_project_root(directory.parent.parent.parent)
+        self.store.validate_project_location(root, feature)
+        return root, feature
+
+    def evidence_record(self, record_id, result_path, environment):
+        from .execution_evidence import _directory, capture
+        from .artifact_io import read_json
+        with self.store.transaction():
+            root, feature = self._evidence_location()
+            request = read_json(_directory(root, feature, record_id) / "request.json")
+            prior = request["binding"]
+            if prior.get("kind") == "preflight":
+                _, _, binding = self._preflight_evidence_binding(prior)
+            else:
+                state, root = self._loaded()
+                binding = self._evidence_binding(state, root)
+            return capture(root, feature, record_id, result_path, environment, binding)
+
+    def evidence_read(self, record_id, *, raw_file=None):
+        from .execution_evidence import read
+        root, feature = self._evidence_location()
+        result = read(root, feature, record_id, allow_incomplete=True)
+        if raw_file is None:
+            return result
+        record = result.get("record", {})
+        files = [record["raw"]] if "raw" in record else record.get("streams", [])
+        item = next((row for row in files if row.get("file") == raw_file and row.get("available", True)), None)
+        if item is None:
+            raise PipelineError("raw-file must name one available file in this exact execution record")
+        from .artifact_io import contained_path
+        path = contained_path(Path(result["path"]).parent, Path(result["path"]).parent / raw_file)
+        try:
+            raw = path.read_bytes()
+            if len(raw) != item["bytes"] or hashlib.sha256(raw).hexdigest() != item["sha256"]:
+                raise PipelineError("execution raw result changed while selecting its contents")
+            value = raw.decode("utf-8")
+        except UnicodeError as exc:
+            raise PipelineError(f"recorded binary bytes require their original file reader: {path}") from exc
+        try:
+            value = json.loads(value)
+        except ValueError:
+            pass  # Exact decoded text, not a guessed JSON schema.
+        return {"record_id": record_id, "ref": result["ref"], "path": result["path"], "record_digest": record["digest"],
+                "provenance": record["provenance"], "raw": {**item, "path": str(path)},
+                "value": value, "semantic_credit": False}
+
+    def _artifact_errors(self, state, root, value):
+        from .artifact_io import validation_errors
+        errors = validation_errors(state, value)
+        if not errors:
+            from .execution_evidence import validate_references
+            try:
+                binding = self._evidence_binding(state, root)
+                validate_references(root, state["feature"], value, binding, state=state)
+                if state["active_assignment"]["phase"] == "qa":
+                    from .qa_draft import validate_projection
+                    validate_projection(state, root, binding, value)
+            except (ValueError, OSError) as exc:
+                errors.append({"path": "/checks", "message": str(exc)})
+        return errors
+
+    def _qa_working_context(self, assignment_id):
+        state, root = self._loaded()
+        active = state.get("active_assignment") or {}
+        if active.get("phase") != "qa" or active.get("id") != assignment_id:
+            raise PipelineError("QA working operation requires the exact current QA assignment_id")
+        self._verify_live_checkout(state, root)
+        return state, root, self._evidence_binding(state, root)
+
+    def qa_draft(self, assignment_id, *, identity_id=None, assertion_id=None):
+        from .qa_draft import load, view
+        with self.store.transaction():
+            state, root, binding = self._qa_working_context(assignment_id)
+            return view(*load(state, root, binding, create=True), identity_id=identity_id, assertion_id=assertion_id)
+
+    def qa_read(self, assignment_id, *, identity_id=None, assertion_id=None):
+        from .qa_draft import load, view
+        state, root, binding = self._qa_working_context(assignment_id)
+        return view(*load(state, root, binding), identity_id=identity_id, assertion_id=assertion_id)
+
+    def qa_prepare(self, assignment_id, assertion_ids=None, method_id=None, *, identity_id=None):
+        from .qa_draft import load, prepare, compact_prepared_request
+        from .execution_evidence import read_producer_probe, validate_issued_native_receipt
+        state, root, binding = self._qa_working_context(assignment_id)
+        draft, definition, path, exists = load(state, root, binding)
+        try:
+            result = prepare(draft, definition, assertion_ids, method_id, identity_id=identity_id)
+        except ValueError as exc:
+            if isinstance(exc, PipelineError):
+                raise
+            error = PipelineError(str(exc))
+            error.path = getattr(exc, "path", "") or "/method_id"
+            raise error from exc
+        result["working_path"] = str(path)
+        result["evidence_destination"] = str(root / state["workflow_path"] / "Evidence")
+        methods = result["obligations"]["method_definitions"]
+        row_methods = {row["id"]: row["methods"] for identity in result["obligations"]["identities"] for row in identity["assertions"]}
+        contexts = {}
+        alternatives = [(row["assertion_id"], reference["ref"], methods[reference["ref"]])
+                        for row in result["prepared_methods"] for reference in row_methods[row["assertion_id"]]]
+        for assertion_id, method_ref, method in alternatives:
+            producer = method.get("producer")
+            key = digest(producer)
+            if key in contexts:
+                if assertion_id not in contexts[key]["assertion_ids"]:
+                    contexts[key]["assertion_ids"].append(assertion_id)
+                if method_ref not in contexts[key]["method_refs"]:
+                    contexts[key]["method_refs"].append(method_ref)
+                continue
+            context = {"assertion_ids": [assertion_id], "method_refs": [method_ref], "producer": producer,
+                       "semantic_credit": False}
+            contexts[key] = context
+            if producer is None:
+                context["prerequisite"] = {"status": "not_declared", "detail": "No execution producer is declared. Follow the complete approved method source; no channel or invocation is inferred."}
+            elif producer["kind"] == "controller_check":
+                context["provenance"] = "controller-process-execution"
+                recipes = [recipe_for(state, argv, index, self.timeout)
+                           for index, argv in enumerate(current_slice(state)["planned_commands"])]
+                context["checks"] = [recipe for recipe in recipes if recipe["id"] in producer["check_ids"]]
+                try:
+                    machine = state["active_assignment"]["capsule"]["context"].get("machine_checks")
+                    if machine is None:
+                        # Legacy capsules without an issued observation retain conservative lookup.
+                        machine = machine_check_inputs(state, binding["candidate_tree_oid"], execution_environment(), self.timeout)
+                    else:
+                        if any(machine.get(key) != binding[key] for key in (
+                                "candidate_tree_oid", "authority_digest", "pipeline_runtime_digest")):
+                            raise PipelineError("issued machine checks do not bind this QA candidate/authority/runtime")
+                        for receipt in machine["checks"]:
+                            if receipt["id"] in producer["check_ids"]:
+                                recipe = next((item for item in context["checks"] if item["id"] == receipt["id"]), None)
+                                validate_issued_native_receipt(root, state["feature"], receipt, binding, state, recipe)
+                    context["receipts"] = [row for row in machine["checks"] if row["id"] in producer["check_ids"]]
+                    missing = set(producer["check_ids"]) - {row["id"] for row in context["receipts"]}
+                    context["prerequisite"] = {"status": "check_required" if missing else "receipts_available",
+                        "pending_check_ids": sorted(missing), "detail": "Use the assigned controller check for missing receipts; never run its argv as a worker. Assess the actual assertions, not the aggregate verdict."}
+                except (PipelineError, OSError, KeyError, TypeError) as exc:
+                    context["receipts"] = []
+                    context["prerequisite"] = {"status": "unresolved", "detail": str(exc)}
+            else:
+                context["provenance"] = "caller-captured-original-result"
+                record_id = producer["probe_ref"].partition(":")[2]
+                context["probe_reader"] = ["evidence-read", "--record-id", record_id]
+                context["product_invocation"] = None
+                context["evidence_begin_request"] = {"record_id": None, "assignment_id": assignment_id,
+                    "invocation": {"channel": producer["channel"], "request": None}, "environment": None, "input_paths": None}
+                try:
+                    probe = read_producer_probe(root, state["feature"], producer, binding)
+                    record = probe["record"]
+                    context["probe"] = {"ref": probe["ref"], "path": probe["path"], "digest": record["digest"],
+                        "provenance": record["provenance"], "request_locator": probe["path"] + "#/before/invocation",
+                        "environment_locator": probe["path"] + "#/before/environment", "resources": record["before"]["inputs"],
+                        "raw_result": {**record["raw"], "path": str(Path(probe["path"]).parent / record["raw"]["file"])}}
+                    context["prerequisite"] = {"status": "probe_bound", "detail": "This record proves only a prior channel probe. Its fixture request is not a product invocation or current product observation. Follow the approved method source and honor actual permission or capability failures."}
+                except (PipelineError, OSError, KeyError, TypeError) as exc:
+                    context["prerequisite"] = {"status": "unresolved", "detail": str(exc)}
+        result["producer_context"] = list(contexts.values())
+        # Canonical native refs are service data; observation/comparison remain empty.
+        native = {row["id"]: row for context in contexts.values() for row in context.get("receipts", [])}
+        for prepared, row in zip(result["prepared_methods"], result["record_request"]["assessments"]):
+            method = next((methods[ref["ref"]] for ref in row_methods[row["id"]]
+                           if methods[ref["ref"]]["id"] == prepared["method_id"]), {})
+            producer = method.get("producer", {})
+            if prepared["assessment_status"] == "recorded" or producer.get("kind") != "controller_check":
+                continue
+            row["evidence"] = [dict(item, ref=native.get(check_id, {}).get("execution_evidence"))
+                for item in row["evidence"] for check_id in (
+                    producer["check_ids"] if item["type"] in {"bound-machine-receipt", "controller-check-receipt"} else [None])]
+        compact_prepared_request(result["record_request"])
+        return {key: result[key] for key in ("binding", "revision", "working_path", "evidence_destination", "producer_context",
+                "obligations", "prepared_methods", "record_request", "semantic_credit", "tests_executed", "required_action")}
+
+    def qa_record(self, assignment_id, request):
+        from .qa_draft import load, view, prepare_update
+        from .artifact_io import write_json
+        from .execution_evidence import validate_references
+        from .checkout import matches
+        with self.store.transaction():
+            state, root, binding = self._qa_working_context(assignment_id)
+            draft, definition, path, exists = load(state, root, binding)
+            changed = {}
+            def acknowledgment(value, present):
+                return {key: item for key, item in view(value, definition, path, present).items()
+                        if key not in {"identities", "technical_decisions"}}
+            try:
+                updated, errors, changed = prepare_update(draft, definition, request)
+                if not errors:
+                    for row in changed.values():
+                        repair = row.get("reason", {}).get("repair")
+                        if repair and not any(matches(repair["target"], rule) for rule in current_slice(state)["allowed_paths"]):
+                            raise PipelineError("QA repair target is outside the approved Engineering write scope")
+                    validate_references(root, state["feature"], {"checks": [{"assertions": list(changed.values())}]}, binding, state=state)
+            except (ValueError, KeyError, TypeError, OSError) as exc:
+                error_path = getattr(exc, "path", "") or "/assessments"
+                prefix = "/checks/0/assertions/"
+                if error_path.startswith(prefix):
+                    index, _, suffix = error_path[len(prefix):].partition("/")
+                    identifier = list(changed)[int(index)]
+                    position = next(i for i, row in enumerate(request["assessments"]) if row.get("id") == identifier)
+                    error_path = f"/assessments/{position}" + ("/" + suffix if suffix else "")
+                updated, errors = None, [{"path": error_path, "message": str(exc)}]
+            if errors:
+                return {**acknowledgment(draft, exists), "valid": False, "errors": errors,
+                        "required_action": "Continue/correct the same QA assessment group; no Engineering repair or execution credit was issued."}
+            self._verify_live_checkout(state, root)
+            if not exists or updated != draft:
+                write_json(path, updated)
+            return {**acknowledgment(updated, True), "valid": True, "errors": [],
+                    "changed_assertion_ids": [key for key in changed if draft["assessments"].get(key) != updated["assessments"][key]],
+                    "terminal_requires_finalize": True}
+
+    def qa_finalize(self, assignment_id, expected_revision):
+        from .qa_draft import load, view, assemble
+        from .artifact_io import write_json
+        with self.store.transaction():
+            state, root, binding = self._qa_working_context(assignment_id)
+            draft, definition, path, exists = load(state, root, binding)
+            metadata = view(draft, definition, path, exists)
+            if type(expected_revision) is not int or expected_revision != draft["revision"]:
+                raise PipelineError("stale QA draft revision; read current draft before finalization")
+            if metadata["pending"]:
+                return {**metadata, "valid": False, "errors": [{"path": "/assessments", "message": "QA assessment remains pending; it is not a not_run verdict or Engineering gap."}],
+                        "required_action": "Continue the same QA working artifact for the remaining assertion groups."}
+            artifact = assemble(draft, definition)
+            errors = self._artifact_errors(state, root, artifact)
+            if errors:
+                return {**metadata, "valid": False, "errors": errors}
+            self._verify_live_checkout(state, root)
+            output = safe_path(root, assignment_output_path(state["active_assignment"], state["feature"]), "assigned QA terminal artifact")
+            write_json(output, artifact)
+            raw = output.read_bytes()
+            return {**metadata, "valid": True, "errors": [], "outcome": artifact["outcome"],
+                    "path": str(output), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+    def artifact_validate(self, source, assignment_id=None):
+        from .artifact_io import read_json
+        state, root = self._loaded()
+        if assignment_id is not None and assignment_id != (state.get("active_assignment") or {}).get("id"):
+            raise PipelineError("artifact assignment_id is not the current issued assignment")
+        value = read_json(source)
+        self._verify_live_checkout(state, root)
+        errors = self._artifact_errors(state, root, value)
+        return {"valid": not errors, "errors": errors, "assignment_id": state["active_assignment"]["id"],
+                "semantic_credit": False, "tests_executed": False}
+
+    def artifact_write(self, source, assignment_id=None):
+        from .artifact_io import read_json, write_json
+        with self.store.transaction():
+            state, root = self._loaded()
+            if not assignment_id or assignment_id != (state.get("active_assignment") or {}).get("id"):
+                raise PipelineError("artifact write requires the exact current assignment_id")
+            value = read_json(source)
+            self._verify_live_checkout(state, root)
+            errors = self._artifact_errors(state, root, value)
+            report = {"valid": not errors, "errors": errors, "assignment_id": state["active_assignment"]["id"],
+                      "semantic_credit": False, "tests_executed": False}
+            if errors:
+                return report
+            output = safe_path(root, assignment_output_path(state["active_assignment"], state["feature"]), "assigned artifact")
+            write_json(output, value)
+            raw = output.read_bytes()
+            return {**report, "path": str(output), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+    @staticmethod
+    def _verify_producer_probes(state, root):
+        from .model import require_verification_feasibility, verification_feasibility
+        from .execution_evidence import read_producer_probe
+        require_verification_feasibility(state)
+        for group in verification_feasibility(state)["probes"]:
+            failures = []
+            for producer in group["alternatives"]:
+                try:
+                    read_producer_probe(root, state["feature"], producer, {
+                        "project_root": str(root), "feature": state["feature"],
+                        "authority_digest": state["authority"]["digest"], "pipeline_runtime_digest": state["pipeline_runtime_digest"]})
+                    break
+                except (PipelineError, OSError, KeyError, TypeError) as exc:
+                    failures.append(f"{producer['method_id']}: {exc}")
+            else:
+                raise PipelineError("all approved producer alternatives are unavailable before Engineering; resolve owning method prerequisite: " + "; ".join(failures))
 
     def _loaded(self, state: dict[str, Any] | None = None) -> tuple[dict[str, Any], Path]:
         state = self.store.load() if state is None else state
@@ -707,6 +1036,8 @@ class Controller:
             }
             if state["phase"] == "qa":
                 command["controller_machine_checks"] = self._machine_check_inputs(state, snapshot)
+            if state["phase"] == "engineering":
+                self._verify_producer_probes(state, root)
             return self.store._dispatch_locked(command)
 
     def reconfigure(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -922,6 +1253,15 @@ class Controller:
                 verification = state.get("execution", {}).get("verification")
             if verification is not None:
                 value["verification"] = seal_verification(verification, value["slices"])
+            if value.get("verification", {}).get("confirm_approved_plan"):
+                from .model import authority_record
+                # Init commands carry resolved items; the reducer's new_state
+                # derives their digest. Use that same canonical authority in
+                # this pre-dispatch preview, rather than a raw command shape.
+                preview = {**value, "authority": authority_record(proposed_items),
+                           "history": [], "artifacts": {}, "execution": {
+                    "qa_contract": value.get("qa_contract"), "verification": value.get("verification", {})}}
+                self._verify_producer_probes(preview, root)
             return self.store._dispatch_locked(value)
 
     def migrate(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -939,6 +1279,8 @@ class Controller:
             replay = self.store._replay_locked(command)
             if replay is not None:
                 return replay
+            if command.get("name") == "accept" and state["phase"] == "slice":
+                self._verify_producer_probes(state, root)
             if command.get("name") == "answer" and "resolution" in command:
                 from .no_progress import verify_resolution_sources
                 command["controller"] = {"resolution_sources": verify_resolution_sources(state, root, command)}
@@ -1065,6 +1407,8 @@ class Controller:
             return self.store._dispatch_prechecked_locked(checked, command)
 
     def _execute_checks(self, state, root, active, action_id, *, collect_independent=False):
+        from .execution_evidence import (_directory, input_snapshot, native_record, read,
+                                         native_attempt, finish_native_attempt)
         results, new_receipts = [], {}
         environment = _process_environment()
         failed = False
@@ -1074,34 +1418,70 @@ class Controller:
                 break
             before = candidate_tree_oid(root)
             binding = receipt_binding(state, before, recipe, environment)
+            executable_before = executable_identity(argv, root=root, environment=environment)
             receipt = state.get("execution", {}).get("receipts", {}).get(binding)
             if receipt is not None:
                 result = deepcopy(receipt["result"])
                 result.update({"duration_ms": 0, "execution_reason": "unchanged_deterministic_inputs",
                                "source_receipt": receipt["id"]})
             else:
-                started = time.monotonic()
-                try:
-                    executable = shutil.which(argv[0]) if os.name == "nt" else None
-                    execution_argv = [executable, *argv[1:]] if executable else argv
-                    process = run_process_tree(execution_argv, cwd=root, env=environment,
-                                               timeout=recipe["timeout_seconds"])
-                    result = {"argv": argv, "returncode": process.returncode,
-                              "stdout_sha256": process.stdout_sha256, "stderr_sha256": process.stderr_sha256}
-                    if process.returncode != 0:
-                        result.update(_stderr_excerpt(process.stderr_tail,
-                                      raw_truncated=process.stderr_tail_truncated, environment=environment, project_root=root))
-                        stdout = _stderr_excerpt(getattr(process, "stdout_tail", b""),
-                                      raw_truncated=getattr(process, "stdout_tail_truncated", False),
-                                      environment=environment, project_root=root)
-                        result.update({key.replace("stderr", "stdout"): value for key, value in stdout.items()})
-                except OSError as exc:
-                    raw = str(exc).encode("utf-8", errors="replace")
-                    result = {"argv": argv, "returncode": TECHNICAL_FAILURE_RETURN_CODE,
-                              "stdout_sha256": _stream_digest(b""), "stderr_sha256": _stream_digest(raw)}
-                    result.update(_stderr_excerpt(raw, raw_truncated=False, environment=environment, project_root=root))
-                result.update({"duration_ms": max(0, int((time.monotonic() - started) * 1000)),
-                               "execution_reason": "environment_sensitive" if binding is None else "new_input_binding"})
+                record_id = "check-" + digest([state["run_id"], active["id"], action_id, index])[:40]
+                directory = _directory(root, state["feature"], record_id)
+                record_binding = self._evidence_binding(state, root, before)
+                inputs_before = input_snapshot(root, recipe.get("input_paths", []))
+                invocation = {"argv": argv, "check_id": recipe["id"], "action_id": action_id}
+                stable_environment = {"process_environment_sha256": digest(environment),
+                                      "input_closure_declared": "input_paths" in recipe, "executable": executable_before}
+                attempt_request = {"binding": record_binding, "invocation": invocation, "recipe": recipe,
+                                   "environment": stable_environment, "inputs": inputs_before, "reusable_binding": binding}
+                result = native_attempt(root, state["feature"], record_id, attempt_request)
+                if result is None:
+                    started = time.monotonic()
+                    stream_digests, capture_error = None, None
+                    try:
+                        execution_argv = [executable_before["path"], *argv[1:]] if executable_before else argv
+                        process = run_process_tree(execution_argv, cwd=root, env=environment,
+                                                   timeout=recipe["timeout_seconds"],
+                                                   stdout_path=directory / "stdout.bin", stderr_path=directory / "stderr.bin")
+                        capture_error = getattr(process, "capture_error", None)
+                        if not all((directory / (name + ".bin")).is_file() for name in ("stdout", "stderr")):
+                            capture_error = capture_error or "process returned without complete raw capture files"
+                        stream_digests = {"stdout": process.stdout_sha256,
+                                          "stderr": getattr(process, "stderr_raw_sha256", None) or process.stderr_sha256}
+                        result = {"argv": argv, "returncode": TECHNICAL_FAILURE_RETURN_CODE if capture_error else process.returncode,
+                                  "stdout_sha256": process.stdout_sha256, "stderr_sha256": process.stderr_sha256}
+                        if capture_error:
+                            result["process_returncode"] = process.returncode
+                        if result["returncode"] != 0:
+                            diagnostic = process.stderr_tail
+                            if capture_error:
+                                diagnostic += ("\nRaw capture failed after process execution: " + capture_error).encode("utf-8")
+                            result.update(_stderr_excerpt(diagnostic, raw_truncated=process.stderr_tail_truncated,
+                                                          environment=environment, project_root=root))
+                            stdout = _stderr_excerpt(getattr(process, "stdout_tail", b""),
+                                                      raw_truncated=getattr(process, "stdout_tail_truncated", False),
+                                                      environment=environment, project_root=root)
+                            result.update({key.replace("stderr", "stdout"): value for key, value in stdout.items()})
+                    except OSError as exc:
+                        capture_error = str(exc)
+                        raw = capture_error.encode("utf-8", errors="replace")
+                        result = {"argv": argv, "returncode": TECHNICAL_FAILURE_RETURN_CODE,
+                                  "stdout_sha256": _stream_digest(b""), "stderr_sha256": _stream_digest(raw)}
+                        result.update(_stderr_excerpt(raw, raw_truncated=False, environment=environment, project_root=root))
+                    result.update({"duration_ms": max(0, int((time.monotonic() - started) * 1000)),
+                                   "check_id": recipe["id"],
+                                   "execution_reason": "environment_sensitive" if binding is None else "new_input_binding"})
+                    # Sink failures are completed technical outcomes. Preserve
+                    # the attempted action before any capture/state publication
+                    # failure; exact retries recover or stop, never re-execute.
+                    result["execution_evidence"] = native_record(root, state["feature"], record_id,
+                        invocation=invocation, binding=record_binding, after_binding=self._evidence_binding(state, root),
+                        environment=stable_environment, inputs_before=inputs_before,
+                        after_environment={**stable_environment, "executable": executable_identity(argv, root=root, environment=environment)},
+                        inputs_after=input_snapshot(root, recipe.get("input_paths", []), missing_ok=True),
+                        result=result, stream_digests=stream_digests, capture_error=capture_error)
+                    result["execution_record_digest"] = read(root, state["feature"], record_id)["record"]["digest"]
+                    finish_native_attempt(root, state["feature"], record_id, result)
             result["check_id"] = recipe["id"]
             after = candidate_tree_oid(root)
             policy = repository_policy_changed(root, state["base_tree_oid"], after)
@@ -1109,15 +1489,16 @@ class Controller:
                 raise PipelineError("planned command changed repository policy; perform a fresh init: " + ", ".join(policy))
             if after != before:
                 raise PipelineError("planned command changed the Git candidate: " + ", ".join(changed_paths(root, before, after)))
+            if executable_identity(argv, root=root, environment=environment) != executable_before:
+                raise PipelineError("verification executable changed during the recorded command; do not replay that action against different executable bytes")
             if binding is not None and receipt_binding(state, after, recipe, environment) != binding:
-                raise PipelineError("verification dependencies changed during the planned command; repeat with stable inputs")
+                raise PipelineError("verification dependencies changed during the planned command; use a new action only after resolving the recorded input change")
             results.append(result)
             if result["returncode"] == 0 and binding is not None:
                 new_receipts[binding] = {"binding": binding, "id": digest([action_id, index, binding]),
                                          "result": deepcopy(result), "candidate_tree_oid": before}
             if result["returncode"] != 0:
                 failed = True
-                # Containment/timeout or a failed prerequisite cannot license later work.
                 if result["returncode"] in {124, TECHNICAL_FAILURE_RETURN_CODE} or not recipe["independent"]:
                     break
         return results, new_receipts
@@ -1173,6 +1554,15 @@ class Controller:
             if required_ids is not None and active["capsule"]["context"].get("required_identity_ids") != required_ids:
                 raise PipelineError("QA assignment identities no longer match approved authority")
             artifact = _worker_artifact(artifact, active["phase"], active["role"], required_ids, state=state)
+            from .execution_evidence import validate_references
+            try:
+                binding = self._evidence_binding(state, root)
+                validate_references(root, state["feature"], artifact, binding, state=state)
+                if active["phase"] == "qa":
+                    from .qa_draft import validate_projection
+                    validate_projection(state, root, binding, artifact)
+            except (ValueError, OSError) as exc:
+                raise WorkerArtifactValidationError(str(exc)) from exc
             results = []
 
             new_receipts = {}

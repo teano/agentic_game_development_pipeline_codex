@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import sys
 import unittest
 from pathlib import Path
@@ -19,6 +20,7 @@ MAINTENANCE = INVARIANT.with_name("maintenance-observation.md")
 sys.path.insert(0, str(SKILLS / "gamedev-pipeline" / "scripts"))
 
 from pipeline_v2.model import PipelineError, ROLES, artifact_schema
+from pipeline_v2.qa_contract import QAContractError, validate_contract, validate_results
 from pipeline_v2.reducer import _worker_artifact
 from pipeline_v2.runner import _caller_slices
 
@@ -46,11 +48,23 @@ class SharedOperationalInvariantTests(unittest.TestCase):
                     self.assertIn("stage-handoff-invariant.md#one-owner-and-one-current-assignment", text)
                 self.assertIn("stage-handoff-invariant.md", text)
 
-    def test_context_rotation_has_one_owner_and_economic_handoff_contract(self) -> None:
+    def test_context_handoff_preserves_related_owner_and_accepted_slice_boundary(self) -> None:
         text = INVARIANT.read_text(encoding="utf-8")
         self.assertNotRegex(text, r"\b(?:70|90)%")
-        for required in ("useful working set", "Never mark incomplete work PASS", "quiescence", "idle `rotate-owner`", "exact next public action"):
-            self.assertIn(required, text)
+        section = text.split("## Working-set checkpoint and rotation\n", 1)[1].split("\n## ", 1)[0]
+        obligations = {
+            "related remediation retains owner": ("same Engineer", "related repairs"),
+            "accepted slice changes physical context": ("accepted behavioral slice boundary", "fresh physical Engineer"),
+            "continuation has actual authority": ("concrete continuity reason", "explicit applicable user authority"),
+            "handoff is quiescent": ("actual termination/quiescence", "no active write/check grant"),
+            "no false completion or quotas": ("Do not manufacture PASS", "telemetry is evidence, never a threshold"),
+            "checkpoint uses current sources": ("current authority paths/revisions/hashes", "native phase/generation/action", "candidate binding from actual sources"),
+            "fresh owner needs actual input": ("full current relevant input", "never another owner's retained baseline"),
+        }
+        for obligation, required in obligations.items():
+            with self.subTest(obligation=obligation):
+                for phrase in required:
+                    self.assertIn(phrase, section)
         # Role routers must discover the shared contract, not invent local
         # thresholds. Behavior under pressure is exercised by role-scenarios.
         for role in ("gamedev-pipeline", "gamedev-engineer", "gamedev-review", "gamedev-qa"):
@@ -134,13 +148,12 @@ class SharedOperationalInvariantTests(unittest.TestCase):
         self.assertIn("director-runtime.md", INVARIANT.read_text(encoding="utf-8"))
 
 
-    def test_minimal_role_examples_pass_the_actual_semantic_validator(self) -> None:
+    def test_minimal_non_qa_role_examples_pass_the_actual_semantic_validator(self) -> None:
         examples = (
             ("plan", "gamedev-pipeline/references/pipeline-protocol.md"),
             ("slice", "gamedev-pipeline/references/pipeline-protocol.md"),
             ("engineering", "gamedev-pipeline/references/semantic-write-packet.md"),
             ("review", "gamedev-review/references/review-output-contract.md"),
-            ("qa", "gamedev-qa/references/qa-output-contract.md"),
         )
         for phase, relative in examples:
             with self.subTest(phase=phase):
@@ -151,6 +164,98 @@ class SharedOperationalInvariantTests(unittest.TestCase):
                 schema = artifact_schema(phase, ROLES[phase])
                 self.assertEqual(set(schema["required_keys"]), set(value))
                 self.assertEqual(value, _worker_artifact(value, phase, ROLES[phase]))
+
+    def test_qa_example_uses_reachable_bound_assertion_contract(self) -> None:
+        role_contract = SKILLS / "gamedev-qa/references/qa-output-contract.md"
+        source = role_contract.read_text(encoding="utf-8")
+        # QA's canonical example is an assertion plus its approved method, not
+        # a second generic checks-only PASS in the role router.
+        target = re.search(r"\]\(([^)]+/qa-acceptance-contract\.md)\)", source)
+        self.assertIsNotNone(target)
+        canonical = (role_contract.parent / target.group(1)).resolve()
+        self.assertEqual(INVARIANT.with_name("qa-acceptance-contract.md").resolve(), canonical)
+        text = canonical.read_text(encoding="utf-8")
+
+        def example(heading: str) -> dict:
+            section = text.split("## " + heading + "\n", 1)[1].split("\n## ", 1)[0]
+            blocks = re.findall(r"```json\n(.*?)\n```", section, re.DOTALL)
+            self.assertTrue(blocks, heading + " must supply its schema example")
+            return json.loads(blocks[0])
+
+        manifest = example("Manifest")
+        assertion = example("Complete terminal results")
+        slice_id, definition = next(iter(manifest["slices"].items()))
+        identity = definition["identities"][0]
+        validate_contract(manifest, {slice_id: [identity["id"]]})
+        value = {"outcome": assertion["outcome"], "checks": [{
+            "id": identity["id"], "outcome": assertion["outcome"],
+            "evidence": "Canonical documentation example; not a claim of product execution.",
+            "assertions": [assertion],
+        }]}
+        self.assertEqual(value, _worker_artifact(value, "qa", ROLES["qa"], [identity["id"]]))
+        self.assertEqual(value["checks"], validate_results(value["checks"], definition, outcome=value["outcome"]))
+        for mutation in ("contradiction", "missing_evidence", "unknown_method"):
+            with self.subTest(mutation=mutation):
+                invalid = json.loads(json.dumps(value))
+                row = invalid["checks"][0]["assertions"][0]
+                if mutation == "contradiction":
+                    row["assessment"]["comparison"] = "contradicts"
+                elif mutation == "missing_evidence":
+                    row["evidence"] = []
+                else:
+                    row["method_id"] = "unapproved-method"
+                with self.assertRaises(QAContractError):
+                    validate_results(invalid["checks"], definition, outcome=invalid["outcome"])
+
+        # A fully populated legacy-looking gap row can still be unfinished QA:
+        # current publication requires a concrete, evidenced Engineering repair.
+        unfinished = json.loads(json.dumps(value))
+        unfinished["outcome"] = unfinished["checks"][0]["outcome"] = "fail"
+        row = unfinished["checks"][0]["assertions"][0]
+        method = row["method_id"]
+        row.update(outcome="not_run", method_id=None,
+                   reason={"kind": "verification_incomplete", "detail": "Captured results are not yet mapped.", "refs": [method]},
+                   evidence=[{"type": "verification-gap", "ref": method, "observation": "Assessment is unfinished."}])
+        row["assessment"].update(observed="No completed comparison yet.", comparison="insufficient")
+        with self.assertRaisesRegex(QAContractError, "Engineering repair"):
+            validate_results(unfinished["checks"], definition, outcome="fail", strict_gaps=True)
+
+    def test_documented_incremental_qa_and_selected_read_commands_are_public(self) -> None:
+        from pipeline_v2.cli import parser
+
+        qa = INVARIANT.with_name("qa-acceptance-contract.md").read_text(encoding="utf-8")
+        incremental = qa.split("## Incremental assessment\n", 1)[1].split("\n## ", 1)[0]
+        delivery = INVARIANT.with_name("delivery-contract.md").read_text(encoding="utf-8")
+        execution = INVARIANT.with_name("execution-contract.md").read_text(encoding="utf-8")
+        examples = (
+            (incremental, ["qa-draft", "--assignment-id", "qa-bound"]),
+            (incremental, ["qa-read", "--assignment-id", "qa-bound", "--identity-id", "MANUAL-FEATURE-RUNTIME", "--format", "json", "--assemble"]),
+            (incremental, ["qa-record", "--assignment-id", "qa-bound", "--source", "assessed-group.json"]),
+            (incremental, ["qa-finalize", "--assignment-id", "qa-bound", "--expected-revision", "1"]),
+            (delivery, ["assignment-read", "--digest", "a" * 64, "--view", "qa-index", "--format", "json", "--assemble"]),
+            (delivery, ["assignment-read", "--digest", "a" * 64, "--view", "qa-assertion", "--assertion-id", "runtime-reset", "--assertion-id", "runtime-exit", "--format", "json", "--assemble"]),
+            (delivery, ["file-read", "--instruction", "director", "--path", "references/director-runtime.md", "--section", "Ordinary event map", "--format", "json", "--assemble"]),
+            (delivery, ["file-read", "--path", "docs/plan.md", "--lines", "1:5", "--format", "text"]),
+            (execution, ["evidence-read", "--record-id", "feature-channel-probe", "--raw-file", "raw.json", "--pointer", "/value/observations", "--format", "json", "--assemble"]),
+        )
+        for instructions, argv in examples:
+            with self.subTest(argv=argv):
+                self.assertIn(argv[0], instructions)
+                actual = parser().parse_args(["--root", str(BUNDLE), "--feature", "sample-feature", *argv])
+                self.assertEqual(argv[0], actual.command)
+
+        # Parse the actual copyable prepared-context examples, so changing a
+        # documented flag cannot leave a separate handwritten test argv green.
+        blocks = re.findall(r"```console\n(.*?)\n```", incremental, re.DOTALL)
+        self.assertTrue(blocks, "The incremental route must expose concrete helper calls")
+        for block in blocks:
+            for line in block.splitlines():
+                argv = shlex.split(line)
+                with self.subTest(documented_command=line):
+                    actual = parser().parse_args(["--root", str(BUNDLE), "--feature", "sample-feature", *argv])
+                    self.assertEqual(argv[0], actual.command)
+                    if actual.command == "qa-prepare" and actual.output:
+                        self.assertFalse(actual.pointer or actual.continuation or actual.assemble)
 
     def test_observed_format_errors_still_fail_without_weakening_validation(self) -> None:
         cases = (
@@ -220,7 +325,9 @@ class SharedOperationalInvariantTests(unittest.TestCase):
         self.assertIn("control-return.md#caller-binding-and-dispatch", runtime)
         self.assertIn("Forward delivery/`role_instructions` unchanged", runtime)
         self.assertIn("Fresh/replaced/lost-context owners need full content", runtime)
-        self.assertIn("self-contained current packet", INVARIANT.read_text(encoding="utf-8"))
+        invariant = INVARIANT.read_text(encoding="utf-8")
+        self.assertIn("full current relevant input", invariant)
+        self.assertIn("never another owner's retained baseline or session-local handles", invariant)
         control = INVARIANT.with_name("control-return.md")
         template = control.read_text(encoding="utf-8")
         for field in ("Role instructions:", "Task and stop boundary:", "Inputs:", "Permissions:", "consume required input completely before work"):
@@ -240,7 +347,10 @@ class SharedOperationalInvariantTests(unittest.TestCase):
         self.assertIn("otherwise obtain it before changing shared pipeline code", text)
         self.assertIn("never manufacture a user message", text)
         self.assertIn("incident is never blanket permission", text)
-        self.assertIn("MUST NOT edit, patch, bypass", INVARIANT.read_text(encoding="utf-8"))
+        invariant = INVARIANT.read_text(encoding="utf-8")
+        restriction = invariant.split("## Evidence, artifacts and incidents\n", 1)[1]
+        self.assertRegex(restriction, r"(?i)workers must not edit, patch, bypass or replace the pipeline under product-only authority")
+        self.assertIn("including a valid prior delegation", restriction)
 
 
     def test_v2_authority_reopen_has_one_public_fail_closed_route(self) -> None:

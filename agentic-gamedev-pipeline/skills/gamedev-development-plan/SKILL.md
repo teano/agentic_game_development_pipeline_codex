@@ -5,7 +5,7 @@ description: Explicit-invocation only. Use only when the user explicitly request
 
 # GameDev Development Plan
 
-When the caller supplies `control_binding`, first apply the shared [control-return contract](../gamedev-pipeline/references/control-return.md). Keep semantic JSON and native stage handoffs unchanged; wrap only the requested return. A bounded caller task performs only its stated existing-role work, without automatic stage restart or approval. Standalone user calls retain their existing public result.
+When the caller supplies `control_binding`, apply [Worker return](../gamedev-pipeline/references/control-return.md#worker-return). For a bounded `recipe` task, use only [Resolve recipes and prerequisites once](../gamedev-pipeline/references/execution-contract.md#resolve-recipes-and-prerequisites-once) and its required sources; for a bounded answer or recovery task, use its supplied procedure and exact question. Return that `task_result` without entering the stage workflow below. These existing-role tasks do not restart Planning, create an Analyst or grant approval. An actual Development Plan stage follows the remaining instructions and returns its unchanged native handoff; standalone user calls retain their public result.
 
 ## Activation gate
 
@@ -28,18 +28,18 @@ Reassess applicable decisions against current PRD/SPEC bytes and incorporate jus
 1. Resolve the project root, lowercase feature, canonical PRD, specification, plan, and append-only decision ledger through the contract. Ask one path question only if ambiguity remains.
 2. Require the exact PRD to pass the complete current approved Requirements validator and require current schema-3 `SPEC_READY` evidence from the same exact feature workflow whose paths and hashes match the files. Planning never scans sibling workflows, migrates legacy specification state, or grandfathers malformed authority; return a controlled upstream revision/reconvergence handoff instead.
 3. Pass global `--feature <slug>` on every controller call and initialize `.agentic-pipeline/Workflows/<feature>/development-plan-state.json` with the resolved paths and exact source hashes.
-4. Assign exactly one fresh internal read-only Planning Analyst with bounded canonical inputs. With `spawn_agent`, pass `fork_turns: "none"`, `model: "gpt-6-sol"`, and `reasoning_effort: "high"` explicitly unless an applicable user override selects different values. Apply the same policy to the fresh Analyst required by revision or reinitialization. Do not reuse an implementation or specification worker.
+4. Assign exactly one fresh internal read-only Planning Analyst with bounded canonical inputs. With `spawn_agent`, pass `fork_turns: "none"`, `model: "gpt-6.1-sol"`, and `reasoning_effort: "high"` explicitly unless an applicable user override selects different values. Apply the same policy to the fresh Analyst required by revision or reinitialization. Do not reuse an implementation or specification worker.
 5. Record the result with `accept-analysis`.
 
 ## Choose ownership shape
 
 Use `single_owner` when production work and tightly coupled automated tests form one bounded write scope or have poor seams. At runtime a stable Engineer owns related implementation/remediation within the slice; assignment IDs and role ownership remain separate, and independent reviewers never share its role.
 
-Use `sequential_slices` only when every slice yields an observable end-to-end result, maps to approved requirements/acceptance, has a bounded working set, and consumes a sealed earlier handoff without competing writes. Never split by backend/UI/tests or plan parallel writers.
+Choose boundaries through the contract's [Analyst decision](references/development-plan-contract.md#analyst-decision): each sequential slice leaves an observable working behavior and stable input for the next. Explain simultaneous states/dependencies and inseparable internal checkpoints; shared files require sequential ownership, not layer-only slices or parallel writers.
 
 Read only controller-provided closed remediation gates and accepted answers as dependency/risk context. They do not add scope. Pipeline v2 keeps findings, answers, and completed actor IDs inside controller state; planning does not invoke a Decision Recorder or deferred-findings handler. The Analyst returns a compact decision packet with mode, complexity/working-set assessment, seams/dependencies, rejected decompositions, risks, slices/milestones, context delivery, coverage boundaries, documentation outputs, and whether each slice needs bounded research.
 
-Plan the smallest relevant working set using exact source locators and on-demand sections or pages. Give the same owner changed facts and evidence deltas; checkpoint when continuity is actually at risk. Do not invent numeric context caps or use historical estimates as gates. Honor a user-provided limit with its actual scope and source.
+Separate read rights from initial working input. Plan same-owner deltas for related remediation and fresh physical context at accepted behavioral boundaries; bind any continuity exception in advance through the contract's Context Delivery instructions. The Director routes that decision mechanically. Do not derive boundaries or turnover from numeric context caps.
 
 For each slice, use either one to three exact `RESEARCH-*` briefs or `research_not_required | reason=<exact source-backed reason>`. Brief IDs must be unique; their questions, sources, exclusions, and stop conditions are approved instructions for the assigned roles, not an automatically launched runtime research workflow. Never add a fake brief merely to satisfy structure.
 
@@ -47,7 +47,7 @@ For each slice, use either one to three exact `RESEARCH-*` briefs or `research_n
 
 Write only the canonical plan path and use the contract/template fields. Every path semantically required to mutate must appear in ordered `Owned Paths` and the identical ordered `Scope Contract.editable_paths`; never rely on the validator to infer a write from specification prose. Keep disjoint `Expected Paths` inside the sealed Context Capsule read scope. Keep `status: draft` until an authorized actor explicitly approves the exact submitted SHA. The user may approve directly or explicitly delegate technical/process approval to an agent; record the real actor and never relabel delegated approval as `user`. Delegation does not cover an unresolved product choice that remains user-owned.
 
-Populate the template's single [QA acceptance contract](../gamedev-pipeline/references/qa-acceptance-contract.md) with source-backed assertions, methods, explicit alternatives, evidence and applicability. Do not duplicate it in another ledger or invent extra platform checks. Existing approved plans can retain their bytes and bind this technical contract explicitly at runtime; missing method authority never implies QA PASS.
+Populate the template's single [QA acceptance contract](../gamedev-pipeline/references/qa-acceptance-contract.md) with source-backed assertions, methods, explicit alternatives, evidence, producer feasibility and applicability. Establish actual prerequisite availability and approved external acceptance order before dependent implementation. Do not duplicate the contract in another ledger or invent platform defaults. Existing approved plans can retain their bytes and bind this technical contract explicitly at runtime; missing method authority never implies QA PASS.
 
 Run `validate-plan`, then `submit`. Validation requires the exact union of all slice acceptance sets to cover the complete approved PRD inventory; cross-slice overlap is allowed only when each named slice genuinely contributes to that end-to-end criterion. Present decision, ordering, boundaries, risks, and exact draft SHA. Every edit requires resubmission. Silence or upstream approval is not plan approval.
 

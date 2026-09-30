@@ -138,25 +138,36 @@ the recipe owner and independent reviewer must substantiate that assertion.
     return _digest(result)
 
 
+def executable_identity(argv, *, root=None, environment=None):
+    """Resolve and hash the actual executable selected by the declared argv."""
+    from .checkout import file_sha256
+    supplied = argv[0]
+    if root is not None and not Path(supplied).is_absolute() and ("/" in supplied or "\\" in supplied):
+        supplied = str(Path(root) / supplied)
+    search_path = environment.get("PATH", os.defpath) if environment is not None else None
+    executable = shutil.which(supplied, path=search_path)
+    if executable is None:
+        return None
+    try:
+        return {"path": os.path.normcase(str(Path(executable).resolve())), "sha256": file_sha256(Path(executable))}
+    except OSError:
+        return None
+
+
 def receipt_binding(state, tree, recipe, environment):
     """Conservative input closure: full candidate, executable bytes, all env.
 
 Only an explicitly deterministic recipe is reusable. No environment value is
 persisted, and a missing executable never receives a reusable identity.
 """
-    from .checkout import file_sha256
-    executable = shutil.which(recipe["argv"][0])
+    executable = executable_identity(recipe["argv"], root=state["project_root"], environment=environment)
     dependencies = dependency_binding(state, recipe)
     if recipe["kind"] != "deterministic" or executable is None or dependencies is None:
         return None
-    try:
-        executable_hash = file_sha256(Path(executable))
-    except OSError:
-        return None
     return _digest({"candidate": tree, "authority": state["authority"]["digest"],
                     "runtime": state["pipeline_runtime_digest"], "recipe": recipe,
-                    "executable": os.path.normcase(str(Path(executable).resolve())),
-                    "executable_sha256": executable_hash, "environment": _digest(environment), "dependencies": dependencies})
+                    "executable": executable["path"],
+                    "executable_sha256": executable["sha256"], "environment": _digest(environment), "dependencies": dependencies})
 
 
 def execution_environment():
@@ -169,6 +180,8 @@ def execution_environment():
 
 def machine_check_row(result, locator, receipt_id):
     return {"id": result["check_id"], "outcome": "pass" if result["returncode"] == 0 else "fail",
+            **({"execution_evidence": result["execution_evidence"]} if "execution_evidence" in result else {}),
+            **({"execution_record_digest": result["execution_record_digest"]} if "execution_record_digest" in result else {}),
             "source_locator": locator, "receipt_id": receipt_id, "receipt_sha256": _digest(result),
             "returncode": result["returncode"], "stdout_sha256": result["stdout_sha256"],
             "stderr_sha256": result["stderr_sha256"]}
