@@ -8,10 +8,10 @@ The user selects these settings when starting the corresponding task. A skill ca
 
 | User-started stage | Model | Effort |
 | --- | --- | --- |
-| `$gamedev-requirements` | `gpt-6-sol` | `medium` |
-| `$gamedev-specification` | `gpt-6-sol` | `medium` |
-| `$gamedev-development-plan` | `gpt-6-sol` | `medium` |
-| `$gamedev-pipeline` implementation Director | `gpt-6-sol` | `medium` |
+| `$gamedev-requirements` | `gpt-6.1-sol` | `medium` |
+| `$gamedev-specification` | `gpt-6.1-sol` | `medium` |
+| `$gamedev-development-plan` | `gpt-6.1-sol` | `medium` |
+| `$gamedev-pipeline` implementation Director | `gpt-6.1-sol` | `medium` |
 
 When an invoked Director is authorized to delegate an upstream stage and no owner is already assigned, use that stage's row for its new Director. Return corrections to an existing stage owner through the parent as required by the handoff invariant.
 
@@ -21,21 +21,21 @@ Choose the row for the actual assigned work. Rows do not create roles, activate 
 
 | Existing role | Model | Effort | Workload |
 | --- | --- | --- | --- |
-| Requirements bounded research agent | `gpt-6-sol` | `high` | Ground questions and constraints in the current project and stack. |
-| Requirements semantic review agent | `gpt-6-sol` | `high` | Check confirmed meaning, contradictions and mandatory coverage before specification work begins. |
-| Technical Spec Architect | `gpt-6-sol` | `high` | Own semantic assessment, minimal design and correction decisions. |
-| Specification Generator/helper | `gpt-6-sol` | `medium` | Generate or correct technical specification text from exact authority. |
-| Specification Proofreader | `gpt-6-sol` | `medium` | Independently compare exact specification bytes with approved scope. |
-| Specification helper semantic review or post-fix verification worker, when its existing route delegates one | `gpt-6-sol` | `medium` | Independently check helper output against the exact request; use the Proofreader setting. |
-| Specification repository-research helper | `gpt-6-sol` | `low` | Answer a bounded project-evidence question. |
-| Development Plan Planning Analyst | `gpt-6-sol` | `high` | Analyze coupling, seams, dependencies, scoped context delivery and coverage. |
-| Runtime Plan (`planner`) | `gpt-6-sol` | `high` | Confirm approved intent and unresolved product decisions. |
-| Runtime Slice (`slicer`) | `gpt-6-sol` | `high` | Confirm bounded approved scope and retained-path coverage. |
-| Engineering (`engineer`) | `gpt-6-sol` | `xhigh` | Implement the assigned game slice and coupled tests. |
-| Review (`reviewer`), including post-Docs Review | `gpt-6-sol` | `xhigh` | Independently inspect mandatory behavior, supported paths and sufficient complexity. |
+| Requirements bounded research agent | `gpt-6.1-sol` | `high` | Ground questions and constraints in the current project and stack. |
+| Requirements semantic review agent | `gpt-6.1-sol` | `high` | Check confirmed meaning, contradictions and mandatory coverage before specification work begins. |
+| Technical Spec Architect | `gpt-6.1-sol` | `high` | Own semantic assessment, minimal design and correction decisions. |
+| Specification Generator/helper | `gpt-6.1-sol` | `medium` | Generate or correct technical specification text from exact authority. |
+| Specification Proofreader | `gpt-6.1-sol` | `medium` | Independently compare exact specification bytes with approved scope. |
+| Specification helper semantic review or post-fix verification worker, when its existing route delegates one | `gpt-6.1-sol` | `medium` | Independently check helper output against the exact request; use the Proofreader setting. |
+| Specification repository-research helper | `gpt-6.1-sol` | `low` | Answer a bounded project-evidence question. |
+| Development Plan Planning Analyst | `gpt-6.1-sol` | `high` | Analyze coupling, seams, dependencies, scoped context delivery and coverage. |
+| Runtime Plan (`planner`) | `gpt-6.1-sol` | `high` | Confirm approved intent and unresolved product decisions. |
+| Runtime Slice (`slicer`) | `gpt-6.1-sol` | `high` | Confirm bounded approved scope and retained-path coverage. |
+| Engineering (`engineer`) | `gpt-6.1-sol` | `xhigh` | Implement the assigned game slice and coupled tests. |
+| Review (`reviewer`), including post-Docs Review | `gpt-6.1-sol` | `xhigh` | Independently inspect mandatory behavior, supported paths and sufficient complexity. |
 | QA (`qa`) | `gpt-6-luna` | `medium` | Execute assigned player/editor acceptance and report bound evidence. |
-| Docs (`documentation_finisher`) | `gpt-6-sol` | `medium` | Synchronize bounded documentation with approved and verified sources. |
-| Explicit standalone Coverage Advisory | `gpt-6-sol` | `high` | Inspect supplied source-to-identity mappings; it is not a runtime assignment. |
+| Docs (`documentation_finisher`) | `gpt-6.1-sol` | `medium` | Synchronize bounded documentation with approved and verified sources. |
+| Explicit standalone Coverage Advisory | `gpt-6.1-sol` | `high` | Inspect supplied source-to-identity mappings; it is not a runtime assignment. |
 
 `ready` is a terminal runtime phase without a worker. Research briefs are context for existing roles, not automatically dispatched researchers. The policy adds no Decision Recorder, coverage executor, or other retired role.
 
@@ -44,7 +44,7 @@ Choose the row for the actual assigned work. Rows do not create roles, activate 
 For every new collaboration worker, supply `fork_turns: "none"`, `model`, and `reasoning_effort` as actual `spawn_agent` arguments, using the effective row or explicit override. For example, a default Engineering dispatch contains:
 
 ```json
-{"task_name":"engineering_slice","fork_turns":"none","model":"gpt-6-sol","reasoning_effort":"xhigh","message":"<self-contained authorized Engineering packet>"}
+{"task_name":"engineering_slice","fork_turns":"none","model":"gpt-6.1-sol","reasoning_effort":"xhigh","message":"<self-contained authorized Engineering packet>"}
 ```
 
 The name and message above are placeholders for the actual assignment. Include effective settings and their override scope in the bounded handoff, outside any immutable helper request or runtime assignment payload. Do not modify controller-owned IDs, semantic tasks, schemas, state or approval hashes to carry model settings. A full-history fork inherits the parent and cannot apply explicit model overrides.
