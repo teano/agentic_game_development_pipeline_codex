@@ -125,6 +125,7 @@ class DeliveryTests(unittest.TestCase):
                 self.assertEqual(role, locator["role"])
                 self.assertEqual((skills / relative).resolve(), Path(locator["path"]))
                 self.assertTrue(Path(locator["path"]).is_file())
+                self.assertEqual(hashlib.sha256(Path(locator["path"]).read_bytes()).hexdigest(), locator["version"])
                 if role in {"planner", "slicer"}:
                     self.assertEqual("Runtime Plan and Slice", locator["section"])
                     self.assertIn("## " + locator["section"], Path(locator["path"]).read_text(encoding="utf-8"))
@@ -136,29 +137,80 @@ class DeliveryTests(unittest.TestCase):
                 self.assertEqual(locator, director_brief(view)["active_assignment"]["role_instructions"])
                 self.assertEqual(view["active_assignment"], packet["assignment"])
                 self.assertEqual(original, view)
-                self.assertEqual({"role", "path", "section"} if role in {"planner", "slicer"}
-                                 else {"role", "path"}, set(locator))
+                self.assertEqual({"role", "path", "version", "section"} if role in {"planner", "slicer"}
+                                 else {"role", "path", "version"}, set(locator))
 
     def test_generated_normal_readers_execute_without_appended_transport_arguments(self):
         for role in ROLES.values():
             view = deepcopy(self.view)
             view["active_assignment"]["role"] = role
             dispatch = export_assignment(self.root, view)["dispatch"]
-            startup = run(parser().parse_args(dispatch["reader"]["bootstrap_argv"][2:]))
+            self.assertIn("--present", dispatch["reader"]["bootstrap_argv"])
+            # This pure packet fixture has no live controller. Its legacy read
+            # remains supported; current issued handles are exercised natively
+            # by SavedPresentationNativeTests.
+            startup = run(parser().parse_args(["--assemble" if item == "--present" else item for item in dispatch["reader"]["bootstrap_argv"][2:]]))
             self.assertTrue(startup["selection_complete"])
             self.assertEqual(role, startup["value"]["assignment"]["role"])
             instruction = run(parser().parse_args(dispatch["role_instructions"]["read_argv"][2:]))
+            locator = dispatch["role_instructions"]
+            self.assertEqual(locator["version"], parser().parse_args(locator["read_argv"][2:]).version)
+            self.assertEqual(locator["version"], instruction["original_selection"]["source"]["sha256"])
+            self.assertEqual(locator["path"], instruction["original_selection"]["source"]["path"])
             self.assertTrue(instruction["selection_complete"])
             self.assertFalse(instruction["delivery_complete"])
             self.assertNotIn("evidence_origin", instruction)
             if role in {"planner", "slicer"}:
-                self.assertTrue(instruction["value"].startswith("## Runtime Plan and Slice"))
+                self.assertTrue(instruction["text"].startswith("## Runtime Plan and Slice"))
             with mock.patch("pipeline_v2.cli.Controller") as controller:
                 controller.return_value.read_status.return_value = view
-                source = run(parser().parse_args(dispatch["reader"]["source_argv_prefix"][2:] + ["src/a.txt"]))
+                source = run(parser().parse_args(["--assemble" if item == "--present" else item for item in dispatch["reader"]["source_argv_prefix"][2:]] + ["src/a.txt"]))
             self.assertEqual("Привет 🌍\r\n", source["value"])
             self.assertEqual(source["source"], source["evidence_origin"]["source"])
             self.assertTrue(source["evidence_origin"]["ref"].startswith("candidate-source:src/a.txt@"))
+
+    def test_generated_startup_refuses_changed_source_even_outside_selected_role_section(self):
+        for role in ("engineer", "planner"):
+            with self.subTest(role=role):
+                view = deepcopy(self.view)
+                view["active_assignment"]["role"] = role
+                locator = export_assignment(self.root, view)["dispatch"]["role_instructions"]
+                target = self.root / f"{role}-instructions.md"
+                payload = Path(locator["path"]).read_bytes()
+                target.write_bytes(payload)
+                with mock.patch("pipeline_v2.delivery._instruction_path", return_value=target):
+                    args = parser().parse_args(locator["read_argv"][2:])
+                    original = run(args)
+                    self.assertEqual(locator["version"], original["original_selection"]["source"]["sha256"])
+                    target.write_bytes(payload + b"\n## Unselected newer section\nChanged source bytes.\n")
+                    with self.assertRaisesRegex(PipelineError, "selected input changed"):
+                        run(args)
+                    args.version = hashlib.sha256(target.read_bytes()).hexdigest()
+                    current = run(args)
+                if role == "planner":
+                    self.assertEqual(original["text"], current["text"])
+                self.assertNotEqual(original["original_selection"]["source"]["sha256"], current["original_selection"]["source"]["sha256"])
+                self.assertFalse(current["delivery_complete"])
+                self.assertNotIn("evidence_origin", current)
+
+    def test_unversioned_v2_role_locator_is_readable_and_upgrades_by_exact_delta(self):
+        exported = export_assignment(self.root, self.view)
+        legacy = self.receive(exported["packet_digest"])
+        legacy["role_instructions"].pop("version")
+        payload = canonical_bytes(legacy)
+        version = hashlib.sha256(payload).hexdigest()
+        (self.root / self.workflow / "Delivery" / f"{version}.json").write_bytes(payload)
+        startup = run(parser().parse_args(["--root", str(self.root), "--feature", self.view["feature"],
+            "assignment-read", "--digest", version, "--view", "bootstrap", "--assemble"]))
+        self.assertEqual(legacy["role_instructions"], startup["value"]["role_instructions"])
+        self.assertFalse(startup["delivery_complete"])
+        current = export_assignment(self.root, self.view, baseline=version)
+        delta = self.receive(current["response_digest"])
+        self.assertEqual("delta", current["mode"])
+        self.assertEqual(self.receive(current["packet_digest"]), apply_patch(legacy, delta["patch"]))
+        self.assertEqual(legacy["assignment"], self.receive(current["packet_digest"])["assignment"])
+        self.assertEqual(current["role_instructions"]["version"],
+                         parser().parse_args(current["dispatch"]["role_instructions"]["read_argv"][2:]).version)
 
     def test_full_and_delta_keep_exact_output_right_separate_from_product_scope(self):
         from pipeline_v2.model import artifact_schema

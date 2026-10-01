@@ -18,9 +18,10 @@ from pipeline_v2.delivery import (host_read_command, read_file, assemble_deliver
                                   _instruction_path, _instruction_link_reads, export_assignment, read_delivery_unit)
 from pipeline_v2.tests import test_qa_working_draft as draft_fixtures
 from pipeline_v2.tests import test_qa_public_io as selection_fixtures
+from pipeline_v2.tests import test_delivery_tools as delivery_fixtures
 
 
-def execute_handle(handle, *, cwd):
+def execute_handle(handle, *, cwd, binary=False):
     request = handle["exec_command"] if "exec_command" in handle else handle
     if request["shell"] == "powershell":
         shell = shutil.which("pwsh") or shutil.which("powershell")
@@ -29,7 +30,7 @@ def execute_handle(handle, *, cwd):
         argv = [shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", request["cmd"]]
     else:
         argv = [request["shell"], "-c", request["cmd"]]
-    return subprocess.run(argv, cwd=cwd, capture_output=True, encoding="utf-8", check=True,
+    return subprocess.run(argv, cwd=cwd, capture_output=True, encoding=None if binary else "utf-8", check=True,
                           env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"})
 
 
@@ -49,6 +50,33 @@ class PresentationNavigationTests(unittest.TestCase):
             posix = host_read_command(["python", *arguments], root, windows=False)
             self.assertEqual(["python", *arguments], shlex.split(posix["cmd"]))
 
+    def test_generated_startup_handle_keeps_bound_source_and_saved_full_envelope(self):
+        fixture = delivery_fixtures.DeliveryTests("runTest"); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        root = fixture.root / "project Ω ' $() `"
+        root.mkdir()
+        exported = export_assignment(root, fixture.view)
+        handle = exported["dispatch"]["role_instructions"]
+        with tempfile.TemporaryDirectory() as foreign:
+            completed = execute_handle(handle, cwd=foreign, binary=True)
+            header, body = completed.stdout.split(b"\n", 1)
+            metadata = json.loads(header)
+            output = root / fixture.workflow / "ReadOutputs" / "startup.json"
+            saved = execute_handle(host_read_command([*handle["read_argv"], "--output", str(output)], root), cwd=foreign)
+        receipt = json.loads(saved.stdout.split("\n", 1)[0])
+        retained = json.loads(output.read_bytes())
+        source_text = Path(handle["path"]).read_bytes().decode("utf-8")
+        self.assertEqual(source_text.encode("utf-8"), body[:-1])
+        self.assertEqual(source_text, retained["value"])
+        self.assertEqual(handle["version"], metadata["version"])
+        self.assertEqual(handle["version"], metadata["original_selection"]["source"]["sha256"])
+        self.assertEqual(retained["source"], metadata["original_selection"]["source"])
+        self.assertEqual(str(root), handle["exec_command"]["workdir"])
+        self.assertFalse(receipt["read_credit"])
+        self.assertTrue(receipt["snapshot_read"])
+        self.assertEqual(hashlib.sha256(output.read_bytes()).hexdigest(), receipt["saved_output"]["sha256"])
+        self.assertFalse(metadata["delivery_complete"])
+        self.assertNotIn("evidence_origin", retained)
+
     def test_link_handle_reads_exact_selected_source_and_deduplicates_targets(self):
         with tempfile.TemporaryDirectory(prefix="instruction Ω ' $() ` ") as directory, tempfile.TemporaryDirectory() as foreign:
             root = Path(directory)
@@ -66,10 +94,10 @@ class PresentationNavigationTests(unittest.TestCase):
             source = handle["source"]
             expected = "".join(Path(source["path"]).read_bytes().decode("utf-8").splitlines(keepends=True)[source["start_line"] - 1:source["end_line"]])
             self.assertEqual(expected, body[:-1])  # print adds exactly one framing newline.
-            self.assertEqual(source, metadata["source"])
+            self.assertEqual(source, metadata["original_selection"]["source"])
             self.assertFalse(metadata["delivery_complete"])
             self.assertTrue(metadata["selection_complete"])
-            self.assertTrue(metadata["linked_reads"])
+            self.assertTrue(metadata["links"]["inventory"])
             self.assertNotIn("evidence_origin", metadata)
 
     def test_missing_ambiguous_and_unadmitted_links_never_select_whole_source(self):
@@ -97,6 +125,12 @@ class PresentationNavigationTests(unittest.TestCase):
             with mock.patch("pipeline_v2.delivery._instruction_path", return_value=target):
                 handle = _instruction_link_reads(root, "fixture", "qa", target, "[chosen](#chosen)")[0]
                 source = handle["source"]
+                first = read_file(root, None, str(target), instruction="qa", feature="fixture", version=source["sha256"],
+                    lines=(source["start_line"], source["end_line"]), limit=7)
+                self.assertIsNotNone(first["continuation"])
+                with self.assertRaisesRegex(ValueError, "continuation does not match"):
+                    read_file(root, None, str(target), instruction="qa", feature="fixture", version=source["sha256"],
+                        lines=(1, source["end_line"]), continuation=first["continuation"], limit=7)
                 result = assemble_delivery_pages(lambda token: read_file(root, None, str(target), instruction="qa",
                     feature="fixture", version=source["sha256"], lines=(source["start_line"], source["end_line"]), continuation=token, limit=7))
                 self.assertEqual("## Chosen\r\n  exact Ω  \r\n", result["value"])
@@ -137,8 +171,14 @@ class PresentationNavigationTests(unittest.TestCase):
             view="qa-index", continuation=token))["value"]
         group = inventory["identities"][0]
         self.assertEqual({"id", "source", "assertion_ids", "read"}, set(group))
+        self.assertIn("--present", group["read"]["exec_command"]["cmd"])
+        # This is a pure immutable packet fixture, without an issued controller.
+        # Exercise its unchanged legacy transport; real current-owner generated
+        # handles are exercised by SavedPresentationNativeTests.
+        legacy = deepcopy(group["read"])
+        legacy["exec_command"]["cmd"] = legacy["exec_command"]["cmd"].replace("--present", "--assemble")
         with tempfile.TemporaryDirectory() as foreign:
-            complete = execute_handle(group["read"], cwd=foreign)
+            complete = execute_handle(legacy, cwd=foreign)
         metadata, body = complete.stdout.split("\n", 1)
         self.assertTrue(json.loads(metadata)["selection_complete"])
         selected = json.loads(body)

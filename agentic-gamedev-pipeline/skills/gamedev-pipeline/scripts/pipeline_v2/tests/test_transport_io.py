@@ -15,11 +15,261 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from pipeline_v2.cli import _check_delivery, parser, run
+from pipeline_v2.cli import _check_delivery, _render_assignment_unit, parser, run
 from pipeline_v2.delivery import (_semantic_page, assemble_delivery_pages,
                                   public_action_invocation, read_delivery_unit)
 from pipeline_v2.model import PipelineError
 from pipeline_v2.tests import test_delivery_work
+
+
+class SavedPresentationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="saved Ω ' $() ` ")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.prefix = ["--root", str(self.root), "--feature", "presentation"]
+
+    def source(self, path="../gamedev-pipeline/references/delivery-contract.md", section="Worker read route", limit=8192):
+        args = self.prefix + ["file-read", "--instruction", "qa", "--path", path, "--format", "json", "--limit", str(limit)]
+        if section:
+            args += ["--section", section]
+        return args
+
+    def saved(self, page, *, pointer="/value", continuation=None, root=None, feature="presentation", limit=8192):
+        args = ["--root", str(root or self.root), "--feature", feature, "delivery-read", "--saved-output", page["saved_output"]["path"],
+                "--digest", page["saved_output"]["sha256"], "--pointer", pointer, "--format", "json", "--limit", str(limit)]
+        if continuation:
+            args += ["--continuation", continuation]
+        return run(parser().parse_args(args))
+
+    def test_full_envelope_is_preserved_and_progressive_body_equals_legacy_rendering(self):
+        for path, section in (("../gamedev-pipeline/references/delivery-contract.md", "Worker read route"),
+                              ("../gamedev-pipeline/references/qa-acceptance-contract.md", "Incremental assessment"),
+                              ("../gamedev-pipeline/references/director-runtime.md", None)):
+            with self.subTest(path=path):
+                args = self.source(path, section, limit=8192)
+                legacy = run(parser().parse_args(args + ["--assemble"]))
+                first = run(parser().parse_args(args + ["--present"]))
+                snapshot = json.loads(Path(first["saved_output"]["path"]).read_bytes())
+                self.assertEqual(legacy, {key: value for key, value in snapshot.items() if key != "presentation_origin"})
+                expected = _render_assignment_unit(legacy).split("\n", 1)[1]
+                restored = assemble_delivery_pages(lambda token: self.saved(first, continuation=token))
+                self.assertEqual(expected, restored["value"])
+                self.assertFalse(first["read_credit"])
+                self.assertFalse(first["semantic_credit"])
+                self.assertFalse(first["delivery_complete"])
+                self.assertEqual(legacy["source"], first["original_selection"]["source"])
+                self.assertNotIn("evidence_origin", first["original_selection"])
+                self.assertNotIn("linked_reads", first)
+                self.assertEqual(len(legacy["linked_reads"]), len(first["links"]["inventory"]))
+                self.assertLess(len(_render_assignment_unit(first).split("\n", 1)[0]),
+                                len(_render_assignment_unit(legacy).split("\n", 1)[0]))
+
+    def test_current_replays_same_page_and_wrong_pointer_snapshot_or_raw_bytes_fail(self):
+        first = run(parser().parse_args(self.source(limit=73) + ["--present"]))
+        second = self.saved(first, continuation=first["continuation"], limit=73)
+        from pipeline_v2.tests.test_presentation_navigation import execute_handle
+        with tempfile.TemporaryDirectory() as foreign:
+            replay = execute_handle(second["reread_current"], cwd=foreign, binary=True)
+        header, body = replay.stdout.split(b"\n", 1)
+        self.assertEqual(second["offset"], json.loads(header)["offset"])
+        self.assertEqual(second["text"].encode("utf-8") + b"\n", body)
+        with self.assertRaisesRegex(PipelineError, "continuation does not match"):
+            self.saved(first, pointer="/source", continuation=first["continuation"], limit=73)
+        other = run(parser().parse_args(self.source(section="Host command presentation", limit=73) + ["--present"]))
+        with self.assertRaisesRegex(PipelineError, "continuation does not match"):
+            self.saved(other, continuation=first["continuation"], limit=73)
+        target = Path(first["saved_output"]["path"])
+        target.write_bytes(target.read_bytes() + b" ")
+        with self.assertRaisesRegex(PipelineError, "changed"):
+            self.saved(first)
+
+    def test_forged_body_origin_or_feature_cannot_become_a_native_snapshot(self):
+        from pipeline_v2.artifact_io import write_read_output
+        first = run(parser().parse_args(self.source() + ["--present"]))
+        original = json.loads(Path(first["saved_output"]["path"]).read_bytes())
+        for change in ("body", "origin", "feature"):
+            snapshot = deepcopy(original)
+            if change == "body":
+                snapshot["value"] = "Forged source body"
+                snapshot["content_digest"] = hashlib.sha256(snapshot["value"].encode()).hexdigest()
+            elif change == "origin":
+                snapshot["source"]["path"] = str(self.root / "outside.md")
+            else:
+                snapshot["presentation_origin"]["feature"] = "foreign"
+            saved = write_read_output(self.root, self.root / ".agentic-pipeline/Workflows/presentation", None, snapshot)
+            with self.subTest(change=change), self.assertRaises(PipelineError):
+                self.saved({"saved_output": saved})
+        outside = self.root / "outside.json"; outside.write_bytes(Path(first["saved_output"]["path"]).read_bytes())
+        with self.assertRaisesRegex(PipelineError, "within"):
+            self.saved({"saved_output": {**first["saved_output"], "path": str(outside)}})
+        with self.assertRaises(PipelineError):
+            self.saved(first, feature="foreign")
+
+    def test_known_link_cardinalities_keep_complete_lazy_rows_and_subprocess_boundaries(self):
+        import pipeline_v2.delivery as delivery
+        import pipeline_v2.cli as cli
+        from pipeline_v2.tests.test_presentation_navigation import execute_handle
+        source_bundle = Path(delivery.__file__).resolve().parents[4]
+        bundle = self.root / "fixture bundle"
+        shutil.copytree(source_bundle, bundle, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        scripts = bundle / "skills/gamedev-pipeline/scripts/pipeline_v2"
+        entry = bundle / "skills/gamedev-pipeline/SKILL.md"
+        references = entry.parent / "references"
+        for count in (9, 13, 29):
+            entry.write_text("# Entry\n" + "".join(f"[part {index}](references/present-part-{index}.md)\n" for index in range(count)), encoding="utf-8")
+            for index in range(count):
+                (references / f"present-part-{index}.md").write_bytes(f"# Part {index}\r\n  exact Ω ' {index}  \r\n".encode("utf-8"))
+            with mock.patch.object(delivery, "__file__", str(scripts / "delivery.py")), mock.patch.object(cli, "__file__", str(scripts / "cli.py")):
+                args = self.prefix + ["file-read", "--instruction", "director", "--format", "json"]
+                legacy = run(parser().parse_args(args + ["--assemble"]))
+                first = run(parser().parse_args(args + ["--present"]))
+                self.assertEqual(count, len(first["links"]["inventory"]))
+                self.assertEqual(legacy["value"], first["text"])
+                for index, row in enumerate(legacy["linked_reads"]):
+                    selected = assemble_delivery_pages(lambda token: self.saved(first, pointer=f"/linked_reads/{index}", continuation=token))
+                    self.assertEqual(row, selected["value"])
+                with tempfile.TemporaryDirectory() as foreign:
+                    replay = execute_handle(first["reread_current"], cwd=foreign, binary=True)
+                    row = self.saved(first, pointer=f"/linked_reads/{count - 1}")
+                    selected = json.loads(row["text"])
+                    linked = execute_handle(selected, cwd=foreign, binary=True)
+                header, body = replay.stdout.split(b"\n", 1)
+                self.assertEqual(first["text"].encode("utf-8") + b"\n", body)
+                self.assertLess(len(json.dumps(json.loads(header), ensure_ascii=False)),
+                                len(_render_assignment_unit(legacy).split("\n", 1)[0]))
+                self.assertEqual((references / f"present-part-{count - 1}.md").read_bytes() + b"\n", linked.stdout.split(b"\n", 1)[1])
+                # Rewrapping expands text independently of native assembly;
+                # full linked commands remain saved rather than retransmitted.
+                self.assertLess(len(json.dumps(replay.stdout.decode("utf-8"))),
+                                len(json.dumps(_render_assignment_unit(legacy))))
+                (references / f"present-part-{count - 1}.md").write_text("# Changed linked source\n", encoding="utf-8")
+                with self.assertRaisesRegex(PipelineError, "no longer current"):
+                    self.saved(first)
+
+
+class SavedPresentationNativeTests(unittest.TestCase):
+    def setUp(self):
+        from pipeline_v2.tests.test_core import PipelineV2CoreTests, _CanonicalTestController
+
+        class ReceiptFixture(PipelineV2CoreTests):
+            @staticmethod
+            def _fixture_qa_contract(slices):
+                contract = PipelineV2CoreTests._fixture_qa_contract(slices)
+                for definition in contract["slices"].values():
+                    method = definition["identities"][0]["assertions"][0]["methods"][0]
+                    method["producer"] = {"kind": "controller_check", "check_ids": ["command-1"]}
+                    method["evidence_types"] = ["bound-machine-receipt"]
+                return contract
+
+            def _initialize(self):
+                self.controller = _CanonicalTestController(self.store, timeout=10)
+                self.controller.reconfigure({"name": "init", "id": "CMD-INIT", "run_id": "RUN-TEST", "feature": self.feature,
+                    "workflow_path": self.workflow_path, "project_root": str(self.root),
+                    "authority_paths": {"requirements": "requirements.md", "specification": "specification.md", "plan": "plan.md"},
+                    "slices": self.slices, "verification": {"version": 1, "pure_documentation_paths": [], "confirm_approved_plan": True, "slices": {"SLICE-1": [{"id": "command-1", "argv": self.command,
+                        "kind": "deterministic", "timeout_seconds": 10, "independent": False, "input_paths": ["game.txt"]}]}}})
+
+        self.h = ReceiptFixture("runTest"); self.h.setUp(); self.addCleanup(self.h.tearDown)
+        if self.h.store.load()["phase"] == "plan":
+            self.h._reach_engineering()
+        self.h._engineer("saved-engineer", "candidate-1\n")
+        self.h._accept("saved-engineering")
+        self.h._review_pass("saved-review")
+        action = self.h.controller.status()["next_action"]
+        self.h.controller.next(command_id=action["command_id"], expected_generation=action["expected_generation"])
+        self.prefix = ["--root", str(self.h.root), "--feature", self.h.feature]
+
+    def invoke(self, *args):
+        return run(parser().parse_args([*self.prefix, *args]))
+
+    def read_saved(self, page, pointer="/value", continuation=None):
+        args = ["delivery-read", "--saved-output", page["saved_output"]["path"], "--digest", page["saved_output"]["sha256"], "--pointer", pointer]
+        if continuation:
+            args += ["--continuation", continuation]
+        return self.invoke(*args)
+
+    def test_generated_current_bootstrap_index_group_and_source_handles_preserve_admission(self):
+        from pipeline_v2.delivery import export_assignment
+        from pipeline_v2.tests.test_presentation_navigation import execute_handle
+        exported = export_assignment(self.h.root, self.h.controller.status())
+        dispatch = exported["dispatch"]
+        with tempfile.TemporaryDirectory() as foreign:
+            result = execute_handle(dispatch["reader"]["bootstrap"], cwd=foreign, binary=True)
+            header, body = result.stdout.split(b"\n", 1)
+            startup = json.loads(body)
+            self.assertEqual(exported["assignment_id"], startup["assignment"]["id"])
+            self.assertFalse(json.loads(header)["read_credit"])
+            result = execute_handle(dispatch["reader"]["qa_index"], cwd=foreign, binary=True)
+            index = json.loads(result.stdout.split(b"\n", 1)[1])
+            group = index["identities"][0]
+            result = execute_handle(group["prepare"], cwd=foreign, binary=True)
+            prepared = json.loads(result.stdout.split(b"\n", 1)[1])
+            self.assertEqual(group["id"], prepared["obligations"]["identities"][0]["id"])
+        source = self.invoke("file-read", "--path", "game.txt", "--present")
+        origin = source["original_selection"]
+        self.assertEqual(origin["source"], origin["evidence_origin"]["source"])
+        self.assertEqual((self.h.root / "game.txt").read_bytes().decode("utf-8"), source["text"])
+        private = self.h.root / "private.txt"; private.write_text("private\n", encoding="utf-8")
+        with self.assertRaises(PipelineError):
+            self.invoke("file-read", "--path", "private.txt", "--present")
+        private.unlink()
+        (self.h.root / "game.txt").write_text("changed candidate\n", encoding="utf-8")
+        with self.assertRaises(PipelineError):
+            self.read_saved(source)
+
+    def test_incomplete_native_attempt_is_preserved_without_execution_or_capture_credit(self):
+        from pipeline_v2.execution_evidence import native_attempt
+        state = self.h.store.load()
+        binding = self.h.controller._evidence_binding(state, self.h.root)
+        native_attempt(self.h.root, self.h.feature, "unfinished-presentation", {"binding": binding, "invocation": {"channel": "fixture"}})
+        page = self.invoke("evidence-read", "--record-id", "unfinished-presentation", "--present")
+        restored = assemble_delivery_pages(lambda token: self.read_saved(page, continuation=token))["value"]
+        self.assertFalse(restored["capture_complete"])
+        self.assertFalse(restored["semantic_credit"])
+        self.assertIn("attempt", restored)
+        self.assertNotIn("record", restored)
+
+    def test_old_receipt_context_survives_new_diagnostic_and_template_edit_without_freshness_credit(self):
+        import pipeline_v2.runner as runner
+        from pipeline_v2.artifact_io import write_json, read_json, write_read_output
+        state = self.h.store.load(); active = state["active_assignment"]
+        definition = active["capsule"]["context"]["qa_contract"]["definition"]
+        identity = definition["identities"][0]["id"]
+        first = self.invoke("qa-prepare", "--assignment-id", active["id"], "--identity-id", identity, "--present")
+        snapshot = read_json(Path(first["saved_output"]["path"]))
+        old_rows = [row for context in snapshot["value"]["producer_context"] for row in context.get("receipts", [])]
+        self.assertTrue(old_rows)
+        request_path = Path(snapshot["value"]["saved_record_request"]["path"])
+        request = read_json(request_path)
+        request["assessments"][0]["assessment"]["observed"] = "Unsaved authored observation; no acceptance credit."
+        write_json(request_path, request)
+        before = request_path.read_bytes()
+        environment = {**runner.execution_environment(), "PRESENTATION_DIAGNOSTIC_FIXTURE": "new-valid-binding"}
+        with mock.patch.object(runner, "execution_environment", return_value=environment):
+            action = self.h.controller.status()["next_action"]
+            self.invoke("check", "--id", "saved-current-diagnostic", "--expected-generation", str(action["expected_generation"]),
+                "--assignment-id", active["id"], "--quiescence", "The mechanical fixture owns no live work.")
+        current = self.h.controller.qa_prepare(active["id"], identity_id=identity)
+        new_rows = [row for context in current["producer_context"] for row in context.get("receipts", [])]
+        self.assertNotEqual(old_rows, new_rows)
+        files_before = sorted(request_path.parent.glob("*.json"))
+        restored = assemble_delivery_pages(lambda token: self.read_saved(first, continuation=token))
+        self.assertEqual(snapshot["value"], restored["value"])
+        methods = assemble_delivery_pages(lambda token: self.read_saved(first, "/value/obligations/method_definitions", token))
+        self.assertEqual(snapshot["value"]["obligations"]["method_definitions"], methods["value"])
+        self.assertEqual(before, request_path.read_bytes())
+        self.assertEqual(files_before, sorted(request_path.parent.glob("*.json")))
+        self.assertTrue(restored["snapshot_read"])
+        self.assertFalse(restored["read_credit"])
+        forged = deepcopy(snapshot)
+        forged["value"]["producer_context"][0]["receipts"][0]["source_locator"] += "forged"
+        saved = write_read_output(self.h.root, self.h.store.path.parent, None, forged)
+        with self.assertRaises(PipelineError):
+            self.read_saved({"saved_output": saved})
+        stale = self.h.controller.qa_record(active["id"], {"binding": snapshot["value"]["binding"], "expected_revision": -1, "assessments": request["assessments"]})
+        self.assertFalse(stale["valid"])
+        self.assertEqual(before, request_path.read_bytes())
 
 
 class ExactAssemblyTests(unittest.TestCase):
@@ -233,7 +483,7 @@ class PublicIOTests(unittest.TestCase):
         self.assertEqual("execution-evidence:failed-check", origin["execution_evidence"])
         parsed = parser().parse_args(origin["read_argv"][2:])
         self.assertEqual("failed-check", parsed.record_id)
-        self.assertTrue(parsed.assemble)
+        self.assertTrue(parsed.present)
 
 
 if __name__ == "__main__":

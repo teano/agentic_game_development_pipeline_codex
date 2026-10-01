@@ -69,20 +69,40 @@ def contained_path(directory: Path, destination: Path) -> Path:
     return destination
 
 
-def write_read_output(root: Path, workflow: Path, destination: Path, value: Any) -> dict[str, Any]:
+def write_read_output(root: Path, workflow: Path, destination: Path | None, value: Any) -> dict[str, Any]:
     from .model import PipelineError
     directory = Path(workflow) / "ReadOutputs"
     if not directory.is_absolute():
         directory = Path(root) / directory
-    destination = Path(destination)
+    raw = (json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    destination = directory / ("read-" + hashlib.sha256(raw).hexdigest() + ".json") if destination is None else Path(destination)
     if not destination.is_absolute():
         destination = Path(root) / destination
     path = contained_path(directory, destination)
-    raw = (json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
     if path.exists() and path.read_bytes() != raw:
         raise PipelineError("read output already exists with different content; choose another destination")
     write_bytes_immutable(path, raw)
     return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+
+def read_read_output(root: Path, workflow: Path, source: Path, sha256: str) -> tuple[Any, dict[str, Any]]:
+    """Load one exact immutable transport result, never grant project read access."""
+    from .model import PipelineError, is_digest
+    if not is_digest(sha256):
+        raise PipelineError("saved output digest must be an exact SHA-256")
+    directory = Path(workflow) / "ReadOutputs"
+    if not directory.is_absolute():
+        directory = root / directory
+    source = Path(source)
+    path = contained_path(directory, source if source.is_absolute() else root / source)
+    try:
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != sha256:
+            raise PipelineError("saved output changed; discard prior presentation pages")
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise PipelineError(f"cannot read exact saved output: {exc}") from exc
+    return value, {"path": str(path), "sha256": sha256, "bytes": len(raw)}
 
 
 def read_json(path: Path) -> Any:

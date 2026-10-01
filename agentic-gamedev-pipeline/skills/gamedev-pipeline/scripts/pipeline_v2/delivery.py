@@ -54,7 +54,11 @@ def _role_instructions(role: str | None) -> dict[str, str] | None:
     path = (bundle / "skills" / sources[role]).resolve()
     if not path.is_relative_to(bundle) or not path.is_file():
         raise PipelineError("assigned role instruction source must exist inside the running bundle")
-    locator = {"role": role, "path": str(path)}
+    try:
+        version = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise PipelineError(f"cannot inspect assigned role instruction source: {exc}") from exc
+    locator = {"role": role, "path": str(path), "version": version}
     if role in {"planner", "slicer"}:
         locator["section"] = "Runtime Plan and Slice"
     return locator
@@ -578,10 +582,10 @@ def _qa_selection(reader: _DeliveryUnits, view: str, assertion_ids: list[str], i
                      "assertion_ids": [row["id"] for row in item["assertions"]]}
             if reader.packet["assignment"].get("role") == "qa":
                 entry["prepare"] = _read_handle([*prefix, "qa-prepare", "--assignment-id", reader.packet["assignment"]["id"],
-                                                "--format", "text", "--assemble", "--identity-id", item["id"]], reader.root)
+                                                "--format", "text", "--present", "--identity-id", item["id"]], reader.root)
             else:
                 entry["read"] = _read_handle([*prefix, "assignment-read", "--digest", reader.packet_digest,
-                    "--view", "qa-assertion", "--format", "text", "--assemble", "--identity-id", item["id"]], reader.root)
+                    "--view", "qa-assertion", "--format", "text", "--present", "--identity-id", item["id"]], reader.root)
             inventory.append(entry)
         return {"identities": inventory,
                 "assertion_count": sum(len(item["assertions"]) for item in identities),
@@ -760,7 +764,8 @@ def assemble_delivery_pages(read_page: Callable[[str | None], dict[str, Any]]) -
     stripping or newline normalization is allowed: whitespace belongs to the
     content digest. This read does not acknowledge any other selection or work.
     """
-    variable = {"text", "offset", "end_offset", "complete", "next_offset", "page_digest", "continuation"}
+    variable = {"text", "offset", "end_offset", "complete", "next_offset", "page_digest", "continuation",
+                "reread_current", "next", "selection_complete"}
     first, fixed, parts, tokens = None, None, [], set()
     continuation, offset = None, 0
     while True:
@@ -999,7 +1004,7 @@ def _dispatch_descriptor(root: Path, view: dict[str, Any], packet: dict[str, Any
     reference = {"packet_digest": saved["digest"]}
     reader_argv = [sys.executable, str(launcher), "--root", packet["project_root"],
                    "--feature", view["feature"], "assignment-read", "--digest", saved["digest"], "--format", "json"]
-    assembled = [*reader_argv[:-1], "text", "--assemble"]
+    assembled = [*reader_argv[:-1], "text", "--present"]
     context = assignment.get("context", {})
     roster = context.get("required_finding_conditions") if isinstance(context, dict) else None
     convergence = context.get("convergence") if isinstance(context, dict) else None
@@ -1027,13 +1032,13 @@ def _dispatch_descriptor(root: Path, view: dict[str, Any], packet: dict[str, Any
                       if has_rework else {}),
                    "section_argv_prefix": [*assembled, "--view", "section", "--pointer"],
                    "source_argv_prefix": [sys.executable, str(launcher), "--root", packet["project_root"],
-                       "--feature", view["feature"], "file-read", "--format", "text", "--assemble", "--path"],
+                       "--feature", view["feature"], "file-read", "--format", "text", "--present", "--path"],
                    **({"qa_index_argv": [*assembled, "--view", "qa-index"],
                        "qa_index": _read_handle([*assembled, "--view", "qa-index"], root),
                        "qa_assertion_argv_prefix": [*assembled, "--view", "qa-assertion", "--assertion-id"],
                        **({"qa_prepare_argv_prefix": [sys.executable, str(launcher), "--root", packet["project_root"],
                            "--feature", view["feature"], "qa-prepare", "--assignment-id", assignment["id"],
-                           "--format", "text", "--assemble", "--assertion-id"]} if assignment.get("role") == "qa" else {}),
+                           "--format", "text", "--present", "--assertion-id"]} if assignment.get("role") == "qa" else {}),
                        "qa_navigation": "Select actual case groups. QA uses qa-prepare for complete obligations, alternatives, producers and editable input in one response; Engineer/Review read exact obligations through qa-assertion."}
                       if isinstance(context.get("qa_contract"), dict) and context["qa_contract"].get("status") == "bound" else {}),
                    "advanced": {"unit_argv_prefix": [*reader_argv, "--view", "unit", "--pointer"],
@@ -1041,7 +1046,7 @@ def _dispatch_descriptor(root: Path, view: dict[str, Any], packet: dict[str, Any
                        "value_argv_prefix": [*reader_argv, "--view", "value", "--pointer"],
                        **({"work_argv": [*reader_argv, "--view", "work"]} if has_rework else {}),
                        "paged_argv": reader_argv,
-                       "usage": "Legacy/debug readers and exact page continuation; normal semantic readers already assemble. --output saves only the selected body and grants no read credit."},
+                       "usage": "Legacy/debug readers remain available. Ordinary --present saves the complete native envelope and supplies exact guarded body continuations; saving and complete transport grant no read credit."},
                    "selector_argument": "append one exact child pointer from a structural unit or logical index",
                    "navigation": "execute bootstrap_argv as supplied; identity/access/schema/checks/current slice are grouped; follow exact source locators and required work roster; lost retention requires full reads without --baseline",
                    "required_resources": [{"pointer": pointer, "digest": item["digest"]}
@@ -1060,7 +1065,8 @@ def _dispatch_descriptor(root: Path, view: dict[str, Any], packet: dict[str, Any
     if "role_instructions" in packet:
         descriptor["role_instructions"] = deepcopy(packet["role_instructions"])
         descriptor["role_instructions"]["read_argv"] = [sys.executable, str(launcher), "--root", packet["project_root"],
-            "--feature", view["feature"], "file-read", "--instruction", assignment["role"], "--format", "text", "--assemble",
+            "--feature", view["feature"], "file-read", "--instruction", assignment["role"], "--format", "text", "--present",
+            *(["--version", descriptor["role_instructions"]["version"]] if "version" in descriptor["role_instructions"] else []),
             *(["--section", descriptor["role_instructions"]["section"]] if "section" in descriptor["role_instructions"] else [])]
         descriptor["role_instructions"]["exec_command"] = host_read_command(descriptor["role_instructions"]["read_argv"], root)
     return descriptor
@@ -1256,11 +1262,11 @@ def _markdown_headings(text):
     return headings
 
 
-def _instruction_link_reads(root, feature, instruction, current, selected):
+def _instruction_link_reads(root, feature, instruction, current, selected, *, admitted_current=False):
     """Resolve only actual selected Markdown links; no policy or instruction index."""
     prefix = [sys.executable, str(Path(__file__).resolve().parents[1] / "pipeline_state.py"),
               "--root", str(root), "--feature", feature, "file-read", "--instruction", instruction,
-              "--format", "text", "--assemble"]
+              "--format", "text", "--present"]
     reads, known = [], {}
     for _, line in _markdown_prose(selected):
         for label, href in re.findall(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)", line):
@@ -1269,7 +1275,16 @@ def _instruction_link_reads(root, feature, instruction, current, selected):
                 parsed = urlsplit(href.strip().strip("<>"))
                 if parsed.scheme or parsed.netloc or parsed.query:
                     continue
-                target = _instruction_path(instruction, str((current.parent / unquote(parsed.path)).resolve()) if parsed.path else str(current))
+                relative = (current.parent / unquote(parsed.path)).resolve() if parsed.path else current
+                if admitted_current:
+                    # read_file already admitted this exact current source. An
+                    # actual local link from it is reachable without rescanning
+                    # the complete entry graph for each displayed link.
+                    target = safe_path(Path(__file__).resolve().parents[4], relative, "linked instruction source", strict=True)
+                    if target.suffix.lower() != ".md":
+                        raise PipelineError("instruction reading is limited to explicitly linked bundle Markdown")
+                else:
+                    target = _instruction_path(instruction, str(relative))
                 raw = target.read_bytes()
                 text, version = raw.decode("utf-8"), hashlib.sha256(raw).hexdigest()
                 first, last = 1, max(1, len(text.splitlines()))
@@ -1358,7 +1373,7 @@ def read_file(root: Path, view: dict[str, Any] | None, relative: str | None, *, 
         metadata["evidence_origin"] = {"ref": source_reference(metadata["source"]), "source": deepcopy(metadata["source"])}
         metadata["semantic_credit"] = False
     elif feature is not None:
-        metadata["linked_reads"] = _instruction_link_reads(root, feature, instruction, target, text)
+        metadata["linked_reads"] = _instruction_link_reads(root, feature, instruction, target, text, admitted_current=True)
     return _semantic_page(text, metadata, continuation, limit, raw_text=True, offset=offset)
 
 

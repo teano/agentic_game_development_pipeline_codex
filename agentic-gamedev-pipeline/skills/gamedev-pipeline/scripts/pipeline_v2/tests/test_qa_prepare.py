@@ -9,8 +9,9 @@ import unittest
 from unittest import mock
 
 from pipeline_v2.artifact_io import read_json, write_json
-from pipeline_v2.cli import main
+from pipeline_v2.cli import main, parser, run
 from pipeline_v2.delivery import read_file
+from pipeline_v2.delivery import assemble_delivery_pages
 from pipeline_v2.execution_evidence import begin, capture, input_snapshot, native_record, native_attempt, finish_native_attempt, read, _directory
 from pipeline_v2.model import PipelineError, qa_contract_context, digest
 from pipeline_v2.qa_contract import contract_digest, source_reference
@@ -31,6 +32,61 @@ class QAPrepareTests(unittest.TestCase):
 
     def prepare(self, *ids, method="observed-action"):
         return self.controller.qa_prepare("qa-current", list(ids), method)
+
+    def present(self, *args):
+        with mock.patch("pipeline_v2.cli.Controller", return_value=self.controller):
+            return run(parser().parse_args(["--root", str(self.root), "--feature", "feature", *args]))
+
+    def saved(self, page, *, pointer="/value", continuation=None, limit=8192):
+        args = ["delivery-read", "--saved-output", page["saved_output"]["path"], "--digest", page["saved_output"]["sha256"],
+                "--pointer", pointer, "--limit", str(limit)]
+        if continuation:
+            args += ["--continuation", continuation]
+        return self.present(*args)
+
+    def test_large_prepared_context_survives_edit_and_lazy_read_without_repreparing_template(self):
+        identity = self.f.definition["identities"][0]
+        prototype = deepcopy(identity["assertions"][0])
+        identity["assertions"] = [{**deepcopy(prototype), "id": f"case-{index}"} for index in range(39)]
+        self.f.state["execution"]["qa_contract_binding"]["contract_digest"] = contract_digest(self.f.contract)
+        self.f.state["active_assignment"]["capsule"]["context"]["qa_contract"] = qa_contract_context(self.f.state)
+        first = self.present("qa-prepare", "--assignment-id", "qa-current", "--identity-id", identity["id"], "--present", "--limit", "8192")
+        snapshot = read_json(Path(first["saved_output"]["path"]))
+        self.assertFalse(first["complete"])
+        self.assertEqual(39, len(snapshot["value"]["obligations"]["identities"][0]["assertions"]))
+        request = Path(snapshot["value"]["saved_record_request"]["path"])
+        edited = read_json(request)
+        edited["assessments"][0]["assessment"]["observed"] = "Actual unsaved local observation"
+        write_json(request, edited)
+        before = request.read_bytes()
+        files_before = sorted(request.parent.glob("*.json"))
+        restored = assemble_delivery_pages(lambda token: self.saved(first, continuation=token))
+        self.assertEqual(snapshot["value"], restored["value"])
+        methods = assemble_delivery_pages(lambda token: self.saved(first, pointer="/value/obligations/method_definitions", continuation=token))
+        self.assertEqual(snapshot["value"]["obligations"]["method_definitions"], methods["value"])
+        self.assertEqual(before, request.read_bytes())
+        self.assertEqual(files_before, sorted(request.parent.glob("*.json")))
+        self.assertFalse(restored["read_credit"])
+        self.assertTrue(restored["snapshot_read"])
+        self.assertFalse(self.controller.qa_record("qa-current", {"expected_revision": -1, "assessments": [self.f.row("case-0")]})["valid"])
+
+    def test_saved_context_rejects_current_owner_candidate_and_forged_producer_facts(self):
+        from pipeline_v2.artifact_io import write_read_output
+        first = self.present("qa-prepare", "--assignment-id", "qa-current", "--assertion-id", "enter", "--present")
+        snapshot = read_json(Path(first["saved_output"]["path"]))
+        forged = deepcopy(snapshot)
+        forged["value"]["producer_context"][0]["prerequisite"]["status"] = "receipts_available"
+        saved = write_read_output(self.root, self.f.store.path.parent, None, forged)
+        with self.assertRaises(PipelineError):
+            self.saved({"saved_output": saved})
+        old = self.f.binding["candidate_tree_oid"]
+        self.f.binding["candidate_tree_oid"] = "d" * 40
+        with self.assertRaises(PipelineError):
+            self.saved(first)
+        self.f.binding["candidate_tree_oid"] = old
+        self.f.state["active_assignment"]["worker_id"] = "different-reader"
+        with self.assertRaises(PipelineError):
+            self.saved(first)
 
     def capture(self, record_id, raw, *, channel="exec_command.playwright", preflight=False):
         request = {"record_id": record_id, "invocation": {"channel": channel, "request": {"argv": ["probe-only-fixture", "not-product.html"]}},

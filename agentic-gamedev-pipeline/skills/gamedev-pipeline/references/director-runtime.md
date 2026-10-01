@@ -4,7 +4,7 @@ Load linked sections only for their named event; do not preload rare routes or r
 
 ## Read instructions without clipping
 
-Use the [instruction/source reader](delivery-contract.md#read-without-loss) with the selected launcher and exact root/feature even before initialization. `file-read --instruction director --path references/director-runtime.md --section "Ordinary event map" --format text --assemble` reads this route; returned `linked_reads` supplies exact handles for its required canonical sections. Use [Host command presentation](delivery-contract.md#host-command-presentation) to retain the full command/session result and emit decoded selected output. Consume required text fully and retain unchanged policy; clipping uses the existing recovery route. The recipient reads semantic sources and its own role instructions.
+Use the [instruction/source reader](delivery-contract.md#read-without-loss) with the selected launcher and exact root/feature even before initialization. `file-read --instruction director --path references/director-runtime.md --section "Ordinary event map" --format text --present` reads this route; its lazy linked rows supply exact handles for required canonical sections. Use [Host command presentation](delivery-contract.md#host-command-presentation) to retain the full command/session result and consume its bound body pages. Read the applicable wait section before the first pending wait. Consume required text fully and retain unchanged policy; clipping restores the same captured selection. The recipient reads semantic sources and its own role instructions.
 
 ## Binding and delivery
 
@@ -20,7 +20,7 @@ Deliver full current input unless this continuing owner has an eligible retained
 
 ## Wait for agent events
 
-Apply [Await a bound response](control-return.md#await-a-bound-response) to Directors and every delegated role. Consume an actual event immediately through its routing row; a host timeout alone creates no routing work. Preserve the one pending request and same owner when a host pause is needed.
+Before the first pending agent wait, read and consume [Await a bound response](control-return.md#await-a-bound-response) through its exact returned instruction handle. Apply that canonical policy and supported host call shape to Directors and every delegated role; its locator alone is not the policy. Consume an actual event immediately through its routing row; a host timeout alone creates no routing work. Preserve the one pending request and same owner when a host pause is needed.
 
 ## Ordinary event map
 

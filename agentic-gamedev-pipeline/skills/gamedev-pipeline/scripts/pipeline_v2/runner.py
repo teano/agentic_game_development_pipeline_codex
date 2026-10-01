@@ -366,7 +366,7 @@ class Controller:
         return view(*load(state, root, binding), identity_id=identity_id, assertion_id=assertion_id)
 
     def qa_prepare(self, assignment_id, assertion_ids=None, method_id=None, *, identity_id=None):
-        from .qa_draft import load, prepare, compact_prepared_request
+        from .qa_draft import load, prepare, bind_prepared_receipts, controller_check_prerequisite
         from .execution_evidence import read_producer_probe, validate_issued_native_receipt
         state, root, binding = self._qa_working_context(assignment_id)
         draft, definition, path, exists = load(state, root, binding)
@@ -418,9 +418,7 @@ class Controller:
                                 recipe = next((item for item in context["checks"] if item["id"] == receipt["id"]), None)
                                 validate_issued_native_receipt(root, state["feature"], receipt, binding, state, recipe)
                     context["receipts"] = [row for row in machine["checks"] if row["id"] in producer["check_ids"]]
-                    missing = set(producer["check_ids"]) - {row["id"] for row in context["receipts"]}
-                    context["prerequisite"] = {"status": "check_required" if missing else "receipts_available",
-                        "pending_check_ids": sorted(missing), "detail": "Use the assigned controller check for missing receipts; never run its argv as a worker. Assess the actual assertions, not the aggregate verdict."}
+                    context["prerequisite"] = controller_check_prerequisite(producer["check_ids"], context["receipts"])
                 except (PipelineError, OSError, KeyError, TypeError) as exc:
                     context["receipts"] = []
                     context["prerequisite"] = {"status": "unresolved", "detail": str(exc)}
@@ -442,18 +440,7 @@ class Controller:
                 except (PipelineError, OSError, KeyError, TypeError) as exc:
                     context["prerequisite"] = {"status": "unresolved", "detail": str(exc)}
         result["producer_context"] = list(contexts.values())
-        # Canonical native refs are service data; observation/comparison remain empty.
-        native = {row["id"]: row for context in contexts.values() for row in context.get("receipts", [])}
-        for prepared, row in zip(result["prepared_methods"], result["record_request"]["assessments"]):
-            method = next((methods[ref["ref"]] for ref in row_methods[row["id"]]
-                           if methods[ref["ref"]]["id"] == prepared["method_id"]), {})
-            producer = method.get("producer", {})
-            if prepared["assessment_status"] == "recorded" or producer.get("kind") != "controller_check":
-                continue
-            row["evidence"] = [dict(item, ref=native.get(check_id, {}).get("execution_evidence"))
-                for item in row["evidence"] for check_id in (
-                    producer["check_ids"] if item["type"] in {"bound-machine-receipt", "controller-check-receipt"} else [None])]
-        compact_prepared_request(result["record_request"])
+        bind_prepared_receipts(result, list(contexts.values()))
         return {key: result[key] for key in ("binding", "revision", "working_path", "evidence_destination", "producer_context",
                 "obligations", "prepared_methods", "record_request", "semantic_credit", "tests_executed", "required_action")}
 

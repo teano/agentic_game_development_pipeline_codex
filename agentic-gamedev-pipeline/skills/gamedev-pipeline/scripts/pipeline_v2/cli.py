@@ -18,6 +18,7 @@ from .model import (
     PIPELINE_STATE_FILENAME,
     PipelineError,
     digest,
+    is_digest,
     feature_slug,
     status_view,
     workflow_relative_path,
@@ -148,6 +149,9 @@ def parser() -> argparse.ArgumentParser:
     delivery = commands.add_parser("delivery-read", help="Read one bounded page of an immutable delivery artifact.")
     delivery.add_argument("--digest", required=True)
     delivery.add_argument("--pointer", help="Optional exact JSON pointer selecting a full semantic section before pagination.")
+    delivery.add_argument("--saved-output", type=Path, help="Exact immutable ReadOutputs native envelope; digest is its raw SHA. Preserves original source/admission.")
+    delivery.add_argument("--continuation", help="Exact saved selection continuation; never mix pointers or snapshots.")
+    delivery.add_argument("--format", choices=("text", "json"), default="json")
     file_read = commands.add_parser("file-read", help="Read exact bounded source text within assigned read access, or explicitly linked current-bundle instructions before init.")
     file_read.add_argument("--path", help="Exact assigned project-relative source; in instruction mode, absolute bundle path or path relative to that instruction entry.")
     file_read.add_argument("--instruction", help="Current bundle role (director/engineer/qa/...) or exact gamedev-* skill. Defaults to its entry; only explicitly linked bundle Markdown is readable. Grants no project read access.")
@@ -217,6 +221,7 @@ def parser() -> argparse.ArgumentParser:
         qa.add_argument("--format", choices=("text", "json"), default="text")
         qa.add_argument("--assemble", action="store_true")
         qa.add_argument("--output", type=Path, help="With --assemble, save the exact selection under workflow/ReadOutputs and return a compact receipt.")
+        qa.add_argument("--present", action="store_true", help="Save the complete native envelope, then present its exact body progressively without read credit.")
     prepare = commands.add_parser("qa-prepare", help="Read complete selected obligations and save a bound editable request under ReadOutputs; preserve unsaved edits on retry. Never assess or execute a probe.")
     prepare.add_argument("--assignment-id", required=True)
     prepare_selection = prepare.add_mutually_exclusive_group(required=True)
@@ -235,6 +240,8 @@ def parser() -> argparse.ArgumentParser:
     finalize = commands.add_parser("qa-finalize", help="Mechanically derive the terminal QA artifact after all assertions are assessed; pending QA stays with QA.")
     finalize.add_argument("--assignment-id", required=True)
     finalize.add_argument("--expected-revision", type=int, required=True)
+    for reader in (unit, file_read, evidence, prepare):
+        reader.add_argument("--present", action="store_true", help="Save the complete native envelope, then present its exact body progressively without read credit.")
     return value
 
 
@@ -280,6 +287,11 @@ def _init_request(root: Path, workflow: str, source: Path) -> dict[str, Any]:
 
 
 def _deliver_selection(root, workflow, args, read_page):
+    if getattr(args, "present", False):
+        if args.continuation is not None or getattr(args, "offset", 0):
+            raise PipelineError("--present starts the exact native selection; use the returned saved continuation")
+        result = assemble_delivery_pages(read_page)
+        return _present_selection(root, workflow, args, result)
     if args.output is not None and not args.assemble:
         raise PipelineError(f"{args.command} --output requires --assemble")
     if args.assemble and args.continuation is not None:
@@ -325,6 +337,241 @@ def _prepared_request_output(root, workflow, request, destination):
             if raw != template:
                 return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}, "preserved_edited_request"
     return write_read_output(root, root / workflow, destination, request), "prepared_request"
+
+
+def _prepared_context(result, saved, request_status):
+    context = {key: value for key, value in result.items() if key != "record_request"}
+    context["saved_record_request"], context["request_status"] = saved, request_status
+    if request_status == "preserved_edited_request":
+        context["required_action"] += " Existing unsaved request bytes were preserved. Read that exact file before editing or recording; its content has not been validated or assessed."
+    return context
+
+
+_PRESENT_READERS = {"assignment-read", "file-read", "qa-prepare", "qa-read", "qa-draft", "evidence-read"}
+
+
+def _reader_request(root, args, result):
+    """Capture exact existing reader selectors, never an arbitrary executable."""
+    fields = {
+        "assignment-read": ("digest", "view", "pointer", "finding_id", "condition_id", "baseline", "identity_id"),
+        "file-read": ("path", "instruction", "version", "section", "lines"),
+        "qa-prepare": ("assignment_id", "identity_id", "method_id", "pointer", "output"),
+        "qa-read": ("assignment_id", "identity_id", "assertion_id", "pointer"),
+        "qa-draft": ("assignment_id", "identity_id", "assertion_id", "pointer"),
+        "evidence-read": ("record_id", "raw_file", "pointer"),
+    }
+    argv = ["--root", str(root), "--feature", feature_slug(args.feature), args.command,
+            "--format", "json", "--assemble", "--limit", str(args.limit)]
+    for field in fields[args.command]:
+        value = getattr(args, field, None)
+        if field == "output" and args.command == "qa-prepare":
+            value = getattr(args, "_qa_request_output", value)
+        if field == "version" and args.command == "file-read":
+            value = result["version"]
+        if value is not None:
+            argv += ["--" + field.replace("_", "-"), str(value)]
+    if args.command in {"assignment-read", "qa-prepare"}:
+        for identifier in args.assertion_id:
+            argv += ["--assertion-id", identifier]
+    return argv
+
+
+def _presentation_scope(root, workflow, args, result):
+    """Reapply current native admission while retaining the original reader owner."""
+    if args.command == "file-read" and args.instruction is not None:
+        return {"kind": "instruction"}
+    controller = Controller(StateStore(root / workflow / PIPELINE_STATE_FILENAME))
+    if args.command in {"qa-prepare", "qa-read", "qa-draft"}:
+        state, actual_root, binding = controller._qa_working_context(args.assignment_id)
+        candidate = binding["candidate_tree_oid"]
+    else:
+        state, actual_root = controller._loaded()
+        active = state.get("active_assignment") or {}
+        candidate = controller._verify_live_checkout(state, actual_root) if active.get("phase") in {"review", "qa"} or args.command == "evidence-read" else None
+    active = state.get("active_assignment")
+    if not isinstance(active, dict) or not active.get("id") or actual_root.resolve() != root.resolve():
+        raise PipelineError("saved presentation requires the same current issued reader assignment")
+    original_binding = result.get("binding") or {}
+    scope = {"kind": "assignment", "run_id": state.get("run_id", original_binding.get("run_id")),
+             "assignment_id": active["id"], "worker_id": active.get("worker_id"), "role": active["role"],
+             "authority_digest": state["authority"]["digest"],
+             "pipeline_runtime_digest": state.get("pipeline_runtime_digest", original_binding.get("pipeline_runtime_digest")),
+             "candidate_tree_oid": candidate}
+    if args.command == "assignment-read":
+        from .delivery import _DeliveryUnits
+        packet = _DeliveryUnits(root, workflow, args.digest).packet
+        if (packet.get("run_id") != scope["run_id"] or packet.get("feature") != state["feature"]
+                or any(packet["assignment"].get(key) != active.get(key) for key in ("id", "worker_id", "role"))):
+            raise PipelineError("saved assignment selection belongs to a different current reader owner")
+        if packet["assignment"].get("access") != status_view(state)["active_assignment"]["access"]:
+            raise PipelineError("saved assignment read scope changed")
+    if args.command == "evidence-read":
+        evidence = controller.evidence_read(args.record_id)
+        before = (evidence["record"]["before"]["binding"] if "record" in evidence
+                  else evidence.get("attempt", {}).get("request", {}).get("binding"))
+        if not isinstance(before, dict):
+            raise PipelineError("saved execution evidence lost its original record/attempt binding")
+        if before.get("kind") == "assignment" and any(before.get(key) != value for key, value in (
+                ("project_root", str(root)), ("feature", state["feature"]),
+                ("authority_digest", scope["authority_digest"]), ("pipeline_runtime_digest", scope["pipeline_runtime_digest"]),
+                ("candidate_tree_oid", candidate))):
+            raise PipelineError("saved execution evidence belongs to another current candidate binding")
+    return scope
+
+
+def _saved_argv(root, feature, saved, pointer, limit=8192):
+    return [sys.executable, str(Path(__file__).resolve().parents[1] / "pipeline_state.py"),
+            "--root", str(root), "--feature", feature, "delivery-read", "--saved-output", saved["path"],
+            "--digest", saved["sha256"], "--limit", str(limit), "--format", "text", "--pointer", pointer]
+
+
+def _present_selection(root, workflow, args, result):
+    from .artifact_io import write_read_output
+    if args.command not in _PRESENT_READERS or result.get("format") not in {"pipeline-source-unit-v1", "pipeline-delivery-unit-v1"}:
+        raise PipelineError("--present requires one complete native semantic selection")
+    origin = {"project_root": str(root), "feature": feature_slug(args.feature),
+              "request": _reader_request(root, args, result), "scope": _presentation_scope(root, workflow, args, result)}
+    if args.command == "qa-prepare" and args.pointer is None:
+        from .artifact_io import contained_path
+        receipt = result["value"]["saved_record_request"]
+        path = contained_path(root / workflow / "ReadOutputs", Path(receipt["path"]))
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != receipt["sha256"] or len(raw) != receipt["bytes"]:
+            raise PipelineError("editable request changed while preserving its native context; prepare again")
+        origin["editable_request"] = {**receipt, "text": raw.decode("utf-8")}
+    snapshot = {**result, "presentation_origin": origin}
+    destination = None if args.command == "qa-prepare" else args.output
+    saved = write_read_output(root, root / workflow, destination, snapshot)
+    return _saved_selection(root, workflow, saved["path"], saved["sha256"], "/value", None, args.limit, native=result)
+
+
+def _snapshot_prepared_result(root, controller, original, unit):
+    """Keep original issued receipts, verifying their durable canonical origins."""
+    from .qa_draft import load, prepare, bind_prepared_receipts, controller_check_prerequisite
+    from .execution import machine_check_row
+    from .execution_evidence import validate_issued_native_receipt
+    if not isinstance(unit["value"], dict):
+        raise PipelineError("saved QA context body is not its original object")
+    state, actual_root, binding = controller._qa_working_context(original.assignment_id)
+    current = controller.qa_prepare(original.assignment_id, original.assertion_id, original.method_id, identity_id=original.identity_id)
+    contexts = unit["value"].get("producer_context")
+    if not isinstance(contexts, list) or len(contexts) != len(current["producer_context"]):
+        raise PipelineError("saved QA producer inventory changed")
+    for saved, canonical in zip(contexts, current["producer_context"]):
+        producer = canonical.get("producer")
+        if not producer or producer.get("kind") != "controller_check":
+            if saved != canonical:
+                raise PipelineError("saved QA producer/probe facts no longer bind their canonical source")
+            continue
+        stable = {key: value for key, value in canonical.items() if key not in {"receipts", "prerequisite"}}
+        if not isinstance(saved, dict) or set(saved) != set(stable) | {"receipts", "prerequisite"} or any(saved[key] != value for key, value in stable.items()):
+            raise PipelineError("saved QA producer methods, recipes or scope were forged")
+        receipts = saved["receipts"]
+        if (not isinstance(receipts, list) or any(not isinstance(row, dict) or not isinstance(row.get("id"), str) for row in receipts)
+                or len({row["id"] for row in receipts}) != len(receipts)):
+            raise PipelineError("saved QA receipt set is invalid")
+        for row in receipts:
+            prefix = state["workflow_path"] + "/pipeline-state.json#/execution/receipts/"
+            locator = row.get("source_locator", "")
+            key = locator[len(prefix):] if isinstance(locator, str) and locator.startswith(prefix) else None
+            receipt = state.get("execution", {}).get("receipts", {}).get(key)
+            if (not is_digest(key) or not isinstance(receipt, dict) or row.get("id") not in producer["check_ids"]
+                    or row != machine_check_row(receipt["result"], locator, receipt["id"])):
+                raise PipelineError("saved QA receipt metadata lacks its exact original state origin")
+            recipe = next((item for item in stable["checks"] if item["id"] == row["id"]), None)
+            validate_issued_native_receipt(root, state["feature"], row, binding, state, recipe)
+        expected = controller_check_prerequisite(producer["check_ids"], receipts)
+        if saved["prerequisite"] != expected and saved != canonical:
+            raise PipelineError("saved QA producer availability was forged")
+    draft, definition, _, _ = load(state, actual_root, binding)
+    base = prepare(draft, definition, original.assertion_id, original.method_id, identity_id=original.identity_id)
+    bind_prepared_receipts(base, contexts)
+    return {**current, "producer_context": contexts, "record_request": base["record_request"]}
+
+
+def _saved_selection(root, workflow, source, sha256, pointer, continuation, limit, *, native=None):
+    """Read an admitted saved native snapshot; its artifact is never SourceOrigin."""
+    from .artifact_io import read_read_output
+    snapshot, saved = read_read_output(root, root / workflow, Path(source), sha256)
+    if not isinstance(snapshot, dict) or snapshot.get("format") not in {"pipeline-source-unit-v1", "pipeline-delivery-unit-v1"}:
+        raise PipelineError("saved output must be a complete native reader envelope")
+    if ("value" not in snapshot or snapshot.get("selection_complete") is not True
+            or not is_digest(snapshot.get("version")) or not is_digest(snapshot.get("content_digest"))):
+        raise PipelineError("saved output lost its exact complete native body and digests")
+    origin = snapshot.get("presentation_origin")
+    if (not isinstance(origin, dict) or set(origin) - {"project_root", "feature", "request", "scope", "editable_request"}
+            or not {"project_root", "feature", "request", "scope"} <= origin.keys()
+            or origin["project_root"] != str(root) or origin["feature"] != feature_slug(Path(workflow).name)
+            or not isinstance(origin["request"], list) or any(not isinstance(item, str) for item in origin["request"])):
+        raise PipelineError("saved output belongs to another root, feature or reader selection")
+    request = origin["request"]
+    if len(request) < 5 or request[:4] != ["--root", str(root), "--feature", origin["feature"]] or request[4] not in _PRESENT_READERS:
+        raise PipelineError("saved output cannot introduce a different reader or root")
+    try:
+        original = parser().parse_args(request)
+    except SystemExit as exc:
+        raise PipelineError("saved output contains invalid native reader selectors") from exc
+    if getattr(original, "present", False) or original.continuation is not None or not original.assemble:
+        raise PipelineError("saved output must retain its original complete native read")
+    if ("editable_request" in origin) != (original.command == "qa-prepare" and original.pointer is None):
+        raise PipelineError("saved output editable provenance does not match its native selector")
+    unit = {key: value for key, value in snapshot.items() if key != "presentation_origin"}
+    if _reader_request(root, original, unit) != request:
+        raise PipelineError("saved reader selectors were changed")
+    if _presentation_scope(root, workflow, original, unit) != origin["scope"]:
+        raise PipelineError("saved reader owner, candidate, authority or runtime changed; read the current selection")
+    if native is None:
+        if original.command == "qa-prepare" and original.pointer is None:
+            from .artifact_io import contained_path
+            controller = Controller(StateStore(root / workflow / PIPELINE_STATE_FILENAME))
+            result = _snapshot_prepared_result(root, controller, original, unit)
+            receipt = unit["value"].get("saved_record_request") if isinstance(unit["value"], dict) else None
+            editable = origin.get("editable_request")
+            if (not isinstance(receipt, dict) or set(receipt) != {"path", "sha256", "bytes"}
+                    or not isinstance(editable, dict) or set(editable) != {"path", "sha256", "bytes", "text"}
+                    or {key: editable[key] for key in receipt} != receipt or not isinstance(editable["text"], str)):
+                raise PipelineError("saved QA context lost its original editable request capture")
+            raw = editable["text"].encode("utf-8")
+            if hashlib.sha256(raw).hexdigest() != receipt["sha256"] or len(raw) != receipt["bytes"]:
+                raise PipelineError("saved QA editable request capture was forged")
+            destination = original.output or root / workflow / "ReadOutputs" / ("qa-request-" + digest(result["record_request"]) + ".json")
+            expected_path = contained_path(root / workflow / "ReadOutputs", destination if destination.is_absolute() else root / destination)
+            if receipt["path"] != str(expected_path):
+                raise PipelineError("saved QA request destination or revision changed")
+            status = unit["value"].get("request_status")
+            template = (json.dumps(result["record_request"], ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+            if status not in {"prepared_request", "preserved_edited_request"} or (status == "prepared_request") != (raw == template):
+                raise PipelineError("saved QA request provenance changed")
+            selected = argparse.Namespace(**vars(original))
+            selected.output, selected.assemble, selected.present = None, True, False
+            native = _focused_result(root, workflow, selected, _prepared_context(result, receipt, status))
+        else:
+            original._read_only_prepare = True
+            native = run(original)
+    if native != unit:
+        raise PipelineError("saved native body, source, origin or selection is no longer current; read the current selection")
+    pointer = "/value" if pointer is None else pointer
+    body = _pointer_value(snapshot, pointer)
+    # Preserve existing decoded text rendering. Original transport digest stays
+    # inside the immutable envelope; this page digest binds the displayed body.
+    metadata = {"format": "pipeline-source-page-v1", "version": unit["version"],
+                "saved_output": saved, "pointer": pointer, "native_content_digest": unit["content_digest"],
+                "original_selection": {key: unit[key] for key in ("view", "pointer", "source", "evidence_origin", "assignment_id", "instruction", "binding", "packet_digest", "record_id", "record_digest", "revision") if key in unit},
+                "snapshot_read": True, "read_credit": False, "semantic_credit": False}
+    page = _semantic_page(body, metadata, continuation, limit, raw_text=isinstance(body, str))
+    argv = _saved_argv(root, origin["feature"], saved, pointer, limit)
+    page["reread_current"] = {"exec_command": host_read_command(
+        [*argv, "--continuation", continuation] if continuation is not None else argv, root)}
+    page["next"] = ({"exec_command": host_read_command([*argv, "--continuation", page["continuation"]], root)}
+                    if page["continuation"] is not None else None)
+    page["selection_complete"] = page["complete"]
+    links = unit.get("linked_reads", [])
+    if links and pointer == "/value":
+        page["links"] = {"inventory": [{"pointer": f"/linked_reads/{index}", "labels": [link["label"] for link in row["links"]]}
+                                         for index, row in enumerate(links)],
+                         "read_argv_prefix": _saved_argv(root, origin["feature"], saved, "")[:-1],
+                         "read": {"exec_command": host_read_command(_saved_argv(root, origin["feature"], saved, "/linked_reads"), root)}}
+    return page
 
 
 def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -425,6 +672,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                                       assertion_ids=args.assertion_id, identity_id=args.identity_id, continuation=continuation, limit=args.limit)
         return _deliver_selection(root, workflow, args, read_page)
     elif args.command == "delivery-read":
+        if args.saved_output is not None:
+            if args.offset:
+                raise PipelineError("saved presentation uses its exact continuation, not numeric offsets")
+            return _saved_selection(root, workflow, args.saved_output, args.digest, args.pointer, args.continuation, args.limit)
+        if args.continuation is not None or args.format != "json":
+            raise PipelineError("delivery-read text/continuation requires its exact --saved-output")
         return read_delivery(root, workflow, args.digest, args.offset, args.limit, args.pointer)
     elif args.command == "file-read":
         if args.path is None and args.instruction is None:
@@ -461,7 +714,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             _json_object(root, args.environment, "execution environment"))
     elif args.command == "evidence-read":
         result = Controller(store).evidence_read(args.record_id, **({"raw_file": args.raw_file} if args.raw_file else {}))
-        if args.pointer is None and not (args.raw_file or args.continuation or args.assemble or args.output):
+        if args.pointer is None and not (args.raw_file or args.continuation or args.assemble or args.output or args.present):
             return result
         return _focused_result(root, workflow, args, result)
     elif args.command == "qa-prepare":
@@ -470,20 +723,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             if args.pointer is not None or args.continuation is not None:
                 raise PipelineError("qa-prepare --output saves the editable record input and returns complete context; do not select pointer/continuation")
             saved, request_status = _prepared_request_output(root, workflow, result["record_request"], args.output)
-            context = {key: value for key, value in result.items() if key != "record_request"}
-            context["saved_record_request"] = saved
-            context["request_status"] = request_status
-            if request_status == "preserved_edited_request":
-                context["required_action"] += " Existing unsaved request bytes were preserved. Read that exact file before editing or recording; its content has not been validated or assessed."
+            context = _prepared_context(result, saved, request_status)
             selected = argparse.Namespace(**vars(args))
+            selected._qa_request_output = args.output
             selected.output, selected.assemble = None, True
             return _focused_result(root, workflow, selected, context)
         return _focused_result(root, workflow, args, result)
     elif args.command in {"qa-draft", "qa-read"}:
         selected = args.identity_id or args.assertion_id
-        if not selected and args.pointer is None and (args.continuation or args.assemble or args.output):
+        if not selected and args.pointer is None and (args.continuation or args.assemble or args.output or args.present):
             raise PipelineError("QA draft paging requires --identity-id or --assertion-id; the default response is compact progress")
-        method = Controller(store).qa_draft if args.command == "qa-draft" else Controller(store).qa_read
+        method = Controller(store).qa_draft if args.command == "qa-draft" and not getattr(args, "_read_only_prepare", False) else Controller(store).qa_read
         result = method(args.assignment_id, identity_id=args.identity_id, assertion_id=args.assertion_id)
         if args.pointer is not None:
             return _focused_result(root, workflow, args, result)
@@ -585,17 +835,17 @@ def _check_delivery(root: Path, state: dict[str, Any], args: argparse.Namespace)
             reference = receipt.get("execution_evidence")
             if isinstance(reference, str) and reference.startswith("execution-evidence:"):
                 receipt["read_argv"] = [*prefix, "evidence-read", "--record-id", reference.partition(":")[2].split("#", 1)[0],
-                                        "--format", "text", "--assemble"]
+                                        "--format", "text", "--present"]
                 receipt["read"] = {"exec_command": host_read_command(receipt["read_argv"], root)}
         exported = export_assignment(root, view)
         reader = [*prefix, "assignment-read", "--digest", exported["packet_digest"], "--format", "text"]
-        read_argv = [*reader, "--view", "check-context", "--assemble"]
+        read_argv = [*reader, "--view", "check-context", "--present"]
         response["assignment_delivery"] = {key: exported[key] for key in
                                            ("packet_digest", "generation", "assignment_id", "worker_id", "mode")}
         response["recovery"]["read_argv"] = read_argv
         response["recovery"]["read"] = {"exec_command": host_read_command(read_argv, root)}
-        response["recovery"]["save_usage"] = "Append --output <workflow/ReadOutputs/file.json> to save the complete selection and return compact metadata."
-        response["recovery"]["bootstrap_argv"] = [*reader, "--view", "bootstrap", "--assemble"]
+        response["recovery"]["save_usage"] = "Append --output <workflow/ReadOutputs/file.json> to retain the complete native envelope there; --present still returns progressive body pages with compact presentation metadata. Legacy --assemble --output returns metadata only and may retain a large header."
+        response["recovery"]["bootstrap_argv"] = [*reader, "--view", "bootstrap", "--present"]
         response["recovery"]["bootstrap"] = {"exec_command": host_read_command(response["recovery"]["bootstrap_argv"], root)}
         response["recovery"]["selectors"] = {
             "diagnostic_checks": "/check_context/diagnostic_checks",
@@ -625,7 +875,7 @@ def main(argv: list[str] | None = None) -> int:
             error["path"] = exc.path
         print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
         return 2
-    if (args.command in {"assignment-read", "file-read", "qa-draft", "qa-read", "qa-prepare", "evidence-read"} and args.format == "text"
+    if (args.command in {"assignment-read", "file-read", "qa-draft", "qa-read", "qa-prepare", "evidence-read", "delivery-read"} and args.format == "text"
             and result.get("format") in {"pipeline-delivery-page-v1", "pipeline-delivery-unit-v1", "pipeline-source-page-v1", "pipeline-source-unit-v1"}):
         print(_render_assignment_unit(result))
     else:

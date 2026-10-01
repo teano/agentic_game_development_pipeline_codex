@@ -188,6 +188,30 @@ def compact_prepared_request(request):
         request["shared"] = shared
 
 
+def controller_check_prerequisite(check_ids, receipts):
+    missing = set(check_ids) - {row["id"] for row in receipts}
+    return {"status": "check_required" if missing else "receipts_available",
+            "pending_check_ids": sorted(missing),
+            "detail": "Use the assigned controller check for missing receipts; never run its argv as a worker. Assess the actual assertions, not the aggregate verdict."}
+
+
+def bind_prepared_receipts(result, contexts):
+    """Bind canonical receipt metadata; leave every observation/comparison empty."""
+    methods = result["obligations"]["method_definitions"]
+    row_methods = {row["id"]: row["methods"] for identity in result["obligations"]["identities"] for row in identity["assertions"]}
+    native = {row["id"]: row for context in contexts for row in context.get("receipts", [])}
+    for prepared, row in zip(result["prepared_methods"], result["record_request"]["assessments"]):
+        method = next((methods[ref["ref"]] for ref in row_methods[row["id"]]
+                       if methods[ref["ref"]]["id"] == prepared["method_id"]), {})
+        producer = method.get("producer", {})
+        if prepared["assessment_status"] == "recorded" or producer.get("kind") != "controller_check":
+            continue
+        row["evidence"] = [dict(item, ref=native.get(check_id, {}).get("execution_evidence"))
+            for item in row["evidence"] for check_id in (
+                producer["check_ids"] if item["type"] in {"bound-machine-receipt", "controller-check-receipt"} else [None])]
+    compact_prepared_request(result["record_request"])
+
+
 def _shared_input(draft, request):
     if "binding" in request and request["binding"] != draft["binding"]:
         raise QAContractError("QA request binding differs from the current draft", path="/binding")

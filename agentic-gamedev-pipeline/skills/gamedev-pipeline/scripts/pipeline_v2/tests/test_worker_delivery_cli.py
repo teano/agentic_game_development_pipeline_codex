@@ -10,7 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pipeline_v2.cli import parser, run, main
-from pipeline_v2.delivery import export_assignment
+from pipeline_v2.delivery import export_assignment, assemble_delivery_pages
 from pipeline_v2.process_tree import ProcessEvidence
 from pipeline_v2.tests import test_core
 
@@ -84,7 +84,7 @@ class WorkerDeliveryCLITests(unittest.TestCase):
             self.assertEqual(active[key], rows[key]["value"])
         self.assertNotIn("value", rows["context"])
         startup = run(parser().parse_args(packet["dispatch"]["reader"]["bootstrap_argv"][2:]))
-        self.assertEqual("bootstrap", startup["view"])
+        self.assertEqual("bootstrap", startup["original_selection"]["view"])
         self.assertFalse(startup["delivery_complete"])
         explicit_index = run(parser().parse_args(argv + ["--view", "index"]))
         self.assertEqual("index", explicit_index["view"])
@@ -141,16 +141,30 @@ class WorkerDeliveryCLITests(unittest.TestCase):
             self.assertEqual(1, process.call_count)
         self.assertEqual(saved, self.h.store.path.read_bytes())
         read = replay["recovery"]["read_argv"][2:]
-        self.assertIn("--assemble", read)
+        self.assertIn("--present", read)
         selected = run(parser().parse_args(read))
         self.assertTrue(selected["selection_complete"])
-        body = selected["value"]
+        body = json.loads(selected["text"])
         self.assertIn("complete independent failure", json.dumps(body["check_context"]["diagnostic_checks"]))
         self.assertIn("pending_check_ids", body["check_context"]["machine_checks"])
         self.assertFalse(body["check_context"]["machine_checks"]["grants_manual_acceptance"])
+        destination = self.h.root / self.h.workflow_path / "ReadOutputs" / "guided-check-context.json"
+        guided = run(parser().parse_args(read + ["--output", str(destination)]))
+        self.assertEqual(selected["text"], guided["text"])
+        self.assertIn("--present", replay["recovery"]["save_usage"])
+        self.assertIn("progressive body", replay["recovery"]["save_usage"])
+        self.assertEqual(body, json.loads(destination.read_bytes())["value"])
+        self.assertFalse(guided["read_credit"])
         origin = replay["result"]["checks"][0]
         self.assertTrue(origin["execution_evidence"].startswith("execution-evidence:"))
-        evidence = run(parser().parse_args(origin["read_argv"][2:]))["value"]
+        evidence_page = run(parser().parse_args(origin["read_argv"][2:]))
+        def evidence_part(token):
+            argv = self.prefix + ["delivery-read", "--saved-output", evidence_page["saved_output"]["path"],
+                "--digest", evidence_page["saved_output"]["sha256"], "--pointer", "/value"]
+            if token:
+                argv += ["--continuation", token]
+            return run(parser().parse_args(argv))
+        evidence = assemble_delivery_pages(evidence_part)["value"]
         self.assertEqual(origin["execution_evidence"], evidence["ref"])
         self.assertEqual(origin["execution_record_digest"], evidence["record"]["digest"])
         self.assertEqual("controller-process-execution", evidence["record"]["provenance"])
