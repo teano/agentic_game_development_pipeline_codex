@@ -294,10 +294,11 @@ def artifact_schema(phase: str, role: str | None = None) -> dict[str, Any]:
     if phase == "qa":
         result["item_shapes"]["checks[]"]["assertions"] = {
             "required_keys": ["id", "outcome", "method_id", "environment", "evidence"],
-            "optional_keys": ["reason"],
+            "optional_keys": ["reason", "assessment"],
             "outcome": "pass|fail|not_run|not_applicable",
-            "evidence[]": "exact {type,ref,observation}; types prescribed by context.qa_contract.definition",
-            "reason": "{kind,detail,refs[]} required for not_run; kind capability_unavailable|dependency_unsatisfied|authority_unresolved|verification_incomplete; verification_incomplete names every approved method alternative and requires verification-gap evidence; containing identity fails without claiming execution",
+            "evidence[]": "{type,ref,observation}; optional source:{path,sha256,start_line?,end_line?} uses exact current-candidate reader metadata. Types prescribed by context.qa_contract.definition.",
+            "reason": "{kind,detail,refs[],repair?} required for not_run; capability_unavailable|dependency_unsatisfied|authority_unresolved|verification_incomplete|method_unavailable|external_wait. New verification_incomplete requires repair:{owner:engineering,target,missing_obligation,attempted_method_ids[],evidence_refs[]} with actual bound execution/source evidence; unassessed QA remains pending, not Engineering repair.",
+            "assessment": "{expected,observed,comparison:matches|contradicts|insufficient}; exact approved expected; explicit contradictions or insufficient observations cannot PASS. Required when the approved method requires it; schema never proves semantic truth.",
         }
     return result
 
@@ -389,7 +390,7 @@ def compact_assignment_context(
     """
     lossless_format = canonical_input or source.get("delivery_version") == 1
     context: dict[str, Any] = {"delivery_version": 1}
-    for key in ("convergence", "diagnostic_checks", "machine_checks", "capability_recovery", "acceptance_contract_version", "qa_contract", "qa_previous_observations"):
+    for key in ("convergence", "diagnostic_checks", "machine_checks", "capability_recovery", "acceptance_contract_version", "qa_contract", "qa_previous_observations", "verification_feasibility", "required_finding_conditions", "qa_working_draft"):
         if key in source:
             context[key] = deepcopy(source[key])
     if isinstance(source.get("technical_journal"), dict):
@@ -474,6 +475,24 @@ def _legacy_artifact_schemas(phase: str, role: str) -> list[dict[str, Any]]:
     legacy = artifact_schema(phase, role)
     previous_descriptions = []
     if phase == "qa":
+        prior_reason = "{kind,detail,refs[]} required for not_run; capability_unavailable|dependency_unsatisfied|authority_unresolved|verification_incomplete|method_unavailable|external_wait. Incomplete executable verification fails; unavailable methods and external prerequisites block without waiver. Cite every method alternative for verification/method gaps."
+        prior_evidence = "exact {type,ref,observation}; types prescribed by context.qa_contract.definition"
+        # Preserve exact earlier descriptive schemas for reading old leases;
+        # current submissions still use the stricter current validator.
+        for reason in (prior_reason,
+                       "{kind,detail,refs[]} required for not_run; kind capability_unavailable|dependency_unsatisfied|authority_unresolved"):
+            previous = deepcopy(legacy)
+            previous["item_shapes"]["checks[]"]["assertions"]["reason"] = reason
+            previous_descriptions.append(deepcopy(previous))
+            previous["item_shapes"]["checks[]"]["assertions"]["evidence[]"] = prior_evidence
+            previous_descriptions.append(previous)
+        legacy["item_shapes"]["checks[]"]["assertions"]["evidence[]"] = prior_evidence
+        legacy["item_shapes"]["checks[]"]["assertions"]["optional_keys"] = ["reason"]
+        legacy["item_shapes"]["checks[]"]["assertions"].pop("assessment", None)
+        legacy["item_shapes"]["checks[]"]["assertions"]["reason"] = (
+            "{kind,detail,refs[]} required for not_run; kind capability_unavailable|dependency_unsatisfied|authority_unresolved|verification_incomplete; verification_incomplete names every approved method alternative and requires verification-gap evidence; containing identity fails without claiming execution"
+        )
+        previous_descriptions.append(deepcopy(legacy))
         previous_reason = deepcopy(legacy)
         previous_reason["item_shapes"]["checks[]"]["assertions"]["reason"] = (
             "{kind,detail,refs[]} required for not_run; kind capability_unavailable|dependency_unsatisfied|authority_unresolved"
@@ -1275,6 +1294,46 @@ def documentation_not_required_after_qa(state: dict[str, Any]) -> bool:
         return False
 
 
+def unresolved_qa_observations(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Retain same-contract residuals across a changed remediation candidate.
+
+    The latest matching QA is authoritative about what still needs reassessment;
+    older failures cannot resurrect a condition that a newer QA actually closed.
+    This projection is deliberately not a complete or current QA result.
+    """
+    contract = qa_contract_context(state)
+    if contract.get("status") != "bound":
+        return None
+    latest_qa = next((event.get("assignment_id") for event in reversed(state.get("history", []))
+                      if event.get("command") == "complete" and event.get("phase") == "qa"), None)
+    sources = [(state.get("artifacts", {}).get("qa"), f"{state['workflow_path']}/pipeline-state.json#/artifacts/qa")]
+    sources += [(event.get("prior_artifacts", {}).get("qa"),
+                 f"{state['workflow_path']}/pipeline-state.json#/history/{index}/prior_artifacts/qa")
+                for index, event in reversed(list(enumerate(state.get("history", []))))]
+    for previous, locator in sources:
+        if not isinstance(previous, dict) or previous.get("qa_contract", {}).get("binding") != contract["binding"]:
+            continue
+        if latest_qa is not None and previous.get("assignment_id") != latest_qa:
+            continue  # A later QA must not be replaced by an older residual.
+        checks = []
+        for check in previous.get("worker", {}).get("checks", []):
+            assertions = [deepcopy(row) for row in check.get("assertions", [])
+                          if row.get("outcome") in {"fail", "not_run"}]
+            if assertions:
+                checks.append({**deepcopy(check), "assertions": assertions})
+        controller_failure = previous.get("controller_failure")
+        if not checks and not isinstance(controller_failure, dict):
+            return None
+        return {"checks": checks, "candidate_binding": deepcopy(previous.get("candidate_binding")),
+                "contract_binding": deepcopy(contract["binding"]), "source_locator": locator,
+                "assignment_id": previous["assignment_id"],
+                "artifact_path": assignment_output_path(previous["assignment_id"], state["feature"]),
+                **({"controller_failure": deepcopy(controller_failure)} if isinstance(controller_failure, dict) else {}),
+                "grants_credit": False, "complete_inventory": False,
+                "reuse_rule": "Historical unresolved observations for this authority/contract/slice only. Engineering addresses repairable work; Review checks its closure; QA re-evaluates every current required assertion. External obligations remain pending; no old PASS or current execution credit."}
+    return None
+
+
 def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
     """Derive the complete technical assignment; callers supply no IDs or path rules."""
     phase = state["phase"]
@@ -1335,28 +1394,22 @@ def default_assignment(state: dict[str, Any]) -> dict[str, Any]:
         assignment["context"]["required_identity_ids"] = required_qa_identity_ids(state)
     if phase == "qa":
         assignment["context"] = {"required_identity_ids": required_qa_identity_ids(state)}
+        assignment["context"]["qa_working_draft"] = {
+            "path": assignment["output_path"][:-5] + ".working.json",
+            "operations": ["qa-draft", "qa-read", "qa-record", "qa-finalize"],
+            "pending_is_not_run": False, "diagnostic_generation_changes_preserve_assessments": True,
+            "semantic_credit": False,
+        }
+    if phase in {"plan", "slice", "engineering"}:
+        assignment.setdefault("context", {})["verification_feasibility"] = verification_feasibility(state)
     if phase in {"engineering", "review", "qa", "docs"}:
         assignment.setdefault("context", {})["acceptance_contract_version"] = 1
     if phase in {"engineering", "qa"} or (phase == "review" and target["kind"] == "current_slice_implementation"):
         assignment.setdefault("context", {})["qa_contract"] = qa_contract_context(state)
-    if phase == "qa":
-        previous = state.get("artifacts", {}).get("qa", {})
-        if not previous:
-            for event in reversed(state["history"]):
-                if event.get("command") == "init" and event.get("result") != "qa_contract_bound":
-                    break
-                prior = event.get("prior_artifacts", {}).get("qa", {})
-                if prior.get("candidate_binding") == current_candidate(state):
-                    previous = prior
-                    break
-        if previous.get("worker", {}).get("checks"):
-            assignment["context"]["qa_previous_observations"] = {
-                "checks": deepcopy(previous["worker"]["checks"]),
-                "candidate_binding": deepcopy(previous.get("candidate_binding")),
-                "qa_contract": deepcopy(previous.get("qa_contract")),
-                "grants_credit": False,
-                "reuse_rule": "Historical observations only. Revalidate current environment and every required assertion; no automatic manual credit.",
-            }
+    if phase in {"engineering", "review", "qa"}:
+        previous = unresolved_qa_observations(state)
+        if previous is not None:
+            assignment.setdefault("context", {})["qa_previous_observations"] = previous
     for index in range(len(state["history"]) - 1, -1, -1):
         event = state["history"][index]
         if event.get("command") == "init":
@@ -1411,6 +1464,25 @@ def seal_qa_contract(root: Path, authority_items: dict[str, Any], slices: list[d
         return None if value is None else validate_contract(value, expected, source_paths=paths)
     except (ValueError, KeyError, OSError, UnicodeError) as exc:
         raise PipelineError(f"invalid approved QA contract: {exc}") from exc
+
+
+def verification_feasibility(state: dict[str, Any]) -> dict[str, Any]:
+    from .qa_contract import producer_feasibility, slice_contract
+    from .execution import recipe_for
+    contract = state.get("execution", {}).get("qa_contract")
+    if contract is None:
+        return {"status": "legacy_unverified", "errors": [], "unverified_methods": [], "probes": [],
+                "semantic_credit": False, "executed_acceptance_credit": False}
+    selected = current_slice(state)
+    recipes = [recipe_for(state, argv, index, 600) for index, argv in enumerate(selected["planned_commands"])]
+    return producer_feasibility(slice_contract(contract, selected["id"]), recipes)
+
+
+def require_verification_feasibility(state: dict[str, Any]) -> None:
+    result = verification_feasibility(state)
+    if result["errors"]:
+        raise PipelineError("verification producer mismatch before Engineering; owning plan/method prerequisite must be resolved: " +
+                            "; ".join(f"{row['method_id']}: {row['detail']}" for row in result["errors"]))
 
 
 def qa_contract_context(state: dict[str, Any]) -> dict[str, Any]:
@@ -1638,6 +1710,16 @@ def validate_state(state: dict[str, Any]) -> None:
             raise PipelineError("history has an invalid shape")
         if not is_generation(item.get("generation")):
             raise PipelineError("history generation must be a non-negative integer")
+        if "execution_records" in item:
+            records = item["execution_records"]
+            if not isinstance(records, list) or any(
+                not isinstance(row, dict) or set(row) != {"ref", "digest", "check_id", "returncode", "argv_sha256"}
+                or not isinstance(row["ref"], str) or not row["ref"].startswith("execution-evidence:")
+                or not is_digest(row["digest"]) or not is_digest(row["argv_sha256"])
+                or not isinstance(row["check_id"], str) or not row["check_id"] or type(row["returncode"]) is not int
+                for row in records
+            ):
+                raise PipelineError("controller execution record history is malformed")
         if "actor_id" in item and (
             not isinstance(item["actor_id"], str) or not item["actor_id"]
             or item.get("phase") not in PHASES[:-1]

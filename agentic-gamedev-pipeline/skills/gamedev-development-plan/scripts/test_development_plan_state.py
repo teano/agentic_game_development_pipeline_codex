@@ -2356,6 +2356,30 @@ Only the approved feature and named shared symbol are in scope.
         self.plan.write_text(text, encoding="utf-8")
         self.assertEqual(["SLICE-001"], controller.command_validate(self.args())["slice_ids"])
 
+    def test_scope_estimates_are_optional_without_relaxing_exact_paths(self) -> None:
+        self.initialize()
+        self.write_plan()
+        text = re.sub(r"(?m)^- max_product_(?:files|lines_changed):[^\n]*\n", "",
+                      self.plan.read_text(encoding="utf-8"))
+        self.plan.write_text(text, encoding="utf-8")
+        self.assertEqual(["SLICE-001"], controller.command_validate(self.args())["slice_ids"])
+        self.plan.write_text(text.replace("- editable_paths: ", "- editable_paths: ../escape, ", 1),
+                             encoding="utf-8")
+        with self.assertRaises(controller.DevelopmentPlanError):
+            controller.command_validate(self.args())
+
+    def test_legacy_scope_estimates_remain_optional_validated_metadata(self) -> None:
+        self.initialize()
+        self.write_plan()
+        original = self.plan.read_text(encoding="utf-8")
+        self.assertEqual(["SLICE-001"], controller.command_validate(self.args())["slice_ids"])
+        for value in ("0", "unknown", "8\n- max_product_files: 9"):
+            with self.subTest(value=value):
+                self.plan.write_text(original.replace("- max_product_files: 8",
+                                                      "- max_product_files: " + value), encoding="utf-8")
+                with self.assertRaisesRegex(controller.DevelopmentPlanError, "optional max_product_files"):
+                    controller.command_validate(self.args())
+
     def test_accepts_exact_no_shared_touchpoints_sentinel(self) -> None:
         self.initialize()
         self.write_plan()

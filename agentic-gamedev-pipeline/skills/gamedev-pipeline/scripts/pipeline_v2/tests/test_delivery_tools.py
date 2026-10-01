@@ -125,8 +125,9 @@ class DeliveryTests(unittest.TestCase):
                 self.assertEqual(role, locator["role"])
                 self.assertEqual((skills / relative).resolve(), Path(locator["path"]))
                 self.assertTrue(Path(locator["path"]).is_file())
+                self.assertEqual(hashlib.sha256(Path(locator["path"]).read_bytes()).hexdigest(), locator["version"])
                 if role in {"planner", "slicer"}:
-                    self.assertEqual("Assignment and artifact boundaries", locator["section"])
+                    self.assertEqual("Runtime Plan and Slice", locator["section"])
                     self.assertIn("## " + locator["section"], Path(locator["path"]).read_text(encoding="utf-8"))
                 else:
                     self.assertNotIn("section", locator)
@@ -136,8 +137,80 @@ class DeliveryTests(unittest.TestCase):
                 self.assertEqual(locator, director_brief(view)["active_assignment"]["role_instructions"])
                 self.assertEqual(view["active_assignment"], packet["assignment"])
                 self.assertEqual(original, view)
-                self.assertEqual({"role", "path", "section"} if role in {"planner", "slicer"}
-                                 else {"role", "path"}, set(locator))
+                self.assertEqual({"role", "path", "version", "section"} if role in {"planner", "slicer"}
+                                 else {"role", "path", "version"}, set(locator))
+
+    def test_generated_normal_readers_execute_without_appended_transport_arguments(self):
+        for role in ROLES.values():
+            view = deepcopy(self.view)
+            view["active_assignment"]["role"] = role
+            dispatch = export_assignment(self.root, view)["dispatch"]
+            self.assertIn("--present", dispatch["reader"]["bootstrap_argv"])
+            # This pure packet fixture has no live controller. Its legacy read
+            # remains supported; current issued handles are exercised natively
+            # by SavedPresentationNativeTests.
+            startup = run(parser().parse_args(["--assemble" if item == "--present" else item for item in dispatch["reader"]["bootstrap_argv"][2:]]))
+            self.assertTrue(startup["selection_complete"])
+            self.assertEqual(role, startup["value"]["assignment"]["role"])
+            instruction = run(parser().parse_args(dispatch["role_instructions"]["read_argv"][2:]))
+            locator = dispatch["role_instructions"]
+            self.assertEqual(locator["version"], parser().parse_args(locator["read_argv"][2:]).version)
+            self.assertEqual(locator["version"], instruction["original_selection"]["source"]["sha256"])
+            self.assertEqual(locator["path"], instruction["original_selection"]["source"]["path"])
+            self.assertTrue(instruction["selection_complete"])
+            self.assertFalse(instruction["delivery_complete"])
+            self.assertNotIn("evidence_origin", instruction)
+            if role in {"planner", "slicer"}:
+                self.assertTrue(instruction["text"].startswith("## Runtime Plan and Slice"))
+            with mock.patch("pipeline_v2.cli.Controller") as controller:
+                controller.return_value.read_status.return_value = view
+                source = run(parser().parse_args(["--assemble" if item == "--present" else item for item in dispatch["reader"]["source_argv_prefix"][2:]] + ["src/a.txt"]))
+            self.assertEqual("Привет 🌍\r\n", source["value"])
+            self.assertEqual(source["source"], source["evidence_origin"]["source"])
+            self.assertTrue(source["evidence_origin"]["ref"].startswith("candidate-source:src/a.txt@"))
+
+    def test_generated_startup_refuses_changed_source_even_outside_selected_role_section(self):
+        for role in ("engineer", "planner"):
+            with self.subTest(role=role):
+                view = deepcopy(self.view)
+                view["active_assignment"]["role"] = role
+                locator = export_assignment(self.root, view)["dispatch"]["role_instructions"]
+                target = self.root / f"{role}-instructions.md"
+                payload = Path(locator["path"]).read_bytes()
+                target.write_bytes(payload)
+                with mock.patch("pipeline_v2.delivery._instruction_path", return_value=target):
+                    args = parser().parse_args(locator["read_argv"][2:])
+                    original = run(args)
+                    self.assertEqual(locator["version"], original["original_selection"]["source"]["sha256"])
+                    target.write_bytes(payload + b"\n## Unselected newer section\nChanged source bytes.\n")
+                    with self.assertRaisesRegex(PipelineError, "selected input changed"):
+                        run(args)
+                    args.version = hashlib.sha256(target.read_bytes()).hexdigest()
+                    current = run(args)
+                if role == "planner":
+                    self.assertEqual(original["text"], current["text"])
+                self.assertNotEqual(original["original_selection"]["source"]["sha256"], current["original_selection"]["source"]["sha256"])
+                self.assertFalse(current["delivery_complete"])
+                self.assertNotIn("evidence_origin", current)
+
+    def test_unversioned_v2_role_locator_is_readable_and_upgrades_by_exact_delta(self):
+        exported = export_assignment(self.root, self.view)
+        legacy = self.receive(exported["packet_digest"])
+        legacy["role_instructions"].pop("version")
+        payload = canonical_bytes(legacy)
+        version = hashlib.sha256(payload).hexdigest()
+        (self.root / self.workflow / "Delivery" / f"{version}.json").write_bytes(payload)
+        startup = run(parser().parse_args(["--root", str(self.root), "--feature", self.view["feature"],
+            "assignment-read", "--digest", version, "--view", "bootstrap", "--assemble"]))
+        self.assertEqual(legacy["role_instructions"], startup["value"]["role_instructions"])
+        self.assertFalse(startup["delivery_complete"])
+        current = export_assignment(self.root, self.view, baseline=version)
+        delta = self.receive(current["response_digest"])
+        self.assertEqual("delta", current["mode"])
+        self.assertEqual(self.receive(current["packet_digest"]), apply_patch(legacy, delta["patch"]))
+        self.assertEqual(legacy["assignment"], self.receive(current["packet_digest"])["assignment"])
+        self.assertEqual(current["role_instructions"]["version"],
+                         parser().parse_args(current["dispatch"]["role_instructions"]["read_argv"][2:]).version)
 
     def test_full_and_delta_keep_exact_output_right_separate_from_product_scope(self):
         from pipeline_v2.model import artifact_schema
@@ -228,7 +301,7 @@ class DeliveryTests(unittest.TestCase):
             locator = exported["role_instructions"]
             self.assertTrue(Path(locator["path"]).is_relative_to(bundle))
             self.assertTrue(Path(exported["dispatch"]["launcher_argv"][1]).is_relative_to(bundle))
-            self.assertEqual(locator, exported["dispatch"]["role_instructions"])
+            self.assertEqual(locator, {key: value for key, value in exported["dispatch"]["role_instructions"].items() if key not in {"read_argv", "exec_command"}})
             self.assertEqual(locator, self.receive(exported["packet_digest"])["role_instructions"])
             self.assertEqual(locator, relocated.director_brief(view)["active_assignment"]["role_instructions"])
         (bundle / "skills/gamedev-engineer/SKILL.md").unlink()
@@ -505,6 +578,17 @@ class DeliveryTests(unittest.TestCase):
 
 
 class ControllerDeliveryIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def captured_process(returncode, stdout=b"fixture stdout", stderr=b"fixture stderr"):
+        def execute(*args, **kwargs):
+            kwargs["stdout_path"].write_bytes(stdout)
+            kwargs["stderr_path"].write_bytes(stderr)
+            stdout_sha = hashlib.sha256(stdout).hexdigest()
+            stderr_sha = hashlib.sha256(stderr).hexdigest()
+            return ProcessEvidence(returncode, stdout_sha, stderr_sha, stderr, False,
+                                   stdout, False, 321, stderr_raw_sha256=stderr_sha)
+        return execute
+
     def setUp(self):
         from pipeline_v2.tests.test_core import PipelineV2CoreTests
         from pipeline_v2.runner import Controller
@@ -525,13 +609,14 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
         tree = candidate_tree_oid(self.root)
         with tempfile.TemporaryDirectory(prefix="foreign dispatch cwd ") as foreign:
             response = subprocess.run(
-                dispatch["reader"]["value_argv_prefix"] + ["/assignment", "--format", "json"],
+                dispatch["reader"]["bootstrap_argv"],
                 cwd=foreign, capture_output=True, text=True, encoding="utf-8", check=True,
             )
-            page = json.loads(response.stdout)
+            header, body = response.stdout.split("\n", 1)
+            page = json.loads(header)
             self.assertTrue(page["unit_complete"])
             self.assertFalse(page["delivery_complete"])
-            assignment = page["value"]
+            assignment = json.loads(body)["assignment"]
             self.assertEqual(dispatch["assignment_id"], assignment["id"])
             self.assertEqual(dispatch["worker_id"], assignment["worker_id"])
             self.assertEqual(str(self.root), dispatch["cwd"])
@@ -664,7 +749,7 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
         action = self.controller.status()["next_action"]
         pending = director_brief(self.controller.status())["next_action"]["assignment"]["role_instructions"]
         self.assertEqual("planner", pending["role"])
-        self.assertEqual("Assignment and artifact boundaries", pending["section"])
+        self.assertEqual("Runtime Plan and Slice", pending["section"])
         argv = ["--root", str(self.root), "--feature", self.fixture.feature, "step",
                 "--expected-generation", str(action["expected_generation"]), "--action-id", action["command_id"]]
         issued = run(parser().parse_args(argv))
@@ -703,10 +788,8 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
         argv = ["--root", str(self.root), "--feature", self.fixture.feature, "--brief", "check",
                 "--id", "CLI-BRIEF-CHECK", "--expected-generation", str(state["generation"]),
                 "--assignment-id", active["id"], "--quiescence", "Writer stopped for this check."]
-        evidence = ProcessEvidence(7, digest("stdout"), digest("stderr"),
-                                   b"full stderr must not be projected", False,
-                                   b"full stdout must not be projected", False, 321)
-        with mock.patch("pipeline_v2.runner.run_process_tree", return_value=evidence):
+        evidence = self.captured_process(7, b"full stdout must not be projected", b"full stderr must not be projected")
+        with mock.patch("pipeline_v2.runner.run_process_tree", side_effect=evidence):
             checked = run(parser().parse_args(argv))
         diagnostic = checked["active_assignment"]["diagnostic_checks"]
         self.assertEqual(active["id"], diagnostic["assignment_id"])
@@ -718,7 +801,11 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
         encoded = json.dumps(checked)
         self.assertNotIn("full stderr", encoded)
         self.assertNotIn("full stdout", encoded)
-        self.assertNotIn('"argv"', encoded)
+        self.assertNotIn('"argv"', json.dumps(diagnostic))
+        invocation = parser().parse_args(checked["next_action"]["invocation"]["argv"][2:])
+        self.assertEqual("step", invocation.command)
+        self.assertEqual(checked["generation"], invocation.expected_generation)
+        self.assertEqual(checked["next_action"]["command_id"], invocation.action_id)
 
     def test_step_complete_validates_artifact_and_accept_is_a_separate_action(self):
         action = self.controller.status()["next_action"]
@@ -795,7 +882,11 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
         waiting = run(parser().parse_args(argv))
         self.assertEqual("waiting_for_artifact", waiting["outcome"])
         self.assertEqual([], waiting["steps"])
-        self.assertEqual(original, waiting["next_action"])
+        self.assertEqual(original, {key: value for key, value in waiting["next_action"].items() if key != "invocation"})
+        invocation = parser().parse_args(waiting["next_action"]["invocation"]["argv"][2:])
+        self.assertEqual(("step", original["expected_generation"], original["command_id"], self.root, self.fixture.feature),
+                         (invocation.command, invocation.expected_generation, invocation.action_id, invocation.root, invocation.feature))
+        self.assertTrue(invocation.through_handoff)
         self.fixture._write_artifact({"outcome": "pass", "summary": "Plan confirmed."})
         execute_step(self.controller, self.root, original["expected_generation"], original["command_id"])
         for after_accept in (False, True):
@@ -887,8 +978,7 @@ class ControllerDeliveryIntegrationTests(unittest.TestCase):
         self.handoff()
         original = self.controller.status()["next_action"]
         self.fixture._write_artifact({"outcome": "pass", "summary": "Implementation ready for its mandatory check."})
-        failed_process = ProcessEvidence(7, digest("stdout"), digest("stderr"))
-        with mock.patch("pipeline_v2.runner.run_process_tree", return_value=failed_process) as process:
+        with mock.patch("pipeline_v2.runner.run_process_tree", side_effect=self.captured_process(7)) as process:
             failed = self.handoff(original)
             self.assertEqual("gate_failed", failed["outcome"])
             self.assertEqual("pass", failed["semantic_outcome"])

@@ -157,7 +157,11 @@ class RequirementsInstructionContractTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 require(mutated, LANE_RULES)
         self.assertIn("stage-handoff-invariant.md", lanes)
-        self.assertIn("useful working set", self.invariant)
+        # The lane links to the shared lifecycle; it need not repeat the former
+        # economic-turnover slogan or turn Engineering's policy into a lane role.
+        self.assertIn("## Working-set checkpoint and rotation", self.invariant)
+        self.assertIn("actual termination/quiescence", self.invariant)
+        self.assertIn("current authority paths/revisions/hashes", self.invariant)
         self.assertIn("authority-contract.md", self.invariant)
         self.assertNotRegex(self.invariant, r"\b(?:70|90)%")
         self.assertNotRegex(self.skill + self.contract, r"\b\d{1,3}%")

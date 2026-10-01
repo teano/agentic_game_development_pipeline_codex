@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
-from .technical_decisions import journal_digest, journal_reference, validate_entry, semantic_journal_digest
+from .technical_decisions import journal_digest, journal_reference, validate_entry, validate_entries, semantic_journal_digest
 from .execution import metadata, owner_key, finding_updates, convergence_context, record_finding_resolutions
 
 from .checkout import authority_items_equal, matches, path_identity, violations as diff_violations
@@ -129,6 +129,9 @@ def _worker_artifact(
     try:
         result = _validate_worker_artifact(value, phase, role, required_identity_ids)
         if state is not None:
+            if phase in {"plan", "slice"} and result["outcome"] == "pass":
+                from .model import require_verification_feasibility
+                require_verification_feasibility(state)
             from .finding_contract import validate_artifact
             validate_artifact(state, phase, result)
             if phase == "qa":
@@ -142,7 +145,12 @@ def _worker_artifact(
                         raise PipelineError("QA contract is unresolved; bind approved methods before PASS")
                 else:
                     try:
-                        validate_results(result["checks"], contract["definition"], outcome=result["outcome"])
+                        validate_results(result["checks"], contract["definition"], outcome=result["outcome"], strict_gaps=True)
+                        for check in result["checks"]:
+                            for assertion in check["assertions"]:
+                                repair = assertion.get("reason", {}).get("repair")
+                                if repair and not any(matches(repair["target"], rule) for rule in current_slice(state)["allowed_paths"]):
+                                    raise PipelineError("QA repair target is outside the approved Engineering write scope")
                     except ValueError as exc:
                         raise PipelineError(str(exc)) from exc
         return result
@@ -167,16 +175,10 @@ def _validate_worker_artifact(
         value = deepcopy(value)
         value["slices"] = slice_records(value["slices"])
     if "technical_decisions" in value:
-        entries = value["technical_decisions"]
-        if not isinstance(entries, list):
-            raise PipelineError("technical_decisions must be a list")
         try:
-            for entry in entries:
-                validate_entry(entry)
+            validate_entries(value["technical_decisions"])
         except ValueError as exc:
             raise PipelineError(str(exc)) from exc
-        if len({entry["id"] for entry in entries}) != len(entries):
-            raise PipelineError("duplicate technical decision ID in artifact")
     for key in ("assumptions", "checks"):
         if key in value and not isinstance(value[key], list):
             raise PipelineError(f"worker {key} must be a list")
@@ -279,7 +281,7 @@ def _validate_controller(
             or not is_digest(item.get("stderr_sha256"))
         ):
             raise PipelineError("malformed controller command result")
-        metadata_keys = {"duration_ms", "check_id", "execution_reason", "source_receipt"}
+        metadata_keys = {"duration_ms", "check_id", "execution_reason", "source_receipt", "execution_evidence", "execution_record_digest", "process_returncode"}
         keys = set(item) - metadata_keys
         stdout_keys = {"stdout_excerpt", "stdout_excerpt_truncated", "stdout_excerpt_redacted"}
         if keys & stdout_keys:
@@ -291,7 +293,11 @@ def _validate_controller(
             keys -= stdout_keys
         if "duration_ms" in item and (type(item["duration_ms"]) is not int or item["duration_ms"] < 0):
             raise PipelineError("malformed command duration")
-        for key in ("check_id", "execution_reason", "source_receipt"):
+        if "execution_record_digest" in item and not is_digest(item["execution_record_digest"]):
+            raise PipelineError("malformed execution record digest")
+        if "process_returncode" in item and type(item["process_returncode"]) is not int:
+            raise PipelineError("malformed observed process return code")
+        for key in ("check_id", "execution_reason", "source_receipt", "execution_evidence"):
             if key in item and (not isinstance(item[key], str) or not item[key]):
                 raise PipelineError("malformed command telemetry")
         if item["returncode"] == 0:
@@ -351,6 +357,13 @@ def _record(
         entry.update(completed_actor)
     if command["name"] == "next":
         entry["issued_identity"] = {key: command["assignment"][key] for key in ("id", "worker_id", "task")}
+    controller = command.get("controller", {})
+    executed = controller.get("commands", controller.get("results", []))
+    anchors = [{"ref": row["execution_evidence"], "digest": row["execution_record_digest"],
+                "check_id": row["check_id"], "returncode": row["returncode"], "argv_sha256": digest(row["argv"])}
+               for row in executed if isinstance(row, dict) and "execution_record_digest" in row]
+    if anchors:
+        entry["execution_records"] = anchors
     state["history"].append(entry)
     validate_state(state)
     return state
@@ -624,6 +637,8 @@ def _retained_candidate_evidence(state: dict[str, Any]) -> dict[str, Any]:
 
 def _confirm_approved_plan(state: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
     """Record controller confirmation only; product verification remains open."""
+    from .model import require_verification_feasibility
+    require_verification_feasibility(state)
     epoch = state["generation"]
     for phase in ("plan", "slice"):
         identity = f"approved-{phase}-{state['authority']['digest'][:16]}-g{epoch}"
@@ -911,11 +926,11 @@ def _reduce_command(
         if baseline is not None:
             value["artifacts"]["plan"] = baseline
         value["history"].append({"id": command["id"], "command": name, "command_digest": command_intent_digest(command), "generation": 0, "result": "initialized"})
+        _bind_qa_contract(value, command.get("qa_contract"))
         if command.get("verification") is not None:
             metadata(value)["verification"] = deepcopy(command["verification"])
             if command["verification"].get("confirm_approved_plan"):
                 value = _confirm_approved_plan(value, baseline)
-        _bind_qa_contract(value, command.get("qa_contract"))
         validate_state(value)
         return value
 
@@ -1078,6 +1093,9 @@ def _reduce_command(
         if "artifact_schema" in spec:
             raise PipelineError("assignment artifact_schema is controller-derived")
         phase = work["phase"]
+        if phase == "engineering":
+            from .model import require_verification_feasibility
+            require_verification_feasibility(work)
         canonical = default_assignment(work)
         for field in ("id", "worker_id", "task"):
             if spec.get(field) != canonical[field]:
@@ -1138,7 +1156,7 @@ def _reduce_command(
         if phase == "qa" and context not in ({}, canonical["context"]):
             raise PipelineError("QA required identities are controller-derived")
         context = deepcopy(context)
-        for field in ("acceptance_contract_version", "qa_contract", "qa_previous_observations"):
+        for field in ("acceptance_contract_version", "qa_contract", "qa_previous_observations", "verification_feasibility"):
             if field in canonical.get("context", {}):
                 context[field] = deepcopy(canonical["context"][field])
             else:
@@ -1170,6 +1188,9 @@ def _reduce_command(
         convergence = convergence_context(work)
         if convergence:
             context["convergence"] = convergence
+        if phase in {"engineering", "review", "docs"}:
+            from .finding_contract import required_condition_roster
+            context["required_finding_conditions"] = required_condition_roster(convergence, phase)
         if phase == "engineering" and candidate is None:
             for item in reversed(work["history"]):
                 prior = item.get("prior", {})
@@ -1323,7 +1344,12 @@ def _reduce_command(
                 "phase": active["phase"],
                 "prompt": _require_text(prompt, "question"),
             }
+        archived_qa = None
         if active["phase"] == "engineering":
+            prior_qa = work["artifacts"].get("qa")
+            if isinstance(prior_qa, dict) and (prior_qa.get("worker", {}).get("outcome") != "pass"
+                                              or isinstance(prior_qa.get("controller_failure"), dict)):
+                archived_qa = deepcopy(prior_qa)
             for stale in ("review", "qa", "docs", "ready"):
                 work["artifacts"].pop(stale, None)
         elif active["phase"] == "docs" and record.get("candidate") is not None:
@@ -1345,10 +1371,13 @@ def _reduce_command(
                     work["artifacts"].pop(stale, None)
             work["phase"] = "docs" if docs_failure else "engineering"
         work["active_assignment"] = None
-        return _record(work, command, active["id"], completed_actor={
+        completed = _record(work, command, active["id"], completed_actor={
             "actor_id": active["worker_id"], "phase": active["phase"],
             "assignment_id": active["id"],
         })
+        if archived_qa is not None:
+            completed["history"][-1].setdefault("prior_artifacts", {})["qa"] = archived_qa
+        return completed
 
     if name == "answer":
         from .no_progress import no_progress_hold, record_resolution
@@ -1379,6 +1408,8 @@ def _reduce_command(
         if phase == "qa" and record.get("required_identity_ids") != required_qa_identity_ids(work):
             raise PipelineError("QA evidence does not cover the approved mandatory identities")
         if phase == "slice":
+            from .model import require_verification_feasibility
+            require_verification_feasibility(work)
             proposed_slices = slice_records(
                 record["worker"].get("slices", work["slices"]), sealed=True,
             )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -17,6 +18,35 @@ from pipeline_v2.delivery import export_assignment, read_delivery_unit
 from pipeline_v2.execution import machine_check_inputs, receipt_binding
 from pipeline_v2.finding_contract import required_condition_roster, required_conditions, normalized_record
 from pipeline_v2.model import PipelineError, _active_assignment_view, artifact_schema, current_candidate, digest, status_view, validate_state
+from pipeline_v2.process_tree import ProcessEvidence
+
+
+LEGACY_QA_ASSERTION_SCHEMA = {
+    "allowed_keys": ["outcome", "checks", "blocker", "required_action", "questions", "technical_decisions"],
+    "required_keys": ["outcome", "checks"],
+    "outcome_enum": ["pass", "fail", "blocked"],
+    "item_shapes": {
+        "checks[]": {
+            "allowed_keys": ["id", "outcome", "evidence", "assertions"],
+            "required_keys": ["id", "outcome", "evidence", "assertions"],
+            "id": "one exact context.required_identity_ids entry, without duplicates",
+            "outcome": "pass|fail|not_run",
+            "evidence": "non-empty observed execution evidence; distinguish the actual integration from substitutes",
+            "assertions": {
+                "required_keys": ["id", "outcome", "method_id", "environment", "evidence"],
+                "optional_keys": ["reason"],
+                "outcome": "pass|fail|not_run|not_applicable",
+                "evidence[]": "exact {type,ref,observation}; types prescribed by context.qa_contract.definition",
+                "reason": "{kind,detail,refs[]} required for not_run; kind capability_unavailable|dependency_unsatisfied|authority_unresolved|verification_incomplete; verification_incomplete names every approved method alternative and requires verification-gap evidence; containing identity fails without claiming execution",
+            },
+        },
+        "checks": "exact identity and assertion inventory on every outcome; methods/evidence/reasons follow context.qa_contract; unresolved contract permits only blocked without credit",
+        "blocker": "non-empty string only and always when blocked",
+        "required_action": "non-empty string only and always when blocked",
+        "questions[]": "non-empty string",
+        "technical_decisions[]": "current TD-* entries: id, situation, decision, basis, checks[], downstream, optional overrides exact reference and diagnostic-only observations[]; execution is controller-owned",
+    },
+}
 
 
 class ReviewEvidenceProjectionTests(unittest.TestCase):
@@ -134,8 +164,14 @@ class NativeReviewEvidenceDeliveryTests(unittest.TestCase):
 
     def candidate(self):
         self.cycle.issue()
-        with mock.patch("pipeline_v2.runner.run_process_tree", return_value=self.cycle.passing()):
+        def captured_success(*args, **kwargs):
+            stdout, stderr = b"fixture successful check\n", b""
+            kwargs["stdout_path"].write_bytes(stdout)
+            kwargs["stderr_path"].write_bytes(stderr)
+            return ProcessEvidence(0, hashlib.sha256(stdout).hexdigest(), hashlib.sha256(stderr).hexdigest())
+        with mock.patch("pipeline_v2.runner.run_process_tree", side_effect=captured_success) as process:
             self.h._complete("ENGINEERING-PROOF", {"outcome": "pass", "summary": "Implementation proof recorded."})
+            self.assertEqual(1, process.call_count)
         self.h._accept("engineering-proof")
         return self.cycle.issue()
 
@@ -196,7 +232,7 @@ class NativeReviewEvidenceDeliveryTests(unittest.TestCase):
         engineering = self.cycle.issue()
         roster = self.h.controller.status()["active_assignment"]["context"]["required_finding_conditions"]
         self.assertEqual([("F/~", "C1"), ("F/~", "C/~")], [(row["finding_id"], row["condition_id"]) for row in roster])
-        self.assertNotIn("required_finding_conditions", engineering["active_assignment"]["capsule"]["context"])
+        self.assertEqual(roster, engineering["active_assignment"]["capsule"]["context"]["required_finding_conditions"])
         self.h._complete("ENGINEERING-CLAIMS", {"outcome": "pass", "summary": "Both conditions addressed."})
         self.h._accept("engineering-claims")
         self.cycle.issue()
@@ -217,9 +253,10 @@ class NativeReviewEvidenceDeliveryTests(unittest.TestCase):
         self.assertNotIn("machine_checks", docs_view["context"])
         exported = export_assignment(self.h.root, view)
         required = read_delivery_unit(self.h.root, self.h.workflow_path, exported["packet_digest"],
-                                     "/assignment/context/required_finding_conditions", "unit")
-        self.assertEqual("F/~", required["children"][0]["finding_id"])
-        self.assertEqual("C/~", required["children"][0]["condition_id"])
+                                     "/assignment/context/required_finding_conditions", "value")
+        self.assertEqual(roster, required["value"])
+        self.assertEqual("F/~", required["value"][0]["finding_id"])
+        self.assertEqual("C/~", required["value"][0]["condition_id"])
         for field, expected in (("original_condition_pointer", finding["conditions"][1]),
                                 ("latest_independent_result_pointer", {"status": "unresolved", "evidence": rows[1]["evidence"]})):
             self.assertEqual(expected, read_delivery_unit(self.h.root, self.h.workflow_path, exported["packet_digest"], roster[0][field], "value")["value"])
@@ -240,6 +277,9 @@ class NativeReviewEvidenceDeliveryTests(unittest.TestCase):
         saved = json.loads(json.dumps(issued))
         saved["active_assignment"]["artifact_schema"]["item_shapes"]["checks[]"]["evidence"] = (
             "non-empty observed execution evidence; distinguish the actual integration from substitutes")
+        with self.assertRaisesRegex(PipelineError, "not controller-derived"):
+            validate_state(saved)  # One old label does not make a coherent historical descriptor.
+        saved["active_assignment"]["artifact_schema"] = deepcopy(LEGACY_QA_ASSERTION_SCHEMA)
         validate_state(saved)
         self.assertEqual(schema, status_view(saved)["active_assignment"]["artifact_schema"])
         saved["active_assignment"]["artifact_schema"]["item_shapes"]["checks[]"]["evidence"] = "array of evidence"

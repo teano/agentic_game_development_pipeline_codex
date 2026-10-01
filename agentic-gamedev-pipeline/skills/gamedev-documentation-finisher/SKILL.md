@@ -7,7 +7,7 @@ description: Explicit-invocation only. Use only when the user explicitly request
 
 ## Activation gate
 
-Proceed only on the explicit activation above. Apply [assignment ownership and event routing](../gamedev-pipeline/references/stage-handoff-invariant.md#one-owner-and-one-current-assignment), then the [worker read route](../gamedev-pipeline/references/delivery-contract.md#worker-read-route) and [Documentation artifact contract](references/documentation-contract.md). Load only named sections for encountered events. A supplied `control_binding` uses [Worker return](../gamedev-pipeline/references/control-return.md#worker-return); bounded caller work does not restart a stage. Standalone calls keep their public result.
+Proceed only on the explicit activation above. Start with the [worker read route](../gamedev-pipeline/references/delivery-contract.md#worker-read-route) for the issued ownership, complete required input and return boundary, then the [Documentation artifact contract](references/documentation-contract.md). A bounded caller task performs only its stated work; standalone calls keep their public result.
 
 Edit only assigned documentation paths. Ground normative statements in approved requirements, specification and plan; ground derived instructions in reviewed and tested public behavior. Reconcile relevant current journal corrections with those sources, independently checking authority and applicability. Preserve repository terminology without an unsupported promise, default, compatibility claim or operator step. Do not restore outdated technical instructions or promote technical choices into product requirements.
 

@@ -33,7 +33,7 @@ Choose the row for the actual assigned work. Rows do not create roles, activate 
 | Runtime Slice (`slicer`) | `gpt-6.1-sol` | `high` | Confirm bounded approved scope and retained-path coverage. |
 | Engineering (`engineer`) | `gpt-6.1-sol` | `xhigh` | Implement the assigned game slice and coupled tests. |
 | Review (`reviewer`), including post-Docs Review | `gpt-6.1-sol` | `xhigh` | Independently inspect mandatory behavior, supported paths and sufficient complexity. |
-| QA (`qa`) | `gpt-6-luna` | `medium` | Execute assigned player/editor acceptance and report bound evidence. |
+| QA (`qa`) | `gpt-6.1-sol` | `medium` | Execute assigned player/editor acceptance and report bound evidence. |
 | Docs (`documentation_finisher`) | `gpt-6.1-sol` | `medium` | Synchronize bounded documentation with approved and verified sources. |
 | Explicit standalone Coverage Advisory | `gpt-6.1-sol` | `high` | Inspect supplied source-to-identity mappings; it is not a runtime assignment. |
 

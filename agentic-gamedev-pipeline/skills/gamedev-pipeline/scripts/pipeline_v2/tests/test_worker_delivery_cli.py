@@ -1,5 +1,6 @@
 """Native default-short check, exact replay and decoded reader integration."""
 import io
+import hashlib
 import json
 import sys
 import unittest
@@ -9,10 +10,19 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pipeline_v2.cli import parser, run, main
-from pipeline_v2.delivery import export_assignment
-from pipeline_v2.model import digest
+from pipeline_v2.delivery import export_assignment, assemble_delivery_pages
 from pipeline_v2.process_tree import ProcessEvidence
 from pipeline_v2.tests import test_core
+
+
+def captured_failure(stdout, stderr):
+    def execute(*args, **kwargs):
+        kwargs["stdout_path"].write_bytes(stdout)
+        kwargs["stderr_path"].write_bytes(stderr)
+        return ProcessEvidence(7, hashlib.sha256(stdout).hexdigest(), hashlib.sha256(stderr).hexdigest(),
+                               stderr, False, stdout, False, 12,
+                               stderr_raw_sha256=hashlib.sha256(stderr).hexdigest())
+    return execute
 
 
 class WorkerDeliveryCLITests(unittest.TestCase):
@@ -30,11 +40,10 @@ class WorkerDeliveryCLITests(unittest.TestCase):
         active = state["active_assignment"]
         argv = self.prefix + ["check", "--id", "short-check", "--expected-generation", str(state["generation"]),
                 "--assignment-id", active["id"], "--quiescence", "All owned work is stopped."]
-        evidence = ProcessEvidence(7, digest("out"), digest("err"), b"full failure detail", False,
-                                   b"full output detail", False, 12)
         delivery = self.h.root / self.h.workflow_path / "Delivery"
         before = sorted(delivery.glob("*.json"))
-        with mock.patch("pipeline_v2.runner.run_process_tree", return_value=evidence) as process:
+        with mock.patch("pipeline_v2.runner.run_process_tree",
+                        side_effect=captured_failure(b"full output detail", b"full failure detail")) as process:
             result = run(parser().parse_args(argv))
             saved = self.h.store.path.read_bytes()
             replay = run(parser().parse_args(argv))
@@ -75,7 +84,7 @@ class WorkerDeliveryCLITests(unittest.TestCase):
             self.assertEqual(active[key], rows[key]["value"])
         self.assertNotIn("value", rows["context"])
         startup = run(parser().parse_args(packet["dispatch"]["reader"]["bootstrap_argv"][2:]))
-        self.assertEqual("bootstrap", startup["view"])
+        self.assertEqual("bootstrap", startup["original_selection"]["view"])
         self.assertFalse(startup["delivery_complete"])
         explicit_index = run(parser().parse_args(argv + ["--view", "index"]))
         self.assertEqual("index", explicit_index["view"])
@@ -110,9 +119,8 @@ class WorkerDeliveryCLITests(unittest.TestCase):
         state = self.h.store.load()
         argv = self.prefix + ["check", "--id", "composed-check", "--expected-generation", str(state["generation"]),
                 "--assignment-id", state["active_assignment"]["id"], "--quiescence", "All owned work is stopped.", "--with-delivery"]
-        evidence = ProcessEvidence(7, digest("out"), digest("err"), b"complete independent failure", False,
-                                   b"full output", False, 12)
-        with mock.patch("pipeline_v2.runner.run_process_tree", return_value=evidence) as process:
+        with mock.patch("pipeline_v2.runner.run_process_tree",
+                        side_effect=captured_failure(b"full output", b"complete independent failure")) as process:
             with mock.patch("pipeline_v2.cli.export_assignment", side_effect=OSError("export failed after commit")):
                 failed = run(parser().parse_args(argv))
             saved = self.h.store.path.read_bytes()
@@ -122,27 +130,44 @@ class WorkerDeliveryCLITests(unittest.TestCase):
             self.assertEqual(failed["generation"], failed["next_action"]["expected_generation"])
             recovered = run(parser().parse_args(failed["recovery"]["export_argv"][2:]))
             self.assertEqual(failed["generation"], recovered["generation"])
-            with mock.patch("pipeline_v2.cli._render_assignment_unit", side_effect=RuntimeError("render failed")):
-                render_failed = run(parser().parse_args(argv))
-            self.assertEqual("failed", render_failed["transport"]["status"])
-            self.assertIn("read_argv", render_failed["recovery"])
+            with mock.patch("pipeline_v2.cli._render_assignment_unit", side_effect=RuntimeError("render failed")) as render:
+                compact = run(parser().parse_args(argv))
+                render.assert_not_called()
+            self.assertEqual("delivered", compact["transport"]["status"])
+            self.assertIn("read_argv", compact["recovery"])
+            self.assertNotIn("check_result", compact)
             replay = run(parser().parse_args(argv))
             self.assertEqual("delivered", replay["transport"]["status"])
             self.assertEqual(1, process.call_count)
         self.assertEqual(saved, self.h.store.path.read_bytes())
-        from pipeline_v2.tests.test_delivery_pages import assemble
         read = replay["recovery"]["read_argv"][2:]
-        pages, continuation = [], None
-        while True:
-            page = run(parser().parse_args(read + (["--continuation", continuation] if continuation else [])))
-            pages.append(page)
-            continuation = page["continuation"]
-            if continuation is None:
-                break
-        body = assemble(pages)
+        self.assertIn("--present", read)
+        selected = run(parser().parse_args(read))
+        self.assertTrue(selected["selection_complete"])
+        body = json.loads(selected["text"])
         self.assertIn("complete independent failure", json.dumps(body["check_context"]["diagnostic_checks"]))
         self.assertIn("pending_check_ids", body["check_context"]["machine_checks"])
         self.assertFalse(body["check_context"]["machine_checks"]["grants_manual_acceptance"])
+        destination = self.h.root / self.h.workflow_path / "ReadOutputs" / "guided-check-context.json"
+        guided = run(parser().parse_args(read + ["--output", str(destination)]))
+        self.assertEqual(selected["text"], guided["text"])
+        self.assertIn("--present", replay["recovery"]["save_usage"])
+        self.assertIn("progressive body", replay["recovery"]["save_usage"])
+        self.assertEqual(body, json.loads(destination.read_bytes())["value"])
+        self.assertFalse(guided["read_credit"])
+        origin = replay["result"]["checks"][0]
+        self.assertTrue(origin["execution_evidence"].startswith("execution-evidence:"))
+        evidence_page = run(parser().parse_args(origin["read_argv"][2:]))
+        def evidence_part(token):
+            argv = self.prefix + ["delivery-read", "--saved-output", evidence_page["saved_output"]["path"],
+                "--digest", evidence_page["saved_output"]["sha256"], "--pointer", "/value"]
+            if token:
+                argv += ["--continuation", token]
+            return run(parser().parse_args(argv))
+        evidence = assemble_delivery_pages(evidence_part)["value"]
+        self.assertEqual(origin["execution_evidence"], evidence["ref"])
+        self.assertEqual(origin["execution_record_digest"], evidence["record"]["digest"])
+        self.assertEqual("controller-process-execution", evidence["record"]["provenance"])
 
     def test_old_check_replay_after_new_check_reports_advanced_cursor_without_export(self):
         state = self.h.store.load()
@@ -150,8 +175,8 @@ class WorkerDeliveryCLITests(unittest.TestCase):
                             "--quiescence", "All owned work is stopped.", "--with-delivery"]
         first = base + ["--id", "first-check", "--expected-generation", str(state["generation"])]
         second = base + ["--id", "second-check", "--expected-generation", str(state["generation"] + 1)]
-        evidence = ProcessEvidence(7, digest("out"), digest("err"), b"failure", False, b"output", False, 12)
-        with mock.patch("pipeline_v2.runner.run_process_tree", return_value=evidence) as process:
+        with mock.patch("pipeline_v2.runner.run_process_tree",
+                        side_effect=captured_failure(b"output", b"failure")) as process:
             run(parser().parse_args(first))
             current = run(parser().parse_args(second))
             before = self.h.store.path.read_bytes()

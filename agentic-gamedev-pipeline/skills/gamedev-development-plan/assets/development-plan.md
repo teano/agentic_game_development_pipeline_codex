@@ -61,7 +61,7 @@ Feature scope, non-goals, protected systems, and authorized shared boundaries.
           "assertions": [{
             "id": "core-behavior",
             "expected": "Exact approved observable core behavior.",
-            "methods": [{"id": "approved-core-check", "source": "PLAN_PATH#verification-and-exit-criteria", "description": "Exact approved executable check and observable acceptance result.", "capabilities": ["planned-check-runner"], "evidence_types": ["bound-machine-receipt"]}],
+            "methods": [{"id": "approved-core-check", "source": "PLAN_PATH#verification-and-exit-criteria", "description": "Exact approved executable check and observable acceptance result.", "capabilities": ["planned-check-runner"], "evidence_types": ["bound-machine-receipt"], "producer": {"kind": "controller_check", "check_ids": ["exact-core-recipe-id"]}, "require_assessment": true}],
             "applicability": {"kind": "always", "condition": "always", "evidence_types": []},
             "depends_on": []
           }]
@@ -72,7 +72,7 @@ Feature scope, non-goals, protected systems, and authorized shared boundaries.
           "assertions": [{
             "id": "runtime-behavior",
             "expected": "Exact approved externally observed runtime behavior.",
-            "methods": [{"id": "approved-runtime-observation", "source": "PLAN_PATH#verification-and-exit-criteria", "description": "Exact approved interaction, method and observable acceptance result.", "capabilities": ["project-runtime-capability"], "evidence_types": ["runtime-observation"]}],
+            "methods": [{"id": "approved-runtime-observation", "source": "PLAN_PATH#verification-and-exit-criteria", "description": "Exact approved interaction, method and observable acceptance result.", "capabilities": ["project-runtime-capability"], "evidence_types": ["runtime-observation"], "producer": {"kind": "manual", "channel": "actual-authorized-observation-channel", "probe_ref": "execution-evidence:feature-runtime-producer"}, "require_assessment": true}],
             "applicability": {"kind": "always", "condition": "always", "evidence_types": []},
             "depends_on": []
           }]
@@ -91,11 +91,11 @@ Feature scope, non-goals, protected systems, and authorized shared boundaries.
 
 ## Context Delivery
 
-Describe the smallest relevant working set, exact source locators and sections/pages to read as needed. Continue the same owner with changed facts and evidence deltas; checkpoint when context continuity is at risk. Record any explicit user limit with its source and scope; do not invent file, byte, or token caps.
+Separate permitted read paths from the first working input: exact sections/symbols, current obligations and conditions for further reading. Retain the Engineer for related remediation; use fresh physical context after an accepted behavioral slice. Bind any exception to named slices and a concrete continuity reason before dispatch. Describe the current factual handoff; do not infer completeness from retained hashes or invent file/time/token caps.
 
 ## Integration Milestones
 
-- MILESTONE-001: one integration-owner checkpoint and its evidence.
+- MILESTONE-001: smallest real connected production path, decisive observation and required exit/reset/repeat; one integration owner, no separate full role wave.
 
 ## Slice SLICE-001
 
@@ -103,6 +103,8 @@ Describe the smallest relevant working set, exact source locators and sections/p
 
 End-to-end: yes
 Observable result: user-visible or externally verifiable outcome.
+
+Actor/trigger, initial state, connected behavior, simultaneous state/dependency changes, and stable result consumed by the next slice. Explain why a smaller behavioral boundary is useful or inseparable; a list of layers/files is not that explanation.
 
 ### Requirements
 
@@ -115,11 +117,11 @@ Observable result: user-visible or externally verifiable outcome.
 
 ### Base Contract
 
-Exact input revision, assumptions, and prerequisite evidence.
+Exact input revision, accepted previous behavior/contract, assumptions and actual prerequisite evidence. Identify external resources, available authorized channels and what must exist before the real dependent run.
 
 ### Handoff Contract
 
-Relevant approved sources and decisions, completed work, verification evidence, and unresolved assumptions needed by the next assigned owner. Use the actual runtime assignment and candidate context; do not invent a generated handoff object.
+Accepted behavior/interface, relevant source revisions, current candidate, retrievable verification records, unresolved conditions and pending actions needed by the next owner. Distinguish local/published state and deferred acceptance. Obtain current bindings at handoff rather than copying historical hashes; use the existing runtime assignment, not another generated handoff object.
 
 Include the current feature technical-journal locator, digest and relevant current entries with their basis/checks and downstream implications. Keep technical TD-* context separate from accepted DEC-* authority; do not carry overwritten record text or invent product obligations. Reassess exact overrides after source revision.
 
@@ -144,8 +146,6 @@ Include the current feature technical-journal locator, digest and relevant curre
 - planned_material_permission: PF-0001 | change_type=lifecycle_change | target_kind=editable_path | target=path/to/exact-file | rationale=accepted lifecycle integration | decision_authority=DEC-001
 - excluded_components: adjacent-system
 - excluded_paths: path/to/adjacent-system/**
-- max_product_files: 10
-- max_product_lines_changed: 500
 - verification_scope: exact affected suites and smoke scenarios
 
 For a legitimately isolated slice, replace both touchpoint rows above with the exact sentinel `- shared_touchpoints: none`.
@@ -177,11 +177,11 @@ Include applicable current technical decisions as verified context; a journal cl
 
 - authority_paths: exact bounded paths
 - evidence_paths: exact bounded paths
-- delivery_instructions: Relevant source sections/pages, current technical-journal records and evidence; send same-owner deltas and checkpoint if continuity is at risk. The controller supplies the journal packet; controller-state files are not candidate edits and TD-* is not DEC-* authority.
+- delivery_instructions: Initial source sections/symbols, complete current obligations and conditions for additional reads through the shared source/section reader; supplied tool/executable/resource locators precede discovery. Reuse compatible contract structure, not old PASS or session handles; related repairs use same-owner deltas. Accepted behavioral boundaries use fresh context unless an exact prebound continuity reason applies. Current journal records are technical context, not DEC-* authority.
 
 ### Verification and Exit Criteria
 
-For every mandatory identity above, state the required check or scenario, execution method, expected result, and acceptance evidence. These examples must be replaced with the actual slice requirements.
+For every mandatory identity above, state the actual scenario and decisive expected/observed comparison; refer to canonical method/producer IDs. Verify the available channel can retain and expose its evidence independently before Engineering. State the actual performer and approved execution point of external checks, separating implementation prerequisites from final acceptance. A user-authorized deferral preserves the mandatory criterion and not_run. Replace these examples with the actual slice requirements.
 
 ### Rollback and Recovery
 

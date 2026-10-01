@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import BinaryIO
@@ -53,12 +54,14 @@ class ProcessEvidence:
     stdout_tail: bytes = b""
     stdout_tail_truncated: bool = False
     duration_ms: int = 0
+    capture_error: str | None = None
+    stderr_raw_sha256: str | None = None
 
 
 class _DigestReader(threading.Thread):
     """Drain a pipe while retaining at most one explicitly bounded tail."""
 
-    def __init__(self, stream: BinaryIO, *, tail_limit: int = 0):
+    def __init__(self, stream: BinaryIO, *, tail_limit: int = 0, sink: BinaryIO | None = None):
         super().__init__(daemon=True)
         self.stream = stream
         self.hasher = hashlib.sha256()
@@ -66,20 +69,28 @@ class _DigestReader(threading.Thread):
         self.tail_limit = tail_limit
         self.tail_bytes = bytearray()
         self.tail_truncated = False
+        self.sink = sink
+        self.capture_error = None
 
     def run(self) -> None:
         try:
             while chunk := self.stream.read(64 * 1024):
                 with self.lock:
                     self.hasher.update(chunk)
+                    if self.sink is not None and self.capture_error is None:
+                        try:
+                            self.sink.write(chunk)
+                        except (OSError, ValueError) as exc:
+                            self.capture_error = str(exc)
                     if self.tail_limit:
                         self.tail_bytes.extend(chunk)
                         if len(self.tail_bytes) > self.tail_limit:
                             del self.tail_bytes[:-self.tail_limit]
                             self.tail_truncated = True
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
             # Tree termination can close a pipe concurrently with the reader.
-            pass
+            if self.sink is not None:
+                self.capture_error = str(exc)
         finally:
             try:
                 self.stream.close()
@@ -124,12 +135,12 @@ class _ReadyReader(threading.Thread):
                 pass
 
 
-def _start_readers(process: subprocess.Popen[bytes]) -> tuple[_DigestReader, _DigestReader]:
+def _start_readers(process: subprocess.Popen[bytes], sinks=(None, None)) -> tuple[_DigestReader, _DigestReader]:
     if process.stdout is None or process.stderr is None:  # pragma: no cover - internal invariant
         raise RuntimeError("planned command pipes were not created")
     readers = (
-        _DigestReader(process.stdout, tail_limit=_STDOUT_TAIL_BYTES),
-        _DigestReader(process.stderr, tail_limit=_STDERR_TAIL_BYTES),
+        _DigestReader(process.stdout, tail_limit=_STDOUT_TAIL_BYTES, sink=sinks[0]),
+        _DigestReader(process.stderr, tail_limit=_STDERR_TAIL_BYTES, sink=sinks[1]),
     )
     for reader in readers:
         reader.start()
@@ -147,6 +158,8 @@ def _finish_readers(
             except OSError:
                 pass
             reader.join(0.1)
+            if reader.is_alive() and reader.sink is not None:
+                reader.capture_error = "raw capture reader did not finish"
     stderr_tail, stderr_tail_truncated = readers[1].tail(stderr_suffix)
     stdout_tail, stdout_tail_truncated = readers[0].tail()
     return (
@@ -167,6 +180,7 @@ def _technical_launch_failure(reason: str) -> ProcessEvidence:
         hashlib.sha256(b"").hexdigest(),
         hashlib.sha256(message).hexdigest(),
         message,
+        stderr_raw_sha256=hashlib.sha256(b"").hexdigest(),
     )
 
 
@@ -206,6 +220,7 @@ def _linux_namespace_adapter(
 
 def _run_posix(
     argv: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
+    sinks=(None, None),
 ) -> ProcessEvidence:
     adapter = _linux_namespace_adapter()
     if adapter is None:
@@ -231,7 +246,7 @@ def _run_posix(
         os.close(ready_write)
         return _technical_launch_failure(str(exc))
     os.close(ready_write)
-    readers = _start_readers(process)
+    readers = _start_readers(process, sinks)
     ready_reader = _ReadyReader(ready_read)
     ready_reader.start()
     ready_reader.join(_PROCESS_JOIN_SECONDS)
@@ -270,6 +285,8 @@ def _run_posix(
         stderr_tail_truncated,
         stdout_tail,
         stdout_tail_truncated,
+        capture_error=next((r.capture_error for r in readers if r.capture_error), None),
+        stderr_raw_sha256=readers[1].hexdigest(),
     )
 
 
@@ -455,6 +472,7 @@ if os.name == "nt":
     def _run_windows(
         argv: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
         _windows_api: _WindowsApi = _WINDOWS_API,
+        sinks=(None, None),
     ) -> ProcessEvidence:
         job = _windows_api.create_kill_job()
         process: subprocess.Popen[bytes] | None = None
@@ -470,7 +488,7 @@ if os.name == "nt":
                 stderr=subprocess.PIPE,
                 creationflags=_CREATE_SUSPENDED,
             )
-            readers = _start_readers(process)
+            readers = _start_readers(process, sinks)
             _windows_api.assign_process(job, process)
             assigned = True
             _windows_api.resume_process(process)
@@ -513,16 +531,32 @@ if os.name == "nt":
         return ProcessEvidence(
             124 if timed_out else int(process.returncode), stdout_digest, stderr_digest,
             stderr_tail, stderr_tail_truncated, stdout_tail, stdout_tail_truncated,
+            capture_error=next((r.capture_error for r in readers if r.capture_error), None),
+            stderr_raw_sha256=readers[1].hexdigest(),
         )
 
 
 def run_process_tree(
     argv: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
+    stdout_path: Path | None = None, stderr_path: Path | None = None,
 ) -> ProcessEvidence:
     """Run one command and end its complete descendant lifetime before returning."""
     started = time.monotonic()
-    if os.name == "nt":
-        result = _run_windows(argv, cwd=cwd, env=env, timeout=timeout)
-    else:
-        result = _run_posix(argv, cwd=cwd, env=env, timeout=timeout)
+    with ExitStack() as stack:
+        sinks = []
+        for path in (stdout_path, stderr_path):
+            if path is None:
+                sinks.append(None)
+            else:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                sinks.append(stack.enter_context(Path(path).open("xb")))
+        kwargs = {"sinks": tuple(sinks)} if any(sinks) else {}
+        if os.name == "nt":
+            result = _run_windows(argv, cwd=cwd, env=env, timeout=timeout, **kwargs)
+        else:
+            result = _run_posix(argv, cwd=cwd, env=env, timeout=timeout, **kwargs)
+        for sink in sinks:
+            if sink is not None:
+                sink.flush()
+                os.fsync(sink.fileno())
     return replace(result, duration_ms=max(0, round((time.monotonic() - started) * 1000)))

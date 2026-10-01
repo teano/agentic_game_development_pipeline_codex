@@ -59,6 +59,16 @@ def validate_entry(entry: dict, *, sealed: bool = False) -> dict:
     return deepcopy(entry)
 
 
+def validate_entries(entries: list) -> list:
+    """Validate worker-authored updates without admitting sealed execution fields."""
+    if not isinstance(entries, list):
+        raise ValueError("technical_decisions must be a list")
+    result = [validate_entry(entry) for entry in entries]
+    if len({entry["id"] for entry in result}) != len(result):
+        raise ValueError("duplicate technical decision ID in artifact")
+    return result
+
+
 def validate_journal(entries: dict) -> dict:
     if not isinstance(entries, dict):
         raise ValueError("technical_decisions must be an object keyed by stable ID")

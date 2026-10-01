@@ -115,7 +115,7 @@ class DeliveryWorkTests(unittest.TestCase):
                 for absent in ("UNRELATED-QA-BODY", "UNRELATED-HISTORY-BODY", "STALE-ENGINEER-CLAIM"):
                     self.assertNotIn(absent, rendered)
                 self.assertEqual("bootstrap", exported["dispatch"]["reader"]["default_view"])
-                self.assertIn("work_argv", exported["dispatch"]["reader"])
+                self.assertIn("work_argv", exported["dispatch"]["reader"]["advanced"])
 
     def test_work_is_complete_without_loading_unrelated_qa_resource_and_cli_displays_values(self):
         exported = self.export()
@@ -123,9 +123,9 @@ class DeliveryWorkTests(unittest.TestCase):
         (self.root / resource["path"]).unlink()
         expected = self.read(exported["packet_digest"])
         output = io.StringIO()
-        argv = exported["dispatch"]["reader"]["work_argv"][2:]
+        argv = exported["dispatch"]["reader"]["advanced"]["work_argv"][2:]
         with redirect_stdout(output):
-            self.assertEqual(0, main(argv))
+            self.assertEqual(0, main(argv + ["--format", "text"]))
         header, body = output.getvalue().split("\n", 1)
         self.assertEqual("work", json.loads(header)["view"])
         self.assertEqual(expected["value"], json.loads(body))
@@ -178,7 +178,7 @@ class DeliveryWorkTests(unittest.TestCase):
                       second["latest_independent_result"]["evidence"]["same_exact_text_as"])
         machine = io.StringIO()
         with redirect_stdout(machine):
-            self.assertEqual(0, main(exported["dispatch"]["reader"]["work_argv"][2:] + ["--format", "json"]))
+            self.assertEqual(0, main(exported["dispatch"]["reader"]["advanced"]["work_argv"][2:] + ["--format", "json"]))
         self.assertEqual(response, json.loads(machine.getvalue()))
         ordinary = read_delivery_unit(self.root, self.workflow, exported["packet_digest"],
                                       "/assignment/context/convergence", "value")
@@ -207,7 +207,7 @@ class DeliveryWorkTests(unittest.TestCase):
         exported = self.export(missing)
         self.assertEqual([], self.read(exported["packet_digest"])["value"]["findings"])
         self.assertEqual("bootstrap", exported["dispatch"]["reader"]["default_view"])
-        self.assertNotIn("work_argv", exported["dispatch"]["reader"])
+        self.assertNotIn("work_argv", exported["dispatch"]["reader"]["advanced"])
         with self.assertRaisesRegex(PipelineError, "work view selects only"):
             read_delivery_unit(self.root, self.workflow, exported["packet_digest"], "/assignment/context", "work")
 
@@ -252,7 +252,7 @@ class NativeWorkReaderTests(unittest.TestCase):
         directory = fixture.root / fixture.workflow_path / "Delivery"
         files = {path.name: path.read_bytes() for path in directory.iterdir()}
         with mock.patch("pipeline_v2.runner.run_process_tree", side_effect=AssertionError("reader must not execute checks")) as process:
-            response = run(parser().parse_args(exported["dispatch"]["reader"]["work_argv"][2:]))
+            response = run(parser().parse_args(exported["dispatch"]["reader"]["advanced"]["work_argv"][2:]))
             self.assertEqual("work", response["view"])
             self.assertEqual(2, response["required_condition_count"])
             self.assertEqual(["C1", "C2"], [row["condition_id"] for row in response["value"]["findings"][0]["conditions"]])
