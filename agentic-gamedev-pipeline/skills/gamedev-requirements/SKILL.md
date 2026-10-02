@@ -19,7 +19,42 @@ When a journal blocker requires a product decision or the approved technology ca
 
 Read the Requirements rows and dispatch rules in the shared [agent model policy](../gamedev-pipeline/references/agent-model-policy.md). Apply its role defaults only where no explicit user or scoped parent override exists; session-start guidance does not change the running session's model.
 
-Before creating, approving, or structurally editing a PRD, read [product-requirements-contract.md](references/product-requirements-contract.md). It is the canonical path, schema, content-boundary, and approval contract; do not restate or override it here.
+Before creating, approving, or structurally editing a PRD, read [product-requirements-contract.md](references/product-requirements-contract.md). It remains the canonical path, schema, content-boundary, and approval contract. Apply its document format below; a repository template with another format does not satisfy this stage.
+
+## Required document format
+
+Use exactly the five frontmatter keys and the literal English headings below, each once and in this order. Keep the body in the selected natural language. This skeleton shows structure only: replace angle-bracket fields with actual metadata or confirmed content, and omit inventory rows until their content is confirmed. Never save the illustrative descriptions as requirements. The existing [product-requirements.md template](assets/product-requirements.md) has this same structure.
+
+```markdown
+---
+document_type: product-requirements
+status: draft
+revision: 1
+language: <content language>
+approved_at: null
+---
+
+# Product Requirements
+## Product Outcome
+## Target Audience
+## Core Gameplay Loop
+## Release Target
+## Scope
+### In Scope
+### Out of Scope
+## Functional Requirements
+- PRD-REQ-001: <confirmed functional requirement>
+## Quality Requirements
+- PRD-NFR-001: <confirmed measurable quality requirement>
+## Acceptance Criteria
+- PRD-AC-001: <confirmed observable acceptance criterion>
+## Assumptions
+## Open Questions
+- PRD-OQ-001: <confirmed open question>
+## Risks
+```
+
+Inventory descriptions must be nonempty plain text, with the exact `- ID: description` form shown and stable unique IDs. Keep `status: draft` and `approved_at: null` until exact-revision approval. `revision` must be a positive integer; before a semantic edit to an approved PRD, increment it once and clear approval metadata. An approved PRD requires nonempty Product Outcome, Target Audience, Core Gameplay Loop, Release Target, In Scope, Out of Scope, Functional Requirements, Quality Requirements, and Acceptance Criteria sections, including at least one `PRD-REQ`, `PRD-NFR`, and `PRD-AC` declaration, and no blocking `PRD-OQ`. Empty draft sections do not permit inventing content to fill them.
 
 ## Resolve product decisions
 
@@ -50,7 +85,7 @@ For context checkpoint and handoff behavior, follow the shared [stage handoff in
 
 ## Complete the stage
 
-Apply the contract's semantic completeness and exact-current-revision approval gate. Run `scripts/validate_product_requirements.py <path>` before requesting approval, and use its post-approval same-byte procedure before reporting readiness.
+Apply the contract's semantic completeness and exact-current-revision approval gate. Run `scripts/validate_product_requirements.py <path>` before requesting approval. After approval of that exact revision, change only approval metadata to `status: approved` and `approved_at: <ISO-8601 UTC timestamp>`, then run `scripts/validate_product_requirements.py <path> --require-approved`. Report `PRD_READY: yes` only after successful validation of those same semantic bytes, using the returned exact SHA-256.
 
 The validator requires exact canonical list declarations: `- PRD-REQ-001: plain-text description`, `- PRD-NFR-001: plain-text description`, `- PRD-OQ-001: plain-text description`, and `- PRD-AC-ID: plain-text description` in their respective authority sections. Alternate markers, missing list markers, non-exact delimiters, bare IDs, code-wrapped IDs, and empty or Markdown-rendered descriptions are invalid inventory; references outside those sections remain non-authoritative. Migrating an already approved legacy declaration is a controlled PRD revision: reopen and increment the PRD, obtain fresh PRD approval, then reconverge and freshly approve downstream SPEC/PLAN exact hashes before runtime.
 
