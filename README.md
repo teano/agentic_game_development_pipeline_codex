@@ -1,6 +1,6 @@
 # Agentic Game Development Skills
 
-Bundle version: [0.22.0](agentic-gamedev-pipeline/VERSION).
+Bundle version: [0.22.1](agentic-gamedev-pipeline/VERSION).
 
 Explicit-only Codex skills for a complete authorized feature: Requirements → Specification → Planning → Implementation. Each stage uses the actual project, preserves original decisions/IDs and returns current source and approval bindings. Existing project formats are sufficient; the bundle requires no workflow controller or external specification service.
 
@@ -10,7 +10,7 @@ Each standalone stage stops after its handoff. `PRD_READY`, `SPEC_READY` and `PL
 
 ## Implementation
 
-[gamedev-pipeline](agentic-gamedev-pipeline/skills/gamedev-pipeline/SKILL.md) orchestrates the authorized product work: a bounded [Engineer](agentic-gamedev-pipeline/skills/gamedev-engineer/SKILL.md) implements and repairs, an [Independent Checker](agentic-gamedev-pipeline/skills/gamedev-qa/SKILL.md) observes the actual candidate, and findings return for repair/rechecking. After the increments, the checker observes final integrated behavior. [Review](agentic-gamedev-pipeline/skills/gamedev-review/SKILL.md) and [Documentation](agentic-gamedev-pipeline/skills/gamedev-documentation-finisher/SKILL.md) are optional specialists for concrete tasks. The orchestrator owns coverage and a brief recoverable note.
+[gamedev-pipeline](agentic-gamedev-pipeline/skills/gamedev-pipeline/SKILL.md) orchestrates the authorized product work: every development slice gets a newly created bounded [Engineer](agentic-gamedev-pipeline/skills/gamedev-engineer/SKILL.md) to implement and repair and a new [Independent Checker](agentic-gamedev-pipeline/skills/gamedev-qa/SKILL.md) to observe the actual candidate; findings return for repair/rechecking within the same slice team. A separate new independent checker, uninvolved in earlier slices, observes final integrated behavior once. If the last planned unit already performs this acceptance, it supplies the final check. [Review](agentic-gamedev-pipeline/skills/gamedev-review/SKILL.md) and [Documentation](agentic-gamedev-pipeline/skills/gamedev-documentation-finisher/SKILL.md) are optional specialists for concrete tasks. The orchestrator owns coverage and a brief recoverable note.
 
 Ordinary permitted engineering/setup recovery proceeds within the task. Real product contradictions or permission changes go to their responsible decision maker. A green automated suite alone does not prove a playable feature; required interaction is observed in the actual permitted runtime. Unperformed observations remain `not_run`. The workflow grants no push, release, spending or unrelated stage activation.
 
