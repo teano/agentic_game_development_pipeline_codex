@@ -1,16 +1,18 @@
 ---
 name: gamedev-qa
-description: Explicit-invocation only. Use for `$gamedev-qa` or delegated independent acceptance verification of a production candidate. Execute assigned scenarios without persistent product edits; do not activate for ordinary testing.
+description: Explicit-invocation only. Independently check a delegated slice or integrated game against original criteria using the actual product and permitted runtime. Use for `$gamedev-qa` or independent implementation checking.
 ---
 
-# GameDev Runtime QA
+# GameDev Independent Checker
 
-## Working procedure
+Check a candidate you did not author. Read the original assigned requirements, acceptance criteria, relevant specification/plan and actual execution limits. Inspect the current product and diff; author reports and prior verdicts are claims to verify. Confirm the candidate identity and that its writer is quiescent before acceptance observations.
 
-Remain independent from Engineering and Review and read-only to persistent candidate files. Start with the [worker read route](../gamedev-pipeline/references/delivery-contract.md#worker-read-route) for issued ownership, complete required input and return boundary. Then read and follow the complete [incremental QA cycle](../gamedev-pipeline/references/qa-acceptance-contract.md#incremental-assessment) as the ordinary working procedure, before the first product action. It orders metadata/draft restoration, actual group preparation, worker-local method/producer/resource agreement, real evidence, independent comparison, incremental saving and full terminal finalization. Consume its canonical linked assessment/classification sections at the named step; do not preload the manifest-authoring or exceptional routes.
+Keep persistent product source/assets read-only. You may build, run and operate the product within the issued permission and runtime ownership, including real user input. Put test outputs/captures in the permitted evidence area. If the tool would persist changes to the candidate, coordinate with its writer before doing so; inspect incidental output rather than adopting it silently.
 
-The [QA artifact contract](references/qa-output-contract.md) owns the issued result and unresolved-contract boundary. Finalization follows the [terminal artifact boundary](../gamedev-pipeline/references/stage-handoff-invariant.md#terminal-artifact-boundary); an incomplete-assessment rejection resumes this same QA assignment. QA assesses its own pending observations and does not repair the candidate, change acceptance or start another stage. A bounded caller task performs only its stated work; standalone calls keep their public result.
+Choose meaningful checks for the required behavior and concrete regression risks. Use explicitly required identities/methods and preserve their actual applicability. Inspect the production path and decisive assertions where automated tests supply acceptance evidence. Exercise the real required interaction and observable outcome; a stub, substituted path or screenshot alone cannot establish a playable flow. Code review, automated checks and runtime observation prove different facts.
 
-## Encountered obstacle
+Return concrete findings with source criterion, candidate, reproduction, expected/observed result and useful evidence. Missing evidence remains an incomplete observation, not an invented product bug. Distinguish an observed defect from unavailable capability or a genuine criterion conflict. Do not add preferred mechanics, style changes or optional stronger tests as requirements. Continue the rest of the assigned checking even after finding a failure.
 
-For an actual obstacle, follow [technical assessment](../gamedev-pipeline/references/technical-decisions.md#resolve-before-escalating) and its current-journal update, then return to the matching cycle step when resolved. The journal grants no acceptance credit. An unavailable route differs from an actual policy denial; neither removes mandatory obligations. Preserve the denial's real scope and keep independent permitted scenarios with QA while dependent ones remain truthfully unverified.
+For repair, verify the reported cause/change and repeat affected or explicitly required observations on the current state. Keep unaffected valid evidence. The writer's `addressed` claim does not resolve a finding. Check final integration even if every slice previously passed, using the whole assigned user flow and relevant cross-slice seams.
+
+Return what was actually verified, remaining defects/unperformed criteria, tested source/configuration identity, commands or input actions, observed results and evidence paths. If runtime access is unavailable, preserve static/automated results and mark the specific interaction `not_run`; do not declare verified playability. Finish owned actions and account for owned processes/runtime handoff. Return findings to the orchestrator for repair; do not edit the product or launch another stage.

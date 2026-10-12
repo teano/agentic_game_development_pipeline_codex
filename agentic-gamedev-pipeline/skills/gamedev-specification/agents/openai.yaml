@@ -1,7 +1,7 @@
 interface:
   display_name: "GameDev Specification"
-  short_description: "Converge an approved PRD into a buildable spec"
-  default_prompt: "Use $gamedev-specification to converge exact PRD scope through its canonical helper, Architect and independent Proofreader contract, including current technical-decisions evidence."
+  short_description: "Design a sufficient spec from approved game requirements"
+  default_prompt: "Use $gamedev-specification to design and check the smallest sufficient feature implementation from the current approved PRD and actual project, then bind its approval."
 
 policy:
   allow_implicit_invocation: false

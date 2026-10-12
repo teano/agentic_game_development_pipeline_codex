@@ -1,6 +1,6 @@
 interface:
-  display_name: "GameDev Production Pipeline"
-  short_description: "Explicit-only bounded GameDev production pipeline"
-  default_prompt: "Use $gamedev-pipeline to complete the authorized cycle with stable owners, current technical-decisions evidence, exact controller gates and the shared authority/incident contract."
+  display_name: "GameDev Implementation"
+  short_description: "Implement approved slices and verify playable behavior"
+  default_prompt: "Use $gamedev-pipeline to orchestrate the authorized feature through a delegated writer, independent checks, repairs and final integrated interaction."
 policy:
   allow_implicit_invocation: false

@@ -1,39 +1,25 @@
 # Agentic Game Development Skills
 
-Explicit-only Codex skills for an authorized, reproducible game-development cycle. The runtime controls exact authority, one writer, independent Review/QA and real verification evidence; it does not replace product decisions or grant publication permission.
+Bundle version: [0.22.0](agentic-gamedev-pipeline/VERSION).
 
-## Entry points
+Explicit-only Codex skills for a complete authorized feature: Requirements → Specification → Planning → Implementation. Each stage uses the actual project, preserves original decisions/IDs and returns current source and approval bindings. Existing project formats are sufficient; the bundle requires no workflow controller or external specification service.
 
-Use `$gamedev-requirements`, `$gamedev-specification`, `$gamedev-development-plan` for their individual stages, or explicitly request `$gamedev-pipeline` for the intended full-cycle scope. A full-cycle Director consumes each stage's real `PRD_READY`, `SPEC_READY`, `PLAN_READY` before production. Stage workers stop at their own handoff; tokens do not activate stages themselves.
+Invoke [gamedev-requirements](agentic-gamedev-pipeline/skills/gamedev-requirements/SKILL.md) to turn confirmed product decisions into a canonical PRD with observable acceptance. [gamedev-specification](agentic-gamedev-pipeline/skills/gamedev-specification/SKILL.md) designs the smallest sufficient implementation from that approved PRD and project evidence. [gamedev-development-plan](agentic-gamedev-pipeline/skills/gamedev-development-plan/SKILL.md) organizes coherent increments, full obligation coverage, checks and final integrated acceptance.
 
-The [authority contract](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/authority-contract.md) preserves direct user decisions and explicit scoped delegation. It distinguishes product choice, exact-revision approval, run-state recovery and shared-pipeline maintenance. A delegated actor is recorded truthfully; there is no blanket autoapproval or forged user consent. A genuine runtime incident pauses product work; do not patch or bypass guards without applicable separate maintenance authority.
+Each standalone stage stops after its handoff. `PRD_READY`, `SPEC_READY` and `PLAN_READY` describe verified artifact readiness; they grant no next-stage permission. An explicitly authorized full-cycle parent may consume those handoffs and delegate the next stage. Actual direct/delegated decisions and approvals remain within their original scope, recorded through [artifact and approval bindings](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/artifacts-and-approval.md).
 
-## Production cycle
+## Implementation
 
-```text
-plan -> slice -> engineering -> review -> qa -> docs -> ready
-```
+[gamedev-pipeline](agentic-gamedev-pipeline/skills/gamedev-pipeline/SKILL.md) orchestrates the authorized product work: a bounded [Engineer](agentic-gamedev-pipeline/skills/gamedev-engineer/SKILL.md) implements and repairs, an [Independent Checker](agentic-gamedev-pipeline/skills/gamedev-qa/SKILL.md) observes the actual candidate, and findings return for repair/rechecking. After the increments, the checker observes final integrated behavior. [Review](agentic-gamedev-pipeline/skills/gamedev-review/SKILL.md) and [Documentation](agentic-gamedev-pipeline/skills/gamedev-documentation-finisher/SKILL.md) are optional specialists for concrete tasks. The orchestrator owns coverage and a brief recoverable note.
 
-One stable Engineer owns related implementation and remediation in its slice. Assignments remain distinct; independent Reviewer and QA have separate role aliases. Active controller checks return bounded compiler/test feedback while that Engineer is quiescent, without ending its assignment or granting semantic PASS. Independent Review retains stable finding IDs; QA proves each required identity through its actual path. New workers receive a bounded current packet rather than inherited conversation. Status questions do not end the run.
+Ordinary permitted engineering/setup recovery proceeds within the task. Real product contradictions or permission changes go to their responsible decision maker. A green automated suite alone does not prove a playable feature; required interaction is observed in the actual permitted runtime. Unperformed observations remain `not_run`. The workflow grants no push, release, spending or unrelated stage activation.
 
-Start with the launcher's current help:
+## Breaking version
 
-```text
-python agentic-gamedev-pipeline/skills/gamedev-pipeline/scripts/pipeline_state.py --help
-```
-
-Global `--root`, `--feature` and optional `--brief` precede the command. State lives only in `.agentic-pipeline/Workflows/<feature>/`. `init` binds the exact approved `requirements`, `specification`, `plan` and ordered three-key caller slices; read scope is controller-derived. The optional verification manifest seals runnable recipes, dependencies, timeouts and conservative reuse categories once. No-op Plan/Slice confirmation is opt-in and guarded, not a substitute for approved upstream artifacts.
-
-Use [Director lifecycle](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/director-runtime.md), [delivery](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/delivery-contract.md) and the relevant [execution/recovery](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/execution-contract.md) route. `step` returns a typed outcome and next action; `check`, `rotate-owner`, `read-admit`, `recover-capability`, `reconcile` and `pin-runtime` retain their specific guards. The [protocol](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/pipeline-protocol.md) documents exact boundaries and legacy-compatible recovery. Command help is authoritative for flags.
-
-Candidate, authority, runtime, executable and environment bindings determine deterministic receipt reuse. Unknown dependencies rerun conservatively. Diagnostic-only journal observations do not waive semantic changes or counterevidence. Historical workflow evidence is provenance, not new product write permission. Product checks run on the canonical live checkout; immutable pinning copies only the pipeline bundle. Schema-10 `migrate` remains a fail-closed tombstone.
-
-`ready` validates the integrated candidate and all required slices, then declares `PRODUCTION_READY_CANDIDATE`. Unexecuted mandatory manual/device checks remain unverified. Ready does not authorize deployment, publication, spending or risk acceptance. Missing host capacity is reported honestly; pipeline code cannot promise to free stuck host slots.
+This version replaces the previous controller workflow throughout the bundle. Its runtime/state code, operational parsers, native envelopes, alternative contracts, suites and historical guides are removed from the current source. Git history retains prior versions. Existing product documents and decision semantics remain valuable inputs, but previous operational states supply no authority for this workflow; current artifacts and actual approval records do. This change does not migrate project state, relink installations or resume production runs.
 
 ## Validation
 
-```text
-python agentic-gamedev-pipeline/scripts/test_skills.py
-```
+Run `python agentic-gamedev-pipeline/scripts/test_skills.py` for current package integrity: skill discovery metadata, explicit-only invocation, local reference resolution and supporting-document reachability. The tests use PyYAML, also used by Codex skill-creator's syntax validator. These deterministic checks do not establish document meaning, actual consent or product acceptance.
 
-Instruction contracts check discoverability, schema examples and behavioral exercise integrity. The independent role exercises are separate evidence of instruction understanding; static phrase checks are not that evidence. Record actual outcomes and limitations in the run's audit.
+Use the installed skill-creator's `quick_validate.py` for changed skill syntax. Independently forward-test the four stages with realistic raw inputs in an isolated workspace: preserve original obligations, bind real approvals, start useful work, repair findings and observe the final integrated flow. Production execution and external actions require their own actual authorization.

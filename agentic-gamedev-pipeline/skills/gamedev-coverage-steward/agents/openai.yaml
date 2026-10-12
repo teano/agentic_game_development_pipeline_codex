@@ -1,6 +1,0 @@
-interface:
-  display_name: "GameDev Coverage Advisory"
-  short_description: "Advisory review of exact feature coverage"
-  default_prompt: "Use $gamedev-coverage-steward for advisory review of supplied coverage and current technical-decisions evidence without runtime or mutation authority."
-policy:
-  allow_implicit_invocation: false

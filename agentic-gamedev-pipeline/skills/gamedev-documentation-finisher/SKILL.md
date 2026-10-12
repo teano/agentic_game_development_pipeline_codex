@@ -1,18 +1,10 @@
 ---
 name: gamedev-documentation-finisher
-description: Explicit-invocation only. Use only when the user explicitly requests `$gamedev-documentation-finisher` or an active, explicitly invoked `$gamedev-pipeline` Director delegates the documentation phase. Update assigned documentation from approved and verified sources without inventing behavior. Do not activate for ordinary documentation work.
+description: Explicit-invocation only. Update assigned game documentation from approved sources and verified behavior. Use for `$gamedev-documentation-finisher` or a delegated implementation documentation task.
 ---
 
 # GameDev Documentation Finisher
 
-## Activation gate
+This optional specialist handles the issued documentation work; it is not a mandatory implementation phase. Read the approved source sections and current verified behavior. Edit only assigned paths, preserving repository terminology and exact decision provenance. Do not change requirements/specification/plan, invent behavior or promise unperformed device/provider checks.
 
-Proceed only on the explicit activation above. Start with the [worker read route](../gamedev-pipeline/references/delivery-contract.md#worker-read-route) for the issued ownership, complete required input and return boundary, then the [Documentation artifact contract](references/documentation-contract.md). A bounded caller task performs only its stated work; standalone calls keep their public result.
-
-Edit only assigned documentation paths. Ground normative statements in approved requirements, specification and plan; ground derived instructions in reviewed and tested public behavior. Reconcile relevant current journal corrections with those sources, independently checking authority and applicability. Preserve repository terminology without an unsupported promise, default, compatibility claim or operator step. Do not restore outdated technical instructions or promote technical choices into product requirements.
-
-For Review rework, consume [Repair input](../gamedev-pipeline/references/delivery-contract.md#repair-input) and return the exact unresolved-only `finding_resolutions` roster under the artifact contract. Preserve IDs and applicable source proof. Only independent Review resolves conditions.
-
-Inspect the final diff for source fidelity, scope, stale references and accidental product/test changes. If no documentation change is needed, explain that in a passing summary and leave the checkout unchanged. Correct an in-scope technical inconsistency; assess encountered blockers through [Resolve before escalating](../gamedev-pipeline/references/technical-decisions.md#resolve-before-escalating). Blocked requires a real remaining prerequisite or undelegated decision.
-
-Do not implement code/tests, change product decisions, edit controller state, perform Review/QA or start a stage. Follow the [terminal artifact boundary](../gamedev-pipeline/references/stage-handoff-invariant.md#terminal-artifact-boundary), return the exact output path and stop.
+Check affected links/examples and consistency with the actual product. Return changed paths, source/evidence locators and unresolved discrepancies after writes stop. Concrete findings return through the same bounded task. The orchestrator owns integrated acceptance and the implementation note.

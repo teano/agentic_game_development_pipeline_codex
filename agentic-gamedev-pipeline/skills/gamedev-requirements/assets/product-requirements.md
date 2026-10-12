@@ -1,35 +1,21 @@
----
-document_type: product-requirements
-status: draft
-revision: 1
-language: unspecified
-approved_at: null
----
+# Product requirements
 
-# Product Requirements
+This optional outline illustrates useful content. Follow the project's existing format, omit inapplicable headings and remove this guidance in the actual artifact. Empty headings and examples supply no product decisions.
 
-## Product Outcome
+## Confirmed outcome and scope
 
-## Target Audience
+State what the authorized feature achieves and its confirmed boundaries. Record the source of applicable direct or delegated decisions.
 
-## Core Gameplay Loop
+## Obligations and acceptance
 
-## Release Target
+Preserve existing IDs. Describe confirmed functional behavior and real quality constraints, with observable criteria that add no new product choices.
 
-## Scope
+## Confirmed exclusions
 
-### In Scope
+Include only actual exclusions and permission limits, with their decision source.
 
-### Out of Scope
+## Unresolved decisions
 
-## Functional Requirements
+Separate real outstanding questions from confirmed obligations. Keep proposals and inspected project facts outside product authority. Remove this section when it is unnecessary.
 
-## Quality Requirements
-
-## Acceptance Criteria
-
-## Assumptions
-
-## Open Questions
-
-## Risks
+Keep actual approval in the project's durable record after the complete bytes are frozen. Do not embed this artifact's own hash or later approval inside it.

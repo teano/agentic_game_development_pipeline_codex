@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Engineer"
-  short_description: "Explicit-only bounded GameDev engineering pass"
-  default_prompt: "Use $gamedev-engineer to implement and remediate the current slice under its stable owner, technical-decisions policy and controller-owned diagnostic checks."
+  short_description: "Build and repair an authorized game implementation slice"
+  default_prompt: "Use $gamedev-engineer to implement the assigned slice from original criteria, integrate it and exercise its actual behavior."
 policy:
   allow_implicit_invocation: false

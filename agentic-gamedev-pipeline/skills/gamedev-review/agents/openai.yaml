@@ -1,6 +1,6 @@
 interface:
-  display_name: "GameDev Final Review"
-  short_description: "Explicit-only GameDev pipeline Review mode"
-  default_prompt: "Use $gamedev-review for independent bounded correctness review, preserving finding IDs and current technical-decisions evidence without product edits."
+  display_name: "GameDev Independent Review"
+  short_description: "Review a candidate against original requirements"
+  default_prompt: "Use $gamedev-review to independently inspect the assigned candidate and its evidence, returning actionable findings without product edits."
 policy:
   allow_implicit_invocation: false
