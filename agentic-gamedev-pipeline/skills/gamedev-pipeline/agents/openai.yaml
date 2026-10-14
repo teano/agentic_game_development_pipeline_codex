@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Implementation"
   short_description: "Implement approved slices and verify playable behavior"
-  default_prompt: "Use $gamedev-pipeline to orchestrate the authorized feature through a delegated writer, independent checks, repairs and final integrated interaction."
+  default_prompt: "Use $gamedev-pipeline to implement the feature from its current approved PRD, specification and plan through delegated writers, independent checks, repairs and final integrated interaction."
 policy:
   allow_implicit_invocation: false

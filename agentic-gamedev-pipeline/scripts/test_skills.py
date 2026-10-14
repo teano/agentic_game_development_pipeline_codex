@@ -25,6 +25,7 @@ PUBLIC_SKILLS = {
     "gamedev-requirements",
     "gamedev-specification",
     "gamedev-development-plan",
+    "gamedev-orchestrator",
     "gamedev-pipeline",
     "gamedev-engineer",
     "gamedev-qa",

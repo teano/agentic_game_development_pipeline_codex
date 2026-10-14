@@ -1,6 +1,6 @@
 ---
 name: gamedev-pipeline
-description: Explicit-invocation only. Use for `$gamedev-pipeline` or an explicitly delegated implementation run. Orchestrate approved game-feature implementation through bounded writers, independent checks, repairs and final integrated behavior; an explicitly authorized full-cycle request may also delegate upstream stages.
+description: Explicit-invocation only. Use for `$gamedev-pipeline` or an explicitly delegated implementation stage. Implement a game feature from current approved PRD, specification and plan through bounded writers, independent checks, repairs and final integrated behavior.
 ---
 
 # GameDev Implementation
@@ -11,7 +11,7 @@ Deliver the authorized feature in the actual project. Act as its orchestrator: r
 
 Resolve the product checkout, current revision/local changes, approved PRD/specification/plan, their exact current versions, accepted decisions and execution permissions. Follow [artifact and approval bindings](references/artifacts-and-approval.md) to verify the actual source and approval records. Preserve canonical paths/IDs and do not edit approved inputs for implementation convenience.
 
-If the user explicitly authorized a full cycle, delegate the needed [Requirements](../gamedev-requirements/SKILL.md), [Specification](../gamedev-specification/SKILL.md) and [Planning](../gamedev-development-plan/SKILL.md) stages with their actual scope/authority, consume each handoff and continue only when its current readiness is established. An implementation invocation alone does not grant missing product decisions or upstream stage approval. Standalone upstream stages stop; the authorized parent coordinates their continuation and returns corrections to an existing owner.
+This skill owns implementation only. Missing, stale or contradictory upstream inputs need a concrete handoff to their [Requirements](../gamedev-requirements/SKILL.md), [Specification](../gamedev-specification/SKILL.md) or [Planning](../gamedev-development-plan/SKILL.md) owner, identifying the affected document, obligation and needed decision or correction. Return that issue to an existing full-cycle parent when present; use [GameDev Orchestrator](../gamedev-orchestrator/SKILL.md) for a separately requested full cycle. Do not conduct Requirements, author upstream documents or activate upstream stages from an implementation invocation. Preserve useful WIP and continue independent authorized implementation when the issue permits it.
 
 Read plan ordering/boundaries and inspect the project for actual build, run and observation methods. Try an appropriate permitted baseline early so environment failures become actionable work. Choose tools/stack skills from the real operation; keep current user/parent model settings. Preserve required methods and run-specific limits.
 

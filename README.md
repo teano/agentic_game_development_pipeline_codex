@@ -1,25 +1,120 @@
-# Agentic Game Development Skills
+# Навыки Agentic Game Development
 
-Bundle version: [0.22.1](agentic-gamedev-pipeline/VERSION).
+Версия набора: [0.22.2](agentic-gamedev-pipeline/VERSION).
 
-Explicit-only Codex skills for a complete authorized feature: Requirements → Specification → Planning → Implementation. Each stage uses the actual project, preserves original decisions/IDs and returns current source and approval bindings. Existing project formats are sufficient; the bundle requires no workflow controller or external specification service.
+GameDev Pipeline — набор навыков Codex для работы над разрешённой пользователем фичей: требования → техническая спецификация → план разработки → реализация. Четыре стадии можно вызывать самостоятельно; отдельный `gamedev-orchestrator` ведёт полный цикл в одном чате. Навыки запускаются только по явному запросу. Каждая стадия опирается на реальный проект, сохраняет исходные решения и идентификаторы, указывает актуальные документы и подтверждения их одобрения. Набор не привязан к конкретному движку или стеку. Достаточно существующих форматов проекта: обязательного контроллера процесса, JSON-файлов состояния или внешнего сервиса подготовки спецификаций нет.
 
-Invoke [gamedev-requirements](agentic-gamedev-pipeline/skills/gamedev-requirements/SKILL.md) to turn confirmed product decisions into a canonical PRD with observable acceptance. [gamedev-specification](agentic-gamedev-pipeline/skills/gamedev-specification/SKILL.md) designs the smallest sufficient implementation from that approved PRD and project evidence. [gamedev-development-plan](agentic-gamedev-pipeline/skills/gamedev-development-plan/SKILL.md) organizes coherent increments, full obligation coverage, checks and final integrated acceptance.
+## Как пользоваться
 
-Each standalone stage stops after its handoff. `PRD_READY`, `SPEC_READY` and `PLAN_READY` describe verified artifact readiness; they grant no next-stage permission. An explicitly authorized full-cycle parent may consume those handoffs and delegate the next stage. Actual direct/delegated decisions and approvals remain within their original scope, recorded through [artifact and approval bindings](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/artifacts-and-approval.md).
+В чате нужного проекта вызовите навык и опишите задачу обычным языком. Укажите выбранную фичу, известные источники и существенные ограничения. Уже существующие документы, решения и идентификаторы сохраняются; заново оформлять их под универсальный шаблон не требуется.
 
-## Implementation
+| Стадия | Что делает | Что вы получаете |
+| --- | --- | --- |
+| [gamedev-requirements](agentic-gamedev-pipeline/skills/gamedev-requirements/SKILL.md) | Уточняет продуктовые решения и отделяет подтверждённые требования от предложений и фактов проекта. | PRD: что должно работать, в каких границах и по каким наблюдаемым критериям это принять. |
+| [gamedev-specification](agentic-gamedev-pipeline/skills/gamedev-specification/SKILL.md) | По одобренному PRD и фактам проекта выбирает минимально достаточный технический подход. | SPEC: как реализовать все требования через существующий код, данные, ресурсы и интеграции. |
+| [gamedev-development-plan](agentic-gamedev-pipeline/skills/gamedev-development-plan/SKILL.md) | По одобренным PRD и SPEC выстраивает связные части работы, зависимости и проверки. | PLAN: порядок реализации, покрытие всех обязательств и приёмка целой фичи. |
+| [gamedev-pipeline](agentic-gamedev-pipeline/skills/gamedev-pipeline/SKILL.md) | Организует реализацию одобренного плана, независимые проверки, исправления и итоговую приёмку. | Изменения в проекте и свидетельства проверок либо точное описание незавершённого результата и оставшейся проверки. |
 
-[gamedev-pipeline](agentic-gamedev-pipeline/skills/gamedev-pipeline/SKILL.md) orchestrates the authorized product work: every development slice gets a newly created bounded [Engineer](agentic-gamedev-pipeline/skills/gamedev-engineer/SKILL.md) to implement and repair and a new [Independent Checker](agentic-gamedev-pipeline/skills/gamedev-qa/SKILL.md) to observe the actual candidate; findings return for repair/rechecking within the same slice team. A separate new independent checker, uninvolved in earlier slices, observes final integrated behavior once. If the last planned unit already performs this acceptance, it supplies the final check. [Review](agentic-gamedev-pipeline/skills/gamedev-review/SKILL.md) and [Documentation](agentic-gamedev-pipeline/skills/gamedev-documentation-finisher/SKILL.md) are optional specialists for concrete tasks. The orchestrator owns coverage and a brief recoverable note.
+Для полного цикла используйте отдельный [gamedev-orchestrator](agentic-gamedev-pipeline/skills/gamedev-orchestrator/SKILL.md): он сначала прорабатывает требования с вами и получает ваше одобрение полного актуального PRD, затем автоматически проводит спецификацию, план и реализацию через владельцев стадий в той же сессии.
 
-Ordinary permitted engineering/setup recovery proceeds within the task. Real product contradictions or permission changes go to their responsible decision maker. A green automated suite alone does not prove a playable feature; required interaction is observed in the actual permitted runtime. Unperformed observations remain `not_run`. The workflow grants no push, release, spending or unrelated stage activation.
+Для обычной поэтапной работы запускайте следующую стадию отдельной командой после завершения и одобрения текущей. Самостоятельно вызванная стадия останавливается на передаче результата. `PRD_READY`, `SPEC_READY` и `PLAN_READY` означают проверенную готовность документов; они не разрешают запуск следующей стадии.
 
-## Breaking version
+Одобрение относится к полному готовому документу и его точному SHA-256. Если одобряете вы, стадия предъявляет этот документ и SHA для вашего решения. Если право одобрения уже явно делегировано и распространяется на этот документ, уполномоченный участник может принять и записать реальное решение в пределах делегирования. Сами полномочия ещё не означают, что решение принято. Прямые и делегированные решения сохраняют свой источник и границы по [правилам документов и одобрения](agentic-gamedev-pipeline/skills/gamedev-pipeline/references/artifacts-and-approval.md).
 
-This version replaces the previous controller workflow throughout the bundle. Its runtime/state code, operational parsers, native envelopes, alternative contracts, suites and historical guides are removed from the current source. Git history retains prior versions. Existing product documents and decision semantics remain valuable inputs, but previous operational states supply no authority for this workflow; current artifacts and actual approval records do. This change does not migrate project state, relink installations or resume production runs.
+Следующая стадия читает все исходные обязательства и полные связанные разделы документов, проверяет текущие версии и реальные записи одобрения. Краткое резюме, список идентификаторов или старый статус готовности этого не заменяют. Если одобренный документ изменился, нужно согласовать именно его актуальное содержимое и оценить затронутые последующие результаты.
 
-## Validation
+### Пример поэтапной работы
 
-Run `python agentic-gamedev-pipeline/scripts/test_skills.py` for current package integrity: skill discovery metadata, explicit-only invocation, local reference resolution and supporting-document reachability. The tests use PyYAML, also used by Codex skill-creator's syntax validator. These deterministic checks do not establish document meaning, actual consent or product acceptance.
+Ниже — обезличенные примеры типовых сообщений. Весь порядок относится к одной выбранной фиче; её документы сохраняются между стадиями.
 
-Use the installed skill-creator's `quick_validate.py` for changed skill syntax. Independently forward-test the four stages with realistic raw inputs in an isolated workspace: preserve original obligations, bind real approvals, start useful work, repair findings and observe the final integrated flow. Production execution and external actions require their own actual authorization.
+**1. Собрать требования.**
+
+```text
+$gamedev-requirements собираем требования. Изучи ГДД и расшифровку обсуждения.
+Требованиями считай только явно принятые решения. Сверяй с текущей реализацией;
+противоречия выноси на уточнение.
+```
+
+Навык исследует нужные источники, задаёт вопросы о недостающих продуктовых решениях и вносит ваши ответы и коррекции в PRD. Факты проекта и рекомендации сами по себе требованиями не становятся. Если предлагаются варианты, можно ответить по номерам вопросов, например `1 — A, 2 — B`, и дописать уточнение к нужному ответу.
+
+Прочитайте готовый документ и проверьте, что он выражает ваши решения. После предъявления конкретного PRD с SHA можно ответить:
+
+```text
+апрув
+```
+
+Такой короткий ответ одобряет единственный однозначно предъявленный документ с указанным SHA. Если выбор неоднозначен, укажите, какой документ и SHA одобряете. Это завершает текущую стадию, а следующую вы вызываете отдельно.
+
+**2. Подготовить техническую спецификацию.**
+
+```text
+$gamedev-specification составь спеку
+```
+
+Навык использует актуальный одобренный PRD и изучает проект. Результат — SPEC с достаточным техническим решением для всех исходных требований. После чтения и необходимых правок одобрите предъявленные SPEC и SHA тем же способом. Продуктовые пробелы возвращаются на уточнение; спецификация не заполняет их догадками.
+
+**3. Подготовить план разработки.**
+
+```text
+$gamedev-development-plan составь план, раздели работу на 3 слайса.
+Нужны ограниченные исполнители, чтобы один агент не делал всё
+с постоянным сжатием контекста.
+```
+
+Здесь три слайса — пример явно заданного пожелания, а не правило набора. Число и границы частей зависят от задачи и ваших ограничений: небольшая фича может состоять из одной связной единицы. План описывает результат каждой части, зависимости, проверки и итоговый пользовательский сценарий. Прочитайте PLAN и одобрите его точный SHA. Это ещё не запускает реализацию.
+
+**4. Запустить реализацию.**
+
+```text
+$gamedev-pipeline реализуй фичу
+```
+
+Оркестратор реализации проверяет актуальные одобренные PRD, SPEC и PLAN, затем ведёт работу по плану до итоговой приёмки в разрешённых границах. Этот навык занимается только реализацией: недостающий или противоречивый исходный документ возвращается владельцу нужной стадии с конкретным вопросом или исправлением. В результате он сообщает, что изменено, что фактически проверено и какие наблюдения остались `not_run`, если выполнить их не удалось.
+
+Существенные ограничения можно включить прямо в запрос. Например, для конкретной Unity-задачи:
+
+```text
+$gamedev-pipeline реализуй фичу. Целевая платформа — Android.
+Проверки агента — только в Editor. Реальные рекламные сети исключены;
+игровые рекламные сценарии нужно проверить.
+```
+
+Это пример границ одного запуска, а не требования ко всем проектам. Проверки в Editor не подтверждают работу на Android-устройстве; невыполненные наблюдения на устройстве отражаются как `not_run`, если они нужны для приёмки.
+
+### Полный цикл по явному запросу
+
+Если хотите пройти все стадии в одной сессии, вызовите отдельный навык полного цикла:
+
+```text
+$gamedev-orchestrator пройди полный цикл для выбранной фичи.
+Сначала проработай со мной требования и получи моё одобрение полного PRD.
+Затем в этой же сессии пройди спецификацию, план и реализацию.
+```
+
+Требования всегда прорабатываются с вами явно, даже если PRD уже существует или был одобрен раньше. Известные решения и готовый документ можно переиспользовать без повторения решённых вопросов. Если пробелов нет, навык предъявляет актуальный объём и полный PRD с SHA для вашего подтверждения и одобрения. Прежнее прямое одобрение можно сохранить, если вы явно подтвердили, что именно этот неизменный PRD задаёт требования нового цикла, а сверка Requirements не выявила новых вопросов. До человеческой точки согласования не начинаются спецификация, план, изменения продукта или работа в его среде выполнения. Финальное одобрение PRD в этом режиме остаётся за вами. Восстановление того же уже подтверждённого цикла после сжатия контекста или перезапуска не требует повторного одобрения при действующих привязках документов.
+
+Вызов полного цикла вместе с вашим одобрением PRD задаёт полномочия на дальнейшее техническое исполнение и одобрение SPEC и PLAN строго внутри этих требований. После этого отдельные команды и обычные ручные апрувы SPEC и PLAN не нужны: уполномоченные владельцы стадий или проверяющие читают полные актуальные документы, проводят нужные независимые проверки и действительно принимают точные версии. Право одобрить документ, готовый черновик или положительное ревью ещё не означают принятого решения. Если вы явно оставили дополнительную точку согласования за собой, оркестратор её соблюдает.
+
+Один родительский оркестратор остаётся в том же чате и передаёт работу владельцам стадий; сам он не пишет за них требования, спеку, план или код. Существенный продуктовый пробел, противоречие, новый объём или необходимое изменение разрешений возвращается к вам и в Requirements. Нужная ревизия PRD получает новое фактическое одобрение; независимая полезная работа сохраняется. Обычный вызов реализации или «апрув» документа в поэтапном режиме не запускает полный цикл.
+
+## Как устроена реализация
+
+[gamedev-pipeline](agentic-gamedev-pipeline/skills/gamedev-pipeline/SKILL.md) выступает оркестратором реализации и используется как самостоятельно, так и владельцем этой стадии внутри полного цикла. Для каждой части разработки (`slice`) или связной единицы реализации из одобренного плана создаются новые экземпляры агентов: [Engineer](agentic-gamedev-pipeline/skills/gamedev-engineer/SKILL.md) вносит изменения и исправляет дефекты, а независимый [Independent Checker](agentic-gamedev-pipeline/skills/gamedev-qa/SKILL.md) проверяет фактический результат. Новое поручение прежнему агенту не заменяет создание нового экземпляра для следующей части. Исправления и повторные проверки внутри одной части остаются у её команды. Границы частей сохраняются по одобренному плану; фиксированного количества частей нет.
+
+Перед передачей файлов или работающей среды предыдущий владелец завершает свои изменения и операции. Для общих файлов действует один автор, для изменяемой среды выполнения — один оператор. Код, незавершённая работа и нужный экземпляр среды сохраняются при передаче.
+
+Итоговую работу всей фичи проверяет отдельный новый независимый проверяющий, который не участвовал в предыдущих частях. Если последняя запланированная единица уже выполняет такую приёмку, её проверка и есть итоговая: вторая финальная QA не добавляется. После исправления найденных дефектов тот же проверяющий повторяет затронутые наблюдения. Для единицы, состоящей только из приёмки, Engineer нужен лишь при необходимости исправления. [Review](agentic-gamedev-pipeline/skills/gamedev-review/SKILL.md) и [Documentation](agentic-gamedev-pipeline/skills/gamedev-documentation-finisher/SKILL.md) подключаются как дополнительные специалисты для конкретной задачи. Оркестратор отвечает за покрытие обязательств и краткую актуальную запись, по которой можно восстановить работу.
+
+Обычные разрешённые инженерные задачи, настройка среды и устранение технических сбоев выполняются в рамках текущей работы. Реальные противоречия продуктовых решений или необходимые изменения полномочий возвращаются тому, кто вправе их разрешить. Успешных автоматических тестов недостаточно для подтверждения игровой фичи: требуемое взаимодействие проверяется реальным вводом и наблюдением результата в разрешённой среде. Невыполненные наблюдения остаются `not_run`. Запуск стадии сам по себе не разрешает push, выпуск релиза, расходы или другие стадии вне поручения.
+
+## Переход с прежнего процесса
+
+Начиная с версии 0.22.0 прежний процесс с контроллером заменён самостоятельными навыками во всём наборе. Текущая версия — 0.22.2. Из исходников удалены прежние код выполнения и состояния, операционные парсеры, служебные конверты, альтернативные контракты, наборы тестов и исторические руководства. Предыдущие версии доступны в истории Git.
+
+Существующие продуктовые документы и смысл принятых решений остаются полезными источниками. Прежние операционные состояния не дают полномочий для нового процесса: основанием служат актуальные документы и реальные записи одобрения. Это изменение не мигрирует состояние проектов, не переподключает установки навыков и не возобновляет рабочие запуски.
+
+## Проверка набора
+
+Команда `python agentic-gamedev-pipeline/scripts/test_skills.py` проверяет целостность текущего пакета: метаданные обнаружения навыков, запуск только по явному запросу, разрешение локальных ссылок и доступность вспомогательных документов. Тесты используют PyYAML, который также нужен синтаксическому валидатору Codex skill-creator. Эти детерминированные проверки не подтверждают смысл документов, реальное согласие пользователя или приёмку продукта.
+
+Для проверки синтаксиса изменённых навыков используйте `quick_validate.py` из установленного skill-creator. Работу четырёх самостоятельных стадий и оркестратора полного цикла независимо проверяйте на реалистичных исходных запросах в изолированном рабочем каталоге: сохраняйте исходные обязательства, привязывайте реальные одобрения, начинайте полезную работу, исправляйте найденные дефекты и наблюдайте итоговый сценарий целиком. Запуски в реальных проектах и внешние действия требуют соответствующих полномочий.

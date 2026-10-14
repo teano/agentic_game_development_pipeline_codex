@@ -1,0 +1,6 @@
+interface:
+  display_name: "GameDev Orchestrator"
+  short_description: "Run a full game cycle after human PRD approval"
+  default_prompt: "Use $gamedev-orchestrator to work through the feature's requirements with me, obtain my approval of the complete PRD, then delegate specification, planning and implementation automatically in this chat within that scope."
+policy:
+  allow_implicit_invocation: false

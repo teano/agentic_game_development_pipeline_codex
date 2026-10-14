@@ -53,4 +53,4 @@ Freeze the complete checked PRD and compute its current SHA-256. Obtain actual a
 
 Return `PRD_READY: yes|no`, project/feature, canonical PRD path and current SHA-256, existing revision if present, approval locator/actor, changed obligations and any exact unresolved decision. `yes` requires a complete usable PRD and actual approval of those current bytes. Give `NEXT_ACTION: $gamedev-specification` when ready, otherwise the concrete missing decision or Requirements correction.
 
-Stop at the handoff. Readiness advises the next stage; only an already authorized full-cycle parent may activate it. This stage grants no implementation, runtime launch, publication or additional permissions.
+Stop at the handoff. Readiness advises the next stage; only an explicitly invoked [GameDev Orchestrator](../gamedev-orchestrator/SKILL.md) parent may continue the authorized full cycle. Under that parent, work through Requirements with the user even for an existing PRD and obtain the user's actual approval of the complete current PRD; its final approval cannot be delegated in this mode. This stage grants no implementation, runtime launch, publication or additional permissions.
