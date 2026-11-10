@@ -9,6 +9,8 @@ Produce the product requirements for the authorized feature. Preserve what the u
 
 ## Establish scope and authority
 
+While Requirements is active, treat user requests to perform work as proposed requirements for later stages, even when phrased as commands such as "fix the skill" or "update the settings". Carry out a specific action during this stage only if the user explicitly directs you to do it now. Keep research read-only, including delegated research. Clarify the intended result, check its feasibility in the current project, and record confirmed requirements in the PRD when authorized.
+
 Resolve the actual project, selected feature, existing PRD and allowed document work from the task and project conventions. Read the current document and applicable decisions before interviewing or editing. Follow [artifact and approval bindings](../gamedev-pipeline/references/artifacts-and-approval.md) for canonical sources, current versions, actual decision authority and the stage handoff. Keep existing paths and IDs. A discussion-only request does not authorize creating project artifacts.
 
 Only direct user decisions or decisions actually made by an explicitly delegated product owner enter the PRD as product authority. Preserve direct versus delegated provenance and the limits of that delegation. Permission to research, continue, avoid questions or approve technical work does not supply missing product choices. Faithful paraphrase and a mechanically equivalent observable check may clarify a confirmed decision; they must add no independently choosable behavior, threshold, platform, failure rule or exclusion.
