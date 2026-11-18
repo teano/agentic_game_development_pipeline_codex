@@ -15,7 +15,7 @@ Read the actual requirements, acceptance criteria, relevant specification passag
 
 Inspect the implementation, extension points, data/assets, tests and supported build/run methods needed to plan this change. Establish interfaces, responsibility boundaries and invariants from evidence. Inspect command/tool locators already supplied before inventing a discovery task. Distinguish inspected facts, selected engineering choices and unknowns. A recipe alone proves neither capability nor execution.
 
-Investigate uncertainty that changes the approach or ordering; delegate bounded research when useful. Ordinary technical setup, method repair and missing command details may remain implementation work with a concrete question and expected resolution. Do not modify product source/assets or launch its runtime as a planning step unless separately authorized. A contradiction affecting product meaning or a required permission needs its responsible decision; retain the affected obligation and continue independent work.
+Investigate uncertainty that changes the approach or ordering; delegate bounded research when useful. Use the [GameDev model settings](../gamedev-pipeline/references/agent-model-policy.md) when starting a researcher or independent plan reader. Ordinary technical setup, method repair and missing command details may remain implementation work with a concrete question and expected resolution. Do not modify product source/assets or launch its runtime as a planning step unless separately authorized. A contradiction affecting product meaning or a required permission needs its responsible decision; retain the affected obligation and continue independent work.
 
 ## Write the smallest useful plan
 

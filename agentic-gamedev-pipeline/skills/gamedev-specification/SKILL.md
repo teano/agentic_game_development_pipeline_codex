@@ -17,7 +17,7 @@ Choose routine technical details within the authorized scope. Return a material 
 
 ## Author the sufficient design
 
-Use the project's specification format and one author for the canonical file. The stage owner may author directly or delegate bounded authoring; another writer starts only after ownership is safely transferred. Give delegated work the actual criterion text, relevant project evidence, existing design state and concrete write boundaries. Apply current user/parent model settings rather than requiring a fixed role graph or external specification service.
+Use the project's specification format and one author for the canonical file. The stage owner may author directly or delegate bounded authoring; another writer starts only after ownership is safely transferred. Give delegated work the actual criterion text, relevant project evidence, existing design state and concrete write boundaries. Select settings for new authors, researchers and independent readers using the [GameDev model settings](../gamedev-pipeline/references/agent-model-policy.md).
 
 Make the following clear where they matter to this feature:
 
