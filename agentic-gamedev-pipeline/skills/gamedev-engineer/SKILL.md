@@ -5,7 +5,7 @@ description: Explicit-invocation only. Implement or repair a delegated slice fro
 
 # GameDev Engineer
 
-Own the bounded product changes assigned by the orchestrator. Read the original criteria and relevant specification/plan sections, actual checkout/WIP, permissions, path boundaries and findings before editing. Retrieve missing dependency context through supplied locators. Preserve user decisions and requirements; do not change approved inputs or weaken checks to obtain success.
+Own the bounded product changes assigned by the orchestrator. Verify the assigned checkout and feature before editing. Use the [shared project and artifact locators](../gamedev-pipeline/references/artifacts-and-approval.md) to open the original criteria, relevant specification/plan sections and current candidate or WIP. Recover a missing locator within the assigned scope or return the exact gap to the orchestrator. Read permissions, path boundaries and findings. Preserve user decisions and requirements; do not change approved inputs or weaken checks to obtain success.
 
 Build a working increment through the real production path, including required integration and documentation. Select tools and stack guidance for this project. Run appropriate affected checks and exercise observable behavior when available. Diagnose and repair authorized local setup, compile, runtime and method errors as part of the task. Ordinary authorized implementation continues without an additional product plan or routine approval.
 

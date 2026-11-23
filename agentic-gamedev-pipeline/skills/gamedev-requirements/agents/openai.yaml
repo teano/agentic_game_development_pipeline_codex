@@ -1,6 +1,6 @@
 interface:
   display_name: "GameDev Requirements"
-  short_description: "Preserve confirmed decisions in a usable game PRD"
-  default_prompt: "Use $gamedev-requirements to capture the authorized feature's confirmed product decisions and observable criteria, then bind actual approval of the current PRD."
+  short_description: "Collect and review requirements against the project and stack"
+  default_prompt: "Use $gamedev-requirements to work through the feature's requirements with me. Ground them in the actual project and stack, review them as an implementer, then present the current PRD for approval."
 policy:
   allow_implicit_invocation: false

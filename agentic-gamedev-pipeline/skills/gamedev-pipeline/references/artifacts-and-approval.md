@@ -1,10 +1,14 @@
 # Current artifacts, authority and handoffs
 
-Read this reference when a GameDev stage consumes an approved source, records approval or hands work to another stage. These are facts about the actual artifacts and permissions, recorded in ordinary project documents and evidence.
+Read this reference to locate the project and artifacts, consume an approved source, record approval or hand off work. Bounded workers use the project and artifact locators relevant to their assignment.
 
 ## Resolve the real inputs
 
-Use the supplied project/feature, repository instructions and existing documents to locate the canonical PRD, specification and plan. Preserve existing paths, IDs, revision conventions and accepted decision sources. Do not copy documents to another namespace to obtain a favorable ready claim. For a new artifact, use the project's document convention; a sibling document is a reasonable default when the location is unambiguous and within authorized writes. Ask only if the target or permission remains materially unclear.
+Identify the game project, its actual checkout or workspace, and the feature before choosing inputs or writing. Use the request, attached workspace and prior handoff as leads. Verify the root against project instructions and relevant engine or project files. Check the active revision and relevant local changes where version control applies. If several checkouts exist, use the one assigned to the work and verify where artifact paths resolve. Preserve existing user work.
+
+Use explicit paths and recent handoffs as search leads. Follow repository documentation conventions, feature indexes, links between artifacts, approval records and existing evidence. When a path is missing, search the intended project by feature name, task ID, document title or known obligation. Open plausible candidates. Compare their scope, source links and approval records to identify the canonical PRD, specification and plan for this feature. A matching filename or newer modification time alone does not identify the current artifact. Ask for the smallest clarification only after the available evidence leaves material ambiguity. Show the relevant checkout or candidate paths and what distinguishes them. If an input is absent or stale, identify the missing artifact or binding and the responsible stage.
+
+Use the dedicated feature directory established by Requirements for new specification and plan files unless the project or user specifies a different destination for that artifact. If the handoff omits the folder, resolve it from the located PRD and feature docs. For a legacy feature without a dedicated directory, follow the project's document convention. An authorized sibling of the verified input is a fallback when the destination is unambiguous. Reuse any existing canonical artifact in place, including a current draft when resuming work. Preserve paths, IDs, revision conventions and accepted decision sources. Do not create a duplicate artifact or infer approval from its location.
 
 Read current complete obligations, relevant source sections and actual decisions. An ID inventory or summary helps retrieval but does not replace criterion text. Keep proposals, implementation observations and engineering choices separate from product authority. Stable source file/heading pointers can carry traceability where IDs are absent.
 
@@ -39,7 +43,7 @@ Ordinary implementation task refinement can proceed within the approved obligati
 
 ## Short stage handoff
 
-Return the stage's `PRD_READY`, `SPEC_READY` or `PLAN_READY`, project/feature, canonical artifact and source paths/versions/hashes, actual approval locator/actor, concrete outstanding matters and the next action. Include useful evidence locators and pertinent execution limits. No workflow state file or machine envelope is required.
+Return the stage's `PRD_READY`, `SPEC_READY` or `PLAN_READY`, project root/checkout, feature name or ID, established feature directory if present, canonical artifact and source paths/versions/hashes, actual approval locator/actor, concrete outstanding matters and the next action. Include useful evidence locators and pertinent execution limits. For a bounded worker, pass the same locators as relevant to its assignment, with the applicable source passages, candidate identity and permitted output paths. No workflow state file or machine envelope is required.
 
 A standalone stage stops after this result. Opening a document, receiving readiness or suggesting a next action does not authorize that stage. An explicitly invoked [GameDev Orchestrator](../../gamedev-orchestrator/SKILL.md) parent may consume each actual handoff and delegate the next authorized stage in the same root chat under its human PRD checkpoint and bounded technical delegation. GameDev Implementation does not activate upstream stages. Bounded research/review/correction tasks perform their supplied task and return, without restarting a whole stage.
 

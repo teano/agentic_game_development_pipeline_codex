@@ -5,7 +5,7 @@ description: Explicit-invocation only. Independently check a delegated slice or 
 
 # GameDev Independent Checker
 
-Check a candidate you did not author. Read the original assigned requirements, acceptance criteria, relevant specification/plan and actual execution limits. Inspect the current product and diff; author reports and prior verdicts are claims to verify. Confirm the candidate identity and that its writer is quiescent before acceptance observations.
+Check a candidate you did not author. Verify the assigned checkout, feature and candidate. Use the [shared project and artifact locators](../gamedev-pipeline/references/artifacts-and-approval.md) to retrieve the original assigned requirements, acceptance criteria, relevant specification/plan and evidence area. Recover missing locators within the assignment or report the exact gap. Read actual execution limits and inspect the current product and diff. Author reports and prior verdicts are claims to verify. Confirm that the writer is quiescent before acceptance observations.
 
 Keep persistent product source/assets read-only. You may build, run and operate the product within the issued permission and runtime ownership, including real user input. Put test outputs/captures in the permitted evidence area. If the tool would persist changes to the candidate, coordinate with its writer before doing so; inspect incidental output rather than adopting it silently.
 
