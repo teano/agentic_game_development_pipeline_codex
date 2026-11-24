@@ -12,6 +12,10 @@ Explain the sufficient approach using inspected extension points, responsibiliti
 
 ## Ordered work
 
+For a changed boundary, identify the owner, dependency direction, integration
+point and affected paths in the relevant unit. Place its first integrated check
+before dependent work repeats the design.
+
 For each coherent increment, describe its observable outcome and source obligations, affected areas, prerequisites/integrations, actual boundaries, check/input procedure and expected result. State what the next increment can depend on.
 
 ## Obligation coverage

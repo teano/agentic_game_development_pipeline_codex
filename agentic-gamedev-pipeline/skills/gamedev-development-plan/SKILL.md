@@ -19,6 +19,12 @@ Investigate uncertainty that changes the approach or ordering; delegate bounded 
 
 ## Write the smallest useful plan
 
+For a boundary change, carry the [architecture decisions](../gamedev-pipeline/references/architecture-review.md)
+into the affected units and checks. Plan the first integrated route early
+enough to check its real dependency and file layout before dependent work
+repeats it. Use the plan review to verify the route against the specification
+and project. Include a representative next variant when extensibility is required.
+
 Use the project's plan convention. The optional [outline](assets/development-plan.md) illustrates useful content, not a heading schema. Add detail at risky seams and dependencies; avoid a second specification, universal manifest or prescribed test implementation.
 
 Explain the concrete approach using inspected project locations and interfaces. Name necessary integrations and important engineering choices with their basis. Respect specification responsibilities and explicit boundaries. Prefer extending established behavior over introducing architecture the feature does not need. Likely filenames are estimates unless they are actual user-imposed write limits.

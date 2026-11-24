@@ -14,6 +14,13 @@ Read current complete obligations, relevant source sections and actual decisions
 
 Record the canonical path and exact current SHA-256 of each artifact and consumed source; include a revision if one actually exists. Hash real bytes with an available trusted tool, for example `Get-FileHash -Algorithm SHA256 -LiteralPath <path>` or Python `hashlib.sha256(Path(path).read_bytes()).hexdigest()`. Normalize digest case for comparison. Do not guess a hash from text or put an artifact's own hash inside its approved bytes.
 
+For affected paths, locate the checkout's applicable instruction chain
+(`AGENTS.md` or a project equivalent), including nested rules and linked
+guidance. Read only the relevant architecture, conventions and checks.
+Include the applicable rule/source locators and their concrete constraints
+in stage and worker handoffs. Recheck the applicable rules when the affected
+paths or checkout change.
+
 ## Actual decisions and approval
 
 Decision authority and approval authority are distinct. Direct user confirmation supplies only the content actually confirmed. An explicit delegation supplies only its stated decisions or approval powers, within its target and limits. Preserve the original authorization statement or trusted locator and the actual actor; never label an agent decision as a direct user decision. Silence, permission to continue, upstream readiness, a worker's success and an `approved` label alone do not approve a document.

@@ -17,6 +17,11 @@ Choose routine technical details within the authorized scope. Return a material 
 
 ## Author the sufficient design
 
+For a new module, changed state owner, cross-module link or public boundary,
+trace the design against the [architecture review baseline](../gamedev-pipeline/references/architecture-review.md).
+Record the relevant ownership, direction, composition and placement. Have the
+independent reader challenge those decisions before approving the specification.
+
 Use the project's specification format and one author for the canonical file. The stage owner may author directly or delegate bounded authoring; another writer starts only after ownership is safely transferred. Give delegated work the actual criterion text, relevant project evidence, existing design state and concrete write boundaries. Select settings for new authors, researchers and independent readers using the [GameDev model settings](../gamedev-pipeline/references/agent-model-policy.md).
 
 Make the following clear where they matter to this feature:

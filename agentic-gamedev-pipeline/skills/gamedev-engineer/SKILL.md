@@ -11,6 +11,12 @@ Build a working increment through the real production path, including required i
 
 For independent findings, reproduce the actual failure, fix its cause and affected behavior, then repeat affected checks. Preserve unchanged applicable evidence. If a finding conflicts with the authoritative criterion or requests optional scope, return the concrete discrepancy for orchestration rather than guessing a product decision. A technical problem is not a user question while safe in-scope approaches remain.
 
+For changed boundaries, apply the [architecture criteria](../gamedev-pipeline/references/architecture-review.md)
+and the project's placement rules. Compare the actual dependencies and paths
+to the assignment before handoff. If the implementation requires a different
+owner, dependency direction or edit boundary, return the exact discrepancy to
+the coordinator before extending that design.
+
 Use only the assigned write resources. Coordinate mutable runtime access with the orchestrator. If a required change contradicts an actual boundary/permission, report that exact conflict and continue unrelated permitted work. Do not take over the orchestrator's note or another owner's files.
 
 When the assigned increment is ready for independent checking, finish pending writes and return the changed paths, candidate revision/local state, checks and observations with useful evidence locators, and unresolved issues. State quiescence and any owned process left running. Author verification does not establish independent acceptance; continue related repair when the orchestrator returns findings. Do not push, publish or start another stage without authorization.

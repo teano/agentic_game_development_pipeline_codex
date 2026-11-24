@@ -30,6 +30,12 @@ For each development slice or coherent implementation unit of the approved plan:
 3. Return valid findings for repair with their criterion, reproduction, expected/observed result and affected candidate. The writer fixes the cause and integrations; the checker repeats affected or explicitly required observations on the repaired state. Preserve unaffected valid evidence. Optional preferences do not become blockers without a requirement, convention or concrete defect.
 4. Accept the slice only after required behavior/checks are established, update coverage and advance with a fresh team for the next slice. Keep same-slice debugging and QA repairs with its current team. Replace a lost or incapable worker after quiescence and a factual handoff, preserving WIP and the rest of the plan.
 
+For a changed boundary, pass the applicable project rules and
+[architecture criteria](references/architecture-review.md) to the writer and
+checker, with the agreed owner, dependency direction, integration and paths.
+Use the existing slice check on the first integrated route before dependent
+work repeats it. Recheck affected boundaries on the final candidate.
+
 If an obligation lacks planned work, retain it and organize necessary technical work within the actual permissions. Refine tasks without changing product scope. A real contradiction or required boundary change needs its responsible decision; record its actual source and never infer one from silence or a workaround.
 
 Give each acceptance-only unit, including final integrated acceptance, a newly created independent checker who took no part in earlier slices. Do not create an idle Engineer; if repair is needed, assign a new author to that acceptance/repair unit and have its checker repeat affected verification. Final acceptance observes the whole integrated candidate, including the required user flow and cross-slice seams; slice PASS results cannot substitute for it. If the last planned unit already performs this acceptance on the current candidate, it supplies the final check without another final QA or duplicate unchanged observations. For games, observe real input, gameplay consequences and the specified outcome in the permitted runtime. Screenshots, compilation and unit tests support this evidence but cannot replace required interaction.

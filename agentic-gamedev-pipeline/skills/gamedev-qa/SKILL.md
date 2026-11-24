@@ -13,6 +13,10 @@ Choose meaningful checks for the required behavior and concrete regression risks
 
 Return concrete findings with source criterion, candidate, reproduction, expected/observed result and useful evidence. Missing evidence remains an incomplete observation, not an invented product bug. Distinguish an observed defect from unavailable capability or a genuine criterion conflict. Do not add preferred mechanics, style changes or optional stronger tests as requirements. Continue the rest of the assigned checking even after finding a failure.
 
+For a changed boundary, check the candidate and diff using the applicable
+project rules and [architecture criteria](../gamedev-pipeline/references/architecture-review.md).
+Report boundary and placement findings separately from runtime observations.
+
 For repair, verify the reported cause/change and repeat affected or explicitly required observations on the current state. Keep unaffected valid evidence. The writer's `addressed` claim does not resolve a finding. Check final integration even if every slice previously passed, using the whole assigned user flow and relevant cross-slice seams.
 
 Return what was actually verified, remaining defects/unperformed criteria, tested source/configuration identity, commands or input actions, observed results and evidence paths. If runtime access is unavailable, preserve static/automated results and mark the specific interaction `not_run`; do not declare verified playability. Finish owned actions and account for owned processes/runtime handoff. Return findings to the orchestrator for repair; do not edit the product or launch another stage.
