@@ -11,7 +11,7 @@ Match the work the agent will actually perform. Within one source, prefer the mo
 
 ## Action rules
 
-Edit this table for pipeline-wide preferences. Add a row describing the action and the fields it overrides. A dash leaves that field to the next applicable rule or role default.
+Edit this table for pipeline-wide preferences. Add a row describing the action and the fields it overrides. A dash leaves that field to the next applicable rule or role default. When the selected model is `gpt-6.2-astra` and the effort comes from a role default of `high`, use `xhigh`. An effort explicitly set by the user, project or action rule takes precedence.
 
 | Action | Model | Reasoning effort |
 | --- | --- | --- |
@@ -26,20 +26,20 @@ For a user-started chat these are recommended starting settings. A running chat 
 
 | Assignment | Model | Reasoning effort |
 | --- | --- | --- |
-| Full-cycle orchestrator | `gpt-6.2-astra` | `high` |
+| Full-cycle orchestrator | `gpt-6.2-astra` | `xhigh` |
 | Requirements owner and PRD interview | `gpt-6.2-sol` | `high` |
 | Research to locate a known fact | `gpt-6.2-sol` | `low` |
 | Research to trace behavior, feasibility or conflicting sources | `gpt-6.2-sol` | `high` |
-| Technical specification and architecture | `gpt-6.2-astra` | `high` |
+| Technical specification and architecture | `gpt-6.2-astra` | `xhigh` |
 | Development plan | `gpt-6.2-sol` | `high` |
 | Implementation orchestrator | `gpt-6.2-sol` | `high` |
 | Engineer implementing a bounded slice | `gpt-6.2-sol` | `high` |
 | Engineer handling a save migration, race condition or cross-system failure | `gpt-6.2-astra` | `xhigh` |
-| Independent code review | `gpt-6.2-astra` | `high` |
+| Independent code review | `gpt-6.2-astra` | `xhigh` |
 | Code review where a defect could cause data loss | `gpt-6.2-astra` | `xhigh` |
 | QA executing a defined scenario | `gpt-6.2-sol` | `medium` |
 | QA primarily operating the Editor or UI to check observable behavior | `gpt-6.1-terra` | `medium` |
-| Final integrated acceptance of the whole feature | `gpt-6.2-astra` | `high` |
+| Final integrated acceptance of the whole feature | `gpt-6.2-astra` | `xhigh` |
 | Documentation from verified results | `gpt-6.2-sol` | `medium` |
 
 For a stage helper writing or independently reading a PRD, specification or plan, use the corresponding stage setting. Use the research rows for bounded investigations. When the same checker owns code review and slice QA, use the review setting. For final integrated acceptance, use the final acceptance setting even when the scenario includes visual checks.
