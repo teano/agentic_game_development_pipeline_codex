@@ -28,4 +28,6 @@ Map all original requirements, acceptance criteria, constraints and specificatio
 
 Describe the whole user flow and seams on the final feature. Name required methods, known recipes, environment and restrictions. Future checks are planned; unavailable observations remain outstanding. Distinguish local technical setup from external prerequisites and actual product decisions.
 
+Identify the feature base and relevant project rules for the final architecture reviewer to check on the same delivered candidate.
+
 Keep actual approval in the project's durable record after the complete bytes are frozen. Do not embed this artifact's own hash or later approval inside it.

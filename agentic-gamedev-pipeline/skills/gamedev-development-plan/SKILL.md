@@ -48,6 +48,8 @@ Plan final acceptance on the whole integrated feature, including the actual user
 
 ## Check, approve and hand off
 
+At final handoff account for both integrated gameplay acceptance and the [final architecture review](../gamedev-pipeline/SKILL.md#final-architecture-review). Implementation assigns one dedicated reviewer for the complete feature and retains it through repairs. This check applies within the final handoff of existing plans as well.
+
 Read the complete draft against its sources: an implementer can start, dependencies are feasible, every original obligation survives, exclusions remain and final checks observe the requested behavior. Use an independent read for complex or consequential plans when it can expose a real coverage or seam defect; perform explicitly required review. Correct valid findings without accepting optional scope expansion.
 
 Freeze the checked plan, compute its SHA-256 and obtain actual approval using the shared authority procedure. Exercise already delegated approval when it covers this artifact. Without applicable approval, deliver the concrete complete plan and exact SHA for the responsible decision. Preserve its PRD/SPEC bindings and name the durable approval record. Do not infer approval from worker success or upstream readiness.

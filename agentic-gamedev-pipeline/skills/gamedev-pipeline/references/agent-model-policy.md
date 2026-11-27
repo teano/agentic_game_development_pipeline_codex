@@ -25,7 +25,9 @@ During Implementation the orchestrator chooses a worker for the outcome, the jud
 
 For mixed work, route by the decision that determines success. A specified HUD over a finished gameplay API can stay with one Terra worker. A new state contract and its tests belong with a Sol engineer. For combined review and QA, choose Sol when the decisive question is correctness of code or data, or Terra when it is the observed player flow. Final acceptance of a defined playable flow uses a fresh independent Terra checker; route a materially different risk by the table. Retain all required observations.
 
-Reserve `xhigh` during Implementation for an identified difficult question that warrants more reasoning. Describe the question and why the lower setting is insufficient. If a selected default model is unavailable, use an available model capable of the assignment and record the substitution. Preserve explicit user and project constraints.
+For the dedicated final architecture review use its named role below. Generic code-review, visual QA and final gameplay settings do not apply to this assignment. Keep its agent for every recheck. If the required model or effort is unavailable, report the missing review rather than silently substituting a cheaper worker. Honor an explicit user instruction for this role; surface a conflicting constraint before dispatch.
+
+For other Implementation assignments reserve `xhigh` for an identified difficult question that warrants more reasoning. Describe the question and why the lower setting is insufficient. If a selected default model is unavailable, use an available model capable of the assignment and record the substitution. Preserve explicit user and project constraints.
 
 Outside Implementation, stage owners and independent readers use the stage defaults below. An upstream visual author or visual design reviewer uses `gpt-6.2-astra` by default. For any upstream assignment that resolves to `gpt-6.2-astra` and would take `high` from its role, keep the upstream `xhigh` setting. Explicit user, project or action effort takes precedence. For image or 3D work, the selected model operates the available tool. The tool controls its own backend.
 
@@ -42,6 +44,7 @@ Outside Implementation, stage owners and independent readers use the stage defau
 | Implementation orchestrator | `gpt-6.2-sol` | `high` |
 | Implementation engineer or independent code reviewer | `gpt-6.2-sol` | `medium` |
 | Independent gameplay QA and final integrated acceptance | `gpt-6.1-terra` | `medium` |
+| Final architecture reviewer | `gpt-6.2-astra` | `xhigh` |
 | Documentation from verified results | `gpt-6-luna` | `medium` |
 
 These are recommended starting settings for a user-started chat. A running owner keeps its actual selection. On an authorized `spawn_agent` call pass `fork_turns="none"`, `model` and `reasoning_effort` as tool arguments. Record the decision in the existing implementation note at dispatch. Reuse the same author and checker for same-slice repairs. Add a read-only adviser only for a specific diagnostic or design question; return the actionable result to the original team.

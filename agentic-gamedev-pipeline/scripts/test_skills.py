@@ -104,10 +104,24 @@ class SkillPackageTests(unittest.TestCase):
             "Implementation orchestrator": ("gpt-6.2-sol", "high"),
             "Implementation engineer or independent code reviewer": ("gpt-6.2-sol", "medium"),
             "Independent gameplay QA and final integrated acceptance": ("gpt-6.1-terra", "medium"),
+            "Final architecture reviewer": ("gpt-6.2-astra", "xhigh"),
         }
         for role, setting in expected.items():
             with self.subTest(role=role):
                 self.assertEqual(setting, defaults.get(role))
+
+    def test_final_architecture_review_handoff(self) -> None:
+        for owner, target in (
+            ("gamedev-orchestrator", "gamedev-pipeline"),
+            ("gamedev-development-plan", "gamedev-pipeline"),
+            ("gamedev-pipeline", "gamedev-review"),
+        ):
+            with self.subTest(owner=owner, target=target):
+                source = (SKILLS / owner / "SKILL.md").read_text(encoding="utf-8")
+                links = MARKDOWN_LINK.findall(source)
+                self.assertIn(f"../{target}/SKILL.md#final-architecture-review", links)
+                target_text = (SKILLS / target / "SKILL.md").read_text(encoding="utf-8")
+                self.assertIn("## Final architecture review", target_text.splitlines())
 
 
 if __name__ == "__main__":

@@ -33,6 +33,8 @@ Authority to approve is not approval. Require an actual actor who reads the full
 
 Keep Implementation's fresh Engineer and independent QA/checker for every development slice, its approved unit boundaries and same-slice repair team. Acceptance-only units and final integrated acceptance require a fresh independent checker uninvolved in earlier slices. If the last planned unit already supplies that acceptance on the current candidate, consume it once without duplicate final QA. Do not replace real required interaction with compilation, screenshots or slice PASS reports.
 
+Before accepting the Implementation handoff, verify the final gameplay evidence and the [final architecture review](../gamedev-pipeline/SKILL.md#final-architecture-review) verdict for the delivered candidate. The Implementation owner keeps the reviewer through repairs and returns its verdict. The full-cycle parent consumes that review once.
+
 ## Resolve changes and recover
 
 Return a material product gap, contradiction or new scope to the Requirements owner and user. Obtain the needed decision, current PRD revision and human approval before dependent work resumes, then reassess affected downstream sources and evidence. A required permission change needs its responsible user's decision. Preserve unrelated useful authorized work while resolving the issue. Routine technical design, implementation refinement, local setup and recoverable failures remain delegated work within the approved obligations; they do not create another product approval checkpoint.

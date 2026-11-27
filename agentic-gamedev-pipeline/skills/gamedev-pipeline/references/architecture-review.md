@@ -2,8 +2,9 @@
 
 Use this baseline when a change introduces a module, a dependency between
 owners, a new owner of state, a public contract or extension point, or moves
-files across module boundaries. A local change inside an existing boundary
-uses the project's normal workflow.
+files across module boundaries. During final architecture review apply the
+criteria to the whole delivered feature, including local changes within an
+existing module. Scale each check to the responsibilities actually affected.
 
 ## Establish the relevant project rules
 
@@ -46,6 +47,16 @@ scope and reason. Nearby legacy code alone does not establish an exception.
 - **Placement.** Determine the owner, location and owning package or assembly
   for new or moved files. Use the project's layout and checks. If no layout is
   documented, use the neighboring example that fulfills the same role.
+- **System and script decomposition.** Follow the affected production paths
+  between peer systems and components, and through their internal layers. Check which
+  element makes each decision and which collaborators it may call or mutate.
+  Inspect changed scripts for mixed responsibilities, duplicate decisions,
+  hidden dependencies and lifecycle or initialization in the wrong layer.
+- **Naming and file structure.** Compare directories, filenames, symbols,
+  module exports and script organization with the applicable project rules
+  and terminology. Check that names communicate the real responsibility and
+  that callers use the intended entry point. Explain any finding with the
+  specific rule or its effect on navigation, ownership or safe extension.
 
 ## Show the evidence at the existing checkpoints
 
