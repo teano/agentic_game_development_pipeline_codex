@@ -29,6 +29,7 @@ Make the following clear where they matter to this feature:
 - Observable behavior, its original requirement/criterion sources and the production path that supplies it.
 - Responsibilities and extension points, data/state changes, interfaces and integration seams that must agree.
 - Important invariants, lifecycle/failure/repeat behavior actually required by sources or necessary for those integrations.
+- At a consequential seam, give the worker a concrete example that distinguishes the intended behavior, such as an older save, a callback arriving after its window closes, or a reference view for an approved pose.
 - How each original obligation and real constraint is achieved and observed, including documentation duties and cross-cutting requirements.
 - Genuine prerequisites, technical uncertainty and explicit exclusions; separate selected technical choices from product decisions still needed.
 

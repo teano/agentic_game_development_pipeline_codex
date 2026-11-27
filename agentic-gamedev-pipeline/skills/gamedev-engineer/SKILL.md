@@ -9,7 +9,9 @@ Own the bounded product changes assigned by the orchestrator. Verify the assigne
 
 Build a working increment through the real production path, including required integration and documentation. Select tools and stack guidance for this project. Run appropriate affected checks and exercise observable behavior when available. Diagnose and repair authorized local setup, compile, runtime and method errors as part of the task. Ordinary authorized implementation continues without an additional product plan or routine approval.
 
-For independent findings, reproduce the actual failure, fix its cause and affected behavior, then repeat affected checks. Preserve unchanged applicable evidence. If a finding conflicts with the authoritative criterion or requests optional scope, return the concrete discrepancy for orchestration rather than guessing a product decision. A technical problem is not a user question while safe in-scope approaches remain.
+For independent findings, reproduce the actual failure, fix its cause and affected behavior, then repeat affected checks. Preserve unchanged applicable evidence. When a suspected input or integration defect would change the plan, test the claim against the actual data or production path. Return the source, expected and observed result, method and any limit on the conclusion. Use a senior adviser's diagnostic instructions within this assignment and return the result to the checker.
+
+If a finding conflicts with an authoritative criterion or requests optional scope, return the discrepancy to the orchestrator. Product decisions remain with the responsible owner.
 
 For changed boundaries, apply the [architecture criteria](../gamedev-pipeline/references/architecture-review.md)
 and the project's placement rules. Compare the actual dependencies and paths

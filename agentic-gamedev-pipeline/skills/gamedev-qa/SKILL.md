@@ -11,7 +11,7 @@ Keep persistent product source/assets read-only. You may build, run and operate 
 
 Choose meaningful checks for the required behavior and concrete regression risks. Use explicitly required identities/methods and preserve their actual applicability. Inspect the production path and decisive assertions where automated tests supply acceptance evidence. Exercise the real required interaction and observable outcome; a stub, substituted path or screenshot alone cannot establish a playable flow. Code review, automated checks and runtime observation prove different facts.
 
-Return concrete findings with source criterion, candidate, reproduction, expected/observed result and useful evidence. Missing evidence remains an incomplete observation, not an invented product bug. Distinguish an observed defect from unavailable capability or a genuine criterion conflict. Do not add preferred mechanics, style changes or optional stronger tests as requirements. Continue the rest of the assigned checking even after finding a failure.
+Return concrete findings with source criterion, candidate, reproduction, expected/observed result and useful evidence. For a suspected contradiction, check the canonical input and report whether the evidence establishes the defect or leaves it open. Distinguish an observed defect from unavailable capability or a genuine criterion conflict. Do not add preferred mechanics, style changes or optional stronger tests as requirements. Continue the rest of the assigned checking even after finding a failure.
 
 For a changed boundary, check the candidate and diff using the applicable
 project rules and [architecture criteria](../gamedev-pipeline/references/architecture-review.md).

@@ -18,6 +18,8 @@ before dependent work repeats the design.
 
 For each coherent increment, describe its observable outcome and source obligations, affected areas, prerequisites/integrations, actual boundaries, check/input procedure and expected result. State what the next increment can depend on.
 
+Where a worker would otherwise have to rediscover a decision, identify one usable project example or reference, the input it applies to and the observation that decides acceptance. If an early check uses a substitute, name the later unit that exercises the real dependency.
+
 ## Obligation coverage
 
 Map all original requirements, acceptance criteria, constraints and specification/documentation duties to work and checks. Preserve IDs or stable source locators. Retain cross-increment and out-of-scope work explicitly.

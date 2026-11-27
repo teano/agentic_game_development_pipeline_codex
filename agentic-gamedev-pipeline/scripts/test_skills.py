@@ -94,6 +94,21 @@ class SkillPackageTests(unittest.TestCase):
             with self.subTest(document=name):
                 self.assertIn(version, (REPOSITORY / name).read_text(encoding="utf-8"))
 
+    def test_implementation_role_defaults(self) -> None:
+        policy = SKILLS / "gamedev-pipeline" / "references" / "agent-model-policy.md"
+        role_section = policy.read_text(encoding="utf-8").split("## Role defaults\n", 1)[1]
+        rows = re.findall(r"^\| ([^|]+?) \| `([^`]+)` \| `([^`]+)` \|$", role_section, re.M)
+        defaults = {name: (model, effort) for name, model, effort in rows}
+        self.assertEqual(len(rows), len(defaults), "Duplicate role defaults")
+        expected = {
+            "Implementation orchestrator": ("gpt-6.2-sol", "high"),
+            "Implementation engineer or independent code reviewer": ("gpt-6.2-sol", "medium"),
+            "Independent gameplay QA and final integrated acceptance": ("gpt-6.1-terra", "medium"),
+        }
+        for role, setting in expected.items():
+            with self.subTest(role=role):
+                self.assertEqual(setting, defaults.get(role))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
