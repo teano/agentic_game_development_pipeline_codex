@@ -27,6 +27,7 @@ PUBLIC_SKILLS = {
     "gamedev-development-plan",
     "gamedev-orchestrator",
     "gamedev-pipeline",
+    "gamedev-refinement",
     "gamedev-engineer",
     "gamedev-qa",
     "gamedev-review",
@@ -102,6 +103,7 @@ class SkillPackageTests(unittest.TestCase):
         self.assertEqual(len(rows), len(defaults), "Duplicate role defaults")
         expected = {
             "Implementation orchestrator": ("gpt-6.2-sol", "high"),
+            "Refinement orchestrator": ("gpt-6.2-sol", "high"),
             "Implementation engineer or independent code reviewer": ("gpt-6.2-sol", "medium"),
             "Independent gameplay QA and final integrated acceptance": ("gpt-6.1-terra", "medium"),
             "Final architecture reviewer": ("gpt-6.2-astra", "xhigh"),
@@ -114,6 +116,7 @@ class SkillPackageTests(unittest.TestCase):
         for owner, target in (
             ("gamedev-orchestrator", "gamedev-pipeline"),
             ("gamedev-development-plan", "gamedev-pipeline"),
+            ("gamedev-refinement", "gamedev-pipeline"),
             ("gamedev-pipeline", "gamedev-review"),
         ):
             with self.subTest(owner=owner, target=target):
@@ -122,6 +125,12 @@ class SkillPackageTests(unittest.TestCase):
                 self.assertIn(f"../{target}/SKILL.md#final-architecture-review", links)
                 target_text = (SKILLS / target / "SKILL.md").read_text(encoding="utf-8")
                 self.assertIn("## Final architecture review", target_text.splitlines())
+
+    def test_refinement_continuation_entry_points(self) -> None:
+        for owner in ("gamedev-pipeline", "gamedev-orchestrator"):
+            with self.subTest(owner=owner):
+                source = (SKILLS / owner / "SKILL.md").read_text(encoding="utf-8")
+                self.assertIn("../gamedev-refinement/SKILL.md", MARKDOWN_LINK.findall(source))
 
 
 if __name__ == "__main__":

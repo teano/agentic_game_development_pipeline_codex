@@ -11,9 +11,11 @@ A model-only override leaves effort to the next matching rule. Apply the most sp
 
 ## Action rules
 
-During Implementation the orchestrator chooses a worker for the outcome, the judgement it needs and the consequence of a mistake. Keep related routine steps with the current worker. Use an available script for deterministic operations. Choose the following settings when issuing an assignment.
+Refinement uses the same operation rules and final architecture reviewer as Implementation. The primary chat agent is the refinement orchestrator. A new chat is recommended to start at the role default below; an existing chat retains its actual model and effort.
 
-| Implementation operation | Model | Reasoning effort |
+During Implementation and Refinement the orchestrator chooses a worker for the outcome, the judgement it needs and the consequence of a mistake. Keep related routine steps with the current worker. Use an available script for deterministic operations. Choose the following settings when issuing an assignment.
+
+| Implementation or refinement operation | Model | Reasoning effort |
 | --- | --- | --- |
 | Run a known CLI build or test recipe, collect specified logs, verify hashes or tabulate results with a fixed rule | `gpt-6-luna` | `low` |
 | Apply a verified example to bounded data, localization, configuration or repeatable test cases | `gpt-6-luna` | `medium` |
@@ -27,9 +29,9 @@ For mixed work, route by the decision that determines success. A specified HUD o
 
 For the dedicated final architecture review use its named role below. Generic code-review, visual QA and final gameplay settings do not apply to this assignment. Keep its agent for every recheck. If the required model or effort is unavailable, report the missing review rather than silently substituting a cheaper worker. Honor an explicit user instruction for this role; surface a conflicting constraint before dispatch.
 
-For other Implementation assignments reserve `xhigh` for an identified difficult question that warrants more reasoning. Describe the question and why the lower setting is insufficient. If a selected default model is unavailable, use an available model capable of the assignment and record the substitution. Preserve explicit user and project constraints.
+For other implementation or refinement assignments reserve `xhigh` for an identified difficult question that warrants more reasoning. Describe the question and why the lower setting is insufficient. If a selected default model is unavailable, use an available model capable of the assignment and record the substitution. Preserve explicit user and project constraints.
 
-Outside Implementation, stage owners and independent readers use the stage defaults below. An upstream visual author or visual design reviewer uses `gpt-6.2-astra` by default. For any upstream assignment that resolves to `gpt-6.2-astra` and would take `high` from its role, keep the upstream `xhigh` setting. Explicit user, project or action effort takes precedence. For image or 3D work, the selected model operates the available tool. The tool controls its own backend.
+During Requirements, Specification and Planning, stage owners and independent readers use the stage defaults below. An upstream visual author or visual design reviewer uses `gpt-6.2-astra` by default. For any upstream assignment that resolves to `gpt-6.2-astra` and would take `high` from its role, keep the upstream `xhigh` setting. Explicit user, project or action effort takes precedence. For image or 3D work, the selected model operates the available tool. The tool controls its own backend.
 
 ## Role defaults
 
@@ -42,6 +44,7 @@ Outside Implementation, stage owners and independent readers use the stage defau
 | Technical specification and architecture | `gpt-6.2-astra` | `xhigh` |
 | Development plan | `gpt-6.2-sol` | `high` |
 | Implementation orchestrator | `gpt-6.2-sol` | `high` |
+| Refinement orchestrator | `gpt-6.2-sol` | `high` |
 | Implementation engineer or independent code reviewer | `gpt-6.2-sol` | `medium` |
 | Independent gameplay QA and final integrated acceptance | `gpt-6.1-terra` | `medium` |
 | Final architecture reviewer | `gpt-6.2-astra` | `xhigh` |

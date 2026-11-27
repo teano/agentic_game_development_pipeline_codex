@@ -1,0 +1,6 @@
+interface:
+  display_name: "GameDev Refinement"
+  short_description: "Coordinate and verify post-implementation feedback"
+  default_prompt: "Use $gamedev-refinement to find the original feature delivery and coordinate this batch of refinements."
+policy:
+  allow_implicit_invocation: false

@@ -46,3 +46,5 @@ Keep one writer for shared files and one operator for a mutable runtime. Finish 
 ## Complete the cycle
 
 Complete only when the authorized original obligations and required final integrated acceptance are established on the delivered state. Required unavailable observations remain `not_run`, with the exact incomplete outcome and missing action. Before returning, make writers quiescent and finish or explicitly hand over owned temporary resources. Report the delivered result, current artifact/approval and candidate/evidence locators, verification and any real blocker. The cycle grants no push, release, spending or unrelated external action.
+
+Keep the root delivery chat locator and delegated Implementation owner's handle in the existing handoff. When the user brings follow-up feedback on this delivered feature to this chat, the root takes up [GameDev Refinement](../gamedev-refinement/SKILL.md) directly and manages its subagents. This continuation requires neither another skill command nor a nested stage coordinator. A different chat enters through an explicit refinement invocation.
